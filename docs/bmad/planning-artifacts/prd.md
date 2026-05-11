@@ -6,6 +6,7 @@ stepsCompleted:
   - step-02c-executive-summary
   - step-03-success
   - step-04-journeys
+  - step-05-domain
 inputDocuments:
   - docs/bmad/planning-artifacts/product-brief-bowerbird-distillate.md
   - docs/bmad/planning-artifacts/product-brief-bowerbird.md
