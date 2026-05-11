@@ -2,6 +2,7 @@
 stepsCompleted:
   - step-01-init
   - step-02-discovery
+  - step-02b-vision
 inputDocuments:
   - docs/bmad/planning-artifacts/product-brief-bowerbird-distillate.md
   - docs/bmad/planning-artifacts/product-brief-bowerbird.md
