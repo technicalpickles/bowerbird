@@ -1,6 +1,7 @@
 ---
 stepsCompleted:
   - step-01-init
+  - step-02-discovery
 inputDocuments:
   - docs/bmad/planning-artifacts/product-brief-bowerbird-distillate.md
   - docs/bmad/planning-artifacts/product-brief-bowerbird.md
@@ -11,6 +12,11 @@ briefCount: 2
 researchCount: 0
 brainstormingCount: 1
 projectDocsCount: 1
+classification:
+  projectType: developer_tool
+  domain: general
+  complexity: medium
+  projectContext: brownfield
 ---
 
 # Product Requirements Document - bowerbird
