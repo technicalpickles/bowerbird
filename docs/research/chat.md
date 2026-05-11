@@ -427,12 +427,12 @@ jsonc
 // ~/.claude/settings.json — one entry per hook event, all pointing at the daemon
 {
   "hooks": {
-    "PreToolUse":  [{ "command": "claude-state-bus emit PreToolUse" }],
-    "PostToolUse": [{ "command": "claude-state-bus emit PostToolUse" }],
+    "PreToolUse":  [{ "command": "bowerbird emit PreToolUse" }],
+    "PostToolUse": [{ "command": "bowerbird emit PostToolUse" }],
     // ...
   }
 }
-The claude-state-bus emit <type> shim:
+The bowerbird emit <type> shim:
 
 reads stdin (the hook payload)
 POSTs to the daemon
@@ -933,7 +933,7 @@ The big architectural one:
 HITL backflow — promote from "out of scope" to extension surface. The original critique flagged this for disler alone. The survey shows at least seven independently developed tools want approval-from-elsewhere (m5-paper-buddy, AgentDeck, claude-watch, Redlight Greenlight, terminaldeck, Bobby-Gray cinematic, Cardputer pager). It's a category, not a feature. If the daemon doesn't do this, every HITL tool installs its own blocking PreToolUse hook — collision returns. Proposed: a "permission decision" channel where exactly one subscriber registers as authoritative answerer per session; others can display informationally.
 Topology gaps:
 
-LAN reachability + mDNS discovery — every wearable/hardware tool runs across LAN, not localhost. AgentDeck explicitly uses mDNS + QR pairing. Daemon should bind two listeners (localhost always-on, LAN opt-in) with _claude-state-bus._tcp.local advertisement and per-device tokens.
+LAN reachability + mDNS discovery — every wearable/hardware tool runs across LAN, not localhost. AgentDeck explicitly uses mDNS + QR pairing. Daemon should bind two listeners (localhost always-on, LAN opt-in) with _bowerbird._tcp.local advertisement and per-device tokens.
 Codex / OpenCode adapter sketch — the design claims agent-agnostic but only details Claude Code. agent-flow, AgentDeck, claude-rpc, ccmanager, opensessions all visualize Codex too. Codex has no hooks at all — pure JSONL tail under ~/.codex/sessions/. If the abstraction holds for a hook-less provider, it's real; if it doesn't, it's "Claude Code with extra steps." Should ship a Codex provider in v1 to validate.
 Marginal:
 
@@ -1105,7 +1105,7 @@ A "what this enables" tour walking every tool in the inventory through v2 — wh
 
 The four open questions explicitly called out: current_state storage strategy, auth model (probably per-daemon-run token, Pixel Agents pattern), event retention, statusline composition order, language/runtime choice (Rust/Go for the shim specifically), and whether to expose payload filtering.
 
-Want to push further? Three natural next moves: (a) sketch the minimum viable prototype — probably the hook router + sqlite event log + the reaction enum projection, ~500 lines; (b) write the protocol spec as JSON Schema or TypeScript types for a @claude-state-bus/protocol package; or (c) put together the "pitch to Pablo De Lucca and Alvin Unreal" memo — they're the two who already articulate the substrate problem.
+Want to push further? Three natural next moves: (a) sketch the minimum viable prototype — probably the hook router + sqlite event log + the reaction enum projection, ~500 lines; (b) write the protocol spec as JSON Schema or TypeScript types for a @bowerbird/protocol package; or (c) put together the "pitch to Pablo De Lucca and Alvin Unreal" memo — they're the two who already articulate the substrate problem.
 
 
 08 design sketch v2
@@ -1462,7 +1462,7 @@ Durable subscriptions: ship now or wait for evidence? (probably wait)
 Per-attachment liveness topic granularity? (probably session-level, filter client-side)
 Explicitly still out of scope — HITL backflow, cross-machine pub/sub, tool blocking, application-level concepts, cross-agent normalization beyond the reaction enum. The substrate's pitch holds: be the data layer the existing tools could adopt, freeing them from per-agent watcher code. Pub/sub is what makes that adoption easy.
 
-Want to push further? Three natural moves: (a) write the actual capabilities YAML files for the tier-1 agents based on AgentDeck's matrix plus what we found in opensessions/agent-flow; (b) sketch the wire protocol as TypeScript types in a shared @claude-state-bus/protocol package; or (c) do the "minimum viable prototype" memo — what's the smallest version that's useful (probably hook router + sqlite event log + Claude adapter + WS pub/sub + the reaction projection, in Rust or Go for the shim binary).
+Want to push further? Three natural moves: (a) write the actual capabilities YAML files for the tier-1 agents based on AgentDeck's matrix plus what we found in opensessions/agent-flow; (b) sketch the wire protocol as TypeScript types in a shared @bowerbird/protocol package; or (c) do the "minimum viable prototype" memo — what's the smallest version that's useful (probably hook router + sqlite event log + Claude adapter + WS pub/sub + the reaction projection, in Rust or Go for the shim binary).
 
 
 11 design sketch v2 1
@@ -1580,7 +1580,7 @@ Closing principle: the substrate is a piece of plumbing. Plumbing earns trust by
 
 Where to push next?
 
-(a) Wire-protocol spec — write the JSON Schema/TypeScript types for the pub/sub frames + event envelope as a @claude-state-bus/protocol package so contributors have a fixed target
+(a) Wire-protocol spec — write the JSON Schema/TypeScript types for the pub/sub frames + event envelope as a @bowerbird/protocol package so contributors have a fixed target
 (b) Adapter-author guide — a single doc explaining "how to add an agent" with Claude as the worked example, so M2/M4/M5 contributors don't have to reverse-engineer the design
 (c) Architectural decision records — capture the load-bearing decisions (Rust, monotonic event_id at daemon, two-channel pub/sub, etc.) with the alternatives considered, so the design isn't relitigated each time a new contributor shows up
 (d) An honest pitch memo — to nudge specific developers (Pablo De Lucca / Pixel Agents, Alvin Unreal / OpenPets, patoles / agent-flow, puritysb / AgentDeck) on whether this substrate would actually help them. They've each solved part of the problem; would they trade their per-agent watcher code for a shared one?
@@ -2019,7 +2019,7 @@ What this actually demonstrates is the design discipline working as intended —
 Where to next?
 
 (a) Apply the same survey-against-evidence discipline to the capabilities matrix proposal from doc 11 — which tools actually need negotiation vs. which would key on source directly?
-(b) Write the wire-protocol spec as concrete TypeScript types (@claude-state-bus/protocol package) — turn the abstraction into something testable
+(b) Write the wire-protocol spec as concrete TypeScript types (@bowerbird/protocol package) — turn the abstraction into something testable
 (c) Adapter-author guide as a single doc with Claude as the worked example — what M2 contributors would need to write a Codex adapter
 (d) Pivot to concrete implementation choices — Rust crate structure, the hook router state machine, storage schema migrations
 
@@ -2275,7 +2275,7 @@ Contribution model — borrow pi-mono's auto-close pattern. PRs from new contrib
 
 Repository structure optimized for AI extension authors:
 
-claude-state-bus/
+bowerbird/
 ├── README.md           # single page, philosophy + no-list
 ├── AGENTS.md           # project rules for humans + AI
 ├── docs/               # reference (design, protocol, adapter-authoring)
@@ -2722,7 +2722,7 @@ May 10
 Claude responded: You're right — this is a genuinely unspecified piece, and the failure modes you're naming are exactly the right ones to worry about.
 You're right — this is a genuinely unspecified piece, and the failure modes you're naming are exactly the right ones to worry about. Let me think about it carefully before drafting anything.
 
-The shim is invoked by Claude Code on every hook event. The hook config says something like command: claude-state-bus-shim. Claude runs it, captures stdout/stderr, looks at the exit code. If the shim exits non-zero or takes "too long," Claude either surfaces an error or stalls — both of which are unacceptable.
+The shim is invoked by Claude Code on every hook event. The hook config says something like command: bowerbird-shim. Claude runs it, captures stdout/stderr, looks at the exit code. If the shim exits non-zero or takes "too long," Claude either surfaces an error or stalls — both of which are unacceptable.
 
 So what does the shim actually need to do? Receive a hook payload (from Claude, on stdin), forward it to the daemon, exit fast.
 
@@ -2758,7 +2758,7 @@ And the shim never actually waits for the daemon to acknowledge anything. Connec
 
 Let me also consider: should the shim spawn a background detached process for the network send, so the parent can exit even faster? That's tempting but adds complexity (process management, signal handling, double-fork pattern) and the UDS round-trip on loopback should be sub-millisecond. Probably not worth it for v1.
 
-One more thing: the spool format. Newline-delimited JSON in ~/.claude-state-bus/spool/. Each file is one event. Atomic file creation via O_CREAT | O_EXCL with <timestamp>-<random>.ndjson. Daemon picks them up, processes, deletes. This is the same pattern that systemd journal and similar tools use.
+One more thing: the spool format. Newline-delimited JSON in ~/.bowerbird/spool/. Each file is one event. Atomic file creation via O_CREAT | O_EXCL with <timestamp>-<random>.ndjson. Daemon picks them up, processes, deletes. This is the same pattern that systemd journal and similar tools use.
 
 Let me write this up.
 
@@ -2787,7 +2787,7 @@ Spool only	~2ms	~3ms
 Catastrophic (spool write fails)	~3ms	~5ms
 5ms p95 budget holds in every scenario, including the catastrophic one.
 
-The crucial property restated: the shim's exit code is always 0, regardless of what happened internally. A separate diagnostic command (claude-state-bus diagnose) checks for accumulating spool files, malformed entries, recent stderr — users who want to know "is my pipeline healthy" run that. The shim never tells them. Claude never sees a failed hook.
+The crucial property restated: the shim's exit code is always 0, regardless of what happened internally. A separate diagnostic command (bowerbird diagnose) checks for accumulating spool files, malformed entries, recent stderr — users who want to know "is my pipeline healthy" run that. The shim never tells them. Claude never sees a failed hook.
 
 Failure mode walkthrough — what happens in each scenario:
 
@@ -2952,7 +2952,7 @@ But there are gotchas worth surfacing:
 The WAL file shared-memory region (-shm) must already exist or the first writer has to create it. If the daemon hasn't run yet, the shim is the first writer and has to do this work, which adds ~1-2ms. Acceptable.
 Writer contention. SQLite WAL allows one writer at a time. If Claude fires multiple hook events nearly simultaneously (e.g., parallel tool calls), the second shim invocation blocks on SQLITE_BUSY until the first commits. With WAL the busy window is very short (~0.5ms typically) but it's non-zero. Setting busy_timeout to ~50ms covers it.
 The "daemon isn't running yet" case is actually easier than UDS+spool. With the shim writing directly to SQLite, there's no separate code path. The database file exists or it doesn't. If it doesn't, the shim creates it (with schema). The daemon, when it starts, opens the same file and finds the events. This is genuinely cleaner.
-The first-ever-shim-invocation case. If ~/.claude-state-bus/events.db doesn't exist, the shim has to create it and run schema migrations. That's ~5-10ms — over budget on that one invocation. Fixable: ship the database file in the daemon's install step, so by the time the shim runs the file exists.
+The first-ever-shim-invocation case. If ~/.bowerbird/events.db doesn't exist, the shim has to create it and run schema migrations. That's ~5-10ms — over budget on that one invocation. Fixable: ship the database file in the daemon's install step, so by the time the shim runs the file exists.
 Disk durability. WAL with synchronous=NORMAL doesn't fsync on every commit; it fsyncs at WAL checkpoint time. This is actually what we want — fast writes, durability on the order of seconds, no per-event sync penalty.
 The polling concern, examined more carefully:
 
@@ -2969,7 +2969,7 @@ Option 2: SQLite's update_hook mechanism. The C API has sqlite3_update_hook() th
 
 Option 3: WAL frame watching. SQLite WAL writes append to events.db-wal. The daemon could notify/inotify watch this file and read new frames when it changes. But parsing WAL frames directly is fragile (it's an internal SQLite format). Not recommended.
 
-Option 4: A "wakeup" sentinel. Shim writes a small sentinel file (~/.claude-state-bus/wake) after the INSERT. Daemon watches this file with notify. On modification, daemon queries for new rows. Combines durable INSERT with fast notification.
+Option 4: A "wakeup" sentinel. Shim writes a small sentinel file (~/.bowerbird/wake) after the INSERT. Daemon watches this file with notify. On modification, daemon queries for new rows. Combines durable INSERT with fast notification.
 
 Latency: file modify → kernel notify → daemon wake → SELECT → emit. Maybe 5-10ms.
 Shim does one extra write (touch the sentinel). ~0.2ms overhead.
@@ -3058,7 +3058,7 @@ Option A: Pure polling. Daemon polls SELECT MAX(event_id) FROM events WHERE even
 
 Option B: SQLite WAL file watch. Daemon watches events.db-wal via notify crate. On file modification, query for new rows. Native FS notification = ~5-10ms latency. Free CPU when idle.
 
-Option C: Sentinel file. Shim writes the row, then touch ~/.claude-state-bus/wake. Daemon watches that one file. Same latency profile as B but using a smaller, simpler file.
+Option C: Sentinel file. Shim writes the row, then touch ~/.bowerbird/wake. Daemon watches that one file. Same latency profile as B but using a smaller, simpler file.
 
 Option D: Hybrid. Daemon polls slowly (200ms) as a backstop, plus watches the WAL file for fast path. Misses on the FS watch get caught by the next poll.
 
@@ -3071,7 +3071,7 @@ The shim and daemon must agree on schema. If the shim writes a row with columns 
 The shim opening SQLite on a database that doesn't exist yet. First-ever-shim-run case. Two options:
 Shim creates the database with schema if it doesn't exist (~5-10ms one-time cost; acceptable since it's once per install).
 Daemon's install command creates the database; shim refuses to write if file doesn't exist (cleaner, but means the install must run before any Claude session).
-I'd pick the second — it's the responsibility of claude-state-bus install to ensure the schema is ready.
+I'd pick the second — it's the responsibility of bowerbird install to ensure the schema is ready.
 Checkpoint behavior. WAL files grow until checkpoint. With many writers and no long-running daemon connection, checkpoint might not happen. Overstory handles this with a long-running daemon that maintains a connection. We'd do the same — the daemon's existence ensures periodic checkpoints. If the daemon is down for a long time, the WAL grows; on daemon startup it does a PRAGMA wal_checkpoint(TRUNCATE).
 macOS fsync caveat from the SQLite-in-production benchmark. Apple's bundled SQLite has fsync patched to a weaker version; if we want true durability, we ship our own SQLite (rusqlite-bundled does this for us). Doc 20's "no fsync on the spool path" trade-off becomes moot — we just use SQLite's durability model and it's correct.
 What this means for documentation:

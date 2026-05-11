@@ -1,6 +1,6 @@
 # Out-of-scope register (the "no-list")
 
-This document lists what `claude-state-bus` deliberately does not do, with the reasoning for each entry and — where applicable — the right pathway for getting that capability another way.
+This document lists what `bowerbird` deliberately does not do, with the reasoning for each entry and — where applicable — the right pathway for getting that capability another way.
 
 The list is split into two sections:
 
@@ -107,7 +107,7 @@ Some tools may prefer to push events via MCP rather than installing hooks or shi
 
 **Why not yet:** No inventoried tool currently asks for it. Building it before there's a concrete use case risks shipping an unused surface. The substrate's POST ingest endpoint already accepts events from any source that speaks the protocol; an MCP wrapper would be a thin shim.
 
-**Pathway when it's time:** A minimal MCP server crate (`claude-state-bus-mcp`) that exposes a single `emit_event` tool and forwards to the daemon. Probably <200 lines. File a discussion if you have a use case.
+**Pathway when it's time:** A minimal MCP server crate (`bowerbird-mcp`) that exposes a single `emit_event` tool and forwards to the daemon. Probably <200 lines. File a discussion if you have a use case.
 
 ### Durable subscriptions with disk-backed queues
 

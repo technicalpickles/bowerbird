@@ -85,7 +85,7 @@ Resisting these is the discipline. Every one of them is "obviously useful," and 
 
 **Polling REST endpoints** for `GET /sessions`, `GET /sessions/:id`, `GET /sessions/:id/events?since=<cursor>`, `GET /sessions/:id/stats`. These exist primarily so a presenter can choose polling if they want; they also serve as the implementation backing for the WS snapshot frame.
 
-**Auth via per-daemon-run token** written to `~/.claude-state-bus/server.json` on startup (Pixel Agents' pattern). WS subscribers and REST clients present the token.
+**Auth via per-daemon-run token** written to `~/.bowerbird/server.json` on startup (Pixel Agents' pattern). WS subscribers and REST clients present the token.
 
 **Shim binary** that exits in <5ms. Rust, statically linked. Takes hook event name and stdin payload, POSTs to the daemon, exits. Never blocks Claude even if the daemon is down (1s timeout, log to local file on failure).
 
@@ -104,7 +104,7 @@ If both work, all four load-bearing claims pass. If only one works, there's a re
 
 ### Performance bars
 
-- Shim exit time: <5ms p95. Measured: `time claude-state-bus emit PostToolUse < /tmp/payload.json` in a loop of 100.
+- Shim exit time: <5ms p95. Measured: `time bowerbird emit PostToolUse < /tmp/payload.json` in a loop of 100.
 - Hook-to-projection-update latency: <50ms p95. Measured: timestamp on shim exit vs. timestamp on STATE channel publish.
 - Hook-to-presenter latency: <100ms p95. Measured: hook fires → lamp color changes.
 - Daemon idle CPU: <0.5% on a typical laptop with one live session.
@@ -123,7 +123,7 @@ If any of these miss by 2x, treat as an MVP failure and revisit.
 ### Repository layout
 
 ```
-claude-state-bus/
+bowerbird/
   ├── crates/
   │   ├── shim/                  # the static binary that hooks invoke
   │   ├── daemon/                # long-running service
@@ -144,9 +144,9 @@ claude-state-bus/
 ### Distribution
 
 - Homebrew tap for macOS (the primary target — most novelty tools are macOS-first)
-- `cargo install claude-state-bus` for source builds
-- A single `claude-state-bus install` command that writes the hook entry to `~/.claude/settings.json` non-destructively (merges with existing hooks)
-- A `claude-state-bus uninstall` command that removes the entries
+- `cargo install bowerbird` for source builds
+- A single `bowerbird install` command that writes the hook entry to `~/.claude/settings.json` non-destructively (merges with existing hooks)
+- A `bowerbird uninstall` command that removes the entries
 
 ## Milestones beyond MVP
 
@@ -166,7 +166,7 @@ Adds the second tier-1 adapter. Validates the abstraction shape — if the same 
 - `adapters/codex/tool-reactions.yaml` mapping `shell_command`→`running`, `apply_patch`→`editing`, etc.
 - Event-name aliasing layer in the shim — same hook events, possibly different names on Codex side
 - A small additional logic path for Codex's TOML config writing (vs. Claude's JSON)
-- `claude-state-bus install --agent codex` writes the right config to the right place
+- `bowerbird install --agent codex` writes the right config to the right place
 - Documentation: adapter-guide.md fleshed out, contributor pathway documented
 
 **Success bar:** an existing Codex presenter (probably agent-flow if patoles is willing to try it) consumes from the daemon for both Claude and Codex sessions side-by-side. Cross-source event ordering works (events from both agents interleave correctly via monotonic `event_id`).
@@ -216,10 +216,10 @@ The second ingest model — tier-2 from the multi-agent analysis. Validates that
 
 **What's in M5:**
 
-- `@claude-state-bus/opencode-plugin` npm package, ~200 lines of TypeScript
+- `@bowerbird/opencode-plugin` npm package, ~200 lines of TypeScript
 - Plugin subscribes to OpenCode's internal events (`session.created`, `session.idle`, `tool.execute.before`, `tool.execute.after`, `chat.message`), translates to the canonical `AgentEvent`, POSTs to the daemon
 - `adapters/opencode/capabilities.yaml`, `tool-reactions.yaml`, `runtime.yaml` (ingest: plugin)
-- The daemon's auth model extended to accept events from a plugin process running in OpenCode's address space (probably: the plugin reads the same token from `~/.claude-state-bus/server.json`)
+- The daemon's auth model extended to accept events from a plugin process running in OpenCode's address space (probably: the plugin reads the same token from `~/.bowerbird/server.json`)
 - Documentation: how to write a plugin-provider for an agent without config-installable hooks
 
 **Presenter that validates it:** opensessions or AgentDeck consuming from the daemon for OpenCode sessions, side-by-side with Claude.
@@ -232,7 +232,7 @@ Different problem; bigger scope. The statusline is pulled, not pushed — Claude
 
 **What's in M6:**
 
-- `claude-state-bus statusline` command Claude is configured to run
+- `bowerbird statusline` command Claude is configured to run
 - Segment provider registration via WS or local socket (`register-segment {name, priority, command}`)
 - Composition per tick: each registered segment called with current session JSON; output composed in priority order
 - Built-in segments: `state` (the reaction enum, emoji-formatted), `tokens`, `context-percentage`, `model`

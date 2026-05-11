@@ -226,22 +226,22 @@ The unified daemon installs **one hook entry per event type**, pointing at a tin
 ```jsonc
 {
   "hooks": {
-    "PreToolUse":       [{ "command": "claude-state-bus emit PreToolUse" }],
-    "PostToolUse":      [{ "command": "claude-state-bus emit PostToolUse" }],
-    "SessionStart":     [{ "command": "claude-state-bus emit SessionStart" }],
-    "SessionEnd":       [{ "command": "claude-state-bus emit SessionEnd" }],
-    "Stop":             [{ "command": "claude-state-bus emit Stop" }],
-    "SubagentStop":     [{ "command": "claude-state-bus emit SubagentStop" }],
-    "Notification":     [{ "command": "claude-state-bus emit Notification" }],
-    "UserPromptSubmit": [{ "command": "claude-state-bus emit UserPromptSubmit" }],
-    "PreCompact":       [{ "command": "claude-state-bus emit PreCompact" }]
+    "PreToolUse":       [{ "command": "bowerbird emit PreToolUse" }],
+    "PostToolUse":      [{ "command": "bowerbird emit PostToolUse" }],
+    "SessionStart":     [{ "command": "bowerbird emit SessionStart" }],
+    "SessionEnd":       [{ "command": "bowerbird emit SessionEnd" }],
+    "Stop":             [{ "command": "bowerbird emit Stop" }],
+    "SubagentStop":     [{ "command": "bowerbird emit SubagentStop" }],
+    "Notification":     [{ "command": "bowerbird emit Notification" }],
+    "UserPromptSubmit": [{ "command": "bowerbird emit UserPromptSubmit" }],
+    "PreCompact":       [{ "command": "bowerbird emit PreCompact" }]
   }
 }
 ```
 
-The `claude-state-bus emit <type>` shim:
+The `bowerbird emit <type>` shim:
 - Reads the JSON payload from stdin
-- POSTs to the local daemon (discovery via `~/.claude-state-bus/server.json`, same pattern as Pixel Agents)
+- POSTs to the local daemon (discovery via `~/.bowerbird/server.json`, same pattern as Pixel Agents)
 - Exits 0 in <5ms regardless of daemon state (failsafe)
 
 Subscribers register with the daemon over a local socket / WS / REST. They **never** touch `~/.claude/settings.json` themselves. This is the key architectural move: the single-tenant hook slot becomes a multi-tenant pub/sub.
@@ -252,7 +252,7 @@ Same idea for the statusline:
 {
   "statusLine": {
     "type": "command",
-    "command": "claude-state-bus statusline"
+    "command": "bowerbird statusline"
   }
 }
 ```

@@ -52,7 +52,7 @@ These are the recipes a new presenter author reads first. They teach how to conn
 
 **Teaches:** Reading the auth token, exponential backoff, snapshot refetch on resubscribe.
 
-**The recipe:** Read `~/.claude-state-bus/server.json` for the token. Connect; on disconnect, reconnect with exponential backoff (1s, 2s, 4s, 8s, capped at 30s). On reconnect, all subscriptions are re-established and fresh snapshots arrive automatically.
+**The recipe:** Read `~/.bowerbird/server.json` for the token. Connect; on disconnect, reconnect with exponential backoff (1s, 2s, 4s, 8s, capped at 30s). On reconnect, all subscriptions are re-established and fresh snapshots arrive automatically.
 
 **Why it matters:** Every presenter needs this. Doing it wrong is the source of most "presenter looks frozen after daemon restart" bug reports.
 
@@ -102,7 +102,7 @@ const collapse = {
 
 ```
 3 active sessions
-  ▶ claude-state-bus/main          working
+  ▶ bowerbird/main          working
   ▶ blog/draft-post                idle
   ▶ scratch/poc                    waiting
 ```
@@ -244,7 +244,7 @@ Includes the threshold logic (>20 = intense, >10 = active) from tamagotchi.
 **The recipe:** Fetch the session list. For each session, render `<session> — <last_event_at relative>`. Refresh display every second.
 
 ```
-claude-state-bus/main    active now
+bowerbird/main    active now
 blog/draft-post          2m ago
 scratch/poc              17m ago
 old-experiment           3h ago
@@ -261,7 +261,7 @@ old-experiment           3h ago
 **The recipe:** Every 10 seconds, check all sessions in `state.current_state === "working"`. For each, check `(now - last_event_at)`. Print badges:
 
 ```
-[ok]    claude-state-bus/main    (30s)
+[ok]    bowerbird/main    (30s)
 [slow]  blog/draft-post          (5m12s)
 [stuck] scratch/poc              (11m4s)  — abort recommended
 ```
@@ -309,7 +309,7 @@ Subscribe to `state.sessions.added/removed` and `state.session.*.current_state` 
 
 ```
 Session                          Read  Edit  Bash  Grep  Total
-claude-state-bus/main              42    18    11     7     78
+bowerbird/main              42    18    11     7     78
 blog/draft-post                    23     5     2     0     30
 scratch/poc                         8     1     0     0      9
 ```
@@ -340,7 +340,7 @@ idle        (0)
 Output the single highest-priority state across all sessions. Useful for menu bar indicators that show one global status.
 
 ```
-[!] waiting   ← claude-state-bus/main needs input
+[!] waiting   ← bowerbird/main needs input
 ```
 
 **Why it matters:** claude-status menu bar does this. So does any "single global indicator" tool. The aggregation is presenter logic, but the substrate provides all the inputs.
@@ -386,7 +386,7 @@ These recipes cover the boring-but-essential failure handling.
 ```bash
 #!/bin/bash
 while true; do
-  curl -s -H "Authorization: Bearer $(cat ~/.claude-state-bus/server.json | jq -r .token)" \
+  curl -s -H "Authorization: Bearer $(cat ~/.bowerbird/server.json | jq -r .token)" \
     http://127.0.0.1:9876/sessions | \
     jq -r '.[] | "\(.session_id) \(.current_state)"'
   sleep 5
@@ -431,7 +431,7 @@ The HTML+JS+CSS is self-contained, no build step, no framework. Connects to the 
 # Coding activity — 2026-05-12
 
 ## Sessions
-- **claude-state-bus/main** (4 hours, 312 events)
+- **bowerbird/main** (4 hours, 312 events)
   - 89 tool calls (Edit: 32, Bash: 24, Read: 18, ...)
   - 2 subagent runs (code-reviewer, researcher)
 - **blog/draft-post** (45 minutes, 67 events)

@@ -7,7 +7,7 @@ visual_tools: intermediate
 
 # Core Configuration Values
 user_name: pickles
-project_name: agent-state-bus
+project_name: bowerbird
 communication_language: English
 document_output_language: English
 output_folder: "{project-root}/docs/bmad/"

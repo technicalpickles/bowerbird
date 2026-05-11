@@ -745,7 +745,7 @@ opensessions is **already most of the design from `03-design-sketch.md`**, minus
 
 If the daemon were built today, the most pragmatic path might be to **fork or extend opensessions** rather than build from scratch. The pieces missing are:
 1. Persistent event log (SQLite, append-only)
-2. Hook router as a fifth ingest source (the unified `claude-state-bus emit`)
+2. Hook router as a fifth ingest source (the unified `bowerbird emit`)
 3. Process-tree scanning for dead-agent detection (steal from tmux-agent-sidebar)
 4. Statusline shim composition
 5. Agent-agnostic projection of the 11-value reaction enum for pets/HUDs

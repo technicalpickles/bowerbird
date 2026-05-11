@@ -4,7 +4,7 @@ Project-specific rules for both human contributors and AI agents working in this
 
 ## What this project is
 
-`claude-state-bus` is a local daemon that observes coding agents (Claude Code in v1; others later) and exposes their state via pub/sub. Read the [README](README.md) for the elevator pitch and [docs/design/](docs/design/) for the full design rationale.
+`bowerbird` is a local daemon that observes coding agents (Claude Code in v1; others later) and exposes their state via pub/sub. Read the [README](README.md) for the elevator pitch and [docs/design/](docs/design/) for the full design rationale.
 
 The substrate's job is to preserve underlying data and expose it to many presenters cheaply. It does not interpret data into application-level concepts (personas, voices, sprites, moods) — that's presenter responsibility.
 
@@ -35,7 +35,7 @@ The shim is invoked by Claude Code on every hook event. Its budget is **<5ms col
 - **No async runtime.** Synchronous std::net is faster for one POST.
 - **No structured logging on the success path.** Log to stderr only on failure.
 - **No config loading at runtime.** Embed defaults at compile time; read overrides from a single small file at startup.
-- **No retry on failure.** If the daemon is down, write the event to `~/.claude-state-bus/spool/` and return immediately. The daemon picks up spooled events on startup.
+- **No retry on failure.** If the daemon is down, write the event to `~/.bowerbird/spool/` and return immediately. The daemon picks up spooled events on startup.
 - **Fire-and-forget always.** The shim never blocks Claude even if the daemon is unhealthy.
 
 Benchmark `shim/benches/hot_path.rs` runs in CI. If your change pushes p95 above 5ms, it doesn't land.
@@ -194,7 +194,7 @@ It isn't. Claude Code can drop hooks if the shim is slow or if Claude itself is 
 
 ### Pitfall: writing to `~/.claude/settings.json` non-atomically
 
-`claude-state-bus install` must do an atomic file replacement. Read, parse, merge, write to `settings.json.tmp`, rename. Anything else risks leaving the user's Claude config in a broken state if interrupted.
+`bowerbird install` must do an atomic file replacement. Read, parse, merge, write to `settings.json.tmp`, rename. Anything else risks leaving the user's Claude config in a broken state if interrupted.
 
 ### Pitfall: spawning subprocesses on the hot path
 
@@ -214,14 +214,14 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 
 # Benchmark the shim
-cargo bench -p claude-state-bus-shim
+cargo bench -p bowerbird-shim
 
 # Run the daemon against a clean state (for local dev)
-RUST_LOG=debug cargo run -p claude-state-bus-daemon -- \
+RUST_LOG=debug cargo run -p bowerbird-daemon -- \
   --data-dir /tmp/csb-dev --hook-token dev-token
 
 # Install hook config (writes to ~/.claude/settings.json — be careful)
-cargo run -p claude-state-bus -- install --dry-run
+cargo run -p bowerbird -- install --dry-run
 ```
 
 CI runs `cargo fmt`, `cargo clippy`, `cargo test --workspace`, `cargo bench --no-run`, and the example smoke tests. A PR doesn't merge until all of these pass on macOS and Linux.

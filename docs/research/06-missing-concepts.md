@@ -164,14 +164,14 @@ The watch/deck tools that don't want to be authoritative just subscribe to displ
 
 **Tools that need it:** claude-watch (iPhone bridge to Mac, watch to iPhone), Happy Coder (phone to Mac), AgentDeck (Pixoo64, ESP32, Android, iOS, all on one bridge — uses **mDNS + QR pairing**), m5-paper-buddy (BLE to Mac, but the same architectural need), claude-rpc (Discord shows status from another machine), Bobby-Gray cinematic display (Chromecast or tablet on LAN), Pixoo family dashboards (Pixoo64 polling LAN-side).
 
-**Current design:** assumes localhost. The discovery file at `~/.claude-state-bus/server.json` carries `127.0.0.1:<port>`.
+**Current design:** assumes localhost. The discovery file at `~/.bowerbird/server.json` carries `127.0.0.1:<port>`.
 
 **Why this matters:** every wearable / hardware / second-screen tool needs to reach the daemon over LAN. Forcing each one to ship its own bridge process on the laptop reproduces the fragmentation we're trying to eliminate.
 
 **Proposed addition:**
 
 - Daemon binds **two listeners**: localhost (always on, no auth required) and LAN (off by default, opt-in)
-- LAN listener uses **mDNS / Bonjour** (`_claude-state-bus._tcp.local`) for zero-config discovery
+- LAN listener uses **mDNS / Bonjour** (`_bowerbird._tcp.local`) for zero-config discovery
 - Per-device pairing via a short-lived QR code containing `{host, port, paired_token}` — same pattern AgentDeck and Happy Coder already use
 - Devices that pair get a long-lived per-device token; can be revoked from the daemon
 - The auth model is per-device, not per-session: a paired Apple Watch can see all sessions; Cardputer can see all sessions; etc.

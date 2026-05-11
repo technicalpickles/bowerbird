@@ -142,7 +142,7 @@ Looking across the seven major coding-agent CLIs, the picture is:
 The shim handles four flavors of the same conversation. Per-agent config:
 
 ```yaml
-# claude-state-bus/adapters/<agent>.yaml
+# bowerbird/adapters/<agent>.yaml
 agent_name: codex
 config_path: ~/.codex/config.toml
 config_format: toml-inline-tables
@@ -164,7 +164,7 @@ A new agent CLI joins by dropping a yaml file. The hook payload normalization in
 Ship a small plugin package:
 
 ```ts
-// @claude-state-bus/opencode-plugin
+// @bowerbird/opencode-plugin
 export default async ({ app, client }) => ({
   event: async ({ event }) => {
     await fetch('http://127.0.0.1:9876/events', {

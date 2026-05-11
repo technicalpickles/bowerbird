@@ -25,7 +25,7 @@ The shim is, fundamentally, a fire-and-forget emitter from Claude's perspective 
 
 ### Option B: Unix domain socket (UDS)
 
-**Shape:** shim opens UDS connection to `~/.claude-state-bus/sock`, writes the event (length-prefixed JSON or NDJSON), closes.
+**Shape:** shim opens UDS connection to `~/.bowerbird/sock`, writes the event (length-prefixed JSON or NDJSON), closes.
 
 **Pros:** Sub-millisecond connect on loopback (no TCP, no IP layer, no port). No HTTP framing. Permissions via filesystem (the socket file is owned by the user, mode 0600). Connection-refused is the only "daemon not running" failure mode and it's instant. Trivially supportable from any language without a library.
 
@@ -45,7 +45,7 @@ The shim is, fundamentally, a fire-and-forget emitter from Claude's perspective 
 
 ### Option D: Named pipe / FIFO
 
-**Shape:** shim opens `~/.claude-state-bus/pipe` for write, writes the event, closes.
+**Shape:** shim opens `~/.bowerbird/pipe` for write, writes the event, closes.
 
 **Pros:** Simple, no protocol.
 
@@ -55,7 +55,7 @@ The shim is, fundamentally, a fire-and-forget emitter from Claude's perspective 
 
 ### Option E: File spool only
 
-**Shape:** shim writes a file to `~/.claude-state-bus/spool/<timestamp>-<random>.ndjson` and exits. Daemon watches the directory (inotify on Linux, FSEvents on macOS) and picks up new files.
+**Shape:** shim writes a file to `~/.bowerbird/spool/<timestamp>-<random>.ndjson` and exits. Daemon watches the directory (inotify on Linux, FSEvents on macOS) and picks up new files.
 
 **Pros:** Fully decoupled. No transport failure modes — if the disk works, the event is delivered. Survives daemon restart trivially: spool files persist; daemon drains the directory on startup. Survives the daemon being absent entirely.
 
@@ -89,7 +89,7 @@ The daemon reads until newline, parses, acknowledges by closing the connection. 
 
 ### UDS path
 
-`$XDG_RUNTIME_DIR/claude-state-bus.sock` on Linux, `~/Library/Application Support/claude-state-bus/run/sock` on macOS. Mode 0600. The daemon creates it on startup (unlinking any stale socket file first).
+`$XDG_RUNTIME_DIR/bowerbird.sock` on Linux, `~/Library/Application Support/bowerbird/run/sock` on macOS. Mode 0600. The daemon creates it on startup (unlinking any stale socket file first).
 
 ### Connect timeout
 
@@ -97,7 +97,7 @@ The shim uses a non-blocking `connect()` with `select()` (or platform equivalent
 
 ### Spool path
 
-`~/.claude-state-bus/spool/` (rooted, not XDG, because it's persistent state across runtime sessions).
+`~/.bowerbird/spool/` (rooted, not XDG, because it's persistent state across runtime sessions).
 
 File naming: `<unix-nanos>-<6-char-random>.ndjson`. The unix-nanos prefix gives chronological ordering; the random suffix prevents collisions if two shim invocations happen in the same nanosecond (which is unlikely but cheap to guard).
 
@@ -105,7 +105,7 @@ Atomic creation: `open(path, O_CREAT | O_EXCL | O_WRONLY, 0600)`. If the file al
 
 ### Daemon spool processing
 
-On startup, the daemon reads every file in `~/.claude-state-bus/spool/`, sorted by filename (which sorts by timestamp). For each file: parse the JSON, ingest the event normally, delete the file. If parsing fails, the file is moved to `~/.claude-state-bus/spool/.malformed/` with the original name preserved — these accumulate for the user to debug but don't block ingest.
+On startup, the daemon reads every file in `~/.bowerbird/spool/`, sorted by filename (which sorts by timestamp). For each file: parse the JSON, ingest the event normally, delete the file. If parsing fails, the file is moved to `~/.bowerbird/spool/.malformed/` with the original name preserved — these accumulate for the user to debug but don't block ingest.
 
 During runtime, the daemon watches the spool directory via inotify/FSEvents. Any new file triggers immediate read-and-ingest. This catches the case where the shim couldn't reach the live UDS (overloaded daemon, momentary failure) and fell back to spool — the daemon picks those up within ~10ms of the file appearing.
 
@@ -125,7 +125,7 @@ fn main(stdin: HookPayload) {
         Err(_) => match spool_write(&serialized) {
             Ok(()) => exit(0),
             Err(_) => {
-                eprintln!("claude-state-bus-shim: failed to write event");
+                eprintln!("bowerbird-shim: failed to write event");
                 exit(0)  // STILL exit 0 — never fail the hook
             }
         }
@@ -135,7 +135,7 @@ fn main(stdin: HookPayload) {
 
 The crucial property: **the shim's exit code is always 0**, regardless of what happened internally. Hook failures surface to the user; the shim's job is to never cause one.
 
-A separate diagnostic facility (`claude-state-bus diagnose`) checks for accumulating spool files, malformed entries, and recent stderr messages. Users who want to know "is my agent state pipeline healthy" run that; the shim never tells them.
+A separate diagnostic facility (`bowerbird diagnose`) checks for accumulating spool files, malformed entries, and recent stderr messages. Users who want to know "is my agent state pipeline healthy" run that; the shim never tells them.
 
 ### Latency budget
 
@@ -235,11 +235,11 @@ This loss case is fixable but with cost: the shim could write the spool file *fi
 - UDS doesn't use the network stack at all. Firewall rules on `127.0.0.1` don't affect UDS.
 - Even in this exotic scenario, UDS works.
 
-### `~/.claude-state-bus/spool/` doesn't exist or isn't writable
+### `~/.bowerbird/spool/` doesn't exist or isn't writable
 
 - Spool write fails.
 - Shim exits 0 anyway. Event is lost.
-- Diagnostic facility detects this on next `claude-state-bus diagnose` run.
+- Diagnostic facility detects this on next `bowerbird diagnose` run.
 
 ## Open questions
 

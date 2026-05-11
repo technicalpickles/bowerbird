@@ -244,7 +244,7 @@ The watchers, mux abstraction, HTTP API, sidebar UI flow all stay.
 
 **What it does that's worth absorbing:**
 
-- **File-drop integration protocol.** Any agent can integrate by writing `working`, `done`, or `wait` to a file path. **This is the lowest-friction ingest source possible.** No HTTP, no MCP, no daemon connection — just a file. The daemon should support a file-drop directory (`~/.config/claude-state-bus/inbox/<session_id>.json`?) for tools that don't want to write code.
+- **File-drop integration protocol.** Any agent can integrate by writing `working`, `done`, or `wait` to a file path. **This is the lowest-friction ingest source possible.** No HTTP, no MCP, no daemon connection — just a file. The daemon should support a file-drop directory (`~/.config/bowerbird/inbox/<session_id>.json`?) for tools that don't want to write code.
 
 - **Per-pane vs. session reduction.** Session status is computed from per-pane status via a small reducer. Generalizes to: a session can have multiple "instances" (panes, windows, processes), and the session-level state is a function of instance states. This matches opensessions's per-thread instance tracking and the design's attachment model.
 

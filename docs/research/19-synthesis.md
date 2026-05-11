@@ -10,7 +10,7 @@ The goal: design a substrate that ingests once and exposes agent state to many p
 
 ## What we converged on
 
-A local daemon called `claude-state-bus` with five load-bearing components:
+A local daemon called `bowerbird` with five load-bearing components:
 
 1. **A static-binary hook shim** (Rust, <5ms cold start) installed into `~/.claude/settings.json` once. Fans hook events out to the daemon. Never blocks Claude.
 
@@ -286,7 +286,7 @@ If somehow Claude and Codex both think they own session ID `abc-123` (different 
 
 ### Authentication model beyond MVP
 
-MVP uses a per-daemon-run token written to `~/.claude-state-bus/server.json`. This is single-user; the daemon trusts anyone with the token.
+MVP uses a per-daemon-run token written to `~/.bowerbird/server.json`. This is single-user; the daemon trusts anyone with the token.
 
 **Future questions we haven't answered:** 
 - Per-presenter tokens with capability scopes?

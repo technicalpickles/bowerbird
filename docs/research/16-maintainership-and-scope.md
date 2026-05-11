@@ -110,7 +110,7 @@ The substrate's repo structure should let an AI agent — Claude, Codex, whoever
 Proposed structure:
 
 ```
-claude-state-bus/
+bowerbird/
 ├── README.md                         # Single-page overview, philosophy, no-list
 ├── AGENTS.md                         # Project rules for humans and AI agents
 ├── docs/
@@ -175,7 +175,7 @@ The substrate should be extensible via four channels:
    - Provide `capabilities.yaml` and `tool-reactions.yaml`
    - Optionally provide an install script that wires their agent's hook config
    
-   Distribution: any mechanism (`cargo install`, `homebrew tap`, raw curl). No central registry. The daemon discovers adapters at startup by reading a config directory (`~/.config/claude-state-bus/adapters/*`).
+   Distribution: any mechanism (`cargo install`, `homebrew tap`, raw curl). No central registry. The daemon discovers adapters at startup by reading a config directory (`~/.config/bowerbird/adapters/*`).
 
 2. **Presenters.** Anyone can write a presenter against the documented pub/sub protocol. The daemon doesn't know or care who's listening. Distribution is whatever the presenter author wants.
 

@@ -206,21 +206,21 @@ Same as v1, single shim per event type:
 ```jsonc
 {
   "hooks": {
-    "PreToolUse":       [{ "command": "claude-state-bus emit PreToolUse" }],
-    "PostToolUse":      [{ "command": "claude-state-bus emit PostToolUse" }],
-    "SessionStart":     [{ "command": "claude-state-bus emit SessionStart" }],
-    "SessionEnd":       [{ "command": "claude-state-bus emit SessionEnd" }],
-    "Stop":             [{ "command": "claude-state-bus emit Stop" }],
-    "SubagentStart":    [{ "command": "claude-state-bus emit SubagentStart" }],
-    "SubagentStop":     [{ "command": "claude-state-bus emit SubagentStop" }],
-    "Notification":     [{ "command": "claude-state-bus emit Notification" }],
-    "UserPromptSubmit": [{ "command": "claude-state-bus emit UserPromptSubmit" }],
-    "PermissionRequest":[{ "command": "claude-state-bus emit PermissionRequest" }],
-    "PreCompact":       [{ "command": "claude-state-bus emit PreCompact" }]
+    "PreToolUse":       [{ "command": "bowerbird emit PreToolUse" }],
+    "PostToolUse":      [{ "command": "bowerbird emit PostToolUse" }],
+    "SessionStart":     [{ "command": "bowerbird emit SessionStart" }],
+    "SessionEnd":       [{ "command": "bowerbird emit SessionEnd" }],
+    "Stop":             [{ "command": "bowerbird emit Stop" }],
+    "SubagentStart":    [{ "command": "bowerbird emit SubagentStart" }],
+    "SubagentStop":     [{ "command": "bowerbird emit SubagentStop" }],
+    "Notification":     [{ "command": "bowerbird emit Notification" }],
+    "UserPromptSubmit": [{ "command": "bowerbird emit UserPromptSubmit" }],
+    "PermissionRequest":[{ "command": "bowerbird emit PermissionRequest" }],
+    "PreCompact":       [{ "command": "bowerbird emit PreCompact" }]
   },
   "statusLine": {
     "type": "command",
-    "command": "claude-state-bus statusline"
+    "command": "bowerbird statusline"
   }
 }
 ```
@@ -354,7 +354,7 @@ Sessions/agents/attachments/usage are derived projections. They can be rebuilt f
 These came up across the inventory and survey work. They're real concerns, but not the daemon's job:
 
 - **Persona, display name, role description, voice map, sprite key.** Presenter config keyed on `agent_type`. PAI's `voices.json`, AgentVibes' voice slots, Outworked's agent definitions all already work this way.
-- **Tool-name-to-human-readable-string formatting.** Ships as a separate library (`@claude-state-bus/format-tool-status`) that presenters can use or override. Not in the daemon.
+- **Tool-name-to-human-readable-string formatting.** Ships as a separate library (`@bowerbird/format-tool-status`) that presenters can use or override. Not in the daemon.
 - **HITL backflow.** Different abstraction (bidirectional, blocking, auth-sensitive). Documented as an *extension surface* in the design — what would have to change to add it — without shipping it. Revisit if evidence grows.
 - **LAN reachability and mDNS discovery.** Presenter-side. AgentDeck's bridge is the LAN listener; it can subscribe to a localhost daemon. The daemon stays localhost-bound.
 - **Codex / OpenCode adapter.** Validate the abstraction by documenting it. Ship the adapter when a presenter actually needs it. The daemon's provider interface should be designed to make this possible, but v1 doesn't have to include it.
@@ -369,7 +369,7 @@ These are the design decisions where reasonable people would disagree, surfaced 
 
 1. **Should `current_state` (the reaction enum) be on the session row or computed per-request?** Storing it as a column means cheap reads but adds a write per state transition. Computing it on-demand from the latest events is more pure but slower. v2 stores it.
 
-2. **Auth model for the localhost API.** A per-daemon-run token rotated on restart, written to `~/.claude-state-bus/server.json` (Pixel Agents' pattern), is probably sufficient. WS subscribers present the token at connect time.
+2. **Auth model for the localhost API.** A per-daemon-run token rotated on restart, written to `~/.bowerbird/server.json` (Pixel Agents' pattern), is probably sufficient. WS subscribers present the token at connect time.
 
 3. **Retention policy on events.** Forever (default), bounded by config, or pruned at first replay? Forever is fine for personal use; a config knob exists.
 

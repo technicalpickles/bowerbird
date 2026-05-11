@@ -1,4 +1,4 @@
-# claude-state-bus
+# bowerbird
 
 A local daemon that watches your coding agents and exposes their state via pub/sub. Built for the dozens of pet/sprite/dashboard/lamp/voice tools that all want to know what Claude Code is doing — without each of them re-implementing hook ingestion.
 
@@ -6,7 +6,7 @@ A local daemon that watches your coding agents and exposes their state via pub/s
 ┌──────────────────────────────────────┐
 │  ~/.claude/settings.json             │
 │  (one hook line installed by         │
-│   claude-state-bus install)          │
+│   bowerbird install)          │
 └─────────────────┬────────────────────┘
                   │
           ┌───────▼────────┐
@@ -42,7 +42,7 @@ Pre-MVP. The design is settled across [`docs/design/`](docs/design/); the implem
 
 Today, every pet, lamp, sprite, dashboard, and voice tool installs its own hook into `~/.claude/settings.json`. They collide. Each one re-implements JSONL transcript parsing or hook payload normalization. Some maintain shadow state files (`~/.claude-pet/global-tracker.json`) to avoid re-processing tokens. Others tail the JSONL on a polling loop. Half of them break when Claude's transcript format shifts.
 
-`claude-state-bus` ingests once, exposes the data via pub/sub, and lets every presenter subscribe to the slice they care about. The lamp wants three reaction states. The voice tool wants `subagentEnd` events. The dashboard wants every session's `current_state`. They all get exactly that, no more, no less, with no hook installation of their own.
+`bowerbird` ingests once, exposes the data via pub/sub, and lets every presenter subscribe to the slice they care about. The lamp wants three reaction states. The voice tool wants `subagentEnd` events. The dashboard wants every session's `current_state`. They all get exactly that, no more, no less, with no hook installation of their own.
 
 ## What it does
 
@@ -75,25 +75,25 @@ If your use case is on the "no" list, the project is probably not the right home
 
 ```bash
 # Homebrew (macOS, the primary target)
-brew install claude-state-bus
+brew install bowerbird
 
 # Or with cargo (any platform)
-cargo install claude-state-bus
+cargo install bowerbird
 
 # Install the hook into ~/.claude/settings.json (non-destructive merge)
-claude-state-bus install
+bowerbird install
 
 # Start the daemon (typically launchd / systemd; manual for now)
-claude-state-bus daemon
+bowerbird daemon
 ```
 
 To uninstall:
 
 ```bash
-claude-state-bus uninstall    # removes hook entries from settings.json
+bowerbird uninstall    # removes hook entries from settings.json
 ```
 
-The daemon binds to `127.0.0.1:9876` by default. The auth token is written to `~/.claude-state-bus/server.json` on first start.
+The daemon binds to `127.0.0.1:9876` by default. The auth token is written to `~/.bowerbird/server.json` on first start.
 
 ## Quick taste
 
@@ -101,7 +101,7 @@ Subscribe to one session's state changes:
 
 ```javascript
 const ws = new WebSocket("ws://127.0.0.1:9876/subscribe");
-const token = readToken("~/.claude-state-bus/server.json");
+const token = readToken("~/.bowerbird/server.json");
 ws.send(JSON.stringify({ op: "auth", token }));
 
 ws.send(JSON.stringify({
@@ -140,7 +140,7 @@ ws.onmessage = (msg) => {
 Get the current session list with snapshots:
 
 ```bash
-curl -H "Authorization: Bearer $(cat ~/.claude-state-bus/server.json | jq -r .token)" \
+curl -H "Authorization: Bearer $(cat ~/.bowerbird/server.json | jq -r .token)" \
   http://127.0.0.1:9876/sessions
 ```
 
@@ -178,7 +178,7 @@ The substrate is small on purpose. Each `no` is justified. If you think a `no` s
 ## Project layout
 
 ```
-claude-state-bus/
+bowerbird/
 ├── AGENTS.md              # project rules for humans and AI agents
 ├── docs/
 │   ├── design/            # how we got here (17 design docs)

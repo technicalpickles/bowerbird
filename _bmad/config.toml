@@ -11,7 +11,7 @@
 # ─────────────────────────────────────────────────────────────────
 
 [core]
-project_name = "agent-state-bus"
+project_name = "bowerbird"
 document_output_language = "English"
 output_folder = "{project-root}/docs/bmad/"
 
