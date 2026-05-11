@@ -7,6 +7,7 @@ stepsCompleted:
   - step-03-success
   - step-04-journeys
   - step-05-domain
+  - step-06-innovation
 inputDocuments:
   - docs/bmad/planning-artifacts/product-brief-bowerbird-distillate.md
   - docs/bmad/planning-artifacts/product-brief-bowerbird.md
@@ -205,3 +206,42 @@ Later that week the daemon does crash — a disk-full edge case during a long se
 | Stable protocol (community tools survive daemon updates) | Journey 3 |
 | Clear "what does install do" documentation | Journeys 1, 3 |
 | Clear "what survives a crash" documentation | Journey 4 |
+
+## Innovation & Novel Patterns
+
+### Detected Innovation Areas
+
+**The substrate-not-actor paradigm for AI agent tooling**
+
+bowerbird makes a deliberate bet that the most valuable layer in an AI coding agent observability stack is the *thinnest* one. The instinct in most tooling is to add interpretation — derive insights, surface recommendations, prioritize signals. bowerbird refuses. A substrate that collects faithfully and routes without opinion gives every tool built on top of it complete creative freedom, and keeps the substrate small enough to be stable and trustworthy over time.
+
+This is the Unix pipes play applied to AI agent observability. The value isn't features; it's a clean separation of concerns that didn't exist before.
+
+**Protocol-first design in an emerging ecosystem**
+
+The Claude Code hook mechanism is the first first-class tap point in a widely-used AI coding agent. bowerbird's bet is that building a stable, versioned, vendor-neutral protocol *now* — before the ecosystem has to design around an ad-hoc one — is worth more than any specific feature on top of it. The adapter model (one protocol, multiple agent sources) is the long-term play: community adapters for Codex, Cursor, Gemini can follow the same protocol without bowerbird changing.
+
+**Instrumentation as a shared solved problem**
+
+Every developer who wants visibility into AI coding agent activity today solves the instrumentation problem themselves: hook delivery, event consistency, performance contracts, protocol stability. bowerbird's bet is that treating this as shared infrastructure worth building once, correctly, lets the ecosystem focus on the display and reaction layer where the interesting ideas live.
+
+### Market Context & Competitive Landscape
+
+No direct competitor currently offers a stable, vendor-neutral, collection-only substrate for AI coding agent activity. The space has:
+- Agent-native observability (built into the agent platform, opinionated, vendor-locked)
+- Log-scraping approaches (brittle, break on format changes)
+- Ad-hoc hook scripts (no stable protocol, no multi-tool support)
+
+bowerbird's position is the infrastructure layer none of these provide.
+
+### Validation Approach
+
+The protocol-first bet is validated by a specific signal: does a developer who has never spoken to pickles build a tool on bowerbird without asking a single question? That's the proof that the protocol is clean and the documentation is sufficient — the innovative design held under real use.
+
+The deliberate restraint bet is validated by what *doesn't* appear in issues and PRs: feature requests to add derived fields, sentiment, priorities, or interpretation to the daemon. If those don't appear, the paradigm is holding. If they appear frequently, the market is providing signal worth examining.
+
+### Risk Mitigation
+
+- **Risk:** The deliberate restraint — bowerbird collects and routes but never derives — reads as a missing feature to users who haven't yet felt the pain of opinionated layers. **Mitigation:** Lead with the concrete value ("skip the plumbing, build the tool you want") rather than the design philosophy; let the philosophy be discoverable in the design docs for those who want to understand why.
+- **Risk:** Claude Code changes its hook schema, breaking the reference adapter. **Mitigation:** The adapter pattern is explicitly designed for this — `adapter-claude` normalizes Claude's schema to the stable protocol; schema changes are adapter concerns, not protocol concerns.
+- **Risk:** The ecosystem doesn't develop independently-authored tools. **Mitigation:** V1 ships reference examples that demonstrate the full pattern; these lower the barrier for the first external author.
