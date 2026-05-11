@@ -4,6 +4,7 @@ stepsCompleted:
   - step-02-discovery
   - step-02b-vision
   - step-02c-executive-summary
+  - step-03-success
 inputDocuments:
   - docs/bmad/planning-artifacts/product-brief-bowerbird-distillate.md
   - docs/bmad/planning-artifacts/product-brief-bowerbird.md
@@ -52,3 +53,71 @@ The separation of concerns is the differentiator: bowerbird owns the collection 
 - **Domain:** Developer tooling / AI agent activity
 - **Complexity:** Medium — technically nuanced (performance contracts, protocol stability, pub/sub architecture) but no regulatory overhead
 - **Project context:** Brownfield pre-MVP — significant design corpus established; implementation not yet started
+
+## Success Criteria
+
+### User Success
+
+The primary success signal for V1 is experiential: a developer running Claude Code can open a locally-built visualization tool and see live agent activity immediately — no hook configuration changes, no agent restarts, nothing to reconfigure. When they want to change what the tool shows or how it looks, they edit the display layer and the data keeps flowing. bowerbird is invisible.
+
+The two properties that define "working":
+- **Live iteration without disruption:** changes to the visualization don't require touching the instrumentation layer or restarting any agent
+- **Multiple simultaneous tools:** two or more tools can run against the same event stream independently, each unaware of the other
+
+V1 success gate: pickles can build and iterate on local example tools against live Claude Code sessions, with multiple tools running simultaneously, without any instrumentation changes between experiments.
+
+### Business Success
+
+**V1:** The reference example tools demonstrate the full flow end-to-end. The substrate works well enough for the first user (pickles) to run real experiments and find it genuinely useful.
+
+**Post-V1:** Someone pickles has never met or suggested to builds a tool on bowerbird independently. This is the honest signal that the protocol is clean, the documentation is sufficient, and the substrate is legible enough to build on without hand-holding.
+
+### Technical Success
+
+Performance bars from the design corpus, treated as success criteria with the expectation that exact numbers will be validated against implementation reality:
+
+| Bar | Target | Notes |
+|---|---|---|
+| Shim exit (warm cache) | < 5ms p95 | Marginal cost of our code; measured separately per platform |
+| Hook → projection | < 50ms p95 | WAL + `synchronous=NORMAL` |
+| Hook → presenter (end-to-end) | < 100ms p95 | Full pipeline including WS delivery |
+| Daemon idle CPU | < 0.5% | Precise definition of "idle" TBD |
+| Daemon RSS | < 50MB | Sample from day one; track for drift |
+| Core LOC | 5K–7K | Alarm at 10K |
+
+All 10 required contract tests passing before MVP ships (WS drop behavior, PRAGMA invariants, state+event atomicity, graceful shutdown, cursor-gap detection, atomic settings.json install, hook unreliability tolerance, outbound envelope additive-compat, shim fuzz, connection factory enforcement).
+
+### Measurable Outcomes
+
+- Multiple tools running simultaneously against a live Claude Code session: **✓ or ✗** (binary gate)
+- Reference example tools ported and smoke-tested in CI: **✓ or ✗**
+- All 10 contract tests passing: **✓ or ✗**
+- All performance bars met on macOS + Linux CI: **✓ or ✗** (with per-platform baselines)
+- Post-V1: independent tool author with no prior contact: **✓ or ✗**
+
+## Product Scope
+
+### MVP — Minimum Viable Product
+
+- Claude Code adapter (reference implementation): shim, daemon, `adapter-claude` crate, TOML tool-reactions
+- WebSocket pub/sub event stream with `events.*` and `state.*` topics
+- REST snapshot API with cursor-based pagination (`/sessions`, `/sessions/:id/events?since=`)
+- Health and readiness endpoints (`/healthz`, `/readyz`)
+- Reference example tools (TypeScript/Node), CI smoke-tested, demonstrating simultaneous multi-tool operation
+- `bowerbird install` / `bowerbird uninstall` with atomic `~/.claude/settings.json` rewrite
+- All 10 required contract tests
+- CI matrix: macOS + Linux, performance regression gating
+
+### Growth Features (Post-MVP)
+
+- Second agent adapter (Codex, Gemini, or Cursor) — validates the adapter model with a real external contributor
+- `/metrics` endpoint (Prometheus-compatible, path reserved at MVP)
+- `bowerbird gc` for event-log truncation (policy decision deferred)
+- arm64 CI runner
+- `@bowerbird/presenter` SDK if presenter boilerplate ratio justifies it (revisit after first external tool)
+
+### Vision (Future)
+
+- bowerbird as the vendor-neutral observability substrate for AI coding agents — adapter-per-agent, single stable protocol, any tool in any language can subscribe
+- Community-maintained adapter ecosystem
+- Protocol versioning (v2+) with full backward-compat guarantee for existing tools
