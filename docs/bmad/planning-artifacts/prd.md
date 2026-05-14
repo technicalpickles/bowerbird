@@ -10,6 +10,7 @@ stepsCompleted:
   - step-06-innovation
   - step-07-project-type
   - step-08-scoping
+  - step-09-functional
 releaseMode: phased
 inputDocuments:
   - docs/bmad/planning-artifacts/product-brief-bowerbird-distillate.md
@@ -267,10 +268,7 @@ The deliberate restraint bet is validated by what *doesn't* appear in issues and
 **1. Prebuilt binaries (GitHub Releases) — primary path**
 Targets: macOS arm64, macOS x86_64, Linux x86_64 (Linux arm64 if CI budget allows). Pickles has prior art for the release pipeline. This is the path for users without a Rust toolchain.
 
-**2. Homebrew tap (macOS)**
-`brew install bowerbird` via a `homebrew-bowerbird` tap. Provides a familiar upgrade path (`brew upgrade bowerbird`). Note: tap maintenance is an ongoing operational burden — formula updates required on every release. Acknowledged as a maintenance commitment, not a free surface.
-
-**3. Source build**
+**2. Source build**
 `cargo install bowerbird` for any platform with a Rust stable toolchain. `Cargo.lock` committed; reproducible builds.
 
 **Hook installation (separate from binary install):**
@@ -426,6 +424,7 @@ V1 ships when pickles can build and iterate on multiple tools simultaneously aga
 ### Post-MVP Features
 
 - Second agent adapter (Codex, Gemini, or Cursor) — validates adapter model with external contributor
+- Homebrew tap — deferred; v1 audience is solo, tap maintenance overhead not justified yet
 - `/metrics` endpoint (Prometheus text format; path reserved at v1)
 - `bowerbird gc` for event-log truncation (policy decision deferred)
 - arm64 CI runner
@@ -453,4 +452,68 @@ V1 ships when pickles can build and iterate on multiple tools simultaneously aga
 **Resource risks:**
 
 - **Solo maintainer = single point of failure.** Mitigation: contribution model, maintainer status protocol, and auto-close tagging are explicitly designed for this. The risk is acknowledged and designed around, not ignored.
-- **Homebrew tap maintenance.** If tap cadence becomes a burden, it gets demoted to community-maintained or dropped in favor of GitHub Releases + `cargo install` only. Documented option, not a crisis.
+
+## Functional Requirements
+
+### Hook Integration & Event Capture
+
+- FR1: The shim can capture Claude Code hook events and deliver them to the daemon without adding perceptible latency to Claude Code's operation
+- FR2: The shim can operate without network timeouts or blocking calls that could delay Claude Code's hook execution
+- FR3: Tool builders can install and remove the bowerbird hook from Claude Code's configuration without manually editing configuration files
+- FR4: The Claude Code adapter can normalize Claude Code hook payloads into the canonical protocol event format
+- FR5: The shim can log failure information to a dedicated log file without writing to stdout or stderr
+
+### Event Storage & Persistence
+
+- FR6: The daemon can persist incoming events to a local event log atomically with their associated session state projection
+- FR7: The daemon can survive unexpected termination without leaving the event log in a corrupt or inconsistent state
+- FR8: Tool builders can query the event log with a cursor to retrieve events from a specific point forward
+- FR9: The daemon exposes the oldest available event identifier so tools can detect whether they have missed events
+
+### Real-Time Event Streaming
+
+- FR10: Tool builders can subscribe to a stream of agent activity events over a persistent connection
+- FR11: Tool builders can filter their subscription to specific topics at session, source, or global scope
+- FR12: Tool builders can subscribe to activity across all sessions simultaneously using a wildcard subscription
+- FR13: The daemon can notify subscribed tools when new sessions appear without requiring reconnection
+- FR14: The daemon can notify a tool when it has missed events due to slow consumption, including how many events were missed
+- FR15: The daemon can deliver a current-state snapshot to a connecting tool without requiring a separate query
+- FR16: Multiple tools can connect to and receive the same event stream simultaneously without affecting each other
+- FR17: The daemon can send a shutdown notification to connected tools before terminating
+
+### Event Query & History
+
+- FR18: Tool builders can retrieve a list of known agent sessions
+- FR19: Tool builders can retrieve the current projected state of a specific session
+- FR20: Tool builders can retrieve paginated event history for a session from a given cursor position
+- FR21: Tool builders can retrieve per-session event statistics
+- FR22: Tool builders can check daemon liveness without authenticating
+- FR23: Tool builders can check daemon readiness — including storage and broadcaster state — without authenticating
+
+### Session Tracking
+
+- FR24: The daemon can track multiple concurrent agent sessions, distinguishing them by both source and session identifier
+- FR25: The daemon can maintain a current-state projection per session, updated in the same operation as event storage
+- FR26: The daemon can tolerate missing hook events without entering an inconsistent or stuck state
+
+### Installation & Configuration
+
+- FR27: Tool builders can install bowerbird without a Rust development environment using prebuilt binaries from GitHub Releases
+- FR28: Tool builders can install bowerbird from source using the Rust toolchain
+- FR29: Tool builders can start and stop the daemon independently of the Claude Code hook configuration
+- FR30: Tool builders can check the daemon's current status and version from the command line
+
+### Developer Tools & Experience
+
+- FR31: Tool builders can replay a recorded event sequence through the daemon's full pub/sub path without a live Claude Code session
+- FR32: Tool builders can export a real session's events to a file for replay or debugging
+- FR33: Tool builders can access reference implementations demonstrating event subscription, multi-session fan-out, and dropped-frame recovery
+- FR34: Tool builders can run all reference implementations against bundled fixture data without a live agent session
+- FR35: Tool builders can access documentation covering: quickstart (no live agent required), tool-building guide, protocol reference, and recipe cookbook
+
+### Protocol & Compatibility
+
+- FR36: The protocol guarantees that tools built against v1 continue to work on any v1.x daemon release without modification
+- FR37: The daemon accepts inbound events via a socket accessible only to the current OS user
+- FR38: Tool builders can authenticate REST and WebSocket connections using a bearer token
+- FR39: Tool builders can access structured changelog information identifying the type and nature of any protocol changes between releases
