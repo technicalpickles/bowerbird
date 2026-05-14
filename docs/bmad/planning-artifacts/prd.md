@@ -8,6 +8,7 @@ stepsCompleted:
   - step-04-journeys
   - step-05-domain
   - step-06-innovation
+  - step-07-project-type
 inputDocuments:
   - docs/bmad/planning-artifacts/product-brief-bowerbird-distillate.md
   - docs/bmad/planning-artifacts/product-brief-bowerbird.md
@@ -245,3 +246,143 @@ The deliberate restraint bet is validated by what *doesn't* appear in issues and
 - **Risk:** The deliberate restraint — bowerbird collects and routes but never derives — reads as a missing feature to users who haven't yet felt the pain of opinionated layers. **Mitigation:** Lead with the concrete value ("skip the plumbing, build the tool you want") rather than the design philosophy; let the philosophy be discoverable in the design docs for those who want to understand why.
 - **Risk:** Claude Code changes its hook schema, breaking the reference adapter. **Mitigation:** The adapter pattern is explicitly designed for this — `adapter-claude` normalizes Claude's schema to the stable protocol; schema changes are adapter concerns, not protocol concerns.
 - **Risk:** The ecosystem doesn't develop independently-authored tools. **Mitigation:** V1 ships reference examples that demonstrate the full pattern; these lower the barrier for the first external author.
+
+## Developer Tool Specific Requirements
+
+### Language Matrix
+
+| Layer | Language | Notes |
+|---|---|---|
+| Protocol crate | Rust | Stable wire surface; public API; all changes need ADR |
+| Shim binary | Rust | Static binary; no async runtime; < 5ms p95 hot path |
+| Daemon binary | Rust | Tokio single-thread; axum; rusqlite |
+| Reference adapter | Rust | `adapter-claude` — Claude Code hook normalization |
+| Reference example tools | TypeScript / Node | Lives in `examples/`; CI smoke-tested |
+| Install/CI scripts | Shell | < 200 line budget; `shellcheck` strict mode in CI |
+
+### Installation Methods
+
+**1. Prebuilt binaries (GitHub Releases) — primary path**
+Targets: macOS arm64, macOS x86_64, Linux x86_64 (Linux arm64 if CI budget allows). Pickles has prior art for the release pipeline. This is the path for users without a Rust toolchain.
+
+**2. Homebrew tap (macOS)**
+`brew install bowerbird` via a `homebrew-bowerbird` tap. Provides a familiar upgrade path (`brew upgrade bowerbird`). Note: tap maintenance is an ongoing operational burden — formula updates required on every release. Acknowledged as a maintenance commitment, not a free surface.
+
+**3. Source build**
+`cargo install bowerbird` for any platform with a Rust stable toolchain. `Cargo.lock` committed; reproducible builds.
+
+**Hook installation (separate from binary install):**
+`bowerbird install` atomically modifies `~/.claude/settings.json` — reads, parses, merges the hook entry, writes to `.tmp`, renames. On collision (concurrent write from Claude Code), the operation retries with backoff. The hook entry written to `settings.json` uses a **PATH-relative binary name** (`bowerbird`) rather than an absolute path, to survive Homebrew upgrades and `cargo install` updates. Version-mismatch between shim and daemon (different binary versions installed via different methods) logs a warning on daemon startup and is documented as unsupported.
+
+### API Surface (v1 Stable)
+
+#### Two Socket Surfaces
+
+| Surface | Protocol | Auth | Callers |
+|---|---|---|---|
+| `~/.bowerbird/ingest.sock` | Unix domain socket | None (filesystem `0600`) | Shim only |
+| `127.0.0.1:<port>` TCP | HTTP + WebSocket | Bearer token | Tools, REST clients |
+
+The ingest path uses a Unix domain socket with filesystem-permission security — no bearer auth. The shim connects to the socket path (compiled-in default, optional config override). This eliminates the "how does the shim get the token" problem and removes auth overhead from the 5ms hot path.
+
+#### REST Endpoints (TCP, Bearer Auth)
+
+| Endpoint | Auth | Description |
+|---|---|---|
+| `GET /healthz` | none | Liveness — process up and responding |
+| `GET /readyz` | none | Readiness — DB reachable, migrations applied, broadcasters live |
+| `GET /status` | bearer | Version, uptime, connected tool count, last event time |
+| `GET /sessions` | bearer | List known sessions |
+| `GET /sessions/:id` | bearer | Session detail and current projection state |
+| `GET /sessions/:id/events?since=<cursor>` | bearer | Cursor-paginated event log; response includes `oldest_available_event_id` |
+| `GET /sessions/:id/stats` | bearer | Per-session event counts and tool-use breakdown. Fields are additive-only; clients must tolerate unknown fields. |
+
+Reserved (not implemented in v1): `GET /metrics` — Prometheus text format; path reserved now.
+
+**Ingest endpoint (Unix socket):**
+`POST /ingest` on the Unix socket. Returns synchronously after the event is accepted into the write queue — not after it is persisted to SQLite. The shim gets an ACK within the 5ms budget; actual persistence happens asynchronously. Under backpressure (write queue full), the daemon returns `503` and the shim logs to `~/.bowerbird/shim.log` and exits cleanly.
+
+#### WebSocket (TCP, Bearer Auth)
+
+Connect: `ws://127.0.0.1:<port>/ws` (bearer token in `Authorization` header or `?token=` query param).
+
+**Subscribe message (client → daemon):**
+```json
+{ "topics": ["state.session.*", "events.*"] }
+```
+
+**Server-sent frame types:**
+
+| Frame | When sent |
+|---|---|
+| `state` | Snapshot on subscribe + on any state change for subscribed sessions |
+| `event` | Each new event matching subscribed topics |
+| `dropped` | Client broadcast slot lagged; includes lag count in events (not bytes). Client should re-fetch snapshot via REST. Socket stays open. |
+| `close` | Daemon graceful shutdown |
+
+**Topics (v1):**
+- `state.session.*` — all session state changes (wildcard; new sessions appear as `state` frames)
+- `state.session.<id>` — one session's full state row
+- `state.session.<id>.current_state` — current_state field only
+- `events.*` — all events, all sources
+- `events.<source>.*` — events from a specific source
+
+**Multi-session behavior:** when a new session appears while a tool is subscribed to `state.session.*`, the daemon emits a `state` frame for the new session. Tools must handle new sessions arriving at any time.
+
+#### What Is NOT Stable (Internal)
+
+- SQLite schema — do not read the DB directly
+- Internal daemon types not in `crates/protocol`
+- Ingest socket wire format beyond what the shim uses
+
+### CLI Surface (v1)
+
+| Command | Description |
+|---|---|
+| `bowerbird install` | Write hook to `~/.claude/settings.json`, start daemon |
+| `bowerbird uninstall` | Remove hook, stop daemon |
+| `bowerbird start` / `bowerbird stop` | Daemon lifecycle without touching hook config |
+| `bowerbird status` | Daemon liveness + version |
+| `bowerbird replay <file>` | Replay a JSONL event file through the daemon's pub/sub path |
+| `bowerbird export <session-id>` | Export a session's events from SQLite to JSONL replay format |
+
+Replay file format is wire-format event envelopes in JSONL — no separate schema. Bundled demo fixtures ship with the binary for the Quickstart. `bowerbird export` enables capturing real sessions for replay and debugging.
+
+### Migration Guide
+
+**Within v1.x — schema guarantee (hard):**
+Additive-only on the wire surface: new fields on outbound types, new topics, new endpoints. No fields removed, no types changed. Tools built for v1 work on any v1.x daemon release without changes.
+
+**Within v1.x — behavioral compatibility (best-effort):**
+The schema guarantee does not extend to all behavioral details. Bug fixes and security fixes may change observable behavior. Two explicit carve-outs:
+- **Security fixes:** may change behavior without a v2 bump, always.
+- **Bug fixes where the old behavior was incorrect per the spec:** may change behavior; must be noted in `protocol-changelog.md` with `type: behavioral`.
+
+`protocol-changelog.md` entries use a structured header: `type: schema | behavioral | security`. CI validates that any change to `crates/protocol/src/*.rs` produces a corresponding changelog entry.
+
+**v1 → v2 (breaking changes):**
+v2 ships as a parallel `protocol@v2` module tree. v1 endpoints continue during a documented transition window. The changelog entry specifies the transition duration and the migration checklist — exact fields or behaviors that changed and what tools must update.
+
+### Documentation Requirements (v1 Deliverables)
+
+The reader path through docs must exist at launch:
+
+| Document | Scope |
+|---|---|
+| Quickstart | Works against `bowerbird replay` with bundled demo fixture — no Claude Code required. Covers install → replay → run reference example → see output. Forward-pointer to `presenter-authoring.md` at the success moment. |
+| `docs/presenter-authoring.md` | How to build a tool that consumes the WebSocket stream: connect, subscribe, handle state/event/dropped frames, snapshot on reconnect. Language-agnostic with TypeScript examples. |
+| `docs/protocol.md` | Wire format reference: all endpoints, frame types, topic syntax, auth contract, ingest socket. Machine-readable enough to generate client stubs from. |
+| `docs/cookbook/` | v1 ships at least three entries paired with reference examples. Must exist at launch — not a post-launch deliverable. |
+| `docs/protocol-changelog.md` | Structured changelog; CI-enforced; required entry for any `crates/protocol/src/*.rs` change. |
+
+### Code Examples
+
+Reference examples in `examples/`, CI smoke-tested against a live daemon. Each example is paired with a cookbook entry. The coupling invariant: a developer changes a function in the reference example, runs the doc build, and the cookbook entry reflects the change without manual editing. Toolchain choice is left to the implementer; the invariant is what the PRD requires.
+
+**V1 reference examples:**
+
+1. **Multi-session event router** — subscribes to `state.session.*` (wildcard), routes events to per-session state, handles new sessions appearing mid-subscription. Demonstrates the core fan-out pattern every non-trivial tool needs.
+2. **Session event log viewer** — reads `events.*`, renders tool-call history. Shows cursor-based pagination via REST.
+3. **Reconnect with snapshot recovery** — demonstrates snapshot-on-connect + `dropped`-frame detection + REST re-fetch. The resilience pattern every tool that runs for more than a few minutes needs.
+
+All three examples must run against `bowerbird replay` with bundled fixture files.
