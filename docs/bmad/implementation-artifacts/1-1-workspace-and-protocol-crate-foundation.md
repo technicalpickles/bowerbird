@@ -1,6 +1,6 @@
 # Story 1.1: Workspace and Protocol Crate Foundation
 
-Status: ready-for-dev
+Status: review
 
 ## Story
 
@@ -24,47 +24,47 @@ So that I can write deserializers and client code against a documented, versione
 
 ## Tasks / Subtasks
 
-- [ ] Task 1: Scaffold workspace root (AC: #1, #4, #5)
-  - [ ] Create root `Cargo.toml` with `[workspace]` + `[package]` sections (root is also the CLI binary crate stub)
-  - [ ] Add workspace members: `crates/protocol`, `crates/shim`, `crates/daemon`, `crates/adapter-claude`
-  - [ ] Add `[workspace.lints.rust] unsafe_code = "forbid"`
-  - [ ] Add `[profile.release-shim]` with `panic="abort"`, `lto="fat"`, `codegen-units=1`, `opt-level="z"`, `strip=true`
-  - [ ] Add `[workspace.dependencies]` section with pinned versions for all shared deps
-  - [ ] Create `rust-toolchain.toml` pinning `channel = "stable"`
-  - [ ] Create stub `src/main.rs` for the root CLI binary (just `fn main() {}` with clap dep declared but not wired)
-- [ ] Task 2: Create crate stubs for shim, daemon, adapter-claude (AC: #1)
-  - [ ] `crates/shim/Cargo.toml`: bin crate; edition 2021; rust-version pinned; deps: protocol (workspace), thiserror (workspace)
-  - [ ] `crates/shim/src/main.rs`: empty `fn main() {}`; `#![deny(unsafe_code)]`
-  - [ ] `crates/daemon/Cargo.toml`: bin crate; edition 2021; rust-version pinned; deps: protocol (workspace), tokio (workspace), axum (workspace), etc.
-  - [ ] `crates/daemon/src/main.rs`: `#[tokio::main] async fn main() {}` stub
-  - [ ] `crates/adapter-claude/Cargo.toml`: lib crate; edition 2021; rust-version pinned
-  - [ ] `crates/adapter-claude/src/lib.rs`: empty lib with `#![deny(unsafe_code)]`
-- [ ] Task 3: Implement `crates/protocol` fully (AC: #1, #2, #3, #4, #5)
-  - [ ] `Cargo.toml`: lib crate; rust-version; deps: serde 1.0.228 (derive), serde_json 1.0.149, thiserror 2.0.18
-  - [ ] `src/error.rs`: `pub enum Error { ... }` + `pub type Result<T> = std::result::Result<T, Error>;`
-  - [ ] `src/constants.rs`: `pub const SHIM_BINARY_NAME: &str = "bowerbird";`
-  - [ ] `src/event.rs`: `EventId(i64)`, `EventKind` (no `rename_all`), `Event`, `EventEnvelope`
-  - [ ] `src/reaction.rs`: `Reaction` enum with custom `Serialize`/`Deserialize` (hand-written, no derive)
-  - [ ] `src/adapter.rs`: `SourceAdapter` trait, `NormalizeResult`, `AdapterMeta`
-  - [ ] `src/rest.rs`: `EventListResponse`, `SessionStats` (outbound — no `deny_unknown_fields`)
-  - [ ] `src/ws.rs`: `ServerMessage`, `ClientMessage`, all frame types (`HelloFrame`, `SyncFrame`, `EventFrame`, `DroppedFrame`, `CloseFrame`)
-  - [ ] `src/lib.rs`: `pub use` re-exports of ALL public types; `#![deny(unsafe_code)]`
-- [ ] Task 4: Write protocol contract tests (AC: #2, #3)
-  - [ ] `crates/protocol/tests/contract_protocol.rs`: wire-format snapshot assertions for `EventKind` (verify PascalCase-as-written, e.g., `"ToolUse"`)
-  - [ ] Test: `EventId` serializes as plain JSON number (not string, not object)
-  - [ ] Test: outbound type (`HelloFrame`) accepts extra unknown fields without error
-  - [ ] Test: inbound type (`ClientMessage`) rejects extra unknown fields with error
-  - [ ] Test: `Reaction::Vendor(42)` serializes to string `"Vendor(42)"`
-  - [ ] Test: `Reaction::Unknown` round-trips correctly
-- [ ] Task 5: Set up GitHub Actions CI (AC: #6)
-  - [ ] `.github/workflows/ci.yml`: matrix on `[macos-latest, ubuntu-latest]`
-  - [ ] Steps: `cargo fmt --check`, `cargo clippy --all-targets --workspace -- -D warnings`, `cargo test --workspace`
-- [ ] Task 6: Verify all checks pass
-  - [ ] `cargo check --workspace` — green
-  - [ ] `cargo fmt --check` — green
-  - [ ] `cargo clippy --all-targets --workspace -- -D warnings` — green
-  - [ ] `cargo test --workspace` — all contract tests pass
-  - [ ] Commit `Cargo.lock`
+- [x] Task 1: Scaffold workspace root (AC: #1, #4, #5)
+  - [x] Create root `Cargo.toml` with `[workspace]` + `[package]` sections (root is also the CLI binary crate stub)
+  - [x] Add workspace members: `crates/protocol`, `crates/shim`, `crates/daemon`, `crates/adapter-claude`
+  - [x] Add `[workspace.lints.rust] unsafe_code = "forbid"`
+  - [x] Add `[profile.release-shim]` with `panic="abort"`, `lto="fat"`, `codegen-units=1`, `opt-level="z"`, `strip=true`
+  - [x] Add `[workspace.dependencies]` section with pinned versions for all shared deps
+  - [x] Create `rust-toolchain.toml` pinning `channel = "stable"`
+  - [x] Create stub `src/main.rs` for the root CLI binary (just `fn main() {}` with clap dep declared but not wired)
+- [x] Task 2: Create crate stubs for shim, daemon, adapter-claude (AC: #1)
+  - [x] `crates/shim/Cargo.toml`: bin crate; edition 2021; rust-version pinned; deps: protocol (workspace), thiserror (workspace)
+  - [x] `crates/shim/src/main.rs`: empty `fn main() {}`; `#![deny(unsafe_code)]`
+  - [x] `crates/daemon/Cargo.toml`: bin crate; edition 2021; rust-version pinned; deps: protocol (workspace), tokio (workspace), axum (workspace), etc.
+  - [x] `crates/daemon/src/main.rs`: `#[tokio::main] async fn main() {}` stub
+  - [x] `crates/adapter-claude/Cargo.toml`: lib crate; edition 2021; rust-version pinned
+  - [x] `crates/adapter-claude/src/lib.rs`: empty lib with `#![deny(unsafe_code)]`
+- [x] Task 3: Implement `crates/protocol` fully (AC: #1, #2, #3, #4, #5)
+  - [x] `Cargo.toml`: lib crate; rust-version; deps: serde 1.0.228 (derive), serde_json 1.0.149, thiserror 2.0.18
+  - [x] `src/error.rs`: `pub enum Error { ... }` + `pub type Result<T> = std::result::Result<T, Error>;`
+  - [x] `src/constants.rs`: `pub const SHIM_BINARY_NAME: &str = "bowerbird";`
+  - [x] `src/event.rs`: `EventId(i64)`, `EventKind` (no `rename_all`), `Event`, `EventEnvelope`
+  - [x] `src/reaction.rs`: `Reaction` enum with custom `Serialize`/`Deserialize` (hand-written, no derive)
+  - [x] `src/adapter.rs`: `SourceAdapter` trait, `NormalizeResult`, `AdapterMeta`
+  - [x] `src/rest.rs`: `EventListResponse`, `SessionStats` (outbound — no `deny_unknown_fields`)
+  - [x] `src/ws.rs`: `ServerMessage`, `ClientMessage`, all frame types (`HelloFrame`, `SyncFrame`, `EventFrame`, `DroppedFrame`, `CloseFrame`)
+  - [x] `src/lib.rs`: `pub use` re-exports of ALL public types; `#![deny(unsafe_code)]`
+- [x] Task 4: Write protocol contract tests (AC: #2, #3)
+  - [x] `crates/protocol/tests/contract_protocol.rs`: wire-format snapshot assertions for `EventKind` (verify PascalCase-as-written, e.g., `"ToolUse"`)
+  - [x] Test: `EventId` serializes as plain JSON number (not string, not object)
+  - [x] Test: outbound type (`HelloFrame`) accepts extra unknown fields without error
+  - [x] Test: inbound type (`ClientMessage`) rejects extra unknown fields with error
+  - [x] Test: `Reaction::Vendor(42)` serializes to string `"Vendor(42)"`
+  - [x] Test: `Reaction::Unknown` round-trips correctly
+- [x] Task 5: Set up GitHub Actions CI (AC: #6)
+  - [x] `.github/workflows/ci.yml`: matrix on `[macos-latest, ubuntu-latest]`
+  - [x] Steps: `cargo fmt --check`, `cargo clippy --all-targets --workspace -- -D warnings`, `cargo test --workspace`
+- [x] Task 6: Verify all checks pass
+  - [x] `cargo check --workspace` — green
+  - [x] `cargo fmt --check` — green
+  - [x] `cargo clippy --all-targets --workspace -- -D warnings` — green
+  - [x] `cargo test --workspace` — all contract tests pass
+  - [x] Commit `Cargo.lock`
 
 ## Dev Notes
 
@@ -415,10 +415,47 @@ jobs:
 
 ### Agent Model Used
 
-{{agent_model_name_version}}
+claude-sonnet-4-6
 
 ### Debug Log References
 
+- Dependency conflict: architecture doc pinned `rusqlite 0.39.0` + `rusqlite_migration 2.5.0` (requires rusqlite ^0.39) + `deadpool-sqlite 0.13.0` (requires rusqlite ^0.38) — mutually incompatible. Resolved by using the consistent 0.38.x set: rusqlite 0.38.0, deadpool-sqlite 0.13.0, rusqlite_migration 2.4.1.
+- tokio workspace feature set was missing `rt-multi-thread`; added to support `#[tokio::main]` in daemon stub.
+
 ### Completion Notes List
 
+- Scaffolded the full Rust workspace: root CLI binary crate + 4 member crates (protocol, shim, daemon, adapter-claude).
+- Implemented all protocol types exactly per spec: EventId (plain number), EventKind (PascalCase no rename_all), EventEnvelope/Event, Reaction (hand-written serde), SourceAdapter trait, REST outbound types (permissive), WebSocket types (ServerMessage permissive, ClientMessage strict deny_unknown_fields).
+- All 6 contract tests pass: EventKind PascalCase wire format, EventId as plain number, Reaction::Vendor serialization, outbound type permissiveness, inbound type strictness.
+- `cargo fmt --check`, `cargo clippy --all-targets --workspace -- -D warnings`, `cargo test --workspace` all pass with zero warnings.
+- Cargo.lock committed (1350 lines, 139 packages locked).
+- Adjusted pinned dependency versions to resolve native library link conflict (see Debug Log).
+
 ### File List
+
+- Cargo.toml
+- Cargo.lock
+- rust-toolchain.toml
+- src/main.rs
+- crates/protocol/Cargo.toml
+- crates/protocol/src/lib.rs
+- crates/protocol/src/error.rs
+- crates/protocol/src/constants.rs
+- crates/protocol/src/event.rs
+- crates/protocol/src/reaction.rs
+- crates/protocol/src/adapter.rs
+- crates/protocol/src/rest.rs
+- crates/protocol/src/ws.rs
+- crates/protocol/tests/contract_protocol.rs
+- crates/shim/Cargo.toml
+- crates/shim/src/main.rs
+- crates/daemon/Cargo.toml
+- crates/daemon/src/main.rs
+- crates/adapter-claude/Cargo.toml
+- crates/adapter-claude/src/lib.rs
+- .github/workflows/ci.yml
+- docs/bmad/implementation-artifacts/sprint-status.yaml
+
+## Change Log
+
+- 2026-05-16: Initial implementation of Story 1.1 — Rust workspace scaffolded, protocol crate implemented with all wire types, 6 contract tests added and passing, CI workflow configured.

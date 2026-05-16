@@ -1,0 +1,50 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.dependencies]
+# Protocol deps
+serde       = { version = "1.0.228", features = ["derive"] }
+serde_json  = "1.0.149"
+thiserror   = "2.0.18"
+# Daemon deps
+tokio            = { version = "1.52.1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "fs"] }
+axum             = "0.8.9"
+rusqlite         = { version = "0.38.0", features = ["bundled", "backup", "blob"] }
+deadpool-sqlite  = "0.13.0"
+tower-http       = "0.6.10"
+tracing          = "0.1.44"
+tracing-subscriber = "0.3.20"
+anyhow           = "1.0.102"
+uuid             = { version = "1.23.1", features = ["v4"] }
+rusqlite_migration = "2.4.1"
+tokio-util       = "0.7.18"
+tokio-stream     = "0.1.17"
+clap             = { version = "4.5.37", features = ["derive"] }
+secrecy          = "0.10.3"
+keyring          = "3.6.1"
+tempfile         = "3.20.0"
+
+[profile.release-shim]
+inherits      = "release"
+panic         = "abort"
+lto           = "fat"
+codegen-units = 1
+opt-level     = "z"
+strip         = true
+
+[package]
+name    = "bowerbird"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+
+[[bin]]
+name = "bowerbird"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }

@@ -1,0 +1,13 @@
+[package]
+name    = "bowerbird-shim"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+
+[[bin]]
+name = "bowerbird-shim"
+path = "src/main.rs"
+
+[dependencies]
+protocol  = { path = "../protocol" }
+thiserror = { workspace = true }
