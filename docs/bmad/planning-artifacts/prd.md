@@ -11,6 +11,7 @@ stepsCompleted:
   - step-07-project-type
   - step-08-scoping
   - step-09-functional
+  - step-10-nonfunctional
 releaseMode: phased
 inputDocuments:
   - docs/bmad/planning-artifacts/product-brief-bowerbird-distillate.md
@@ -517,3 +518,46 @@ V1 ships when pickles can build and iterate on multiple tools simultaneously aga
 - FR37: The daemon accepts inbound events via a socket accessible only to the current OS user
 - FR38: Tool builders can authenticate REST and WebSocket connections using a bearer token
 - FR39: Tool builders can access structured changelog information identifying the type and nature of any protocol changes between releases
+
+## Non-Functional Requirements
+
+### Performance
+
+- NFR1: The shim must add no more than 5ms at the p95 percentile to Claude Code's hook execution time (hard constraint; benchmarked from day one via `shim/benches/hot_path.rs`)
+- NFR2: The daemon must introduce no perceptible lag under normal single-developer load on a modern laptop; performance is tuned when evidence warrants, not speculatively
+- NFR3: The daemon must be ready to accept connections within 2 seconds of cold start on reference hardware; verified via the health endpoint (FR22)
+
+### Reliability & Data Integrity
+
+- NFR4: The event log is unbounded for V1; a documented one-command operation exists for the user to truncate or clear it; automatic retention and rotation are deferred post-V1
+- NFR5: When the host filesystem is full (ENOSPC), the daemon logs the drop at error level and closes the ingest connection; the shim treats any write error as fire-and-forget and exits 0 without blocking Claude Code
+- NFR6: The event log survives unexpected daemon termination; any event acknowledged to the shim is durable on restart (guaranteed by WAL-mode atomic writes)
+- NFR7: The daemon accepts unbounded event ingest rate in V1 for single-developer workloads; no rate limiting or burst protection; this is a documented design limitation
+
+### Compatibility & Portability
+
+- NFR8: Prebuilt binaries target currently-supported macOS versions on both x86_64 and arm64
+- NFR9: Linux prebuilts target glibc-based distributions; musl deferred post-V1
+- NFR10: The `cargo install` path requires only the Rust stable toolchain; no nightly features
+
+### Security
+
+- NFR11: The daemon bearer token is stored in the system keychain (macOS Keychain / Linux Secret Service) and retrieved via `bowerbird auth token`
+- NFR12: Fallback order when keychain unavailable: (1) environment variable, (2) on-disk config file in `~/.bowerbird/`; fallback mechanism is documented
+- NFR13: If no token is resolvable via any fallback path, the daemon exits non-zero with a human-readable error to stderr
+- NFR14: Token rotation requires a daemon restart; the daemon reads the token once at startup and does not hot-reload it
+- NFR15: The shim failure log is created with mode `0600` regardless of the process umask
+
+### Operability
+
+- NFR16: The daemon logs at error level by default; `-v` and `-vv` flags expose progressively more detail; each log line follows the format `<ISO8601 timestamp> <LEVEL> <message>`; structured JSON logging deferred to V2
+- NFR17: On unexpected crash, the daemon writes crash information to `~/.bowerbird/`; no external crash reporting
+- NFR18: A daemon metrics endpoint is deferred until usage patterns justify it; health and readiness endpoints (FR22, FR23) are sufficient for V1
+
+### Protocol & API Stability
+
+- NFR19: No breaking changes to the REST or WebSocket protocol within any v1.x release series; tools built against v1.0 continue to work on any v1.x daemon without modification (anchors FR36)
+
+### Implementation Constraints
+
+- NFR20: The daemon's ingest socket listen backlog is at minimum 128; the shim treats `ECONNREFUSED` identically to any other write error — silent drop, exit 0
