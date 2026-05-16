@@ -6,10 +6,15 @@ stepsCompleted:
   - step-04-decisions
   - step-05-patterns
   - step-06-structure
+  - step-07-validation
+  - step-08-complete
 inputDocuments:
   - docs/bmad/planning-artifacts/prd.md
   - docs/bmad/project-context.md
 workflowType: 'architecture'
+lastStep: 8
+status: 'complete'
+completedAt: '2026-05-16'
 project_name: 'bowerbird'
 user_name: 'pickles'
 date: '2026-05-16'
@@ -914,3 +919,135 @@ tool REST client
 bowerbird CLI
   → client.rs (TCP + bearer from keychain) → api/sessions.rs / health.rs
 ```
+
+---
+
+## Architecture Validation Results
+
+### Coherence Validation ✅
+
+**Decision compatibility:** All technology choices are compatible. Tokio
+`current_thread` + axum 0.8 + deadpool-sqlite is a well-established combination
+with no known conflicts. rusqlite_migration 2.5.0 is compatible with rusqlite
+0.39.0. The secrecy/zeroize chain is compatible with keyring v3. clap 4.5
+derive is stable.
+
+**Pattern consistency:** The asymmetric serde rule is enforced at every inbound
+surface. EventKind uses PascalCase-as-written consistently. `Reaction::Vendor(n)`
+serialization has a designated custom impl in `reaction.rs`. The
+`thiserror`/`anyhow` boundary is precise: `thiserror` in all library code and
+internal modules; `anyhow` only in `main.rs` files.
+
+**Structure alignment:** Every architectural decision has a structural address.
+The transaction invariant has a sole owner (`projection/session.rs`). All SQL
+is centralized. The shim/daemon naming collision is resolved (`socket.rs` for
+shim write path; `listener.rs` for daemon accept loop). Bearer token issuance
+and validation are in separate files.
+
+**Runtime constraint:** The `current_thread` runtime means all daemon work runs
+on a single OS thread. All SQLite access goes through the deadpool-sqlite pool
+— agents must never introduce raw `thread::spawn` for SQLite work.
+
+### Requirements Coverage Validation ✅
+
+| FR Group | Coverage |
+|---|---|
+| FR1–FR5: Hook capture | shim/socket.rs + adapter-claude/hooks/ + normalize.rs ✅ |
+| FR6–FR9: Event persistence | db/ + projection/session.rs atomic transaction ✅ |
+| FR10–FR17: WS streaming | broadcast/ + api/ws.rs; DroppedFrame; SyncFrame; HelloFrame ✅ |
+| FR18–FR23: REST history | api/sessions.rs + events.rs + health.rs; EventListResponse ✅ |
+| FR24–FR26: Session tracking | projection/session.rs UPSERT; no stuck state on missing PostToolUse ✅ |
+| FR27–FR30: Install/lifecycle | commands/daemon.rs + adapter-claude/install.rs + config.rs ✅ |
+| FR31–FR35: Developer tools | replay.rs + export.rs + examples/ workspace members + fixtures/ ✅ |
+| FR36–FR39: Protocol compat | protocol/ wire types + additive serde + CHANGELOG CI gate ✅ |
+
+**NFR coverage:** Shim p95 <5ms → criterion benchmark gate. Daemon 2s readiness
+→ readyz. WAL durability → rusqlite WAL mode on startup. ENOSPC → log + close.
+Keychain + env-var + file fallback chain defined. `unsafe_code = "forbid"`
+workspace-wide. ✅
+
+### Implementation Readiness Validation ✅
+
+**Decision completeness:** 19 dependencies pinned with exact patch versions. All
+5 crates have defined internal module layouts to file level. `AppState` fields
+explicitly named. Transaction owner explicitly designated. Error type contract
+explicit per-crate. `ingest_channel_capacity` backpressure constant in `config.rs`.
+
+**Structure completeness:** Complete directory tree to individual file level.
+Fixture ownership table. Data flow diagram. FR-to-structure mapping table.
+Boundary descriptions for every inter-crate surface.
+
+**Pattern completeness:** 18 explicit process decisions. Wire format snapshot
+testing mandated. `skip_all` tracing policy. Exit code semantics (0/1/never-2).
+Shim binary name constant in protocol. Named integration test files.
+
+**One deferred implementation detail:** Ingest socket wire framing
+(length-prefixed vs newline-delimited) is TBD at implementation time. This
+does not affect any other component's design.
+
+### Architecture Completeness Checklist
+
+**Requirements Analysis**
+- [x] Project context thoroughly analyzed
+- [x] Scale and complexity assessed (Medium; single-developer; local tool)
+- [x] Technical constraints identified (stable toolchain; no async in shim; single-writer SQLite; 127.0.0.1 bind)
+- [x] Cross-cutting concerns mapped (performance isolation; atomicity; protocol stability; observability; security; error propagation)
+
+**Architectural Decisions**
+- [x] Critical decisions documented with versions (19 pinned deps; all 5 crates specified)
+- [x] Technology stack fully specified (Rust stable; Tokio current_thread; axum 0.8; SQLite WAL; deadpool-sqlite; clap 4.x)
+- [x] Integration patterns defined (SourceAdapter trait; WS pub/sub; REST cursor-based)
+- [x] Performance considerations addressed (shim hot-path rules; benchmark gate; no speculative optimization)
+
+**Implementation Patterns**
+- [x] Naming conventions established (18 explicit decisions; table by context)
+- [x] Structure patterns defined (test placement; error.rs contract; protocol re-exports)
+- [x] Communication patterns specified (WS frame enum; ClientMessage; serde asymmetry; DroppedFrame trigger)
+- [x] Process patterns documented (transaction invariant; exit codes; tracing skip_all; bearer token type)
+
+**Project Structure**
+- [x] Complete directory structure defined (file-level for all 5 crates + examples + fixtures)
+- [x] Component boundaries established (ingest; normalization; persistence; API; broadcast)
+- [x] Integration points mapped (data flow diagram; boundary descriptions)
+- [x] Requirements to structure mapping complete (FR group → file table)
+
+### Architecture Readiness Assessment
+
+**Overall Status: READY FOR IMPLEMENTATION**
+
+All 16 checklist items confirmed. No critical gaps remain. Two party mode
+rounds surfaced 14 distinct gaps across steps 5 and 6; all resolved. The
+document now specifies architecture to a level where independent agents will
+make the same structural choices on any given decision point.
+
+**Confidence level: High**
+
+**Key strengths:**
+- Transaction invariant has a sole designated owner — the most common
+  correctness failure point is structurally addressed
+- Shim exit code semantics verified against Claude Code hook documentation
+- `Reaction::Vendor(u16)` escape hatch allows external adapters without
+  protocol crate changes
+- `recording_sessions` shadow table + sentinel events give gap detection
+  without client-side inference
+- 19 dependency versions pinned; `Cargo.lock` committed
+
+**Post-V1 enhancements (deferred by design):**
+- Linux systemd service integration
+- `bowerbird gc` event-log truncation
+- V2 adapter contract (subprocess model)
+- Rate limiting on TCP surface
+- Non-loopback TCP bind option
+- `Reaction::Vendor(n)` → named variant graduation (two-presenters rule)
+
+### Implementation Handoff
+
+**AI agent guidelines:**
+- Follow all architectural decisions exactly as documented
+- The anti-pattern list is a code review gate — treat violations as build failures
+- All SQL strings go in `db/queries.rs`; all wire types come from `crates/protocol`
+- The transaction in `projection/session.rs` is the load-bearing correctness
+  invariant — never split it
+
+**First implementation story:** Initialize the workspace scaffold, verify all
+19 crate version pins compile, get `cargo check --workspace` green.
