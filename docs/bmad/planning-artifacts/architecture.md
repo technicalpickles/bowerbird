@@ -5,6 +5,7 @@ stepsCompleted:
   - step-03-starter
   - step-04-decisions
   - step-05-patterns
+  - step-06-structure
 inputDocuments:
   - docs/bmad/planning-artifacts/prd.md
   - docs/bmad/project-context.md
@@ -318,6 +319,10 @@ Then replace root `Cargo.toml` with the workspace manifest below.
 | rusqlite_migration | 2.5.0 | Schema migrations from day one |
 | tokio-util | 0.7.18 | Codec, compat utilities |
 | tokio-stream | 0.1.17 | Stream adapters for WS fan-out |
+| clap | 4.5.37 | `derive` feature; CLI argument parsing |
+| secrecy | 0.10.3 | `SecretString` for bearer token; zeroizes on drop |
+| keyring | 3.6.1 | System keychain access (macOS Keychain / Linux Secret Service) |
+| tempfile | 3.20.0 | Dev-only; `TempDir` for integration test socket paths |
 
 **Code Organization:**
 
@@ -709,3 +714,203 @@ session_id in their own logic if needed.
 - Exit code 2 from the shim
 - Any explicit `event_id` value in an INSERT statement
 - Fixed Unix socket paths in tests
+
+---
+
+## Project Structure & Boundaries
+
+### Complete Project Directory Structure
+
+```
+bowerbird/
+├── Cargo.toml                          # workspace manifest; members includes examples/*
+├── Cargo.lock                          # committed; reproducible builds
+├── rust-toolchain.toml                 # stable channel pin
+├── .github/
+│   └── workflows/
+│       ├── ci.yml                      # build+test+clippy; macOS arm64/x86_64; Linux x86_64
+│       └── release.yml                 # prebuilt binary distribution
+├── fixtures/                           # versioned test/demo data; single authoritative location
+│   ├── hook_pre_tool_use.json          # raw Claude Code hook payloads for shared use
+│   ├── hook_post_tool_use.json
+│   ├── hook_stop.json
+│   └── event_log_sample.db             # SQLite fixture for replay/export demos
+├── examples/                           # Cargo workspace members; compile in CI
+│   ├── multi-session-router/
+│   │   ├── Cargo.toml                  # depends on protocol; listed in root Cargo.toml members
+│   │   └── src/main.rs
+│   ├── event-log-viewer/
+│   │   ├── Cargo.toml
+│   │   └── src/main.rs
+│   └── reconnect-recovery/
+│       ├── Cargo.toml
+│       └── src/main.rs
+├── docs/
+│   ├── architecture/                   # ADRs and decision records
+│   └── api/                            # socket protocol specs, wire format reference
+└── crates/
+    ├── protocol/                       # stable wire surface; dep of all crates
+    │   ├── Cargo.toml
+    │   └── src/
+    │       ├── lib.rs                  # pub use re-exports of ALL public types
+    │       ├── error.rs                # pub enum Error; pub type Result<T>
+    │       ├── event.rs                # Event, EventEnvelope, EventId(i64), EventKind
+    │       ├── reaction.rs             # Reaction enum; custom Serialize/Deserialize
+    │       ├── adapter.rs              # SourceAdapter trait, NormalizeResult, AdapterMeta
+    │       ├── constants.rs            # SHIM_BINARY_NAME and other cross-crate string constants
+    │       ├── rest.rs                 # EventListResponse, SessionStats; no framework types
+    │       └── ws.rs                  # ServerMessage, ClientMessage, all frame types
+    │   └── tests/
+    │       └── contract_protocol.rs   # wire-format snapshot assertions (pre-MVP gate)
+    │
+    ├── shim/                           # sync-only static binary; no Tokio; <5ms hot path
+    │   ├── Cargo.toml
+    │   └── src/
+    │       ├── main.rs                 # arg parse → socket::send() → exit 0/1
+    │       ├── error.rs
+    │       └── socket.rs              # Unix socket write path; timeout; failure logging
+    │   └── tests/
+    │       └── contract_shim.rs        # exit-code contract; silence-on-success contract
+    │
+    ├── daemon/                         # Tokio current_thread + axum + SQLite
+    │   ├── Cargo.toml
+    │   └── src/
+    │       ├── main.rs                 # startup; migration; socket bind; axum serve; shutdown
+    │       ├── error.rs
+    │       ├── config.rs              # socket paths; port; pool sizes; token source;
+    │       │                          #   ingest_channel_capacity: usize (default 1024)
+    │       ├── state.rs               # AppState { db: DbPools, hub: BroadcastHub,
+    │       │                          #             auth: BearerToken, shutdown: CancellationToken }
+    │       ├── db/
+    │       │   ├── mod.rs
+    │       │   ├── migrations.rs       # rusqlite_migration definitions
+    │       │   ├── pool.rs             # deadpool-sqlite writer(1) + readers(4)
+    │       │   └── queries.rs          # ALL SQL strings live here; no inline SQL elsewhere
+    │       ├── ingest/
+    │       │   ├── mod.rs
+    │       │   ├── listener.rs         # Unix socket accept loop; umask(0o177) before bind
+    │       │   └── handler.rs          # receive raw bytes → normalize → projection::write()
+    │       ├── projection/
+    │       │   ├── mod.rs
+    │       │   └── session.rs          # OWNS the transaction: projection UPSERT + event INSERT
+    │       ├── api/
+    │       │   ├── mod.rs
+    │       │   ├── auth.rs             # tower auth layer; bearer token validation (timing-safe)
+    │       │   ├── token.rs            # UUID4 token issuance; SecretString wrapping
+    │       │   ├── sessions.rs         # GET /sessions
+    │       │   ├── events.rs           # GET /sessions/:id/events?since=<cursor>
+    │       │   ├── health.rs           # GET /healthz, GET /readyz
+    │       │   └── ws.rs              # WS upgrade; subscription router; fan-out; DroppedFrame
+    │       └── broadcast/
+    │           ├── mod.rs
+    │           ├── event.rs            # BroadcastEvent wrapper; channel capacity constants
+    │           └── hub.rs              # BroadcastHub; tokio broadcast channels per topic
+    │   └── tests/
+    │       ├── contract_config.rs      # config round-trip; missing env var; bad pool size
+    │       ├── contract_daemon.rs      # ingest → DB → WS fan-out contract tests
+    │       └── contract_ws.rs          # WS frame protocol contract tests
+    │
+    └── adapter-claude/
+        ├── Cargo.toml
+        └── src/
+            ├── lib.rs
+            ├── error.rs
+            ├── normalize.rs            # normalize(hook_kind, raw) → NormalizeResult
+            ├── install.rs              # write settings.json atomically;
+            │                          #   uses protocol::SHIM_BINARY_NAME
+            └── hooks/
+                ├── mod.rs
+                ├── pre_tool_use.rs
+                ├── post_tool_use.rs
+                ├── stop.rs
+                └── notification.rs
+        └── tests/
+            ├── contract_adapter.rs
+            └── fixtures/               # adapter-specific payloads ONLY (not shared with root)
+                                        # naming: <hook_type>/<scenario>.json
+                                        # loaded via include_str!
+
+bowerbird/                              # CLI binary crate
+├── Cargo.toml
+└── src/
+    ├── main.rs                         # clap entrypoint; anyhow::Context permitted here only
+    ├── client.rs                      # TCP daemon client; bearer token loading from keychain
+    └── commands/
+        ├── mod.rs
+        ├── daemon.rs                   # start / stop / status / install / uninstall
+        ├── replay.rs
+        ├── export.rs
+        └── version.rs
+└── tests/
+    └── integration/
+        ├── replay.rs                   # fixture-driven: bowerbird replay <fixture> → assert output
+        └── export.rs                   # fixture-driven: bowerbird export <fixture> → assert shape
+```
+
+### Fixture Ownership
+
+| Location | Contains | Used by |
+|---|---|---|
+| `fixtures/` (workspace root) | Shared hook payloads + demo SQLite | `examples/*/`, `bowerbird/tests/integration/` |
+| `crates/adapter-claude/tests/fixtures/` | Adapter-specific raw payloads | `contract_adapter.rs` only; loaded via `include_str!` |
+
+No overlap. No symlinks. Workspace root fixtures are the single authoritative source for anything shared across crates.
+
+### Architectural Boundaries
+
+**Ingest boundary (shim → daemon):**
+- `crates/shim/src/socket.rs` — write path, timeout, failure log
+- `crates/daemon/src/ingest/listener.rs` — accept loop (renamed from `socket.rs` to avoid naming collision)
+- Raw hook JSON bytes on the wire; no normalization in shim
+
+**Normalization boundary:**
+- `crates/daemon/src/ingest/handler.rs` calls `adapter_claude::normalize()`
+- Result passed immediately to `projection::session::write()`
+
+**Transaction boundary (load-bearing):**
+- `crates/daemon/src/projection/session.rs` is the SOLE owner of the SQLite transaction
+- Projection UPSERT + event INSERT; nothing else joins the transaction
+- All SQL strings in `crates/daemon/src/db/queries.rs`
+
+**API boundary:**
+- `api/auth.rs` — validation (timing-safe compare against stored token)
+- `api/token.rs` — UUID4 issuance on daemon start; `SecretString` wrapping
+- `bowerbird/src/client.rs` — CLI-side TCP client + keychain token loading
+
+**Protocol crate boundary:**
+- `crates/protocol/src/constants.rs` owns `SHIM_BINARY_NAME` — single authoritative string used by `adapter-claude/src/install.rs`. No duplication across crates.
+
+**Examples boundary:**
+- `examples/*/Cargo.toml` listed in root `Cargo.toml` `members`
+- Depend on `protocol` directly; compile in CI; break loudly on API changes
+
+### Requirements to Structure Mapping
+
+| FR Group | Location |
+|---|---|
+| FR1–FR5: Hook capture + shim | `crates/shim/src/socket.rs`, `crates/adapter-claude/src/hooks/` |
+| FR6–FR9: Event persistence | `crates/daemon/src/db/`, `crates/daemon/src/projection/session.rs` |
+| FR10–FR17: WS pub/sub | `crates/daemon/src/api/ws.rs`, `crates/daemon/src/broadcast/` |
+| FR18–FR23: REST + history | `crates/daemon/src/api/sessions.rs`, `events.rs`, `health.rs` |
+| FR24–FR26: Session tracking | `crates/daemon/src/projection/session.rs` (UPSERT) |
+| FR27–FR30: Install + lifecycle | `bowerbird/src/commands/daemon.rs`, `crates/adapter-claude/src/install.rs` |
+| FR31–FR35: Developer tools + examples | `bowerbird/src/commands/replay.rs`, `export.rs`, `examples/*/` |
+| FR36–FR39: Protocol compat | `crates/protocol/` (wire types + constants) |
+
+### Data Flow
+
+```
+Claude Code process
+  → crates/shim/src/socket.rs (raw JSON) → Unix socket
+  → crates/daemon/src/ingest/listener.rs (accept)
+  → ingest/handler.rs → adapter_claude::normalize()
+  → projection/session.rs (UPSERT + INSERT, same tx)
+  → broadcast/hub.rs (fan-out per topic)
+  → api/ws.rs (DroppedFrame on lag) → tool WS client
+
+tool REST client
+  → api/events.rs → db/queries.rs (reader pool) → EventListResponse
+
+bowerbird CLI
+  → client.rs (TCP + bearer from keychain) → api/sessions.rs / health.rs
+```
