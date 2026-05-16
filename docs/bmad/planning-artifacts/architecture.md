@@ -3,6 +3,7 @@ stepsCompleted:
   - step-01-init
   - step-02-context
   - step-03-starter
+  - step-04-decisions
 inputDocuments:
   - docs/bmad/planning-artifacts/prd.md
   - docs/bmad/project-context.md
@@ -339,3 +340,170 @@ bowerbird/
 
 **Note:** The first implementation story is: initialize this workspace scaffold,
 verify all crate version pins compile, and get `cargo check --workspace` green.
+
+---
+
+## Core Architectural Decisions
+
+### Decision Priority Analysis
+
+**Critical Decisions (Block Implementation):**
+- SQLite schema (events, session_projections, recording_sessions)
+- Auth model split: Unix socket 0600 ingest / UUID4 bearer TCP
+- EventId(i64) AUTOINCREMENT cursor semantics
+- Process supervision: launchd (macOS V1); manual on Linux V1
+
+**Important Decisions (Shape Architecture):**
+- deadpool-sqlite writer(max=1) + readers(max=4) pool split
+- Asymmetric serde `deny_unknown_fields`
+- SourceAdapter trait: sync + pure `normalize()`; `Reaction::Vendor(u16)` escape hatch
+- CLI framework: clap 4.x with derive macro
+- Keyring crate: `keyring` v3
+
+**Deferred Decisions (Post-MVP):**
+- Linux systemd service integration
+- Event-log truncation (`bowerbird gc`)
+- V2 adapter contract (subprocess vs. in-process)
+- Rate limiting
+- Non-loopback TCP bind
+- Metrics collection
+
+### Data Architecture
+
+**Database: SQLite (WAL mode)**
+- Bundled via rusqlite 0.39.0 (`bundled,backup,blob` features)
+- WAL mode enabled on startup; read/write concurrency without locking
+- deadpool-sqlite 0.13.0: writer pool `max_size=1`, reader pool `max_size=4`
+- Pool starvation behavior: defined error returned (not silent hang) — contract test required
+- ENOSPC: error logged; ingest socket closed cleanly
+
+**Schema Migrations: rusqlite_migration 2.5.0**
+- Auto-migration on daemon startup; fatal on failure (daemon refuses to start with unknown schema)
+- Append-only; no destructive migrations in V1
+
+**SQLite Schema:**
+
+```sql
+CREATE TABLE events (
+    event_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    source     TEXT    NOT NULL,         -- adapter source, e.g. "claude-code"
+    session_id TEXT    NOT NULL,
+    kind       TEXT    NOT NULL,         -- EventKind as string
+    reaction   TEXT,                     -- Reaction variant; NULL for daemon sentinels
+    payload    TEXT    NOT NULL,         -- verbatim raw JSON; no information loss
+    created_at INTEGER NOT NULL          -- Unix timestamp ms
+);
+
+CREATE TABLE session_projections (
+    source     TEXT    NOT NULL,
+    session_id TEXT    NOT NULL,
+    state      TEXT    NOT NULL,         -- JSON blob of projected session state
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (source, session_id)
+);
+
+-- Shadow table; never truncated; enables history_begins_cleanly post-truncation
+CREATE TABLE recording_sessions (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_event_id INTEGER NOT NULL,
+    ended_event_id   INTEGER             -- NULL until clean shutdown
+);
+```
+
+**Cursors & IDs:**
+- `EventId(i64)` newtype; AUTOINCREMENT; wire format: plain JSON number
+- `WHERE event_id > $cursor` — integer comparison, no collation concerns
+- `oldest_available_event_id` is `i64::MAX` when the events table is empty
+
+**Caching:** None. Local SQLite with WAL readers is sufficient for the developer-tool load profile.
+
+### Authentication & Security
+
+**Ingest socket (shim → daemon):**
+- Unix domain socket `~/.bowerbird/ingest.sock`; filesystem 0600; no wire auth
+- Listen backlog ≥ 128
+- Shim failure log: `~/.bowerbird/shim.log` mode 0600
+
+**TCP surface (tools → REST + WS):**
+- Bind: `127.0.0.1:<port>` only
+- Auth: UUID4 bearer token, `Authorization: Bearer <token>` header
+- `/healthz` and `/readyz` unauthenticated
+- Token storage: `keyring` v3 (system keychain primary → `BOWERBIRD_TOKEN` env-var → `~/.bowerbird/token` file mode 0600)
+
+**Invariants:**
+- Ingest path never reads or logs the bearer token
+- `unsafe_code = "forbid"` workspace-wide
+
+### API & Communication Patterns
+
+**HTTP Server: axum 0.8.9**
+- Tokio `current_thread` runtime — no work-stealing overhead; sufficient for local tool load
+- tower-http 0.6.10 for auth + tracing middleware
+- `AppState { db: DbPools, broadcasters: Broadcasters, auth: TokenStore, shutdown: CancellationToken }`
+
+**REST:**
+- `GET /sessions` — list sessions with stats
+- `GET /sessions/:id/events?since=<cursor>` — returns `EventListResponse { events, cursor, oldest_available_event_id }`
+- `GET /healthz` — liveness (unauthenticated)
+- `GET /readyz` — readiness; 503 until migrations complete (unauthenticated)
+
+**WebSocket:**
+- Upgrade at `GET /ws`; bearer auth on upgrade
+- Topic filtering: session_id or wildcard subscriptions
+- Fan-out: tokio broadcast channel per topic; slow consumer receives `DroppedFrame`; channel never blocks
+- Max 256 concurrent WS connections; 257th receives defined rejection
+
+**Protocol serde:**
+- Inbound: `deny_unknown_fields` — strict
+- Outbound: permissive — additive forward-compat guaranteed
+- `Event.payload: String` — verbatim raw JSON
+
+**Error handling:**
+- `thiserror` in `protocol` + `shim`; `anyhow` at binary edges only
+- HTTP errors: `{ "error": "<message>" }` with appropriate status code
+
+**Rate limiting:** None in V1; documented limitation.
+
+### Frontend Architecture
+
+Not applicable.
+
+### Infrastructure & Deployment
+
+**Process supervision:**
+- macOS V1: `bowerbird daemon install` writes a launchd plist to `~/Library/LaunchAgents/` and
+  runs `launchctl load`; `bowerbird daemon uninstall` reverses this
+- Linux V1: manual invocation only; systemd integration is post-V1
+
+**CLI framework: clap 4.x with derive macro**
+- Subcommands: `daemon` (start/stop/status/install/uninstall), `replay`, `export`, `version`
+
+**Distribution:**
+- Prebuilt binaries: macOS arm64, macOS x86_64, Linux x86_64 (glibc)
+- `cargo install` as alternative
+- `Cargo.lock` committed
+
+**Logging:**
+- `tracing` + `tracing-subscriber`; default level `error`; `RUST_LOG` override
+- Span fields consistent across ingest → projection → WS handler: `source`, `session_id`, `event_id`
+- Crash info to `~/.bowerbird/`; metrics deferred
+
+**CI matrix:** macOS arm64, macOS x86_64, Linux x86_64 — per-platform perf baselines, no averaging.
+
+### Decision Impact Analysis
+
+**Implementation sequence:**
+1. Workspace scaffold (`cargo check --workspace` green)
+2. `crates/protocol` — EventId, wire types, SourceAdapter trait, Reaction enum
+3. `crates/shim` — sync hot path, Unix socket write, shim.log failure handler
+4. `crates/daemon` — SQLite schema + migrations, ingest socket, event INSERT + projection (same transaction)
+5. `crates/daemon` — axum REST endpoints + auth middleware
+6. `crates/daemon` — WebSocket pub/sub, DroppedFrame, HelloFrame
+7. `crates/adapter-claude` — hook normalization, shim installation
+8. CLI binary — clap subcommands, launchd plist install/uninstall
+
+**Cross-component dependencies:**
+- `protocol` is a dep of all crates; every change has maximum blast radius — dep budget tightest here
+- `shim` depends on `protocol` only; zero daemon deps — enforced by Cargo dep graph
+- `daemon` depends on `protocol`; normalizes via `SourceAdapter` at the ingest boundary
+- launchd integration depends on stable daemon binary path from the distribution step
