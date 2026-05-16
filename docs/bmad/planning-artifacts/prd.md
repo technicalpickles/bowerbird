@@ -302,7 +302,7 @@ The ingest path uses a Unix domain socket with filesystem-permission security �
 Reserved (not implemented in v1): `GET /metrics` — Prometheus text format; path reserved now.
 
 **Ingest endpoint (Unix socket):**
-`POST /ingest` on the Unix socket. Returns synchronously after the event is accepted into the write queue — not after it is persisted to SQLite. The shim gets an ACK within the 5ms budget; actual persistence happens asynchronously. Under backpressure (write queue full), the daemon returns `503` and the shim logs to `~/.bowerbird/shim.log` and exits cleanly.
+`POST /ingest` on the Unix socket. Returns synchronously after the event is accepted into the write queue — not after it is persisted to SQLite. The shim gets an ACK within the 5ms budget; actual persistence happens asynchronously. Under backpressure (write queue full), the daemon returns `503` and the shim logs to `~/.bowerbird/shim.log` and exits cleanly (exit 0). If the daemon is unreachable (socket does not exist, `ECONNREFUSED`), the shim logs to `~/.bowerbird/shim.log` and exits non-zero — surfacing to Claude Code that the hook failed.
 
 #### WebSocket (TCP, Bearer Auth)
 
@@ -556,4 +556,4 @@ V1 ships when pickles can build and iterate on multiple tools simultaneously aga
 
 ### Implementation Constraints
 
-- NFR20: The daemon's ingest socket listen backlog is at minimum 128; the shim treats `ECONNREFUSED` identically to any other write error — silent drop, exit 0
+- NFR20: The daemon's ingest socket listen backlog is at minimum 128; the shim exits non-zero on `ECONNREFUSED` or socket-not-found (daemon unreachable), and exits 0 on mid-write errors (transient daemon issues, backpressure)
