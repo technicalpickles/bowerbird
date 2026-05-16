@@ -2,6 +2,7 @@
 stepsCompleted:
   - step-01-validate-prerequisites
   - step-02-design-epics
+  - step-03-create-stories
 inputDocuments:
   - docs/bmad/planning-artifacts/prd.md
   - docs/bmad/project-context.md
@@ -434,3 +435,377 @@ So that I can build tools that show current Claude Code session state and recove
 **Given** `GET /sessions/:id/stats` with a valid bearer token
 **When** the response body contains an extra unknown field that was added in a future daemon release
 **Then** a v1.0 client that does not know about that field still deserializes the response without error (additive-compat validation)
+
+---
+
+## Epic 2: Live event streaming to multiple simultaneous tools
+
+Tool builders can subscribe to Claude Code activity via WebSocket, with multiple tools running simultaneously, automatic lag recovery via dropped frames, and state snapshot delivery on connect. Builds on Epic 1's daemon foundation.
+
+### Story 2.1: WebSocket connection and topic subscription
+
+As a tool builder,
+I want to establish an authenticated WebSocket connection to bowerbird and declare which event topics I want to receive,
+So that I only receive the agent activity relevant to my tool without filtering it myself.
+
+**Acceptance Criteria:**
+
+**Given** a tool connects to `ws://127.0.0.1:<port>/ws` with a valid bearer token in the Authorization header or `?token=` query parameter
+**When** the connection is established
+**Then** the daemon sends a `hello` frame immediately containing `protocol_version` and the daemon version string
+
+**Given** a tool sends a subscribe message `{"topics": ["state.session.*", "events.*"]}`
+**When** the daemon processes it
+**Then** subsequent frames are filtered to only those matching the declared topics
+
+**Given** a tool connects with an invalid or missing bearer token
+**When** the WebSocket upgrade is attempted
+**Then** the connection is rejected with a 401 response before the upgrade completes
+
+**Given** 257 tools attempt concurrent WebSocket connections (exceeding the default cap of 256)
+**When** the 257th connection arrives
+**Then** it is rejected gracefully (semaphore acquire fails) and the 256 existing connections are unaffected
+
+**Given** a connected tool has been idle with no frames exchanged for 30 seconds
+**When** the daemon's per-client ping timer fires
+**Then** the daemon sends a WebSocket Ping frame; when the client responds with Pong, the connection remains open
+
+**Given** a connected tool whose underlying TCP connection has been dropped without a FIN (e.g., abrupt network loss)
+**When** the 30-second ping fires and no Pong is received within a timeout
+**Then** the per-client task detects the dead connection and cleans up without leaking the task
+
+### Story 2.2: Real-time event and state broadcast to multiple tools
+
+As a tool builder,
+I want to receive live Claude Code event and state frames over my WebSocket connection simultaneously with other connected tools,
+So that multiple tools can observe the same agent activity independently without affecting each other.
+
+**Acceptance Criteria:**
+
+**Given** three tools connected and subscribed to `events.*`
+**When** a new event is ingested by the daemon
+**Then** all three tools receive the `event` frame with identical content, in the same order, within the end-to-end latency budget (hook→presenter p99 ≤100ms)
+
+**Given** a tool subscribed to `state.session.<id>.current_state`
+**When** an event causes the projection for session `<id>` to change
+**Then** the tool receives a `state` frame containing the updated `current_state` value for that session only
+
+**Given** a tool subscribed to `events.claude.*`
+**When** an event from source `claude` is ingested and an event from a hypothetical second source is ingested
+**Then** the tool receives only the `claude` event, confirming source-scoped topic filtering
+
+**Given** a tool subscribed to `state.session.*` (wildcard)
+**When** events arrive for three different concurrent sessions
+**Then** the tool receives state frames for all three sessions routed correctly by session identity
+
+**Given** two tools with identical topic subscriptions
+**When** one tool's connection is closed
+**Then** the other tool continues receiving frames uninterrupted — tools are fully independent consumers
+
+### Story 2.3: New session discovery and state snapshot on connect
+
+As a tool builder,
+I want to receive the current state of all matching sessions immediately when I connect, and to be notified automatically when new sessions appear while I am subscribed,
+So that my tool is always up to date without polling and without missing sessions that started before or during my connection.
+
+**Acceptance Criteria:**
+
+**Given** three active sessions exist when a tool connects and subscribes to `state.session.*`
+**When** the subscription message is processed
+**Then** the daemon sends one `state` frame per active session before sending any subsequent `event` frames, giving the tool a complete snapshot
+
+**Given** a tool is connected and subscribed to `state.session.*`
+**When** a new Claude Code session starts and its first event is ingested
+**Then** the daemon emits a `state` frame for the new session to the subscribed tool without requiring the tool to reconnect or re-subscribe
+
+**Given** a tool subscribed to `state.session.<specific-id>` (single session)
+**When** a new session with a different ID starts
+**Then** the tool does not receive a `state` frame for the new session — wildcard and specific-session subscriptions are correctly distinguished
+
+**Given** a tool connects to a daemon with no active sessions
+**When** the subscription message is sent
+**Then** the daemon sends no initial `state` frames and transitions immediately to streaming new events as they arrive
+
+### Story 2.4: Lagged consumer recovery with dropped frame
+
+As a tool builder,
+I want bowerbird to notify me with a single `dropped` frame when my tool falls behind the event stream, rather than silently losing events or closing my connection,
+So that my tool can detect the gap and re-fetch state via REST to recover gracefully.
+
+**Acceptance Criteria:**
+
+**Given** a broadcast channel with capacity 1024 and a tool whose WebSocket read loop is blocked
+**When** 1025 events are published before the tool reads any
+**Then** the tool receives exactly one `dropped` frame containing the lag count in events (not bytes), and the next frame is the next legitimate event — the socket remains open
+
+**Given** a tool receives a `dropped` frame
+**When** the tool calls `GET /sessions/:id/events?since=<last_cursor>` via REST
+**Then** it can re-fetch the missed events using `oldest_available_event_id` in the response to detect whether the gap is recoverable
+
+**Given** a tool is lagging continuously for 30 seconds past the drop threshold
+**When** the backpressure policy is applied
+**Then** the daemon does not emit 50,000 individual `dropped` frames — it coalesces them into a bounded number of `dropped` frames per policy period (backpressure escalation contract test)
+
+**Given** a tool that has received a `dropped` frame
+**When** it resumes consuming events normally
+**Then** subsequent events arrive in order with no further interruption — the channel is not permanently degraded
+
+### Story 2.5: Graceful shutdown notification to connected tools
+
+As a tool builder,
+I want to receive a `close` frame from bowerbird before it shuts down,
+So that my tool knows the disconnection is intentional and can show an appropriate status to the user rather than treating it as an error.
+
+**Acceptance Criteria:**
+
+**Given** three tools are connected via WebSocket and an event is mid-ingest
+**When** SIGTERM is sent to the daemon
+**Then** the daemon stops accepting new WebSocket connections, sends a `close` frame to all three connected tools, drains the broadcast channels (5-second timeout), flushes the DB connection pools, and exits with code 0
+
+**Given** SIGTERM is sent to the daemon while a SQLite write transaction is in progress
+**When** the daemon shuts down
+**Then** the in-flight event is either fully committed or fully rolled back — no partial rows exist after restart (graceful shutdown contract test)
+
+**Given** Ctrl-C (SIGINT) is received by the daemon
+**When** the shutdown sequence runs
+**Then** it follows the same path as SIGTERM — `close` frames to all clients, clean DB flush, exit 0
+
+**Given** the broadcast channel drain takes longer than 5 seconds during shutdown
+**When** the timeout expires
+**Then** the daemon proceeds with shutdown rather than hanging indefinitely, logs a warning about the drain timeout, and still exits 0
+
+---
+
+## Epic 3: Easy installation, lifecycle management, and secure access
+
+Tool builders can install bowerbird with a single command, manage the daemon lifecycle via CLI, and authenticate tool connections using a secure bearer token backed by the system keychain. Prebuilt binaries make bowerbird available without a Rust toolchain.
+
+### Story 3.1: bowerbird install and uninstall
+
+As a tool builder,
+I want to add and remove the bowerbird hook from my Claude Code configuration with a single CLI command,
+So that I never have to manually edit `~/.claude/settings.json` or worry about leaving my config in a broken state if the operation is interrupted.
+
+**Acceptance Criteria:**
+
+**Given** `~/.claude/settings.json` exists and is valid JSON
+**When** I run `bowerbird install`
+**Then** the hook entry is merged into settings.json using the atomic sequence (read → parse → merge → write `.tmp` → rename), the hook binary reference is a PATH-relative name (`bowerbird`), and the daemon is started if not already running
+
+**Given** a concurrent write to `~/.claude/settings.json` occurs during `bowerbird install` (e.g., Claude Code updating settings simultaneously)
+**When** the rename step detects the conflict
+**Then** the operation retries with exponential backoff and either succeeds or exits non-zero with a descriptive error — never leaves settings.json partially overwritten
+
+**Given** `bowerbird install` is interrupted mid-write (process killed between write `.tmp` and rename)
+**When** Claude Code next reads `~/.claude/settings.json`
+**Then** the original settings.json is still valid JSON and not partially overwritten (atomic install contract test)
+
+**Given** `bowerbird install` has been run successfully
+**When** I run `bowerbird uninstall`
+**Then** the hook entry is removed from settings.json atomically, the daemon is stopped, and settings.json remains valid JSON
+
+**Given** `~/.claude/settings.json` does not exist
+**When** I run `bowerbird install`
+**Then** a valid settings.json is created with the hook entry and the operation succeeds
+
+### Story 3.2: Daemon lifecycle CLI
+
+As a tool builder,
+I want CLI commands to start, stop, and inspect the bowerbird daemon independently of my Claude Code hook configuration,
+So that I can restart the daemon after a crash or manually test it without reinstalling the hook.
+
+**Acceptance Criteria:**
+
+**Given** the daemon is not running
+**When** I run `bowerbird start`
+**Then** the daemon starts in the background, `~/.bowerbird/ingest.sock` appears, and `GET /healthz` returns 200 within 2 seconds (NFR3)
+
+**Given** the daemon is running
+**When** I run `bowerbird stop`
+**Then** the daemon receives SIGTERM, executes its graceful shutdown sequence (close frames, DB flush), and exits 0
+
+**Given** the daemon is running
+**When** I run `bowerbird status`
+**Then** the output includes the daemon version, process uptime, and a liveness indicator; if the daemon is not running, the output clearly states it is stopped
+
+**Given** the daemon crashes unexpectedly
+**When** I run `bowerbird start` after freeing the cause (e.g., disk space)
+**Then** the daemon starts cleanly, applies any pending WAL checkpoint, and `GET /readyz` returns 200
+
+**Given** `bowerbird install` is run
+**When** the installation completes
+**Then** the daemon starts automatically as part of the install flow (daemon auto-start on install)
+
+### Story 3.3: Bearer token auth with keychain storage
+
+As a tool builder,
+I want bowerbird's API to be protected by a secure bearer token that is stored in my system keychain and retrievable via CLI,
+So that tools I build can authenticate without storing credentials in plaintext, and unauthorized processes on the same host cannot access my agent activity data.
+
+**Acceptance Criteria:**
+
+**Given** the daemon starts for the first time
+**When** no existing token is found in the keychain
+**Then** a UUID4 bearer token is generated, stored in the system keychain (macOS Keychain / Linux Secret Service), and the daemon uses it for all authenticated requests in this and future runs
+
+**Given** the keychain is unavailable (e.g., headless CI environment)
+**When** the daemon starts and resolves the token
+**Then** it falls back in order: (1) `BOWERBIRD_TOKEN` environment variable, (2) `~/.bowerbird/config.toml` token field; the active fallback path is logged at info level
+
+**Given** no token is resolvable via any fallback path (keychain unavailable, no env var, no config file)
+**When** the daemon attempts to start
+**Then** it exits non-zero with a human-readable error to stderr (NFR13)
+
+**Given** the daemon is running with a valid token
+**When** I run `bowerbird auth token`
+**Then** the current bearer token is printed to stdout so I can copy it into tool configuration or HTTP client headers
+
+**Given** a new token is needed (e.g., token rotation)
+**When** I update the token in the keychain and restart the daemon
+**Then** the daemon reads the new token at startup and uses it from that point forward; the token is never reloaded at runtime without a restart (NFR14)
+
+### Story 3.4: Prebuilt binary distribution and release pipeline
+
+As a tool builder,
+I want to install bowerbird from a prebuilt binary without needing a Rust development environment,
+So that I can start using bowerbird in under a minute regardless of my local toolchain setup.
+
+**Acceptance Criteria:**
+
+**Given** a tagged release on GitHub
+**When** the release CI pipeline runs
+**Then** prebuilt binaries are produced and attached to the GitHub Release for: macOS arm64, macOS x86\_64, and Linux x86\_64 (glibc)
+
+**Given** a Linux user on a musl-based distribution
+**When** they check the release notes
+**Then** musl support is documented as deferred post-V1, with `cargo install` as the recommended alternative (NFR9)
+
+**Given** a user with only the Rust stable toolchain installed
+**When** they run `cargo install bowerbird`
+**Then** the build succeeds using only stable Rust features — no nightly required (NFR10); `Cargo.lock` is committed and the build is reproducible
+
+**Given** a user who downloads a prebuilt binary and runs `bowerbird install`
+**When** the install completes
+**Then** the hook entry in settings.json uses the PATH-relative binary name `bowerbird` (not an absolute install path), so the binary survives being updated via a new download to the same PATH location
+
+**Given** the project documentation
+**When** a new user reads about `bowerbird install`
+**Then** they find a clear description of exactly what the command does to their system (files created, settings modified, daemon started) before they run it
+
+---
+
+## Epic 4: Developer experience, replay, and protocol stability
+
+Tool builders can learn bowerbird via comprehensive docs and reference examples, experiment with a fake event stream without a live Claude Code session, and build against a stable protocol with a documented compatibility guarantee and CI-enforced changelog.
+
+### Story 4.1: bowerbird replay and export commands
+
+As a tool builder,
+I want to replay a recorded event sequence through bowerbird's full pub/sub path and export real sessions to replay files,
+So that I can develop and debug my tools against realistic event streams without needing a live Claude Code session.
+
+**Acceptance Criteria:**
+
+**Given** a JSONL file containing wire-format EventEnvelope records
+**When** I run `bowerbird replay <file>`
+**Then** each event is routed through the daemon's broadcast channels exactly as if it arrived via the ingest socket — subscribed WebSocket clients receive the frames in order
+
+**Given** a live session in the daemon's SQLite event log
+**When** I run `bowerbird export <session-id>`
+**Then** a JSONL file is produced containing all events for that session in wire-format EventEnvelope format, suitable for use with `bowerbird replay`
+
+**Given** the bowerbird binary distribution
+**When** I run `bowerbird replay` with no file argument
+**Then** the command uses bundled demo fixture data (embedded in the binary) so new users can run the Quickstart without capturing a real session first
+
+**Given** a replay file with events spanning two sessions
+**When** `bowerbird replay` runs
+**Then** tools subscribed to `state.session.*` receive state frames for both sessions, demonstrating multi-session fan-out without a live Claude Code instance
+
+**Given** a replay file event whose timestamp is in the past
+**When** `bowerbird replay` processes it
+**Then** the daemon does not attempt to preserve original inter-event timing — events are replayed as fast as the pub/sub path allows (replay is for development, not performance reproduction)
+
+### Story 4.2: Three reference example tools
+
+As a tool builder,
+I want complete, working TypeScript reference examples that demonstrate the core bowerbird patterns,
+So that I can understand how to build my own tools by reading and running real code, not just documentation.
+
+**Acceptance Criteria:**
+
+**Given** `examples/multi-session-router/`
+**When** I run it against `bowerbird replay` with the bundled fixture
+**Then** it subscribes to `state.session.*`, correctly routes state frames to per-session state objects, and handles a new session appearing mid-subscription — demonstrating the core fan-out pattern
+
+**Given** `examples/event-log-viewer/`
+**When** I run it against `bowerbird replay` with the bundled fixture
+**Then** it reads `events.*`, fetches initial history via `GET /sessions/:id/events?since=0`, and renders a tool-call history list — demonstrating cursor-based pagination via REST
+
+**Given** `examples/reconnect-recovery/`
+**When** I run it against a daemon and the WebSocket is intentionally disrupted
+**Then** it fetches a snapshot on connect, detects a `dropped` frame and re-fetches via REST, and resumes correctly — demonstrating the resilience pattern every long-running tool needs
+
+**Given** all three examples in `examples/`
+**When** CI runs `cargo build --examples` (or equivalent for Node examples) on every PR
+**Then** all three examples compile and pass their smoke tests against a live daemon with bundled fixture data
+
+**Given** a cookbook entry referencing code from a reference example
+**When** I update a function in the example
+**Then** the cookbook entry automatically reflects the change via include anchors — no manual copy-paste required (cookbook-example coupling invariant)
+
+### Story 4.3: Documentation suite
+
+As a tool builder,
+I want comprehensive documentation that takes me from zero to a working tool without needing to contact the maintainer,
+So that bowerbird is genuinely self-serve for the developer audience it targets.
+
+**Acceptance Criteria:**
+
+**Given** the Quickstart document
+**When** I follow it step by step on a machine with bowerbird installed
+**Then** I can run a reference example against `bowerbird replay` with bundled fixture data and see live output — no Claude Code session or live agent required
+
+**Given** `docs/presenter-authoring.md`
+**When** I read it
+**Then** it covers: establishing a WebSocket connection, sending a subscribe message, handling `state`/`event`/`dropped`/`close` frames, and fetching a REST snapshot on reconnect — with TypeScript code examples
+
+**Given** `docs/protocol.md`
+**When** a tool builder reads it
+**Then** it contains: all REST endpoints with auth requirements and response shapes, all WebSocket frame types with their JSON schemas, topic syntax (wildcards, source-scoped, session-scoped), and the ingest socket contract
+
+**Given** `docs/cookbook/` at launch
+**When** I browse it
+**Then** it contains at least three entries, each paired with a reference example, each following the format: Problem → Approach → Code (inlined via anchor, not copy-pasted) → Variants
+
+**Given** `docs/no-list.md`
+**When** an epic author or contributor reads it
+**Then** it explicitly names the scope cuts: no Windows support, no distro packaging, no HITL backflow, no tool blocking, no personas, no LAN/multi-host — so contributors don't propose features that are deliberate non-targets
+
+### Story 4.4: Protocol compatibility guarantee and contract test suite
+
+As a tool builder,
+I want a documented and CI-enforced guarantee that my tools will continue working on future bowerbird releases, backed by a complete contract test suite,
+So that I can build on bowerbird with confidence rather than checking every daemon update for breaking changes.
+
+**Acceptance Criteria:**
+
+**Given** `docs/protocol-changelog.md`
+**When** any file under `crates/protocol/src/` is changed in a PR
+**Then** CI enforces that a corresponding entry exists in protocol-changelog.md with a structured header (`type: schema | behavioral | security`); the PR fails without it (FR39 CI gate)
+
+**Given** the v1.x compatibility guarantee
+**When** a tool built against v1.0 is run against any v1.x daemon
+**Then** it continues to function — no REST endpoint removed, no WebSocket frame type removed, no required field added to outbound types (FR36 additive-only contract)
+
+**Given** all 10 required contract tests
+**When** `cargo test --workspace` runs on CI
+**Then** all 10 pass: (1) WS dropped-frame behavior, (2) PRAGMA invariants on every connection, (3) connection factory lint enforcement, (4) state+event INSERT atomicity, (5) graceful shutdown, (6) cursor-gap detection, (7) atomic settings.json install, (8) hook unreliability tolerance, (9) outbound envelope additive-compat, (10) (source, session\_id) collision safety
+
+**Given** the shim hot-path bench (`shim/benches/hot_path.rs`)
+**When** CI runs it
+**Then** it compares p99 against the committed per-platform baseline file and fails if regression exceeds 15%; the baseline file is updated only via a deliberate PR with reviewer sign-off — not auto-rolled
+
+**Given** a future daemon version vN+1 is started against a data directory written by daemon vN
+**When** the daemon completes startup
+**Then** no data is lost, existing projection rows are intact, and additive-compat holds for all API responses (cross-version protocol upgrade contract test)
