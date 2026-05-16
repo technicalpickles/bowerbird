@@ -3,6 +3,7 @@ stepsCompleted:
   - step-01-validate-prerequisites
   - step-02-design-epics
   - step-03-create-stories
+  - step-04-final-validation
 inputDocuments:
   - docs/bmad/planning-artifacts/prd.md
   - docs/bmad/project-context.md
@@ -279,6 +280,14 @@ So that I can trust no acknowledged event is ever lost due to unexpected daemon 
 **Given** any file in the codebase
 **When** a CI lint (grep or clippy) scans for `rusqlite::Connection::open`
 **Then** any call outside the designated connection factory module fails the build, confirming the factory-only access policy
+
+**Given** the daemon is running with default log level
+**When** it emits log output
+**Then** each line follows the format `<ISO8601 timestamp> <LEVEL> <message>` and the default level is error; running with `-v` exposes info-level output and `-vv` exposes debug-level output (NFR16)
+
+**Given** the daemon crashes unexpectedly (panic or unhandled error)
+**When** the process exits
+**Then** crash information (panic message, backtrace if available) is written to a file under `~/.bowerbird/` and nothing is sent to an external crash reporting service (NFR17)
 
 ### Story 1.3: Unix socket ingest endpoint
 
