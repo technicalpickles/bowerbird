@@ -4,6 +4,7 @@ stepsCompleted:
   - step-02-context
   - step-03-starter
   - step-04-decisions
+  - step-05-patterns
 inputDocuments:
   - docs/bmad/planning-artifacts/prd.md
   - docs/bmad/project-context.md
@@ -507,3 +508,204 @@ Not applicable.
 - `shim` depends on `protocol` only; zero daemon deps — enforced by Cargo dep graph
 - `daemon` depends on `protocol`; normalizes via `SourceAdapter` at the ingest boundary
 - launchd integration depends on stable daemon binary path from the distribution step
+
+---
+
+## Implementation Patterns & Consistency Rules
+
+### Pattern Categories
+
+**Conflict points addressed:** 18 explicit decisions covering naming, structure,
+wire format, and process conventions — all areas where independent AI agents
+could make incompatible choices while individually following reasonable defaults.
+
+### Naming Conventions
+
+| Context | Convention | Example |
+|---|---|---|
+| Rust types, traits, enums, variants | PascalCase | `EventKind`, `ToolUse`, `SourceAdapter` |
+| Rust functions, variables, modules, fields | snake_case | `event_id`, `normalize`, `session_id` |
+| SQLite tables | snake_case, plural | `events`, `session_projections` |
+| SQLite columns | snake_case | `event_id`, `created_at`, `session_id` |
+| JSON wire fields | snake_case (serde default; no `rename_all`) | `"event_id"`, `"session_id"` |
+| REST path segments | snake_case, plural resources | `/sessions`, `/sessions/:id/events` |
+| REST query parameters | snake_case | `?since=42` |
+| WS subscription topic | `session:<session_id>` or literal `*` | `session:abc-123` |
+| EventKind wire string | PascalCase matching variant name | `"ToolUse"`, `"RecordingStarted"` |
+| Reaction wire string | PascalCase; Vendor(n) as string | `"Pause"`, `"Vendor(42)"` |
+| WS frame op value | snake_case via `rename_all` on outer enum | `"hello"`, `"dropped"`, `"sync"` |
+
+**Critical:** `EventKind` uses PascalCase-as-written (no `rename_all`). The WS
+frame outer enum uses `rename_all = "snake_case"`. These are different policies
+on different types. Applying `rename_all` to `EventKind` would silently break
+wire compatibility.
+
+### Structural Conventions
+
+**Test placement:**
+- Unit tests: `#[cfg(test)]` module at the bottom of the file under test
+- Integration tests: `crates/<name>/tests/<name>.rs`
+- Contract tests (pre-MVP gates): `crates/<name>/tests/contract_<name>.rs`
+
+**Error module contract** — every crate's `src/error.rs` must contain exactly:
+```rust
+pub enum Error { ... }
+pub type Result<T> = std::result::Result<T, Error>;
+```
+And `lib.rs` re-exports: `pub use error::{Error, Result};`. Callers always
+import from the crate root (`protocol::Error`), never from the submodule path
+(`protocol::error::Error`).
+
+**Protocol re-exports:** `crates/protocol/src/lib.rs` re-exports all public
+types. Callers never import internal submodule paths.
+
+### Wire Format Conventions
+
+**WS frame enum:**
+```rust
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum ServerMessage {
+    Hello(HelloFrame),
+    Sync(SyncFrame),
+    Event(EventFrame),
+    Dropped(DroppedFrame),
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ClientMessage {
+    Subscribe { topic: String },
+    Unsubscribe { topic: String },
+}
+```
+
+**Timestamps:** Unix milliseconds as `i64` everywhere on the wire. No RFC3339
+strings. No seconds. No microseconds.
+
+**EventId on wire:** plain JSON number. Never a string, never an object.
+
+**HTTP error body:** exactly `{ "error": "<human-readable message>" }`. No
+`code` field, no nested structure, no additional keys.
+
+**`Reaction::Vendor(n)` serialization:** custom `impl Serialize` /
+`impl Deserialize` on `Reaction` in `crates/protocol/src/reaction.rs`. Wire
+string is `"Vendor(42)"`. No serde derive on this type — hand-written only.
+This is the single exception to the derive-based serde pattern.
+
+**Serde policy:**
+- Inbound (client→daemon): `#[serde(deny_unknown_fields)]` on every type — no exceptions
+- Outbound (daemon→client): no `deny_unknown_fields` — additive forward-compat guaranteed
+
+### Process Conventions
+
+**Shim exit codes:**
+- `0` on success
+- `1` on any failure (daemon down, write error) — non-blocking warning; Claude continues
+- `2` is **forbidden** — exit 2 blocks Claude tool calls, which violates the
+  substrate-not-actor axiom
+
+**Shim wire format:** shim writes raw hook JSON verbatim to the Unix socket.
+No normalization in shim. Daemon calls
+`adapter_claude::normalize(hook_kind, raw) -> Result<NormalizeResult>`.
+
+**Shim hot-path rules (non-negotiable):**
+- No heap allocation on the success path (best-effort; enforced via criterion
+  benchmark with p95 < 5ms CI gate, not a compile-time guarantee)
+- No `unwrap()` or `expect()` anywhere in shim
+- No `eprintln!` / `println!` / `tracing` calls — silence on success path;
+  failures write to `~/.bowerbird/shim.log` only
+
+**Transaction invariant (load-bearing correctness rule):**
+```rust
+// Exactly these two operations; nothing else joins this transaction
+conn.execute("INSERT INTO session_projections ... ON CONFLICT DO UPDATE ...", ...)?;
+conn.execute("INSERT INTO events ...", ...)?;
+```
+The projection UPSERT and event INSERT are the only operations in the
+transaction. A broader wrapping transaction is a prohibited pattern.
+
+**Projection UPSERT pattern** (handles both first-event and subsequent events):
+```sql
+INSERT INTO session_projections (source, session_id, state, updated_at)
+VALUES (?, ?, ?, ?)
+ON CONFLICT(source, session_id)
+DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at;
+```
+
+**`event_id` INSERT:** always omit the `event_id` column. Never pass `0` or any
+explicit value. AUTOINCREMENT assigns. The schema has no `DEFAULT` on this
+column to prevent accidental explicit-zero inserts.
+
+**Error propagation:**
+- `thiserror` error types in `protocol` and `shim` crates, and in all internal
+  modules of binary crates (`db.rs`, `server.rs`, `ingest.rs`, etc.)
+- `anyhow::Context` permitted only in `main.rs` files (the binary entry points)
+- `?` throughout all call chains; no `.unwrap()` outside `#[cfg(test)]` code
+
+**Tracing instrumentation:**
+```rust
+#[tracing::instrument(skip_all, fields(session_id = %session_id))]
+async fn handle_event(session_id: &str, ...) { ... }
+```
+- `skip_all` is the default — prevents payloads, DB handles, and sensitive data
+  from appearing in traces
+- Specific fields opted in via `fields(...)` syntax only
+- Zero tracing on shim (not even `tracing::error!`)
+- `#[tracing::instrument]` applied to every async fn crossing a crate boundary
+
+**Bearer token storage:**
+```rust
+// crates/daemon/src/auth.rs
+use secrecy::SecretString;
+pub struct BearerToken(SecretString);
+```
+`secrecy::SecretString` wraps `Zeroizing<String>` and prevents accidental
+logging via `Debug`/`Display`. This is a mandatory security control, not a
+style preference.
+
+**Unix socket 0600 mechanism:** `umask(0o177)` set before `bind()`, not
+`chmod` after bind. This closes the TOCTOU window between file creation and
+permission setting.
+
+**WAL checkpoint:** PASSIVE checkpoint on clean daemon shutdown only. No
+periodic checkpointing in V1. SQLite's automatic WAL threshold handles routine
+operation.
+
+**WS `DroppedFrame` trigger:** emitted when a `tokio::sync::broadcast`
+receiver's lag exceeds channel capacity (default 256). Sent on the next
+successful delivery to that subscriber after the lag is detected. The channel
+never blocks on slow consumers.
+
+**WS wildcard `*` delivery:** delivers all events across all sessions, including
+events for sessions that started before the subscribe. Subscribers filter by
+session_id in their own logic if needed.
+
+**Integration test fixture:**
+- SQLite: `:memory:` per test (not a shared file)
+- Unix socket: unique temp path via `tempfile::TempDir` per test, dropped on
+  test teardown. Never a fixed path — parallel tests would collide.
+- Contract tests testing WAL behavior specifically may use a file-backed SQLite
+  in a `TempDir`.
+
+### Enforcement Guidelines
+
+**All AI agents MUST:**
+- Run `cargo test --workspace` before marking any story complete
+- Run `cargo clippy --workspace --all-targets -- -D warnings` and fix all warnings
+- Snapshot-test every wire-format type in `crates/protocol/tests/contract_protocol.rs`
+  with `assert_eq!(serde_json::to_string(&EventKind::ToolUse).unwrap(), "\"ToolUse\"")`
+  — this is the canonical guard against `rename_all` drift
+- Never add `deny_unknown_fields` to any outbound (daemon→client) type
+- Never emit exit code 2 from the shim
+
+**Anti-patterns (explicitly forbidden):**
+- `unwrap()` / `expect()` outside `#[cfg(test)]` code
+- `eprintln!` / `println!` anywhere in shim or daemon
+- Splitting the projection UPSERT and event INSERT across separate transactions
+- Importing internal submodule paths from `crates/protocol`
+- `deny_unknown_fields` on any daemon→client type
+- `anyhow::Context` in any module other than `main.rs` files
+- Exit code 2 from the shim
+- Any explicit `event_id` value in an INSERT statement
+- Fixed Unix socket paths in tests
