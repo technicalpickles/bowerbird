@@ -127,9 +127,69 @@ All 10 required contract tests passing before MVP ships (WS drop behavior, PRAGM
 
 ### Vision (Future)
 
-- bowerbird as the vendor-neutral observability substrate for AI coding agents — adapter-per-agent, single stable protocol, any tool in any language can subscribe
+- bowerbird as the vendor-neutral visibility substrate for AI coding agents — adapter-per-agent, single stable protocol, any tool in any language can subscribe
 - Community-maintained adapter ecosystem
 - Protocol versioning (v2+) with full backward-compat guarantee for existing tools
+
+## Project Scoping
+
+### MVP Strategy & Philosophy
+
+**Approach: Experience MVP — prove the substrate works by using it.**
+
+The MVP is shaped around a single user (pickles) running real experiments. This is intentional and honest: the riskiest assumption is not "can we build the protocol correctly" but "does the separation of instrumentation from display layer actually make experiments cheap?" The only way to validate that is to run experiments.
+
+V1 ships when pickles can build and iterate on multiple tools simultaneously against live Claude Code sessions without instrumentation friction. The reference examples serve dual purpose: they demonstrate the pattern to future tool authors, and they are the experiments that validate the substrate.
+
+**Resource requirements:** Solo maintainer (pickles). All core crates in Rust; reference examples in TypeScript/Node. No coordination overhead — one person decides what ships.
+
+**MVP philosophy carve-out:** the contribution model (auto-close by default, weekly triage) is explicitly designed for a solo maintainer. V1 does not need community adoption to succeed — it needs one user (the maintainer) to find it genuinely useful.
+
+### MVP Feature Set
+
+**All four user journeys supported at v1:**
+- Journey 1 (tool builder, first tool) — full happy path
+- Journey 2 (iterating without disruption) — core value prop validated
+- Journey 3 (tool user, installing a shared tool) — enabled by prebuilt binaries + stable protocol
+- Journey 4 (troubleshooting) — `dropped` frame + reconnect + shim failure logging
+
+**Must-have capabilities (confirmed):**
+- Claude Code adapter (shim + daemon + `adapter-claude` + TOML tool-reactions)
+- WebSocket pub/sub (`state.*` + `events.*` topics, wildcard subscriptions, multi-session fan-out)
+- REST snapshot API (cursor-paginated `/sessions/:id/events?since=`)
+- Unix domain socket ingest path (shim → daemon)
+- `bowerbird install` / `bowerbird uninstall` (atomic `~/.claude/settings.json`)
+- `bowerbird replay` + `bowerbird export` (fake signal stream for Quickstart + session capture)
+- Three reference examples (multi-session router, event log viewer, reconnect recovery)
+- All 10 required contract tests
+- Documentation path: Quickstart → presenter-authoring → protocol → cookbook
+- CI: macOS + Linux, performance regression gating, `cargo build --examples`
+
+### Post-MVP Features
+
+- Second agent adapter (Codex, Gemini, or Cursor) — validates adapter model with external contributor
+- Homebrew tap — deferred; v1 audience is solo, tap maintenance overhead not justified yet
+- `/metrics` endpoint (Prometheus text format; path reserved at v1)
+- `bowerbird gc` for event-log truncation (policy decision deferred)
+- arm64 CI runner
+- `@bowerbird/presenter` SDK if boilerplate ratio justifies it (revisit after first external tool)
+
+### Risk Mitigation Strategy
+
+**Technical risks:**
+
+- **Shim performance budget (< 5ms p95)** — most technically uncertain item; depends on Claude Code's hook execution model and platform-specific process spawn timing. Mitigation: bench from day one (`shim/benches/hot_path.rs`), measure separately on macOS and Linux. If the number can't be met cleanly, the right response is an ADR documenting the real number — not a silent miss.
+- **Unix domain socket ingest** — new decision; simpler than TCP+auth, not more complex. Low risk.
+- **Protocol stability guarantee** — committing to additive-only within v1.x is a design discipline constraint. Mitigation: the protocol crate is the enforcement mechanism; CI gates on changelog entries.
+
+**Market risks:**
+
+- **Primary: the substrate works but experiments aren't actually cheap.** If iterating on a tool still requires enough ceremony that it doesn't feel lighter than rolling your own, the core bet fails. Mitigation: pickles is the canary. If the experience isn't meaningfully better than ad-hoc, that's a V1 finding, not a V2 failure.
+- **Secondary: no one finds it.** Acceptable for V1 — the post-V1 signal (stranger builds a tool without being asked) is the adoption gate, not V1 itself.
+
+**Resource risks:**
+
+- **Solo maintainer = single point of failure.** Mitigation: contribution model, maintainer status protocol, and auto-close tagging are explicitly designed for this. The risk is acknowledged and designed around, not ignored.
 
 ## User Journeys
 
@@ -390,66 +450,6 @@ Reference examples in `examples/`, CI smoke-tested against a live daemon. Each e
 3. **Reconnect with snapshot recovery** — demonstrates snapshot-on-connect + `dropped`-frame detection + REST re-fetch. The resilience pattern every tool that runs for more than a few minutes needs.
 
 All three examples must run against `bowerbird replay` with bundled fixture files.
-
-## Project Scoping
-
-### MVP Strategy & Philosophy
-
-**Approach: Experience MVP — prove the substrate works by using it.**
-
-The MVP is shaped around a single user (pickles) running real experiments. This is intentional and honest: the riskiest assumption is not "can we build the protocol correctly" but "does the separation of instrumentation from display layer actually make experiments cheap?" The only way to validate that is to run experiments.
-
-V1 ships when pickles can build and iterate on multiple tools simultaneously against live Claude Code sessions without instrumentation friction. The reference examples serve dual purpose: they demonstrate the pattern to future tool authors, and they are the experiments that validate the substrate.
-
-**Resource requirements:** Solo maintainer (pickles). All core crates in Rust; reference examples in TypeScript/Node. No coordination overhead — one person decides what ships.
-
-**MVP philosophy carve-out:** the contribution model (auto-close by default, weekly triage) is explicitly designed for a solo maintainer. V1 does not need community adoption to succeed — it needs one user (the maintainer) to find it genuinely useful.
-
-### MVP Feature Set
-
-**All four user journeys supported at v1:**
-- Journey 1 (tool builder, first tool) — full happy path
-- Journey 2 (iterating without disruption) — core value prop validated
-- Journey 3 (tool user, installing a shared tool) — enabled by prebuilt binaries + stable protocol
-- Journey 4 (troubleshooting) — `dropped` frame + reconnect + shim failure logging
-
-**Must-have capabilities (confirmed):**
-- Claude Code adapter (shim + daemon + `adapter-claude` + TOML tool-reactions)
-- WebSocket pub/sub (`state.*` + `events.*` topics, wildcard subscriptions, multi-session fan-out)
-- REST snapshot API (cursor-paginated `/sessions/:id/events?since=`)
-- Unix domain socket ingest path (shim → daemon)
-- `bowerbird install` / `bowerbird uninstall` (atomic `~/.claude/settings.json`)
-- `bowerbird replay` + `bowerbird export` (fake signal stream for Quickstart + session capture)
-- Three reference examples (multi-session router, event log viewer, reconnect recovery)
-- All 10 required contract tests
-- Documentation path: Quickstart → presenter-authoring → protocol → cookbook
-- CI: macOS + Linux, performance regression gating, `cargo build --examples`
-
-### Post-MVP Features
-
-- Second agent adapter (Codex, Gemini, or Cursor) — validates adapter model with external contributor
-- Homebrew tap — deferred; v1 audience is solo, tap maintenance overhead not justified yet
-- `/metrics` endpoint (Prometheus text format; path reserved at v1)
-- `bowerbird gc` for event-log truncation (policy decision deferred)
-- arm64 CI runner
-- `@bowerbird/presenter` SDK if boilerplate ratio justifies it (revisit after first external tool)
-
-### Risk Mitigation Strategy
-
-**Technical risks:**
-
-- **Shim performance budget (< 5ms p95)** — most technically uncertain item; depends on Claude Code's hook execution model and platform-specific process spawn timing. Mitigation: bench from day one (`shim/benches/hot_path.rs`), measure separately on macOS and Linux. If the number can't be met cleanly, the right response is an ADR documenting the real number — not a silent miss.
-- **Unix domain socket ingest** — new decision; simpler than TCP+auth, not more complex. Low risk.
-- **Protocol stability guarantee** — committing to additive-only within v1.x is a design discipline constraint. Mitigation: the protocol crate is the enforcement mechanism; CI gates on changelog entries.
-
-**Market risks:**
-
-- **Primary: the substrate works but experiments aren't actually cheap.** If iterating on a tool still requires enough ceremony that it doesn't feel lighter than rolling your own, the core bet fails. Mitigation: pickles is the canary. If the experience isn't meaningfully better than ad-hoc, that's a V1 finding, not a V2 failure.
-- **Secondary: no one finds it.** Acceptable for V1 — the post-V1 signal (stranger builds a tool without being asked) is the adoption gate, not V1 itself.
-
-**Resource risks:**
-
-- **Solo maintainer = single point of failure.** Mitigation: contribution model, maintainer status protocol, and auto-close tagging are explicitly designed for this. The risk is acknowledged and designed around, not ignored.
 
 ## Functional Requirements
 
