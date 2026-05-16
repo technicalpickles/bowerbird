@@ -302,7 +302,7 @@ The ingest path uses a Unix domain socket with filesystem-permission security �
 Reserved (not implemented in v1): `GET /metrics` — Prometheus text format; path reserved now.
 
 **Ingest endpoint (Unix socket):**
-`POST /ingest` on the Unix socket. Returns synchronously after the event is accepted into the write queue — not after it is persisted to SQLite. The shim gets an ACK within the 5ms budget; actual persistence happens asynchronously. Under backpressure (write queue full), the daemon returns `503` and the shim logs to `~/.bowerbird/shim.log` and exits cleanly (exit 0). If the daemon is unreachable (socket does not exist, `ECONNREFUSED`), the shim logs to `~/.bowerbird/shim.log` and exits non-zero — surfacing to Claude Code that the hook failed.
+`POST /ingest` via HTTP/1.1 over the Unix domain socket. Returns synchronously after the event is accepted into the write queue — not after it is persisted to SQLite. The shim gets an ACK within the 5ms budget; actual persistence happens asynchronously. Under backpressure (write queue full), the daemon returns `503` and the shim logs to `~/.bowerbird/shim.log` and exits cleanly (exit 0). If the daemon is unreachable (socket does not exist, `ECONNREFUSED`), the shim logs to `~/.bowerbird/shim.log` and exits non-zero — surfacing to Claude Code that the hook failed.
 
 #### WebSocket (TCP, Bearer Auth)
 
@@ -317,6 +317,7 @@ Connect: `ws://127.0.0.1:<port>/ws` (bearer token in `Authorization` header or `
 
 | Frame | When sent |
 |---|---|
+| `hello` | Sent immediately on connect; includes `protocol_version` and daemon version |
 | `state` | Snapshot on subscribe + on any state change for subscribed sessions |
 | `event` | Each new event matching subscribed topics |
 | `dropped` | Client broadcast slot lagged; includes lag count in events (not bytes). Client should re-fetch snapshot via REST. Socket stays open. |
@@ -538,7 +539,7 @@ V1 ships when pickles can build and iterate on multiple tools simultaneously aga
 
 ### Security
 
-- NFR11: The daemon bearer token is stored in the system keychain (macOS Keychain / Linux Secret Service) and retrieved via `bowerbird auth token`
+- NFR11: The daemon bearer token is a UUID4 value, stored in the system keychain (macOS Keychain / Linux Secret Service) and retrieved via `bowerbird auth token`
 - NFR12: Fallback order when keychain unavailable: (1) environment variable, (2) on-disk config file in `~/.bowerbird/`; fallback mechanism is documented
 - NFR13: If no token is resolvable via any fallback path, the daemon exits non-zero with a human-readable error to stderr
 - NFR14: Token rotation requires a daemon restart; the daemon reads the token once at startup and does not hot-reload it
@@ -557,3 +558,5 @@ V1 ships when pickles can build and iterate on multiple tools simultaneously aga
 ### Implementation Constraints
 
 - NFR20: The daemon's ingest socket listen backlog is at minimum 128; the shim exits non-zero on `ECONNREFUSED` or socket-not-found (daemon unreachable), and exits 0 on mid-write errors (transient daemon issues, backpressure)
+- NFR21: The daemon auto-migrates the SQLite schema on startup; migration failures are fatal with a human-readable error to stderr
+- NFR22: The V1 event log schema includes a timestamp column on all event rows to support future event-log management without schema changes
