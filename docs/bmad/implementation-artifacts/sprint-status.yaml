@@ -1,0 +1,79 @@
+# generated: 2026-05-16
+# last_updated: 2026-05-16
+# project: bowerbird
+# project_key: NOKEY
+# tracking_system: file-system
+# story_location: docs/bmad//implementation-artifacts
+
+# STATUS DEFINITIONS:
+# ==================
+# Epic Status:
+#   - backlog: Epic not yet started
+#   - in-progress: Epic actively being worked on
+#   - done: All stories in epic completed
+#
+# Epic Status Transitions:
+#   - backlog → in-progress: Automatically when first story is created (via create-story)
+#   - in-progress → done: Manually when all stories reach 'done' status
+#
+# Story Status:
+#   - backlog: Story only exists in epic file
+#   - ready-for-dev: Story file created in stories folder
+#   - in-progress: Developer actively working on implementation
+#   - review: Ready for code review (via Dev's code-review workflow)
+#   - done: Story completed
+#
+# Retrospective Status:
+#   - optional: Can be completed but not required
+#   - done: Retrospective has been completed
+#
+# WORKFLOW NOTES:
+# ===============
+# - Epic transitions to 'in-progress' automatically when first story is created
+# - Stories can be worked in parallel if team capacity allows
+# - Developer typically creates next story after previous one is 'done' to incorporate learnings
+# - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
+
+generated: 2026-05-16
+last_updated: 2026-05-16
+project: bowerbird
+project_key: NOKEY
+tracking_system: file-system
+story_location: docs/bmad//implementation-artifacts
+
+development_status:
+  # Epic 1: Agent activity captured and queryable via REST
+  epic-1: backlog
+  1-1-workspace-and-protocol-crate-foundation: backlog
+  1-2-daemon-foundation-with-sqlite-persistence: backlog
+  1-3-unix-socket-ingest-endpoint: backlog
+  1-4-claude-code-adapter-and-event-normalization: backlog
+  1-5-shim-binary-with-hot-path-event-delivery: backlog
+  1-6-session-projection-and-hook-unreliability-tolerance: backlog
+  1-7-rest-query-api: backlog
+  epic-1-retrospective: optional
+
+  # Epic 2: Live event streaming to multiple simultaneous tools
+  epic-2: backlog
+  2-1-websocket-connection-and-topic-subscription: backlog
+  2-2-real-time-event-and-state-broadcast-to-multiple-tools: backlog
+  2-3-new-session-discovery-and-state-snapshot-on-connect: backlog
+  2-4-lagged-consumer-recovery-with-dropped-frame: backlog
+  2-5-graceful-shutdown-notification-to-connected-tools: backlog
+  epic-2-retrospective: optional
+
+  # Epic 3: Easy installation, lifecycle management, and secure access
+  epic-3: backlog
+  3-1-bowerbird-install-and-uninstall: backlog
+  3-2-daemon-lifecycle-cli: backlog
+  3-3-bearer-token-auth-with-keychain-storage: backlog
+  3-4-prebuilt-binary-distribution-and-release-pipeline: backlog
+  epic-3-retrospective: optional
+
+  # Epic 4: Developer experience, replay, and protocol stability
+  epic-4: backlog
+  4-1-bowerbird-replay-and-export-commands: backlog
+  4-2-three-reference-example-tools: backlog
+  4-3-documentation-suite: backlog
+  4-4-protocol-compatibility-guarantee-and-contract-test-suite: backlog
+  epic-4-retrospective: optional
