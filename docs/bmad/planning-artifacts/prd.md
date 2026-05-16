@@ -12,6 +12,7 @@ stepsCompleted:
   - step-08-scoping
   - step-09-functional
   - step-10-nonfunctional
+  - step-11-polish
 releaseMode: phased
 inputDocuments:
   - docs/bmad/planning-artifacts/product-brief-bowerbird-distillate.md
@@ -218,7 +219,7 @@ Later that week the daemon does crash — a disk-full edge case during a long se
 
 **The substrate-not-actor paradigm for AI agent tooling**
 
-bowerbird makes a deliberate bet that the most valuable layer in an AI coding agent observability stack is the *thinnest* one. The instinct in most tooling is to add interpretation — derive insights, surface recommendations, prioritize signals. bowerbird refuses. A substrate that collects faithfully and routes without opinion gives every tool built on top of it complete creative freedom, and keeps the substrate small enough to be stable and trustworthy over time.
+bowerbird makes a deliberate bet that the most valuable layer in an AI coding agent visibility stack is the *thinnest* one. The instinct in most tooling is to add interpretation — derive insights, surface recommendations, prioritize signals. bowerbird refuses. A substrate that collects faithfully and routes without opinion gives every tool built on top of it complete creative freedom, and keeps the substrate small enough to be stable and trustworthy over time.
 
 This is the Unix pipes play applied to AI agent observability. The value isn't features; it's a clean separation of concerns that didn't exist before.
 
@@ -232,7 +233,7 @@ Every developer who wants visibility into AI coding agent activity today solves 
 
 ### Market Context & Competitive Landscape
 
-No direct competitor currently offers a stable, vendor-neutral, collection-only substrate for AI coding agent activity. The space has:
+No direct competitor currently offers a stable, vendor-neutral, collection-only substrate for AI coding agent activity. The legibility gap is real: developers using AI coding agents have no low-friction way to see what their agent is doing. The space has:
 - Agent-native observability (built into the agent platform, opinionated, vendor-locked)
 - Log-scraping approaches (brittle, break on format changes)
 - Ad-hoc hook scripts (no stable protocol, no multi-tool support)
@@ -346,6 +347,7 @@ Connect: `ws://127.0.0.1:<port>/ws` (bearer token in `Authorization` header or `
 | `bowerbird status` | Daemon liveness + version |
 | `bowerbird replay <file>` | Replay a JSONL event file through the daemon's pub/sub path |
 | `bowerbird export <session-id>` | Export a session's events from SQLite to JSONL replay format |
+| `bowerbird auth token` | Print the current bearer token from keychain or configured fallback |
 
 Replay file format is wire-format event envelopes in JSONL — no separate schema. Bundled demo fixtures ship with the binary for the Quickstart. `bowerbird export` enables capturing real sessions for replay and debugging.
 
@@ -430,12 +432,6 @@ V1 ships when pickles can build and iterate on multiple tools simultaneously aga
 - `bowerbird gc` for event-log truncation (policy decision deferred)
 - arm64 CI runner
 - `@bowerbird/presenter` SDK if boilerplate ratio justifies it (revisit after first external tool)
-
-### Vision (Future)
-
-- Vendor-neutral substrate for AI coding agents — adapter-per-agent, single stable protocol
-- Community-maintained adapter ecosystem
-- Protocol versioning (v2+) with full backward-compat guarantee
 
 ### Risk Mitigation Strategy
 
@@ -529,7 +525,7 @@ V1 ships when pickles can build and iterate on multiple tools simultaneously aga
 
 ### Reliability & Data Integrity
 
-- NFR4: The event log is unbounded for V1; a documented one-command operation exists for the user to truncate or clear it; automatic retention and rotation are deferred post-V1
+- NFR4: The event log is unbounded for V1; the documented V1 escape hatch is deleting or truncating `~/.bowerbird/bower.db` directly; a dedicated `bowerbird gc` command for managed truncation is post-V1
 - NFR5: When the host filesystem is full (ENOSPC), the daemon logs the drop at error level and closes the ingest connection; the shim treats any write error as fire-and-forget and exits 0 without blocking Claude Code
 - NFR6: The event log survives unexpected daemon termination; any event acknowledged to the shim is durable on restart (guaranteed by WAL-mode atomic writes)
 - NFR7: The daemon accepts unbounded event ingest rate in V1 for single-developer workloads; no rate limiting or burst protection; this is a documented design limitation
