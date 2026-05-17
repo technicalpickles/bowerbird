@@ -456,6 +456,32 @@ claude-sonnet-4-6
 - .github/workflows/ci.yml
 - docs/bmad/implementation-artifacts/sprint-status.yaml
 
+## Review Findings
+
+### Decision Needed
+
+- [ ] [Review][Decision] EventEnvelope derives Serialize/Deserialize despite "Never pass to wire" comment — The doc comment says `EventEnvelope` should never be sent on the wire, yet it derives `Serialize, Deserialize`. This is ambiguous: (a) remove serde derives if it's truly internal-only, or (b) keep derives because the shim→daemon Unix socket transport will use it (and "never pass to wire" means the public REST/WS protocol only). Correct fix requires knowing whether shim→daemon will serialize this type.
+- [ ] [Review][Decision] EventId is signed i64 — semantically all IDs are non-negative, but i64 allows negatives and the contract test asserts EventId(-1) round-trips — Options: (a) change to u64 to match semantics, (b) add validation in daemon, (c) accept as-is since SQLite rowids are i64 and -1 is never produced in practice.
+- [ ] [Review][Decision] Reaction::Unknown silently masks unrecognized reactions — Any unknown wire string deserializes to Reaction::Unknown instead of an error, hiding future protocol extensions — Options: (a) remove Unknown variant, return error on unrecognized strings (Vendor already provides extensibility), (b) keep Unknown for forward-compat tolerance.
+
+### Patches
+
+- [ ] [Review][Patch] Workspace lints not inherited — no member crate has `[lints] workspace = true`, so `unsafe_code = "forbid"` in `[workspace.lints.rust]` does not apply to protocol, daemon, shim, or adapter-claude [crates/protocol/Cargo.toml, crates/daemon/Cargo.toml, crates/shim/Cargo.toml, crates/adapter-claude/Cargo.toml]
+- [ ] [Review][Patch] CI missing rustfmt and clippy components — `rust-toolchain.toml` declares no `components`, so `cargo fmt --check` and `cargo clippy` may fail on runners that don't pre-install these [rust-toolchain.toml, .github/workflows/ci.yml]
+- [ ] [Review][Patch] AC#2 test covers HelloFrame directly but not through ServerMessage dispatch — the actual wire path goes through the ServerMessage tagged enum; an unknown field test against ServerMessage is missing [crates/protocol/tests/contract_protocol.rs]
+- [ ] [Review][Patch] rust-toolchain.toml pins only `channel = "stable"` without a version — CI can silently break when new stable releases introduce new clippy lints [rust-toolchain.toml]
+
+### Deferred
+
+- [x] [Review][Defer] SourceAdapter.meta() returns AdapterMeta with `&'static str` source — prevents runtime-configured adapters [crates/protocol/src/adapter.rs:7] — deferred, pre-existing design choice
+- [x] [Review][Defer] payload field is opaque String with no JSON schema enforcement on EventEnvelope and Event [crates/protocol/src/event.rs:25,36] — deferred, pre-existing design choice for future story
+- [x] [Review][Defer] Reaction::Vendor u16 boundary error messages ambiguous — Vendor(65536) and Vendor(abc) produce the same error string [crates/protocol/src/reaction.rs:17] — deferred, error quality improvement for future story
+- [x] [Review][Defer] SyncFrame does not validate oldest_available_event_id <= latest_event_id [crates/protocol/src/ws.rs:33] — deferred, daemon validation in next story
+- [x] [Review][Defer] DroppedFrame count/first/last have no relational invariant check [crates/protocol/src/ws.rs:45] — deferred, daemon validation in next story
+- [x] [Review][Defer] ClientMessage::Subscribe accepts empty topic string [crates/protocol/src/ws.rs:21] — deferred, validation belongs in daemon routing logic
+- [x] [Review][Defer] CI matrix does not test Windows despite keyring being a workspace dep [.github/workflows/ci.yml] — deferred, Windows not a current target
+
 ## Change Log
 
 - 2026-05-16: Initial implementation of Story 1.1 — Rust workspace scaffolded, protocol crate implemented with all wire types, 6 contract tests added and passing, CI workflow configured.
+- 2026-05-17: Code review — 3 decision-needed, 4 patch, 7 deferred, 8 dismissed.
