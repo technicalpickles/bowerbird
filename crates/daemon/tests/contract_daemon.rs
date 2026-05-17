@@ -4,7 +4,10 @@ use std::time::Duration;
 
 use assert_cmd::Command;
 use bowerbird_daemon::api;
-use bowerbird_daemon::db::queries::{event_kind_as_str, SELECT_EVENT_BY_ID};
+use bowerbird_daemon::db::migrations::migrations;
+use bowerbird_daemon::db::queries::{
+    event_kind_as_str, SELECT_EVENT_BY_ID, UPSERT_SESSION_PROJECTION,
+};
 use bowerbird_daemon::db::{init_pools, run_migrations, DbPools};
 use bowerbird_daemon::projection;
 use bowerbird_daemon::state::AppState;
@@ -109,6 +112,81 @@ async fn wal_durability_after_simulated_crash() {
     assert_eq!(row.5, envelope.payload);
 }
 
+/// Rollback surrogate for AC #1. Pairs with `wal_durability_after_simulated_crash`
+/// (which covers the crash-after-commit path): this test covers the
+/// crash-mid-transaction path by issuing an explicit `tx.rollback()` after a
+/// partial write and asserting both tables remain empty, then exercises the
+/// real `projection::session::write` happy path and confirms both rows commit
+/// atomically. The full SIGKILL-process variant is deferred (see
+/// `deferred-work.md`); this surrogate guards the SQL-pattern + transaction
+/// config against regressions in the meantime.
+#[tokio::test(flavor = "current_thread")]
+async fn state_plus_event_atomicity_rollback() {
+    let (_tmp, pools) = fresh_pools().await;
+
+    {
+        let conn = pools.writer.get().await.expect("writer get");
+        conn.interact(|c| -> rusqlite::Result<()> {
+            let tx = c.transaction()?;
+            tx.execute(
+                UPSERT_SESSION_PROJECTION,
+                rusqlite::params!["src", "sess", "{}", 100i64],
+            )?;
+            // Intentionally do not insert the event row; rollback to simulate
+            // crash-mid-transaction semantics.
+            tx.rollback()?;
+            Ok(())
+        })
+        .await
+        .expect("interact")
+        .expect("rollback path");
+    }
+
+    let reader = pools.reader.get().await.expect("reader get");
+    let (proj_count, event_count): (i64, i64) = reader
+        .interact(|c| -> rusqlite::Result<(i64, i64)> {
+            let p: i64 =
+                c.query_row("SELECT COUNT(*) FROM session_projections", [], |r| r.get(0))?;
+            let e: i64 = c.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))?;
+            Ok((p, e))
+        })
+        .await
+        .expect("interact")
+        .expect("count");
+    assert_eq!(
+        proj_count, 0,
+        "rollback must leave session_projections empty"
+    );
+    assert_eq!(event_count, 0, "rollback must leave events empty");
+    drop(reader);
+
+    let envelope = EventEnvelope {
+        source: "src".to_string(),
+        session_id: "sess".to_string(),
+        kind: EventKind::PreToolUse,
+        reaction: None,
+        payload: "{}".to_string(),
+    };
+    let id = projection::session::write(&pools.writer, envelope)
+        .await
+        .expect("write");
+    assert!(id.0 > 0);
+
+    let reader = pools.reader.get().await.expect("reader get");
+    let (proj_count, event_count): (i64, i64) = reader
+        .interact(|c| -> rusqlite::Result<(i64, i64)> {
+            let p: i64 =
+                c.query_row("SELECT COUNT(*) FROM session_projections", [], |r| r.get(0))?;
+            let e: i64 = c.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))?;
+            Ok((p, e))
+        })
+        .await
+        .expect("interact")
+        .expect("count");
+    assert_eq!(proj_count, 1, "happy path must commit projection row");
+    assert_eq!(event_count, 1, "happy path must commit event row");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn concurrent_read_during_write() {
     let (_tmp, pools) = fresh_pools().await;
@@ -144,6 +222,63 @@ async fn concurrent_read_during_write() {
     );
 
     writer_task.await.expect("writer task");
+}
+
+#[test]
+fn migrations_validate() {
+    migrations()
+        .validate()
+        .expect("rusqlite_migration validate() must pass");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn migrations_apply_on_fresh_db() {
+    let (_tmp, pools) = fresh_pools().await;
+    let conn = pools.writer.get().await.expect("writer get");
+    let columns: Vec<(String, Vec<String>)> = conn
+        .interact(|c| -> rusqlite::Result<Vec<(String, Vec<String>)>> {
+            let mut out = Vec::new();
+            for table in ["events", "session_projections", "recording_sessions"] {
+                let mut stmt = c.prepare(&format!("PRAGMA table_info({table})"))?;
+                let rows = stmt
+                    .query_map([], |r| r.get::<_, String>(1))?
+                    .collect::<rusqlite::Result<Vec<String>>>()?;
+                out.push((table.to_owned(), rows));
+            }
+            Ok(out)
+        })
+        .await
+        .expect("interact")
+        .expect("query");
+
+    let events = &columns[0].1;
+    for col in [
+        "event_id",
+        "source",
+        "session_id",
+        "kind",
+        "reaction",
+        "payload",
+        "created_at",
+    ] {
+        assert!(events.contains(&col.to_string()), "events.{col} missing");
+    }
+
+    let proj = &columns[1].1;
+    for col in ["source", "session_id", "state", "updated_at"] {
+        assert!(
+            proj.contains(&col.to_string()),
+            "session_projections.{col} missing"
+        );
+    }
+
+    let rec = &columns[2].1;
+    for col in ["id", "started_event_id", "ended_event_id"] {
+        assert!(
+            rec.contains(&col.to_string()),
+            "recording_sessions.{col} missing"
+        );
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
