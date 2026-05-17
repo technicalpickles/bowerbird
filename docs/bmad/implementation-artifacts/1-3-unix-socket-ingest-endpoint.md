@@ -1,6 +1,6 @@
 # Story 1.3: Unix Socket Ingest Endpoint
 
-Status: review
+Status: done
 
 ## Story
 
@@ -78,9 +78,10 @@ So that only processes running as my OS user can inject events into bowerbird, w
   - [x] Add `pub mod ingest;` to `crates/daemon/src/lib.rs`
   - [x] In `main.rs run()`, after `write_recording_started` and before `axum::serve`:
     - [x] `let (ingest_tx, ingest_rx) = tokio::sync::mpsc::channel::<protocol::EventEnvelope>(config.ingest_channel_capacity);`
+    - [x] Bind the ingest listener synchronously via `ingest::listener::bind(&config.ingest_sock_path)` so socket setup failures abort startup instead of being only logged from a spawned task
     - [x] Spawn writer: `tokio::spawn(bowerbird_daemon::ingest::writer::run(ingest_rx, pools.writer.clone(), shutdown.clone()));`
-    - [x] Spawn listener: `tokio::spawn(ingest_listener_task(config.ingest_sock_path.clone(), ingest_tx, shutdown.clone()));`
-  - [x] Add private `async fn ingest_listener_task(sock_path, tx, shutdown)` in `main.rs` that calls `ingest::listener::run(...)` and logs any error at `error` level
+    - [x] Spawn listener with the already-bound socket via `tokio::spawn(ingest::listener::run_bound(...));`
+    - [x] On shutdown, cancel ingest and await listener/writer tasks before writing `RecordingEnded`, so 200-ACKed queued events are not aborted by runtime teardown
   - [x] Ordering is load-bearing: ingest socket MUST open only after migrations complete and `RecordingStarted` is written, so the daemon is fully ready to accept and write events before any shim can connect
 
 - [x] **Task 6: Contract tests** (AC: #1, #2, #3, #5, #6)
@@ -100,6 +101,12 @@ So that only processes running as my OS user can inject events into bowerbird, w
   - [x] `cargo fmt --check` — green
   - [x] `cargo clippy --all-targets --workspace -- -D warnings` — green
   - [x] `cargo test --workspace` — all tests pass including new ingest contract tests
+
+### Review Findings
+
+- [x] [Review][Patch] Ingest listener startup failures were only logged from a spawned task, allowing the daemon to serve HTTP without a working ingest socket. [crates/daemon/src/main.rs:90]
+- [x] [Review][Patch] Graceful shutdown did not await ingest listener/writer tasks, so queued 200-ACKed events could be aborted before persistence and before the RecordingEnded marker. [crates/daemon/src/main.rs:127]
+- [x] [Review][Patch] Fatal Unix socket accept errors were logged and retried indefinitely instead of breaking the accept loop and cleaning up the socket. [crates/daemon/src/ingest/listener.rs:47]
 
 ## Dev Notes
 

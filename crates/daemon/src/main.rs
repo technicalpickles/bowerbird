@@ -12,7 +12,6 @@ use bowerbird_daemon::{
     write_error_report,
 };
 use clap::Parser;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Parser)]
@@ -88,12 +87,19 @@ async fn run(config: Config) -> anyhow::Result<()> {
 
     let (ingest_tx, ingest_rx) =
         tokio::sync::mpsc::channel::<protocol::EventEnvelope>(config.ingest_channel_capacity);
-    tokio::spawn(ingest::writer::run(
+    let ingest_listener = ingest::listener::bind(&config.ingest_sock_path).with_context(|| {
+        format!(
+            "failed to bind ingest socket {}",
+            config.ingest_sock_path.display()
+        )
+    })?;
+    let ingest_writer_task = tokio::spawn(ingest::writer::run(
         ingest_rx,
         pools.writer.clone(),
         shutdown.clone(),
     ));
-    tokio::spawn(ingest_listener_task(
+    let ingest_listener_task = tokio::spawn(ingest::listener::run_bound(
+        ingest_listener,
         config.ingest_sock_path.clone(),
         ingest_tx,
         shutdown.clone(),
@@ -117,6 +123,19 @@ async fn run(config: Config) -> anyhow::Result<()> {
     let serve_result = axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_fut)
         .await;
+
+    // Ensure ingest shuts down before the final lifecycle marker is written:
+    // queued accepted events must either be persisted before RecordingEnded or
+    // rejected by a closed queue, not silently aborted by runtime teardown.
+    shutdown.cancel();
+    match ingest_listener_task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::error!(error = ?e, "ingest listener exited with error"),
+        Err(e) => tracing::error!(error = ?e, "ingest listener task join failed"),
+    }
+    if let Err(e) = ingest_writer_task.await {
+        tracing::error!(error = ?e, "ingest writer task join failed");
+    }
 
     // Drain marker for load balancers / probes — flip ready BEFORE writing the
     // sentinel so a probe between now and process exit observes 503.
@@ -194,16 +213,6 @@ async fn next_signal() {
         _ = recv_or_pending(&mut sigterm) => {}
         _ = recv_or_pending(&mut sighup) => {}
         _ = recv_or_pending(&mut sigquit) => {}
-    }
-}
-
-async fn ingest_listener_task(
-    sock_path: PathBuf,
-    tx: mpsc::Sender<protocol::EventEnvelope>,
-    shutdown: tokio_util::sync::CancellationToken,
-) {
-    if let Err(e) = ingest::listener::run(sock_path, tx, shutdown).await {
-        tracing::error!(error = ?e, "ingest listener exited with error");
     }
 }
 
