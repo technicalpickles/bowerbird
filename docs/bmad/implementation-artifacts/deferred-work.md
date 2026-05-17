@@ -9,3 +9,7 @@
 - **DroppedFrame invariants not validated** — `count`, `first_dropped_event_id`, `last_dropped_event_id` have no relational guards. Add validation in daemon when DroppedFrame is constructed. [crates/protocol/src/ws.rs]
 - **ClientMessage empty topic accepted** — `Subscribe { topic: String }` accepts empty strings. Add non-empty validation in daemon topic routing. [crates/protocol/src/ws.rs]
 - **CI matrix omits Windows** — `keyring` has a Windows backend; add a Windows runner when Windows is a supported target. [.github/workflows/ci.yml]
+
+## Deferred from: code review of 1-2-daemon-foundation-with-sqlite-persistence (2026-05-17)
+
+- **AC #1 full SIGKILL/restart durability process test** — Deferred to Story 3.2 lifecycle/spawnable daemon harness; Story 1.2 keeps the rollback surrogate plus `projection::session::write` happy-path persistence coverage, while the full process-kill/restart acceptance check remains tracked explicitly. [docs/bmad/implementation-artifacts/1-2-daemon-foundation-with-sqlite-persistence.md]
