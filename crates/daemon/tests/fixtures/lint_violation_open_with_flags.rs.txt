@@ -1,0 +1,8 @@
+// Lint self-test fixture: `open_with_flags` violation.
+// Catches non-`open` factory variants.
+
+use rusqlite::{Connection, OpenFlags};
+
+fn _violation_open_with_flags() {
+    let _ = Connection::open_with_flags("/tmp/foo", OpenFlags::SQLITE_OPEN_READ_ONLY);
+}

@@ -9,6 +9,7 @@ use bowerbird_daemon::{
     db::{init_pools, run_migrations, DbPools},
     ensure_bowerbird_dir, init_tracing, install_panic_hook, projection, set_crash_dir,
     state::AppState,
+    write_error_report,
 };
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
@@ -48,7 +49,11 @@ async fn main() {
 
     let config = Config::with_bowerbird_dir(&bowerbird_dir);
     if let Err(e) = run(config).await {
-        tracing::error!(error = format!("{e:#}"), "daemon exited with error");
+        let msg = format!("{e:#}");
+        tracing::error!(error = msg, "daemon exited with error");
+        // AC #8: write a crash log for unhandled-error exits too, not just
+        // panics. Best-effort — failure here must not block the exit path.
+        let _ = write_error_report(&msg);
         std::process::exit(1);
     }
 }

@@ -47,6 +47,26 @@ pub fn set_crash_dir(new_dir: PathBuf) {
     }
 }
 
+/// Write a crash log for a top-level unhandled error (i.e. a `Result::Err`
+/// returned from the startup orchestrator). AC #8 covers both panics — handled
+/// by the panic hook — and unhandled-error exits, which this function covers.
+/// Best-effort: returns `None` if the crash directory is unset or the file
+/// cannot be written.
+pub fn write_error_report(message: &str) -> Option<PathBuf> {
+    let dir = CRASH_DIR
+        .get()
+        .and_then(|l| l.read().ok().map(|g| g.clone()))?;
+    write_error_to_dir(&dir, message)
+}
+
+fn write_error_to_dir(dir: &Path, message: &str) -> Option<PathBuf> {
+    let path = dir.join(crash_filename());
+    let backtrace = std::backtrace::Backtrace::capture();
+    let body = format!("ERROR\n{message}\nBacktrace:\n{backtrace}\n");
+    write_crash_file(&path, body.as_bytes()).ok()?;
+    Some(path)
+}
+
 fn write_crash_log(info: &std::panic::PanicHookInfo<'_>) {
     let dir = match CRASH_DIR
         .get()
@@ -206,5 +226,30 @@ pub fn ensure_bowerbird_dir(path: &Path) -> std::io::Result<()> {
             Ok(())
         }
         Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_error_to_dir_creates_file_with_message() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = write_error_to_dir(tmp.path(), "test error: missing config")
+            .expect("crash file should be written");
+        assert!(path.starts_with(tmp.path()));
+        assert!(path.exists());
+        let contents = std::fs::read_to_string(&path).expect("read report");
+        assert!(contents.starts_with("ERROR\n"));
+        assert!(contents.contains("test error: missing config"));
+        assert!(contents.contains("Backtrace:"));
+    }
+
+    #[test]
+    fn write_error_to_dir_returns_none_when_dir_missing() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let missing = tmp.path().join("does-not-exist");
+        assert!(write_error_to_dir(&missing, "anything").is_none());
     }
 }
