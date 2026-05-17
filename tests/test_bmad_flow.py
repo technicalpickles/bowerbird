@@ -55,7 +55,7 @@ class TestFindStoryFile:
 
 class TestDeterminePosition:
     def _dev_status(self, fixture_name):
-        p = Path("tests/fixtures") / fixture_name
+        p = Path(__file__).parent / "fixtures" / fixture_name
         data = yaml.safe_load(p.read_text())
         return data.get("development_status", {})
 
@@ -97,7 +97,7 @@ class TestDeterminePosition:
         assert pos["epic"] == "epic-1"
 
     def test_all_epics_done_returns_all_done(self, m, tmp_path):
-        data = yaml.safe_load(Path("tests/fixtures/sprint_status_done.yaml").read_text())
+        data = yaml.safe_load((Path(__file__).parent / "fixtures" / "sprint_status_done.yaml").read_text())
         pos = m.determine_position(data["development_status"], tmp_path)
         assert pos["step"] == "all_done"
 
@@ -113,7 +113,7 @@ class TestDeterminePosition:
         assert pos["epic"] == "epic-2"
 
     def test_mid_fixture_routes_to_needs_validation(self, m, tmp_path):
-        data = yaml.safe_load(Path("tests/fixtures/sprint_status_mid.yaml").read_text())
+        data = yaml.safe_load((Path(__file__).parent / "fixtures" / "sprint_status_mid.yaml").read_text())
         # 1-1 done, 1-2 ready-for-dev -> needs_validation
         pos = m.determine_position(data["development_status"], tmp_path)
         assert pos["step"] == "needs_validation"
@@ -122,7 +122,7 @@ class TestDeterminePosition:
 
 class TestFormatOutput:
     def _mid_fixtures(self):
-        data = yaml.safe_load(Path("tests/fixtures/sprint_status_mid.yaml").read_text())
+        data = yaml.safe_load((Path(__file__).parent / "fixtures" / "sprint_status_mid.yaml").read_text())
         return data
 
     def test_contains_project_name(self, m):
@@ -167,16 +167,19 @@ class TestFormatOutput:
         assert str(fake_file) in output
 
     def test_all_done_shows_completion_message(self, m):
-        data = yaml.safe_load(Path("tests/fixtures/sprint_status_done.yaml").read_text())
+        data = yaml.safe_load((Path(__file__).parent / "fixtures" / "sprint_status_done.yaml").read_text())
         position = {"step": "all_done", "epic": None, "story": None, "story_status": None}
         output = m.format_output(data, position, story_file=None)
         assert "Sprint done" in output
 
 
+# NOTE: These tests run against the live bowerbird sprint-status.yaml.
+# Assertions are coupled to the current sprint state and will need
+# updating as stories advance (e.g., when 1-2 moves to in-progress).
 class TestReadProjectState:
     def test_routes_to_needs_story_creation_for_bowerbird(self, m):
         """Integration: run against the actual bowerbird project."""
-        project_root = Path(".")
+        project_root = Path(__file__).parent.parent
         shared = {"project_root": project_root}
         node = m.ReadProjectState()
         action = node._run(shared)
@@ -186,7 +189,7 @@ class TestReadProjectState:
         assert shared["current_position"]["story"] == "1-2-daemon-foundation-with-sqlite-persistence"
 
     def test_populates_sprint_status_in_shared(self, m):
-        project_root = Path(".")
+        project_root = Path(__file__).parent.parent
         shared = {"project_root": project_root}
         node = m.ReadProjectState()
         node._run(shared)
@@ -204,7 +207,7 @@ class TestReadProjectState:
 class TestFullFlow:
     def test_flow_runs_to_completion_on_bowerbird(self, m, capsys):
         """Full end-to-end: flow prints output and exits cleanly."""
-        project_root = Path(".")
+        project_root = Path(__file__).parent.parent
         shared = {"project_root": project_root}
         flow = m.build_flow()
         flow.run(shared)
