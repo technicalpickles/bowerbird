@@ -45,7 +45,7 @@ development_status:
   # Epic 1: Agent activity captured and queryable via REST
   epic-1: in-progress
   1-1-workspace-and-protocol-crate-foundation: done
-  1-2-daemon-foundation-with-sqlite-persistence: ready-for-dev
+  1-2-daemon-foundation-with-sqlite-persistence: review
   1-3-unix-socket-ingest-endpoint: backlog
   1-4-claude-code-adapter-and-event-normalization: backlog
   1-5-shim-binary-with-hot-path-event-delivery: backlog
