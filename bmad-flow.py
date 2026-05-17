@@ -106,3 +106,73 @@ def determine_position(dev_status: dict, story_dir: Path) -> dict:
 
     # All stories in this epic are done
     return dict(step="epic_complete", epic=current_epic, story=None, story_status=None)
+
+
+# ---------------------------------------------------------------------------
+# Output formatting
+# ---------------------------------------------------------------------------
+
+STATUS_ICONS = {
+    "done":          "✓",
+    "in-progress":   "→",
+    "ready-for-dev": "→",
+    "review":        "→",
+    "backlog":       "○",
+}
+
+STEP_LABELS = {
+    "needs_sprint_planning": "Sprint Planning",
+    "needs_story_creation":  "Create Story",
+    "needs_validation":      "Validate Story",
+    "needs_dev":             "Dev Story",
+    "needs_review":          "Code Review",
+    "epic_complete":         "Retrospective",
+    "all_done":              "Complete",
+}
+
+SKILL_COMMANDS = {
+    "needs_sprint_planning": "/bmad-sprint-planning",
+    "needs_story_creation":  "/bmad-create-story",
+    "needs_validation":      "/bmad-create-story:validate",
+    "needs_dev":             "/bmad-dev-story",
+    "needs_review":          "/bmad-code-review",
+    "epic_complete":         "/bmad-retrospective",
+    "all_done":              None,
+}
+
+
+def format_output(sprint_status: dict, position: dict, story_file: Path | None) -> str:
+    project_name = (sprint_status or {}).get("project", "Unknown")
+    dev_status = (sprint_status or {}).get("development_status", {})
+    step = position["step"]
+    current_story = position.get("story")
+
+    lines = [
+        "BMAD Phase 4 - Sprint Status",
+        "═" * 32,
+        "",
+        f"Project: {project_name}",
+        "",
+    ]
+
+    for key, status in dev_status.items():
+        if is_epic_key(key):
+            lines.append(f"{key}  [{status}]")
+        elif is_story_key(key):
+            if key == current_story:
+                icon = "→"
+                note = f"  ({STEP_LABELS.get(step, step)})"
+            else:
+                icon = STATUS_ICONS.get(status, "○")
+                note = ""
+            lines.append(f"  {icon}  {key}{note}")
+
+    lines += ["", "═" * 32, f"Next: {STEP_LABELS.get(step, step)}", ""]
+
+    if story_file:
+        lines += [f"Story file: {story_file}", ""]
+
+    cmd = SKILL_COMMANDS.get(step)
+    lines.append(f"Run: {cmd}" if cmd else "All epics complete. Sprint done.")
+
+    return "\n".join(lines)

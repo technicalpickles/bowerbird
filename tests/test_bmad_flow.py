@@ -118,3 +118,56 @@ class TestDeterminePosition:
         pos = m.determine_position(data["development_status"], tmp_path)
         assert pos["step"] == "needs_validation"
         assert pos["story"] == "1-2-account-mgmt"
+
+
+class TestFormatOutput:
+    def _mid_fixtures(self):
+        data = yaml.safe_load(Path("tests/fixtures/sprint_status_mid.yaml").read_text())
+        return data
+
+    def test_contains_project_name(self, m):
+        data = self._mid_fixtures()
+        position = {"step": "needs_validation", "epic": "epic-1", "story": "1-2-account-mgmt", "story_status": "ready-for-dev"}
+        output = m.format_output(data, position, story_file=None)
+        assert "test-project" in output
+
+    def test_contains_next_step_label(self, m):
+        data = self._mid_fixtures()
+        position = {"step": "needs_validation", "epic": "epic-1", "story": "1-2-account-mgmt", "story_status": "ready-for-dev"}
+        output = m.format_output(data, position, story_file=None)
+        assert "Validate Story" in output
+
+    def test_contains_skill_command(self, m):
+        data = self._mid_fixtures()
+        position = {"step": "needs_review", "epic": "epic-1", "story": "1-2-account-mgmt", "story_status": "review"}
+        output = m.format_output(data, position, story_file=None)
+        assert "/bmad-code-review" in output
+
+    def test_current_story_marked_with_arrow(self, m):
+        data = self._mid_fixtures()
+        position = {"step": "needs_dev", "epic": "epic-1", "story": "1-2-account-mgmt", "story_status": "in-progress"}
+        output = m.format_output(data, position, story_file=None)
+        lines = output.splitlines()
+        story_line = next(l for l in lines if "1-2-account-mgmt" in l)
+        assert "→" in story_line
+
+    def test_done_story_marked_with_checkmark(self, m):
+        data = self._mid_fixtures()
+        position = {"step": "needs_validation", "epic": "epic-1", "story": "1-2-account-mgmt", "story_status": "ready-for-dev"}
+        output = m.format_output(data, position, story_file=None)
+        lines = output.splitlines()
+        done_line = next(l for l in lines if "1-1-user-auth" in l)
+        assert "✓" in done_line
+
+    def test_story_file_path_shown_when_provided(self, m, tmp_path):
+        data = self._mid_fixtures()
+        position = {"step": "needs_dev", "epic": "epic-1", "story": "1-2-account-mgmt", "story_status": "in-progress"}
+        fake_file = tmp_path / "1-2-account-mgmt.md"
+        output = m.format_output(data, position, story_file=fake_file)
+        assert str(fake_file) in output
+
+    def test_all_done_shows_completion_message(self, m):
+        data = yaml.safe_load(Path("tests/fixtures/sprint_status_done.yaml").read_text())
+        position = {"step": "all_done", "epic": None, "story": None, "story_status": None}
+        output = m.format_output(data, position, story_file=None)
+        assert "Sprint done" in output
