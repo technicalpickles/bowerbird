@@ -1,0 +1,8 @@
+{
+  "hook_kind": "PreToolUse",
+  "session_id": "test-session-abc123",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "cargo test"
+  }
+}

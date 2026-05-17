@@ -14,6 +14,8 @@ use bowerbird_daemon::{
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
 
+use adapter_claude::ClaudeAdapter;
+
 #[derive(Parser)]
 #[command(name = "bowerbird-daemon")]
 struct Args {
@@ -85,6 +87,8 @@ async fn run(config: Config) -> anyhow::Result<()> {
         "recording started"
     );
 
+    let adapter = Arc::new(ClaudeAdapter::new(config.tool_reactions_path.clone()));
+
     let (ingest_tx, ingest_rx) =
         tokio::sync::mpsc::channel::<protocol::EventEnvelope>(config.ingest_channel_capacity);
     let ingest_listener = ingest::listener::bind(&config.ingest_sock_path).with_context(|| {
@@ -103,6 +107,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
         config.ingest_sock_path.clone(),
         ingest_tx,
         shutdown.clone(),
+        adapter,
     ));
 
     let state = AppState {

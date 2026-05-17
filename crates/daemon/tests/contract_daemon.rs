@@ -15,6 +15,8 @@ use protocol::{EventEnvelope, EventKind};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
+use adapter_claude::ClaudeAdapter;
+
 async fn fresh_pools() -> (TempDir, DbPools) {
     let tmp = TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("bower.db");
@@ -466,8 +468,13 @@ async fn start_ingest_listener(
     let shutdown = tokio_util::sync::CancellationToken::new();
     let path_clone = sock_path.clone();
     let shutdown_clone = shutdown.clone();
+    // Use a nonexistent TOML path — adapter degrades gracefully to Unknown reactions.
+    let adapter = Arc::new(ClaudeAdapter::new(
+        tmp.path().join("nonexistent-tool-reactions.toml"),
+    ));
     tokio::spawn(async move {
-        let _ = bowerbird_daemon::ingest::listener::run(path_clone, tx, shutdown_clone).await;
+        let _ =
+            bowerbird_daemon::ingest::listener::run(path_clone, tx, shutdown_clone, adapter).await;
     });
     // Give the listener a moment to bind and chmod.
     tokio::time::sleep(Duration::from_millis(20)).await;
