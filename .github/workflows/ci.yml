@@ -13,3 +13,9 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --workspace -- -D warnings
       - run: cargo test --workspace
+      - name: Lint - connection factory enforcement
+        shell: bash
+        run: ./scripts/lint-connection-factory.sh
+      - name: Lint - inline SQL ban
+        shell: bash
+        run: ./scripts/lint-inline-sql.sh
