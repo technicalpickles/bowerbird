@@ -15,11 +15,21 @@ impl ClaudeAdapter {
             tool_reactions_path,
         }
     }
+
+    /// Inspect the tool-reactions TOML for misconfiguration at startup.
+    /// Returns a list of human-readable warnings; empty when the file is clean.
+    /// The adapter has no tracing of its own (it's a pure library); callers
+    /// surface these to their own logging layer.
+    pub fn validate_config(&self) -> Vec<String> {
+        normalize::validate_config(&self.tool_reactions_path)
+    }
 }
 
 impl SourceAdapter for ClaudeAdapter {
     fn meta(&self) -> AdapterMeta {
-        AdapterMeta { source: "claude" }
+        AdapterMeta {
+            source: normalize::SOURCE,
+        }
     }
 
     fn normalize(&self, hook_kind: &str, raw: &[u8]) -> protocol::Result<NormalizeResult> {
