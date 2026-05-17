@@ -2,6 +2,7 @@ pub mod api;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod ingest;
 pub mod projection;
 pub mod state;
 

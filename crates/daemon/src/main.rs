@@ -7,11 +7,12 @@ use bowerbird_daemon::{
     api,
     config::Config,
     db::{init_pools, run_migrations, DbPools},
-    ensure_bowerbird_dir, init_tracing, install_panic_hook, projection, set_crash_dir,
+    ensure_bowerbird_dir, ingest, init_tracing, install_panic_hook, projection, set_crash_dir,
     state::AppState,
     write_error_report,
 };
 use clap::Parser;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Parser)]
@@ -84,6 +85,19 @@ async fn run(config: Config) -> anyhow::Result<()> {
         recording_session_id = started.recording_session_id,
         "recording started"
     );
+
+    let (ingest_tx, ingest_rx) =
+        tokio::sync::mpsc::channel::<protocol::EventEnvelope>(config.ingest_channel_capacity);
+    tokio::spawn(ingest::writer::run(
+        ingest_rx,
+        pools.writer.clone(),
+        shutdown.clone(),
+    ));
+    tokio::spawn(ingest_listener_task(
+        config.ingest_sock_path.clone(),
+        ingest_tx,
+        shutdown.clone(),
+    ));
 
     let state = AppState {
         db: pools.clone(),
@@ -180,6 +194,16 @@ async fn next_signal() {
         _ = recv_or_pending(&mut sigterm) => {}
         _ = recv_or_pending(&mut sighup) => {}
         _ = recv_or_pending(&mut sigquit) => {}
+    }
+}
+
+async fn ingest_listener_task(
+    sock_path: PathBuf,
+    tx: mpsc::Sender<protocol::EventEnvelope>,
+    shutdown: tokio_util::sync::CancellationToken,
+) {
+    if let Err(e) = ingest::listener::run(sock_path, tx, shutdown).await {
+        tracing::error!(error = ?e, "ingest listener exited with error");
     }
 }
 

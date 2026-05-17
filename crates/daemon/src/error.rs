@@ -8,6 +8,8 @@ pub enum Error {
     Migration(String),
     #[error("clock error: {0}")]
     Clock(String),
+    #[error("ingest error: {0}")]
+    Ingest(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
