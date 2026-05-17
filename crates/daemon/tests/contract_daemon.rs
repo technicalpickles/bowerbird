@@ -15,6 +15,8 @@ use protocol::{EventEnvelope, EventKind};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
+use adapter_claude::ClaudeAdapter;
+
 async fn fresh_pools() -> (TempDir, DbPools) {
     let tmp = TempDir::new().expect("tempdir");
     let db_path = tmp.path().join("bower.db");
@@ -466,8 +468,13 @@ async fn start_ingest_listener(
     let shutdown = tokio_util::sync::CancellationToken::new();
     let path_clone = sock_path.clone();
     let shutdown_clone = shutdown.clone();
+    // Use a nonexistent TOML path — adapter degrades gracefully to Unknown reactions.
+    let adapter = Arc::new(ClaudeAdapter::new(
+        tmp.path().join("nonexistent-tool-reactions.toml"),
+    ));
     tokio::spawn(async move {
-        let _ = bowerbird_daemon::ingest::listener::run(path_clone, tx, shutdown_clone).await;
+        let _ =
+            bowerbird_daemon::ingest::listener::run(path_clone, tx, shutdown_clone, adapter).await;
     });
     // Give the listener a moment to bind and chmod.
     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -508,7 +515,11 @@ async fn ingest_200_on_valid_json_object() {
     let tmp = TempDir::new().expect("tempdir");
     let (shutdown, sock_path, _rx) = start_ingest_listener(&tmp, 16).await;
 
-    let resp = send_line_recv_response(&sock_path, b"{\"session_id\":\"s1\"}\n").await;
+    let resp = send_line_recv_response(
+        &sock_path,
+        b"{\"session_id\":\"s1\",\"tool_name\":\"Test\"}\n",
+    )
+    .await;
     assert!(resp.starts_with("200"), "expected 200, got: {resp:?}");
     shutdown.cancel();
 }
@@ -518,7 +529,11 @@ async fn ingest_event_reaches_channel_after_200() {
     let tmp = TempDir::new().expect("tempdir");
     let (shutdown, sock_path, mut rx) = start_ingest_listener(&tmp, 16).await;
 
-    let resp = send_line_recv_response(&sock_path, b"{\"session_id\":\"s1\"}\n").await;
+    let resp = send_line_recv_response(
+        &sock_path,
+        b"{\"session_id\":\"s1\",\"tool_name\":\"Test\"}\n",
+    )
+    .await;
     assert!(resp.starts_with("200"), "expected 200, got: {resp:?}");
 
     let envelope = tokio::time::timeout(Duration::from_millis(500), rx.recv())
@@ -539,7 +554,11 @@ async fn ingest_200_is_ack_before_db_commit() {
     let tmp = TempDir::new().expect("tempdir");
     let (shutdown, sock_path, _rx) = start_ingest_listener(&tmp, 16).await;
 
-    let resp = send_line_recv_response(&sock_path, b"{\"session_id\":\"s1\"}\n").await;
+    let resp = send_line_recv_response(
+        &sock_path,
+        b"{\"session_id\":\"s1\",\"tool_name\":\"Test\"}\n",
+    )
+    .await;
     // The response was received synchronously (before DB commit) as long as it
     // arrives at all; the test verifies the write-path works end-to-end.
     assert!(resp.starts_with("200"), "expected 200, got: {resp:?}");
@@ -553,14 +572,22 @@ async fn ingest_503_on_full_queue() {
     let (shutdown, sock_path, rx) = start_ingest_listener(&tmp, 1).await;
 
     // First event fills the capacity-1 channel.
-    let resp1 = send_line_recv_response(&sock_path, b"{\"session_id\":\"s1\"}\n").await;
+    let resp1 = send_line_recv_response(
+        &sock_path,
+        b"{\"session_id\":\"s1\",\"tool_name\":\"Test\"}\n",
+    )
+    .await;
     assert!(
         resp1.starts_with("200"),
         "first should be 200, got: {resp1:?}"
     );
 
     // Don't consume from rx — channel is now full. Second send → 503.
-    let resp2 = send_line_recv_response(&sock_path, b"{\"session_id\":\"s2\"}\n").await;
+    let resp2 = send_line_recv_response(
+        &sock_path,
+        b"{\"session_id\":\"s2\",\"tool_name\":\"Test\"}\n",
+    )
+    .await;
     assert!(
         resp2.starts_with("503"),
         "second should be 503, got: {resp2:?}"
@@ -634,7 +661,11 @@ async fn ingest_eof_before_newline_is_silent() {
     // Give the daemon a moment to process the EOF, then assert it can still
     // accept a normal connection.
     tokio::time::sleep(Duration::from_millis(20)).await;
-    let resp = send_line_recv_response(&sock_path, b"{\"session_id\":\"s1\"}\n").await;
+    let resp = send_line_recv_response(
+        &sock_path,
+        b"{\"session_id\":\"s1\",\"tool_name\":\"Test\"}\n",
+    )
+    .await;
     assert!(
         resp.starts_with("200"),
         "daemon should still work after EOF client, got: {resp:?}"

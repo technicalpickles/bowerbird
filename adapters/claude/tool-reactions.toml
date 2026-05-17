@@ -1,0 +1,20 @@
+# Claude Code tool name → Reaction mapping
+# Values: "Pause", "Continue", "Unknown", or "Vendor(N)" where N is a u16
+# Tool names not listed here default to Reaction::Unknown
+
+[tool_reactions]
+Bash         = "Continue"
+Read         = "Continue"
+Write        = "Continue"
+Edit         = "Continue"
+MultiEdit    = "Continue"
+Glob         = "Continue"
+Grep         = "Continue"
+LS           = "Continue"
+TodoWrite    = "Continue"
+TodoRead     = "Continue"
+WebFetch     = "Continue"
+WebSearch    = "Continue"
+Task         = "Continue"
+NotebookRead = "Continue"
+NotebookEdit = "Continue"

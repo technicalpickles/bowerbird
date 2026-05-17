@@ -1,8 +1,11 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+use adapter_claude::ClaudeAdapter;
 
 use crate::error::{Error, Result};
 
@@ -10,9 +13,10 @@ pub async fn run(
     sock_path: PathBuf,
     tx: mpsc::Sender<protocol::EventEnvelope>,
     shutdown: CancellationToken,
+    adapter: Arc<ClaudeAdapter>,
 ) -> Result<()> {
     let listener = bind(&sock_path)?;
-    run_bound(listener, sock_path, tx, shutdown).await
+    run_bound(listener, sock_path, tx, shutdown, adapter).await
 }
 
 pub fn bind(sock_path: &std::path::Path) -> Result<UnixListener> {
@@ -36,13 +40,14 @@ pub async fn run_bound(
     sock_path: PathBuf,
     tx: mpsc::Sender<protocol::EventEnvelope>,
     shutdown: CancellationToken,
+    adapter: Arc<ClaudeAdapter>,
 ) -> Result<()> {
     loop {
         tokio::select! {
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((stream, _)) => {
-                        tokio::spawn(super::handler::handle(stream, tx.clone()));
+                        tokio::spawn(super::handler::handle(stream, tx.clone(), adapter.clone()));
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
                         tracing::warn!(error = ?e, "transient ingest accept error");

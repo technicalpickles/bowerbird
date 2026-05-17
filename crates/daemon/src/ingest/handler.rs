@@ -1,11 +1,27 @@
+use std::sync::Arc;
+
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
-use protocol::EventEnvelope;
+use adapter_claude::ClaudeAdapter;
+use protocol::{EventEnvelope, SourceAdapter};
+
+// Wire 400 responses are line-framed. Collapse internal newlines and cap
+// length so a multi-line serde_json::Error Display can't desync the client.
+fn sanitize_for_wire(s: &str) -> String {
+    s.chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .take(512)
+        .collect()
+}
 
 #[tracing::instrument(skip_all)]
-pub(super) async fn handle(stream: UnixStream, tx: mpsc::Sender<EventEnvelope>) {
+pub(super) async fn handle(
+    stream: UnixStream,
+    tx: mpsc::Sender<EventEnvelope>,
+    adapter: Arc<ClaudeAdapter>,
+) {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     let mut buf = String::new();
@@ -28,8 +44,9 @@ pub(super) async fn handle(stream: UnixStream, tx: mpsc::Sender<EventEnvelope>) 
         Ok(v) => v,
         Err(e) => {
             tracing::debug!(error = ?e, "ingest: invalid JSON");
+            let sanitized = sanitize_for_wire(&e.to_string());
             let _ = write_half
-                .write_all(format!("400 invalid JSON: {e}\n").as_bytes())
+                .write_all(format!("400 invalid JSON: {sanitized}\n").as_bytes())
                 .await;
             let _ = write_half.flush().await;
             return;
@@ -43,7 +60,23 @@ pub(super) async fn handle(stream: UnixStream, tx: mpsc::Sender<EventEnvelope>) 
         return;
     }
 
-    let envelope = make_placeholder_envelope(trimmed, &value);
+    let hook_kind = value
+        .get("hook_kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("PreToolUse");
+
+    let envelope = match adapter.normalize(hook_kind, trimmed.as_bytes()) {
+        Ok(result) => result.envelope,
+        Err(e) => {
+            tracing::debug!(error = ?e, "ingest: normalize failed");
+            let sanitized = sanitize_for_wire(&e.to_string());
+            let _ = write_half
+                .write_all(format!("400 normalize error: {sanitized}\n").as_bytes())
+                .await;
+            let _ = write_half.flush().await;
+            return;
+        }
+    };
 
     if envelope.session_id.trim().is_empty() {
         tracing::debug!("ingest: session_id is empty");
@@ -74,20 +107,5 @@ pub(super) async fn handle(stream: UnixStream, tx: mpsc::Sender<EventEnvelope>) 
             let _ = write_half.write_all(b"503\n").await;
             let _ = write_half.flush().await;
         }
-    }
-}
-
-fn make_placeholder_envelope(raw: &str, value: &serde_json::Value) -> EventEnvelope {
-    let session_id = value
-        .get("session_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_string();
-    EventEnvelope {
-        source: "claude".to_string(),
-        session_id,
-        kind: protocol::EventKind::PreToolUse,
-        reaction: None,
-        payload: raw.to_string(),
     }
 }
