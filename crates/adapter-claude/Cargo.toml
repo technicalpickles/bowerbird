@@ -11,3 +11,6 @@ path = "src/lib.rs"
 [dependencies]
 protocol  = { path = "../protocol" }
 thiserror = { workspace = true }
+
+[lints]
+workspace = true

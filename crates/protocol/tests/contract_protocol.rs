@@ -1,4 +1,4 @@
-use protocol::{ClientMessage, EventId, EventKind, HelloFrame, Reaction};
+use protocol::{ClientMessage, EventId, EventKind, HelloFrame, Reaction, ServerMessage};
 
 #[test]
 fn event_kind_serializes_pascal_case() {
@@ -82,4 +82,12 @@ fn outbound_type_accepts_unknown_fields() {
 fn inbound_type_rejects_unknown_fields() {
     let with_unknown = r#"{"op":"subscribe","topic":"events.*","unknown_field":"bad"}"#;
     assert!(serde_json::from_str::<ClientMessage>(with_unknown).is_err());
+}
+
+#[test]
+fn server_message_dispatch_accepts_unknown_fields() {
+    // AC#2: permissive deserialization must hold through the ServerMessage tagged-enum
+    // dispatch path, not just when deserializing frame structs directly.
+    let hello_with_extra = r#"{"op":"hello","protocol_version":"1.0","daemon_version":"0.1.0","oldest_available_event_id":0,"daemon_started_at":0,"history_begins_cleanly":true,"unknown_future_field":"ok"}"#;
+    assert!(serde_json::from_str::<ServerMessage>(hello_with_extra).is_ok());
 }

@@ -16,7 +16,7 @@ pub enum EventKind {
 }
 
 /// Pre-storage; daemon sets event_id at INSERT. Never pass to wire.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct EventEnvelope {
     pub source: String,
     pub session_id: String,

@@ -1,6 +1,6 @@
 # Story 1.1: Workspace and Protocol Crate Foundation
 
-Status: review
+Status: done
 
 ## Story
 
@@ -460,16 +460,16 @@ claude-sonnet-4-6
 
 ### Decision Needed
 
-- [ ] [Review][Decision] EventEnvelope derives Serialize/Deserialize despite "Never pass to wire" comment — The doc comment says `EventEnvelope` should never be sent on the wire, yet it derives `Serialize, Deserialize`. This is ambiguous: (a) remove serde derives if it's truly internal-only, or (b) keep derives because the shim→daemon Unix socket transport will use it (and "never pass to wire" means the public REST/WS protocol only). Correct fix requires knowing whether shim→daemon will serialize this type.
-- [ ] [Review][Decision] EventId is signed i64 — semantically all IDs are non-negative, but i64 allows negatives and the contract test asserts EventId(-1) round-trips — Options: (a) change to u64 to match semantics, (b) add validation in daemon, (c) accept as-is since SQLite rowids are i64 and -1 is never produced in practice.
-- [ ] [Review][Decision] Reaction::Unknown silently masks unrecognized reactions — Any unknown wire string deserializes to Reaction::Unknown instead of an error, hiding future protocol extensions — Options: (a) remove Unknown variant, return error on unrecognized strings (Vendor already provides extensibility), (b) keep Unknown for forward-compat tolerance.
+- [x] [Review][Decision] EventEnvelope derives Serialize/Deserialize despite "Never pass to wire" comment — Resolved: architecture confirms shim sends raw hook JSON; EventEnvelope is never serialized. Removed serde derives from EventEnvelope.
+- [x] [Review][Decision] EventId is signed i64 — Dismissed: i64 is intentional (OQ#4); matches SQLite INTEGER rowid and i64::MAX sentinel for empty-table case.
+- [x] [Review][Decision] Reaction::Unknown silently masks unrecognized reactions — Dismissed: Unknown only matches the literal string "Unknown"; other unrecognized strings still error out. No catch-all behavior.
 
 ### Patches
 
-- [ ] [Review][Patch] Workspace lints not inherited — no member crate has `[lints] workspace = true`, so `unsafe_code = "forbid"` in `[workspace.lints.rust]` does not apply to protocol, daemon, shim, or adapter-claude [crates/protocol/Cargo.toml, crates/daemon/Cargo.toml, crates/shim/Cargo.toml, crates/adapter-claude/Cargo.toml]
-- [ ] [Review][Patch] CI missing rustfmt and clippy components — `rust-toolchain.toml` declares no `components`, so `cargo fmt --check` and `cargo clippy` may fail on runners that don't pre-install these [rust-toolchain.toml, .github/workflows/ci.yml]
-- [ ] [Review][Patch] AC#2 test covers HelloFrame directly but not through ServerMessage dispatch — the actual wire path goes through the ServerMessage tagged enum; an unknown field test against ServerMessage is missing [crates/protocol/tests/contract_protocol.rs]
-- [ ] [Review][Patch] rust-toolchain.toml pins only `channel = "stable"` without a version — CI can silently break when new stable releases introduce new clippy lints [rust-toolchain.toml]
+- [x] [Review][Patch] Workspace lints not inherited — added `[lints] workspace = true` to all 4 member crates; removed redundant `#![deny(unsafe_code)]` crate attributes (workspace `forbid` is now active) [crates/protocol/Cargo.toml, crates/daemon/Cargo.toml, crates/shim/Cargo.toml, crates/adapter-claude/Cargo.toml]
+- [x] [Review][Patch] CI missing rustfmt and clippy components — added `components = ["rustfmt", "clippy"]` to rust-toolchain.toml [rust-toolchain.toml]
+- [x] [Review][Patch] AC#2 test covers HelloFrame directly but not through ServerMessage dispatch — added `server_message_dispatch_accepts_unknown_fields` test [crates/protocol/tests/contract_protocol.rs]
+- [x] [Review][Patch] rust-toolchain.toml pins only `channel = "stable"` without a version — pinned to `1.94.1` [rust-toolchain.toml]
 
 ### Deferred
 

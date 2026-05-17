@@ -1,5 +1,3 @@
-#![deny(unsafe_code)]
-
 mod adapter;
 mod constants;
 mod error;
