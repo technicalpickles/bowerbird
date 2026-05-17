@@ -1,0 +1,11 @@
+project: test-project
+story_location: docs/bmad/implementation-artifacts
+
+development_status:
+  epic-1: in-progress
+  1-1-user-auth: done
+  1-2-account-mgmt: ready-for-dev
+  1-3-password-reset: backlog
+  epic-1-retrospective: optional
+  epic-2: backlog
+  2-1-product-catalog: backlog

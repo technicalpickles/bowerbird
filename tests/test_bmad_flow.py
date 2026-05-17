@@ -51,3 +51,70 @@ class TestFindStoryFile:
     def test_returns_none_when_dir_missing(self, m, tmp_path):
         result = m.find_story_file("1-1-story", tmp_path / "nonexistent")
         assert result is None
+
+
+class TestDeterminePosition:
+    def _dev_status(self, fixture_name):
+        p = Path("tests/fixtures") / fixture_name
+        data = yaml.safe_load(p.read_text())
+        return data.get("development_status", {})
+
+    def test_empty_returns_needs_sprint_planning(self, m, tmp_path):
+        pos = m.determine_position({}, tmp_path)
+        assert pos["step"] == "needs_sprint_planning"
+
+    def test_backlog_story_no_file_returns_needs_story_creation(self, m, tmp_path):
+        dev_status = {"epic-1": "in-progress", "1-1-story": "backlog"}
+        pos = m.determine_position(dev_status, tmp_path)
+        assert pos["step"] == "needs_story_creation"
+        assert pos["story"] == "1-1-story"
+        assert pos["epic"] == "epic-1"
+
+    def test_ready_for_dev_returns_needs_validation(self, m, tmp_path):
+        dev_status = {"epic-1": "in-progress", "1-1-story": "ready-for-dev"}
+        pos = m.determine_position(dev_status, tmp_path)
+        assert pos["step"] == "needs_validation"
+
+    def test_in_progress_returns_needs_dev(self, m, tmp_path):
+        dev_status = {"epic-1": "in-progress", "1-1-story": "in-progress"}
+        pos = m.determine_position(dev_status, tmp_path)
+        assert pos["step"] == "needs_dev"
+
+    def test_review_returns_needs_review(self, m, tmp_path):
+        dev_status = {"epic-1": "in-progress", "1-1-story": "review"}
+        pos = m.determine_position(dev_status, tmp_path)
+        assert pos["step"] == "needs_review"
+
+    def test_all_stories_done_returns_epic_complete(self, m, tmp_path):
+        dev_status = {
+            "epic-1": "in-progress",
+            "1-1-story": "done",
+            "1-2-story": "done",
+            "epic-1-retrospective": "optional",
+        }
+        pos = m.determine_position(dev_status, tmp_path)
+        assert pos["step"] == "epic_complete"
+        assert pos["epic"] == "epic-1"
+
+    def test_all_epics_done_returns_all_done(self, m, tmp_path):
+        data = yaml.safe_load(Path("tests/fixtures/sprint_status_done.yaml").read_text())
+        pos = m.determine_position(data["development_status"], tmp_path)
+        assert pos["step"] == "all_done"
+
+    def test_skips_done_epic_to_find_next(self, m, tmp_path):
+        dev_status = {
+            "epic-1": "done",
+            "1-1-story": "done",
+            "epic-2": "in-progress",
+            "2-1-story": "backlog",
+        }
+        pos = m.determine_position(dev_status, tmp_path)
+        assert pos["step"] == "needs_story_creation"
+        assert pos["epic"] == "epic-2"
+
+    def test_mid_fixture_routes_to_needs_validation(self, m, tmp_path):
+        data = yaml.safe_load(Path("tests/fixtures/sprint_status_mid.yaml").read_text())
+        # 1-1 done, 1-2 ready-for-dev -> needs_validation
+        pos = m.determine_position(data["development_status"], tmp_path)
+        assert pos["step"] == "needs_validation"
+        assert pos["story"] == "1-2-account-mgmt"

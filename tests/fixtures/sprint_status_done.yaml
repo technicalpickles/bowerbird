@@ -1,0 +1,10 @@
+project: test-project
+story_location: docs/bmad/implementation-artifacts
+
+development_status:
+  epic-1: done
+  1-1-user-auth: done
+  epic-1-retrospective: optional
+  epic-2: done
+  2-1-product-catalog: done
+  epic-2-retrospective: optional
