@@ -6,12 +6,11 @@ use anyhow::Context;
 use bowerbird_daemon::{
     api,
     config::Config,
-    db::{init_pools, queries, run_migrations, DbPools},
-    ensure_bowerbird_dir, init_tracing, install_panic_hook, projection,
+    db::{init_pools, run_migrations, DbPools},
+    ensure_bowerbird_dir, init_tracing, install_panic_hook, projection, set_crash_dir,
     state::AppState,
 };
 use clap::Parser;
-use protocol::{EventEnvelope, EventId, EventKind};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Parser)]
@@ -26,10 +25,17 @@ struct Args {
 async fn main() {
     let args = Args::parse();
 
+    // Arm the panic hook BEFORE any code that can panic during startup, so
+    // early panics (clap parsing-tail, HOME resolution, dir creation) still
+    // produce a crash log. Initial destination is the OS temp dir; it gets
+    // upgraded to `~/.bowerbird/` once the real directory is known.
+    install_panic_hook(std::env::temp_dir());
+    init_tracing(args.verbose);
+
     let home = match home_dir() {
-        Some(h) => h,
-        None => {
-            eprintln!("error: HOME environment variable is not set");
+        Some(h) if !h.as_os_str().is_empty() && h.is_absolute() => h,
+        _ => {
+            eprintln!("error: HOME is unset, empty, or not absolute");
             std::process::exit(1);
         }
     };
@@ -38,13 +44,11 @@ async fn main() {
         eprintln!("error: failed to create {}: {}", bowerbird_dir.display(), e);
         std::process::exit(1);
     }
-
-    install_panic_hook(bowerbird_dir.clone());
-    init_tracing(args.verbose);
+    set_crash_dir(bowerbird_dir.clone());
 
     let config = Config::with_bowerbird_dir(&bowerbird_dir);
     if let Err(e) = run(config).await {
-        eprintln!("error: {e:#}");
+        tracing::error!(error = format!("{e:#}"), "daemon exited with error");
         std::process::exit(1);
     }
 }
@@ -60,7 +64,6 @@ async fn run(config: Config) -> anyhow::Result<()> {
     let pools = init_pools(&config.db_path)
         .await
         .with_context(|| format!("failed to init pools at {}", config.db_path.display()))?;
-    let pools = Arc::new(pools);
 
     run_migrations(&pools.writer)
         .await
@@ -68,9 +71,14 @@ async fn run(config: Config) -> anyhow::Result<()> {
     migrations_complete.store(true, Ordering::Release);
     tracing::info!("migrations complete");
 
-    let recording_started_id = emit_sentinel(&pools, EventKind::RecordingStarted).await?;
-    record_recording_session_started(&pools, recording_started_id).await?;
-    tracing::info!(event_id = recording_started_id.0, "recording started");
+    let started = projection::session::write_recording_started(&pools.writer)
+        .await
+        .context("write_recording_started")?;
+    tracing::info!(
+        event_id = started.event_id.0,
+        recording_session_id = started.recording_session_id,
+        "recording started"
+    );
 
     let state = AppState {
         db: pools.clone(),
@@ -82,101 +90,92 @@ async fn run(config: Config) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("failed to bind {}", config.bind_addr))?;
     let local_addr = listener.local_addr().context("listener.local_addr")?;
-    tracing::info!(addr = %local_addr, "daemon listening");
+    // WARN, not INFO: the bound address is operationally important and must be
+    // visible at the default verbosity (`error`). See P20 in story 1.2 review.
+    tracing::warn!(addr = %local_addr, "daemon listening");
 
     let shutdown_fut = shutdown_signal(shutdown.clone());
-    axum::serve(listener, router)
+    let serve_result = axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_fut)
-        .await
-        .context("axum::serve")?;
+        .await;
 
-    let recording_ended_id = emit_sentinel(&pools, EventKind::RecordingEnded).await?;
-    record_recording_session_ended(&pools, recording_ended_id).await?;
-    tracing::info!(event_id = recording_ended_id.0, "recording ended");
+    // Drain marker for load balancers / probes — flip ready BEFORE writing the
+    // sentinel so a probe between now and process exit observes 503.
+    migrations_complete.store(false, Ordering::Release);
 
-    wal_checkpoint_passive(&pools).await?;
+    // Always run cleanup, even if axum::serve returned an error. Skipping the
+    // sentinel + checkpoint on a serve error would break the gap-detection
+    // invariant the recording_sessions schema exists to support.
+    if let Err(e) =
+        projection::session::write_recording_ended(&pools.writer, started.recording_session_id)
+            .await
+    {
+        tracing::error!(error = ?e, "write_recording_ended failed");
+    } else {
+        tracing::info!("recording ended");
+    }
+    if let Err(e) = wal_checkpoint_passive(&pools).await {
+        tracing::error!(error = ?e, "wal_checkpoint(PASSIVE) failed");
+    }
+
+    serve_result.context("axum::serve")?;
     Ok(())
 }
 
 async fn shutdown_signal(token: CancellationToken) {
-    use tokio::signal::unix::{signal, SignalKind};
+    tokio::select! {
+        _ = next_signal() => {
+            tracing::warn!("shutdown signal received");
+            token.cancel();
+            // Arm a force-exit watcher for the next signal so a hung graceful
+            // shutdown can be terminated with a second Ctrl-C / SIGTERM.
+            tokio::spawn(force_exit_on_next_signal());
+        }
+        _ = token.cancelled() => {
+            tracing::warn!("shutdown requested via cancellation token");
+        }
+    }
+}
 
-    let ctrl_c = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
-    let terminate = async {
-        match signal(SignalKind::terminate()) {
-            Ok(mut s) => {
+async fn force_exit_on_next_signal() {
+    next_signal().await;
+    eprintln!("second shutdown signal received; forcing exit");
+    std::process::exit(130);
+}
+
+async fn next_signal() {
+    use tokio::signal::unix::{signal, Signal, SignalKind};
+
+    fn register(kind: SignalKind, name: &str) -> Option<Signal> {
+        match signal(kind) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::error!("failed to register {name} handler: {e}");
+                None
+            }
+        }
+    }
+
+    let mut sigint = register(SignalKind::interrupt(), "SIGINT");
+    let mut sigterm = register(SignalKind::terminate(), "SIGTERM");
+    let mut sighup = register(SignalKind::hangup(), "SIGHUP");
+    let mut sigquit = register(SignalKind::quit(), "SIGQUIT");
+
+    async fn recv_or_pending(s: &mut Option<Signal>) {
+        match s {
+            Some(s) => {
                 let _ = s.recv().await;
             }
-            Err(_) => std::future::pending::<()>().await,
+            None => std::future::pending::<()>().await,
         }
-    };
-    let cancelled = token.cancelled();
+    }
 
     tokio::select! {
-        _ = ctrl_c => {}
-        _ = terminate => {}
-        _ = cancelled => {}
+        _ = recv_or_pending(&mut sigint) => {}
+        _ = recv_or_pending(&mut sigterm) => {}
+        _ = recv_or_pending(&mut sighup) => {}
+        _ = recv_or_pending(&mut sigquit) => {}
     }
-    tracing::info!("shutdown signal received");
-}
-
-async fn emit_sentinel(pools: &DbPools, kind: EventKind) -> anyhow::Result<EventId> {
-    let envelope = EventEnvelope {
-        source: "daemon".to_string(),
-        session_id: "daemon".to_string(),
-        kind,
-        reaction: None,
-        payload: "{}".to_string(),
-    };
-    let id = projection::session::write(&pools.writer, envelope)
-        .await
-        .context("projection::session::write")?;
-    Ok(id)
-}
-
-async fn record_recording_session_started(
-    pools: &DbPools,
-    started_id: EventId,
-) -> anyhow::Result<()> {
-    let conn = pools
-        .writer
-        .get()
-        .await
-        .map_err(|e| anyhow::anyhow!("writer pool get failed: {e}"))?;
-    let started = started_id.0;
-    conn.interact(move |c| -> rusqlite::Result<()> {
-        c.execute(
-            queries::INSERT_RECORDING_SESSION_STARTED,
-            rusqlite::params![started],
-        )?;
-        Ok(())
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("interact failed: {e}"))?
-    .context("INSERT_RECORDING_SESSION_STARTED")?;
-    Ok(())
-}
-
-async fn record_recording_session_ended(pools: &DbPools, ended_id: EventId) -> anyhow::Result<()> {
-    let conn = pools
-        .writer
-        .get()
-        .await
-        .map_err(|e| anyhow::anyhow!("writer pool get failed: {e}"))?;
-    let ended = ended_id.0;
-    conn.interact(move |c| -> rusqlite::Result<()> {
-        c.execute(
-            queries::UPDATE_RECORDING_SESSION_ENDED,
-            rusqlite::params![ended],
-        )?;
-        Ok(())
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("interact failed: {e}"))?
-    .context("UPDATE_RECORDING_SESSION_ENDED")?;
-    Ok(())
 }
 
 async fn wal_checkpoint_passive(pools: &DbPools) -> anyhow::Result<()> {

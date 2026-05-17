@@ -1,6 +1,6 @@
 # Story 1.2: Daemon Foundation with SQLite Persistence
 
-Status: review
+Status: done
 
 ## Story
 
@@ -12,7 +12,7 @@ So that I can trust no acknowledged event is ever lost due to unexpected daemon 
 
 1. **Given** a running daemon that has accepted an event through the projection write path **When** SIGKILL is sent to the daemon (or the SQLite connection is dropped without graceful close) and the daemon is restarted **Then** the previously-written event is present in the event log on the next read (NFR6: WAL durability guarantee). [Note: Story 1.2 has no ingest socket yet — Story 1.3 wires `POST /ingest`. Durability is proven here via a contract test that calls `projection::session::write()` directly and verifies survival across SQLite open/close cycles.]
 
-2. **Given** a connection is checked out from either the writer pool (max_size=1) or any reader pool (max_size=4) **When** `PRAGMA foreign_keys`, `PRAGMA journal_mode`, and `PRAGMA synchronous` are queried on that connection **Then** the results are `1` (ON), `wal`, and `1` (NORMAL) respectively, on every checkout without exception.
+2. **Given** a connection is checked out from either the writer pool (max_size=1) or any reader pool (max_size=4) **When** `PRAGMA foreign_keys`, `PRAGMA journal_mode`, `PRAGMA synchronous`, and `PRAGMA busy_timeout` are queried on that connection **Then** the results are `1` (ON), `wal`, `1` (NORMAL), and `5000` (ms) respectively, on every checkout without exception. The connection-factory hook also rejects (and prevents pool reuse of) any connection whose `journal_mode` did not actually flip to `wal` — guarding against read-only or network filesystems where the WAL pragma silently no-ops.
 
 3. **Given** the daemon starts for the first time against a fresh data directory **When** the daemon process becomes ready **Then** schema migrations have run automatically via `rusqlite_migration` and `GET /readyz` returns 200 (NFR21).
 
@@ -96,6 +96,70 @@ So that I can trust no acknowledged event is ever lost due to unexpected daemon 
   - [x] `cargo clippy --all-targets --workspace -- -D warnings` — green
   - [x] `cargo test --workspace` — all contract tests pass
 
+### Review Findings (2026-05-17)
+
+Three-layer adversarial review (Blind Hunter + Edge Case Hunter + Acceptance Auditor) against commit `ae0ef96`. Triaged into decision-needed / patch / defer. See `deferred-work.md` for deferred items.
+
+#### Decisions (resolved 2026-05-17)
+
+- [x] [Review][Decision→Defer] **Singleton enforcement** — deferred to Story 3.1/3.2 (daemon lifecycle CLI). Single-user assumption acknowledged; P8 explicit started-rowid reduces corruption surface in 1.2
+- [x] [Review][Decision→Defer] **Daemon address discoverability** — deferred to Story 3.x (bearer-token + lifecycle); P20 (bind log at WARN) covers local-dev observability
+- [x] [Review][Decision→Patch] **Deadpool checkout timeout** — chosen: add `Pool::timeouts.wait = Some(Duration::from_secs(5))` on both pools, surface as typed error (becomes Patch P22)
+- [x] [Review][Decision→Defer] **Envelope size/format validation** — deferred to Story 1.3 ingest endpoint; trust boundary lives at the ingress
+- [x] [Review][Decision→Patch] **`recording_sessions` ↔ `events` atomicity** — chosen: fold sentinel event + `recording_sessions` row into a single projection-layer transaction (becomes Patch P23)
+- [x] [Review][Decision→Patch] **`PRAGMA busy_timeout = 5000`** — chosen: keep and update Dev Notes (AC#2 too) to document the 4-pragma bundle (becomes Patch P24)
+- [x] [Review][Decision→Patch] **Malformed `RUST_LOG` warning** — chosen: parse first, `eprintln!` warning on Err, fall back to verbosity-derived default (becomes Patch P25)
+- [x] [Review][Decision→Patch] **FK from `recording_sessions` to `events`** — chosen: add `FOREIGN KEY(started_event_id) REFERENCES events(event_id)` and same for `ended_event_id` in the V1 migration (becomes Patch P26)
+
+#### Patches
+
+- [x] [Review][Patch] **Panic hook replaces default with no stderr fallback / no recursion guard / non-string payload truncation** [crates/daemon/src/lib.rs] — chain previous hook, `eprintln!` on file-write failure, wrap body in `catch_unwind`, attempt Debug downcast for non-string payloads
+- [x] [Review][Patch] **Crash-log file mode set after creation — TOCTOU + symlink hijack window** [crates/daemon/src/lib.rs:839-844] — use `OpenOptions::new().mode(0o600).create_new(true).write(true).open(...)` on Unix
+- [x] [Review][Patch] **`ensure_bowerbird_dir` widens perms unconditionally and follows symlinks** [crates/daemon/src/lib.rs:872-879] — `symlink_metadata` check; refuse to chmod symlinks; only `set_permissions(0o700)` when dir is newly created
+- [x] [Review][Patch] **Empty / non-absolute `$HOME` accepted silently** [crates/daemon/src/main.rs:914-921] — reject empty or non-absolute HOME with `eprintln! + exit(1)` (sanctioned dir-creation prerequisite)
+- [x] [Review][Patch] **`init_tracing` swallows `try_init` error** [crates/daemon/src/lib.rs:860-869] — use `.init()` per spec example, or `eprintln!` on Err so a duplicate subscriber install does not mute logging silently
+- [x] [Review][Patch] **`CancellationToken` never cancelled on signal** [crates/daemon/src/main.rs shutdown_signal] — call `shutdown.cancel()` inside `shutdown_signal` after the `select!` resolves
+- [x] [Review][Patch] **`RecordingEnded` sentinel + WAL checkpoint skipped on `axum::serve` error** [crates/daemon/src/main.rs:974-984] — capture serve result with `let`; always run sentinel + `wal_checkpoint(PASSIVE)` cleanup; propagate the original error after
+- [x] [Review][Patch] **`UPDATE_RECORDING_SESSION_ENDED` closes `MAX(id)` instead of the started-row PK** [crates/daemon/src/db/queries.rs + main.rs:1057] — return the rowid from `INSERT_RECORDING_SESSION_STARTED` and pass it as a bound parameter to the UPDATE
+- [x] [Review][Patch] **`current_unix_millis` silently returns `0` on clock failure / clamps i64 overflow** [crates/daemon/src/projection/session.rs:1151-1158] — propagate `duration_since` error; use `i64::try_from(u128)?` and surface a typed error
+- [x] [Review][Patch] **`migrations_complete` never reset on shutdown — `/readyz` keeps returning 200 during drain** [crates/daemon/src/main.rs shutdown path] — `migrations_complete.store(false, Ordering::Release)` before the RecordingEnded sentinel
+- [x] [Review][Patch] **Double Ctrl-C cannot force-exit; SIGHUP/SIGQUIT silently ignored** [crates/daemon/src/main.rs shutdown_signal] — install a second-signal handler that `process::exit(130)` after the first; add SIGHUP/SIGQUIT arms to the `select!` (treat as terminate)
+- [x] [Review][Patch] **Two panics within the same millisecond overwrite the same crash log filename** [crates/daemon/src/lib.rs:823] — include nanoseconds + pid + thread-id in the filename, e.g. `crash-<unix_ns>-<pid>-<tid>.log`
+- [x] [Review][Patch] **PRAGMA `journal_mode = WAL` silently falls back on read-only FS** [crates/daemon/src/db/pool.rs:31-42] — after `execute_batch`, run `PRAGMA journal_mode` and verify result is `"wal"`; return `HookError::Backend` otherwise
+- [x] [Review][Patch] **Reaction storage helper bypasses protocol's serde impl — silent drift risk** [crates/daemon/src/db/queries.rs:770-777] — per Dev Notes "EventKind & Reaction Serialization", use `serde_json::to_string(&reaction)?.trim_matches('"')` instead of hand-rolled `format!("Vendor({n})")`
+- [x] [Review][Patch] **`AppState.db` wrapped in `Arc` deviates from spec type signature** [crates/daemon/src/state.rs:1172-1174] — spec says `pub db: DbPools`; diff has `Arc<DbPools>` + `#[derive(Clone)]`. Drop the Arc wrapper (DbPools' inner Pools are already Arc-shared); update main.rs and tests
+- [x] [Review][Patch] **`eprintln!` used outside sanctioned migration/dir-creation paths** [crates/daemon/src/main.rs:934] — violates Dev Notes "Anti-Patterns to Avoid". Catch-all `run()`-error eprintln must route through `tracing::error!`
+- [x] [Review][Patch] **PRAGMA `post_create` hook does not run on every checkout — partial AC#2 coverage** [crates/daemon/src/db/pool.rs] — AC#2 mandates "every checkout without exception". Wire `post_recycle` (or `pre_recycle`) to re-apply the bundle, or document why post_create suffices and update AC
+- [x] [Review][Patch] **Dead error variants: `MigrationError`, `Error::Sqlite`, `Error::Io`** [crates/daemon/src/db/migrations.rs:596-600, crates/daemon/src/error.rs:789] — declared and re-exported but never constructed. Remove
+- [x] [Review][Patch] **`/readyz` 503 body reads "migrations in progress" even after migration failure** [crates/daemon/src/api/health.rs:537] — change to `"not ready"` so a regression that lets the daemon survive a migration failure is not masked
+- [x] [Review][Patch] **Default verbosity (`error`) hides the "daemon listening on <addr>" line** [crates/daemon/src/main.rs:971] — emit the bind line at WARN (or ERROR) so operators can see the port on default launch (overlaps with Decision: address discoverability)
+- [x] [Review][Patch] **Early-startup panic (before `install_panic_hook` runs) produces no crash log** [crates/daemon/src/main.rs:36-42] — install panic hook FIRST with a temp-path fallback (e.g., `/tmp`), then create the dir; or fold both steps so the hook is always armed for any code that can panic
+- [x] [Review][Patch] **(D3→P22) Deadpool checkout timeout** [crates/daemon/src/db/pool.rs] — configure `Pool::timeouts.wait = Some(Duration::from_secs(5))` on both writer and reader pools; map elapsed-timeout error to a typed `Error::Pool` variant
+- [x] [Review][Patch] **(D5→P23) Fold sentinel event + `recording_sessions` row into single transaction** [crates/daemon/src/projection/session.rs + main.rs] — extend the projection helper (or add a sibling) that takes an optional sentinel-marker action and commits both INSERTs in one transaction; preserves the spec's "single load-bearing transaction" invariant
+- [x] [Review][Patch] **(D6→P24) Document `PRAGMA busy_timeout = 5000` in spec** [docs/bmad/implementation-artifacts/1-2-…md Dev Notes "PRAGMA Enforcement Pattern" + AC#2] — update spec to list the 4-pragma bundle so the implementation stops being an undisclosed deviation
+- [x] [Review][Patch] **(D7→P25) Warn on malformed `RUST_LOG`** [crates/daemon/src/lib.rs:858] — parse `RUST_LOG` explicitly; on Err, `eprintln!` a warning ("RUST_LOG=… could not be parsed; falling back to -v verbosity") and use the verbosity-derived default
+- [x] [Review][Patch] **(D8→P26) Add FK from `recording_sessions` to `events`** [crates/daemon/src/db/migrations.rs] — extend V1 migration with `FOREIGN KEY(started_event_id) REFERENCES events(event_id)` and `FOREIGN KEY(ended_event_id) REFERENCES events(event_id)`; V1 has not shipped so no migration-versioning cost
+
+#### Deferred
+
+- [x] [Review][Defer] **SIGKILL / `exit(1)` paths skip the `RecordingEnded` sentinel + WAL checkpoint** — covered by Story 1.6 gap-detection design
+- [x] [Review][Defer] **`event_kind_as_str` ↔ serde equivalence untested** [crates/daemon/src/db/queries.rs:758-767]
+- [x] [Review][Defer] **Migration idempotency on a populated DB is untested** [crates/daemon/src/db/migrations.rs]
+- [x] [Review][Defer] **`Pool::interact` errors collapse to opaque strings, losing cause chain** [crates/daemon/src/db/migrations.rs:648, projection/session.rs:1145]
+- [x] [Review][Defer] **`migration_failure_exits_nonzero` could hang for 20s if a regression lets the daemon survive** [crates/daemon/tests/contract_daemon.rs:1347-1352]
+- [x] [Review][Defer] **No tests for `install_panic_hook` or `init_tracing`** — should follow the panic-hook patches in this round
+- [x] [Review][Defer] **CLI surface: no `--db-path`, `--bind-addr`, `--config`, `--version`** [crates/daemon/src/main.rs:904-910] — explicitly out of scope for this story
+- [x] [Review][Defer] **`init_pools` does not validate that `db_path` parent exists / is writable** [crates/daemon/src/db/pool.rs] — SQLite returns a reasonable error at first checkout
+- [x] [Review][Defer] **`i64::try_from(u128)` timestamp overflow at year 292278994 AD** [crates/daemon/src/projection/session.rs]
+- [x] [Review][Defer] **`wal_durability_after_simulated_crash` uses `drop(pool)` not a true crash** [crates/daemon/tests/contract_daemon.rs:60-95] — AC#1 acknowledges this; richer subprocess-based test is follow-up work
+- [x] [Review][Defer] **`migration_failure_exits_nonzero` TempDir cleanup vs daemon panic-write race** [crates/daemon/tests/contract_daemon.rs:148-176]
+- [x] [Review][Defer] **`scripts/lint-db-access.sh` bypassable via aliased imports / BSD grep symlink behavior** [scripts/lint-db-access.sh] — clippy-based version planned per spec
+- [x] [Review][Defer] **`tokio::signal::unix::signal(...)` registration failure is not logged** [crates/daemon/src/main.rs shutdown_signal]
+- [x] [Review][Defer] **`migration_failure_exits_nonzero` does not assert "before accepting any connections"** [crates/daemon/tests/contract_daemon.rs:1332-1365] — AC#4 wording; implicit in main.rs ordering today
+- [x] [Review][Defer] **(D1) Singleton enforcement — file lock / PID file** — deferred to Story 3.1/3.2 (daemon lifecycle CLI); single-user assumption documented
+- [x] [Review][Defer] **(D2) Daemon address discoverability — port file or pinned port** — deferred to Story 3.x (bearer-token + lifecycle); P20 covers local-dev observability for 1.2
+- [x] [Review][Defer] **(D4) Envelope size/format validation in projection layer** — deferred to Story 1.3 ingest endpoint; validation belongs at the trust boundary
+
 ## Dev Notes
 
 ### Critical Context From Story 1.1 (DO NOT REPEAT MISTAKES)
@@ -161,28 +225,32 @@ CREATE TABLE recording_sessions (
 
 ### PRAGMA Enforcement Pattern (AC#2)
 
-**The non-negotiable rule:** Every SQLite connection — writer or reader, fresh or returned-to-pool — must have `foreign_keys=ON`, `journal_mode=wal`, `synchronous=NORMAL` set **before** any application query runs.
+**The non-negotiable rule:** Every SQLite connection — writer or reader, fresh or returned-to-pool — must have `foreign_keys=ON`, `journal_mode=wal`, `synchronous=NORMAL`, and `busy_timeout=5000` set **before** any application query runs.
 
-**Mechanism:** Use `deadpool::managed::Hook` (post-create hook) on the pool builder. The hook is a closure that runs every time deadpool produces or recycles a connection.
+`busy_timeout=5000` (ms) is included in the bundle to avoid `SQLITE_BUSY` under brief lock contention — operationally important for any future writer/reader interleaving, and harmless on the single-writer pool today. The factory **also asserts** that `PRAGMA journal_mode` actually returned `"wal"` after the batch ran, refusing the connection otherwise — this guards against read-only or network filesystems where the pragma silently no-ops and leaves the database in `delete` mode.
+
+**Mechanism:** Use `deadpool::managed::Hook` on the pool builder, wired to **both** `post_create` and `post_recycle` so the bundle re-runs on every checkout — literal AC#2 conformance. Configure `Pool::timeouts.wait = Some(Duration::from_secs(5))` so a starved pool returns a typed `PoolError::Timeout(TimeoutType::Wait)` rather than blocking forever.
 
 ```rust
-use deadpool_sqlite::{Config, Hook, Runtime};
+use std::time::Duration;
+use deadpool_sqlite::{Config, Hook, HookError, Runtime, Timeouts};
 
-let writer_cfg = Config::new(db_path);
-let writer_pool = writer_cfg.builder(Runtime::Tokio1)?
+const PRAGMA_BUNDLE: &str = "
+    PRAGMA foreign_keys = ON;
+    PRAGMA journal_mode = WAL;
+    PRAGMA synchronous = NORMAL;
+    PRAGMA busy_timeout = 5000;
+";
+
+let pool = Config::new(db_path)
+    .builder(Runtime::Tokio1)?
     .max_size(1)
-    .post_create(Hook::async_fn(|conn, _metrics| Box::pin(async move {
-        conn.interact(|c| -> rusqlite::Result<()> {
-            c.execute_batch("
-                PRAGMA foreign_keys = ON;
-                PRAGMA journal_mode = WAL;
-                PRAGMA synchronous = NORMAL;
-            ")?;
-            Ok(())
-        }).await.map_err(|e| HookError::Message(e.to_string().into()))??;
-        Ok(())
-    })))
+    .timeouts(Timeouts { wait: Some(Duration::from_secs(5)), create: None, recycle: None })
+    .post_create(Hook::async_fn(|w, _| Box::pin(apply_pragmas(w))))
+    .post_recycle(Hook::async_fn(|w, _| Box::pin(apply_pragmas(w))))
     .build()?;
+// apply_pragmas runs execute_batch(PRAGMA_BUNDLE), then queries journal_mode and
+// returns HookError::Backend if the result is not "wal".
 ```
 
 **Verify pragmas via test (AC#2):** Inside `contract_daemon.rs`, after every checkout, run:
@@ -419,7 +487,7 @@ crates/daemon/
 
 - `rusqlite::Connection::open(...)` outside `crates/daemon/src/db/pool.rs` — fails CI lint (Task 9)
 - `unwrap()` or `expect()` outside `#[cfg(test)]` code — fails clippy
-- `eprintln!` or `println!` anywhere except `crates/daemon/src/main.rs` for the migration/dir-creation failure path
+- `eprintln!` or `println!` anywhere except: (a) `crates/daemon/src/main.rs` for the migration / dir-creation / HOME-validation failure path, and (b) `crates/daemon/src/lib.rs::init_tracing` for tracing-bootstrap failure reporting (malformed `RUST_LOG` warning, failed `try_init`) — these are the only sanctioned exceptions, justified by the chicken-and-egg of needing a way to report tracing-setup failures before tracing is up
 - `anyhow::Context` outside `main.rs` — all internal modules use `thiserror`-based `Error`
 - Splitting the projection UPSERT and event INSERT across two transactions
 - Wrapping the projection transaction inside a larger transaction
