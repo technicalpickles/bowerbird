@@ -1,0 +1,531 @@
+# Story 1.2: Daemon Foundation with SQLite Persistence
+
+Status: ready-for-dev
+
+## Story
+
+As a tool builder,
+I want bowerbird's daemon to persist events durably to a local WAL-mode SQLite database that survives crashes,
+So that I can trust no acknowledged event is ever lost due to unexpected daemon termination.
+
+## Acceptance Criteria
+
+1. **Given** a running daemon that has accepted an event through the projection write path **When** SIGKILL is sent to the daemon (or the SQLite connection is dropped without graceful close) and the daemon is restarted **Then** the previously-written event is present in the event log on the next read (NFR6: WAL durability guarantee). [Note: Story 1.2 has no ingest socket yet — Story 1.3 wires `POST /ingest`. Durability is proven here via a contract test that calls `projection::session::write()` directly and verifies survival across SQLite open/close cycles.]
+
+2. **Given** a connection is checked out from either the writer pool (max_size=1) or any reader pool (max_size=4) **When** `PRAGMA foreign_keys`, `PRAGMA journal_mode`, and `PRAGMA synchronous` are queried on that connection **Then** the results are `1` (ON), `wal`, and `1` (NORMAL) respectively, on every checkout without exception.
+
+3. **Given** the daemon starts for the first time against a fresh data directory **When** the daemon process becomes ready **Then** schema migrations have run automatically via `rusqlite_migration` and `GET /readyz` returns 200 (NFR21).
+
+4. **Given** a migration failure (e.g., manually corrupted `user_version`) **When** the daemon attempts to start **Then** it exits non-zero with a human-readable error message to stderr before accepting any connections.
+
+5. **Given** the writer pool is actively inserting rows **When** a reader pool connection executes a SELECT query concurrently **Then** the reader completes without blocking on the writer (WAL concurrent read/write validation).
+
+6. **Given** any file in the codebase **When** a CI lint (grep) scans for `rusqlite::Connection::open` **Then** any call outside the designated connection factory module (`crates/daemon/src/db/pool.rs`) fails the build, confirming the factory-only access policy.
+
+7. **Given** the daemon is running with default log level **When** it emits log output **Then** each line follows the format `<ISO8601 timestamp> <LEVEL> <message>` and the default level is `error`; running with `-v` exposes `info`-level output and `-vv` exposes `debug`-level output (NFR16).
+
+8. **Given** the daemon crashes unexpectedly (panic or unhandled error) **When** the process exits **Then** crash information (panic message, location, backtrace if available) is written to a file under `~/.bowerbird/` and nothing is sent to an external crash reporting service (NFR17).
+
+## Tasks / Subtasks
+
+- [ ] **Task 1: Create `crates/daemon/src/db/` module with connection factory and pool configuration** (AC: #2, #5, #6)
+  - [ ] Create `crates/daemon/src/db/mod.rs` — re-exports public types (`DbPools`, `init_pools`); the SOLE public API surface of the module
+  - [ ] Create `crates/daemon/src/db/pool.rs` — the **only** file in the entire workspace that may call `rusqlite::Connection::open` or `deadpool_sqlite::Pool::builder`
+  - [ ] Define `pub struct DbPools { pub writer: deadpool_sqlite::Pool, pub reader: deadpool_sqlite::Pool }`
+  - [ ] Implement `pub async fn init_pools(db_path: &std::path::Path) -> Result<DbPools>` that builds the writer pool with `max_size(1)` and reader pool with `max_size(4)`
+  - [ ] Configure both pools with `deadpool_sqlite::Config::new(db_path).create_pool(Runtime::Tokio1)` and install a **per-connection setup hook** that runs the PRAGMA bundle on every checkout (see Dev Notes → "PRAGMA enforcement pattern")
+  - [ ] Add `[CI Lint]` CI step or test in `crates/daemon/tests/contract_db.rs`: `grep -r "rusqlite::Connection::open" crates/daemon/src/ | grep -v "src/db/pool.rs"` must produce no output (factory-only policy)
+- [ ] **Task 2: Implement schema migrations** (AC: #3, #4)
+  - [ ] Create `crates/daemon/src/db/migrations.rs` with a `Migrations` value defined via `rusqlite_migration::Migrations::new(...)`
+  - [ ] V1 migration creates exactly three tables: `events`, `session_projections`, `recording_sessions` (see Dev Notes → "SQLite schema (V1)")
+  - [ ] `events.event_id` is `INTEGER PRIMARY KEY AUTOINCREMENT` (with `AUTOINCREMENT`, NOT just `INTEGER PRIMARY KEY` — the autoincrement keyword forces strict monotonicity and prevents ID reuse)
+  - [ ] Migrations execute synchronously in the writer pool before `axum` begins serving readyz=200; readyz returns 503 until migrations complete
+  - [ ] Migration failure → `main.rs` writes the error to stderr via `anyhow::Context` and `process::exit(1)`; nothing has been bound yet so no socket cleanup is needed
+- [ ] **Task 3: Centralize all SQL strings in `crates/daemon/src/db/queries.rs`** (AC: #1, AC#6 spirit)
+  - [ ] Define `pub const` string statements for every SQL operation in this story:
+    - `INSERT_EVENT` — `INSERT INTO events (source, session_id, kind, reaction, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)` — note: `event_id` is **omitted** (AUTOINCREMENT assigns)
+    - `UPSERT_SESSION_PROJECTION` — see Dev Notes → "Projection UPSERT pattern"
+    - `INSERT_RECORDING_SESSION_STARTED`, `UPDATE_RECORDING_SESSION_ENDED`
+    - `SELECT_EVENT_BY_ID` (used only by tests in this story)
+  - [ ] **No inline SQL anywhere else in the daemon crate** — clippy/grep-based lint enforces this in a follow-up story; for now, code review is the gate
+- [ ] **Task 4: Implement `crates/daemon/src/projection/session.rs` — the SOLE owner of the SQLite write transaction** (AC: #1)
+  - [ ] Create `crates/daemon/src/projection/mod.rs` re-exporting `session::write`
+  - [ ] Implement `pub async fn write(writer_pool: &deadpool_sqlite::Pool, envelope: protocol::EventEnvelope) -> Result<protocol::EventId>`
+  - [ ] Use `conn.interact(|conn| { ... })` to enter the blocking SQLite context; inside it:
+    - Open a **single** transaction via `conn.transaction()`
+    - Execute exactly two statements: `UPSERT_SESSION_PROJECTION` then `INSERT_EVENT`
+    - Read `event_id` via `conn.last_insert_rowid()`
+    - Commit
+  - [ ] **Forbidden:** any additional statement, sub-transaction, savepoint, or external call inside this transaction. The transaction has exactly two write operations and nothing else.
+  - [ ] Reject `EventEnvelope` if it has non-zero `event_id` field — but note `EventEnvelope` does not declare an `event_id` field (per `protocol/src/event.rs:18-26`), so this guard is structural, not runtime
+- [ ] **Task 5: Implement `crates/daemon/src/api/` HTTP server foundation** (AC: #3)
+  - [ ] Create `crates/daemon/src/api/mod.rs` exposing `pub fn router(state: AppState) -> axum::Router`
+  - [ ] Create `crates/daemon/src/api/health.rs` with two handlers:
+    - `GET /healthz` → always returns 200 once axum is serving (liveness)
+    - `GET /readyz` → returns 200 if `AppState.migrations_complete` is true, else 503
+  - [ ] Both endpoints are **unauthenticated** — no bearer middleware (token middleware lands in Story 3.3)
+  - [ ] HTTP error body format: exactly `{ "error": "<human-readable message>" }` — no `code` field, no nested structure
+- [ ] **Task 6: Implement `crates/daemon/src/state.rs` and `crates/daemon/src/config.rs`** (AC: #3, #4)
+  - [ ] `config.rs` — define `pub struct Config { pub db_path: PathBuf, pub bind_addr: SocketAddr, pub ingest_channel_capacity: usize }`; default `bind_addr` = `127.0.0.1:0` (port assigned by OS until Story 3.x; persistent port lives in config file then), `ingest_channel_capacity = 1024`, `db_path = ~/.bowerbird/bower.db`
+  - [ ] `state.rs` — define `pub struct AppState { pub db: DbPools, pub migrations_complete: Arc<AtomicBool>, pub shutdown: tokio_util::sync::CancellationToken }` (broadcast hub and auth fields land in Stories 2.x and 3.x)
+- [ ] **Task 7: Wire `crates/daemon/src/main.rs` end-to-end** (AC: #3, #4, #7, #8)
+  - [ ] Use `#[tokio::main(flavor = "current_thread")]` — **NOT** the default multi-thread runtime (architecture mandate: `current_thread` only)
+  - [ ] Parse `-v` / `-vv` CLI flags (use `clap` derive, or hand-rolled — see Dev Notes → "CLI verbosity parsing")
+  - [ ] Initialize `tracing-subscriber` with custom formatter producing exactly `<ISO8601 timestamp> <LEVEL> <message>` (see Dev Notes → "Tracing format")
+  - [ ] Install a panic hook that writes crash info to `~/.bowerbird/crash-<unix_ms>.log` (mode 0600) before propagating (see Dev Notes → "Panic hook")
+  - [ ] Ensure `~/.bowerbird/` directory exists with mode 0700; if creation fails, exit non-zero with an error to stderr
+  - [ ] Emit `EventKind::RecordingStarted` sentinel via `projection::session::write()` **after** migrations complete and **before** `axum` serves traffic (this paves the way for Story 1.6 — gap detection)
+  - [ ] Bind axum to `config.bind_addr`; serve via `axum::serve(listener, router).with_graceful_shutdown(shutdown_signal())`
+  - [ ] On clean shutdown (SIGTERM/SIGINT via `tokio::signal`): emit `EventKind::RecordingEnded` sentinel, run `PRAGMA wal_checkpoint(PASSIVE)` once on the writer pool, then exit 0
+  - [ ] On migration failure or directory-creation failure: write the error to stderr via `eprintln!` (this is `main.rs` — the **only** place `eprintln!` is permitted in the daemon binary), then `process::exit(1)`
+- [ ] **Task 8: Contract tests (`crates/daemon/tests/contract_daemon.rs`)** (AC: #1, #2, #4, #5)
+  - [ ] **`pragmas_on_every_writer_checkout`** (AC#2): check out a writer connection, query the three pragmas; assert results `(1, "wal", 1)`; repeat 3 times — pragmas must be set per-checkout, not once-per-pool
+  - [ ] **`pragmas_on_every_reader_checkout`** (AC#2): same as above for reader pool
+  - [ ] **`wal_durability_after_simulated_crash`** (AC#1): create a tempfile-backed SQLite DB, run migrations, write an event via `projection::session::write()`, drop the connection without WAL checkpoint, reopen DB with same migrations, query `SELECT * FROM events WHERE event_id = ?`, assert the event is present with all fields intact
+  - [ ] **`concurrent_read_during_write`** (AC#5): spawn a reader task running a long `SELECT` while the writer pool inserts; assert reader completes within 100ms regardless of writer activity
+  - [ ] **`migration_failure_exits_nonzero`** (AC#4): create a tempfile DB and manually `PRAGMA user_version = 9999` (a version higher than the migrator knows), launch the daemon binary (`assert_cmd::Command::cargo_bin("bowerbird-daemon")`), assert exit code != 0 and stderr contains a clear error message
+  - [ ] **`pool_starvation_returns_defined_error`** (AC#5, deferred contract from architecture): check out all 4 reader connections, attempt a 5th with `.timeout()`; assert a defined error (not silent hang)
+  - [ ] **`readyz_returns_503_before_migrations_complete`** (AC#3): start daemon with a slow migration (insert a `sleep` via test-only feature flag, or migrate against a slow-disk tempfs); poll `/readyz` and observe 503 → 200 transition
+  - [ ] **`healthz_returns_200_immediately`** (AC#3): `/healthz` returns 200 even when readyz is 503
+- [ ] **Task 9: CI lint for connection factory policy** (AC: #6)
+  - [ ] Add a job step to `.github/workflows/ci.yml` (or a new `scripts/lint-db-access.sh`) that runs: `! grep -rn "rusqlite::Connection::open" crates/daemon/src/ | grep -v "crates/daemon/src/db/pool.rs"` — non-zero exit if any other file calls `Connection::open` directly
+  - [ ] Document the lint command in the daemon crate's `README.md` (create if missing — single-paragraph note pointing to `db/pool.rs` as the factory)
+- [ ] **Task 10: Final checks**
+  - [ ] `cargo build --workspace` — green, zero warnings
+  - [ ] `cargo fmt --check` — green
+  - [ ] `cargo clippy --all-targets --workspace -- -D warnings` — green
+  - [ ] `cargo test --workspace` — all contract tests pass
+
+## Dev Notes
+
+### Critical Context From Story 1.1 (DO NOT REPEAT MISTAKES)
+
+**Dependency conflict resolved in 1.1 — DO NOT roll back to architecture's pinned versions:** The architecture doc (`docs/bmad/planning-artifacts/architecture.md#Dependency Version Pins`) lists `rusqlite 0.39.0` + `rusqlite_migration 2.5.0` + `deadpool-sqlite 0.13.0`. **These are mutually incompatible.** Story 1.1 resolved this to the actually-installed set in `Cargo.toml`:
+
+| Dep | Architecture says | **Actually installed in workspace** |
+|---|---|---|
+| rusqlite | 0.39.0 | **0.38.0** |
+| rusqlite_migration | 2.5.0 | **2.4.1** |
+| deadpool-sqlite | 0.13.0 | 0.13.0 |
+| tokio | 1.52.1 | 1.52.1 |
+| axum | 0.8.9 | 0.8.9 |
+
+Use the **workspace dep table** as the source of truth, not the architecture doc. The daemon `Cargo.toml` already declares all needed deps via `{ workspace = true }` — see `crates/daemon/Cargo.toml:11-26`.
+
+**Workspace lints already inherited:** Each member crate has `[lints] workspace = true` per the 1.1 patch. **Do not** add `#![deny(unsafe_code)]` to daemon source files — the workspace `unsafe_code = "forbid"` is already active. Adding the attribute will cause `clippy::duplicated_attributes` lint failures.
+
+**Error module contract:** Every crate's `src/error.rs` must contain exactly:
+```rust
+#[derive(Debug, thiserror::Error)]
+pub enum Error { /* variants */ }
+pub type Result<T> = std::result::Result<T, Error>;
+```
+The daemon's current `src/main.rs` is just `#[tokio::main] async fn main() {}` — you need to create `src/error.rs` from scratch with `#[error("io error: {0}")] Io(#[from] std::io::Error)`, `#[error("sqlite error: {0}")] Sqlite(#[from] rusqlite::Error)`, `#[error("pool error: {0}")] Pool(String)`, `#[error("migration error: {0}")] Migration(String)` etc. The error module is extended by later stories.
+
+**`anyhow::Context` boundary:** Permitted **only** in `main.rs` files (the binary entry points). All other daemon source files (`db.rs`, `state.rs`, `api/*`, `projection/*`, etc.) must use `thiserror`-based `Error` types and `?` propagation. **Do not** add `anyhow` `use` statements to internal modules.
+
+### SQLite Schema (V1)
+
+```sql
+CREATE TABLE events (
+    event_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    source     TEXT    NOT NULL,
+    session_id TEXT    NOT NULL,
+    kind       TEXT    NOT NULL,         -- EventKind serialized as PascalCase
+    reaction   TEXT,                     -- nullable; NULL for daemon sentinels
+    payload    TEXT    NOT NULL,         -- verbatim raw JSON; no parsing
+    created_at INTEGER NOT NULL          -- Unix milliseconds
+);
+
+CREATE TABLE session_projections (
+    source     TEXT    NOT NULL,
+    session_id TEXT    NOT NULL,
+    state      TEXT    NOT NULL,         -- JSON blob; structure defined in Story 1.6
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (source, session_id)
+);
+
+-- Shadow table; never truncated; enables history_begins_cleanly after future truncation
+CREATE TABLE recording_sessions (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_event_id INTEGER NOT NULL,
+    ended_event_id   INTEGER             -- NULL until clean shutdown
+);
+```
+
+**For Story 1.2:** All three tables are created in V1 migration. `session_projections.state` is populated with a placeholder `'{}'` JSON blob in this story — the real state machine projection lands in Story 1.6.
+
+**`event_id` INSERT rule (load-bearing):** Always **omit** the `event_id` column from `INSERT INTO events`. Never pass `0` or any explicit value. AUTOINCREMENT assigns. The schema deliberately has no `DEFAULT` on this column to make accidental explicit-zero inserts fail loudly.
+
+[Source: docs/bmad/planning-artifacts/architecture.md#Data Architecture]
+
+### PRAGMA Enforcement Pattern (AC#2)
+
+**The non-negotiable rule:** Every SQLite connection — writer or reader, fresh or returned-to-pool — must have `foreign_keys=ON`, `journal_mode=wal`, `synchronous=NORMAL` set **before** any application query runs.
+
+**Mechanism:** Use `deadpool::managed::Hook` (post-create hook) on the pool builder. The hook is a closure that runs every time deadpool produces or recycles a connection.
+
+```rust
+use deadpool_sqlite::{Config, Hook, Runtime};
+
+let writer_cfg = Config::new(db_path);
+let writer_pool = writer_cfg.builder(Runtime::Tokio1)?
+    .max_size(1)
+    .post_create(Hook::async_fn(|conn, _metrics| Box::pin(async move {
+        conn.interact(|c| -> rusqlite::Result<()> {
+            c.execute_batch("
+                PRAGMA foreign_keys = ON;
+                PRAGMA journal_mode = WAL;
+                PRAGMA synchronous = NORMAL;
+            ")?;
+            Ok(())
+        }).await.map_err(|e| HookError::Message(e.to_string().into()))??;
+        Ok(())
+    })))
+    .build()?;
+```
+
+**Verify pragmas via test (AC#2):** Inside `contract_daemon.rs`, after every checkout, run:
+```rust
+let (fk, jm, sync): (i64, String, i64) = conn.interact(|c| -> rusqlite::Result<_> {
+    Ok((
+        c.query_row("PRAGMA foreign_keys", [], |r| r.get(0))?,
+        c.query_row("PRAGMA journal_mode", [], |r| r.get(0))?,
+        c.query_row("PRAGMA synchronous", [], |r| r.get(0))?,
+    ))
+}).await??;
+assert_eq!((fk, jm.as_str(), sync), (1, "wal", 1));
+```
+
+**Note on `journal_mode = WAL`:** Running `PRAGMA journal_mode = WAL` on a fresh SQLite DB returns `"wal"`. Running it on an existing non-WAL DB also flips it to WAL. The pragma is idempotent — running it on every checkout is safe and cheap.
+
+**Note on `synchronous = NORMAL` + WAL:** This combination gives crash-safety for committed transactions (the WAL log is fsync'd) without per-statement fsync. It is the documented SQLite WAL-mode default for "the right balance of safety and speed." Per SQLite docs and architecture decision — see [Source: docs/bmad/planning-artifacts/architecture.md#Data Architecture].
+
+### Projection UPSERT Pattern (Load-Bearing Transaction Invariant)
+
+The projection module **owns the transaction**. Exactly these two statements run inside it; nothing else joins:
+
+```rust
+// Inside conn.interact(|c| { let tx = c.transaction()?; ... tx.commit()?; ... })
+tx.execute(
+    UPSERT_SESSION_PROJECTION,
+    rusqlite::params![source, session_id, state_json, now_ms],
+)?;
+let _ = tx.execute(
+    INSERT_EVENT,
+    rusqlite::params![source, session_id, kind_str, reaction_str, payload, now_ms],
+)?;
+let event_id = tx.last_insert_rowid();
+tx.commit()?;
+```
+
+Where `UPSERT_SESSION_PROJECTION` is:
+```sql
+INSERT INTO session_projections (source, session_id, state, updated_at)
+VALUES (?, ?, ?, ?)
+ON CONFLICT(source, session_id)
+DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at;
+```
+
+**Forbidden patterns (prohibited by architecture):**
+- Wrapping the UPSERT + INSERT in a larger transaction that includes anything else
+- Splitting the UPSERT and INSERT across two transactions
+- Running either statement outside `projection::session::write()`
+- Calling `projection::session::write()` from anywhere other than the ingest pipeline (which lands in Story 1.3)
+
+[Source: docs/bmad/planning-artifacts/architecture.md#Process Conventions]
+
+### EventKind & Reaction Serialization (Use Existing protocol Crate Types)
+
+**Do not redefine these.** They are already in `crates/protocol/src/event.rs` and `reaction.rs`. Import via `use protocol::{EventKind, Reaction, EventEnvelope, EventId};` from the crate root only — never from internal submodule paths.
+
+**For `INSERT_EVENT`, serialize:**
+- `kind: EventKind` → `serde_json::to_string(&kind)?` produces `"\"PreToolUse\""` (a JSON-encoded string). Strip the outer quotes before storing as `TEXT`, **or** use `format!("{:?}", kind)` (Debug derives match the variant names exactly: `"PreToolUse"`).
+  - **Recommended:** add a helper `pub fn event_kind_as_str(k: &EventKind) -> &'static str` in `crates/daemon/src/db/queries.rs` returning the bare string. This avoids serde round-trip on the hot path.
+- `reaction: Option<Reaction>` → serialize via `serde_json::to_string()` (strip quotes) when `Some`; SQL `NULL` when `None`. Daemon sentinel events (`RecordingStarted`, `RecordingEnded`) have `reaction: None`.
+- `payload: String` is stored verbatim in the `payload TEXT NOT NULL` column. No parsing. No re-encoding.
+
+**EventKind is PascalCase-as-written** — `"PreToolUse"`, `"RecordingStarted"`, etc. **No `rename_all`.** This is enforced by the protocol contract tests in 1.1; daemon code must match the same wire strings when writing to / reading from SQLite.
+
+[Source: crates/protocol/src/event.rs, crates/protocol/tests/contract_protocol.rs]
+
+### Connection Factory Policy (AC#6)
+
+**`rusqlite::Connection::open` is permitted in exactly one file:** `crates/daemon/src/db/pool.rs`. Every other call site must take a connection from `DbPools.writer` or `DbPools.reader`. This is enforced by:
+
+1. A CI step (Task 9) running `grep -rn "rusqlite::Connection::open" crates/daemon/src/ | grep -v "crates/daemon/src/db/pool.rs"` — non-zero exit fails the build
+2. Code review
+
+**Why:** WAL mode + PRAGMA bundle must be applied to every connection. Direct `Connection::open` bypasses the post-create hook and silently produces a connection with wrong pragmas — corrupting the durability guarantee.
+
+Test-only exception: tests in `crates/daemon/tests/` may use `Connection::open` for setup (e.g., manually setting `PRAGMA user_version` to simulate migration failure). The CI lint scans `crates/daemon/src/` only, not `tests/`.
+
+### Tracing Format (AC#7)
+
+Default level is `error`. Flag mapping:
+- (no flag) → `error`
+- `-v` → `info`
+- `-vv` → `debug`
+- `-vvv` → `trace` (allowed but undocumented)
+
+Per-line format: `<ISO8601 timestamp> <LEVEL> <message>`. Example: `2026-05-17T14:23:01.123Z ERROR migration failed: malformed user_version`
+
+**Implementation:**
+```rust
+use tracing_subscriber::{fmt, EnvFilter, prelude::*};
+
+let level = match verbosity {
+    0 => "error",
+    1 => "info",
+    2 => "debug",
+    _ => "trace",
+};
+
+tracing_subscriber::registry()
+    .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level)))
+    .with(fmt::layer()
+        .with_target(false)        // no module path
+        .with_level(true)
+        .with_ansi(false)
+        .with_timer(fmt::time::ChronoUtc::rfc_3339())) // ISO8601
+    .init();
+```
+
+`RUST_LOG=...` env var overrides the CLI flag when present (standard `tracing-subscriber` behavior; preserve this).
+
+**Note:** `tracing-subscriber 0.3.20` may require enabling the `chrono` feature. Check `Cargo.toml` workspace deps — if `tracing-subscriber` is declared without features, you may need to depend on `tracing-subscriber = { workspace = true, features = ["chrono", "env-filter"] }` in the daemon crate. Verify and adjust.
+
+[Source: docs/bmad/planning-artifacts/prd.md NFR16]
+
+### Panic Hook (AC#8)
+
+```rust
+use std::panic;
+
+let bowerbird_dir = home_dir.join(".bowerbird");
+std::fs::create_dir_all(&bowerbird_dir)?;
+#[cfg(unix)] {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&bowerbird_dir, std::fs::Permissions::from_mode(0o700))?;
+}
+
+let crash_dir = bowerbird_dir.clone();
+panic::set_hook(Box::new(move |info| {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis()).unwrap_or(0);
+    let crash_path = crash_dir.join(format!("crash-{}.log", now_ms));
+    let backtrace = std::backtrace::Backtrace::capture();
+    let _ = std::fs::write(
+        &crash_path,
+        format!("PANIC at {}\n{}\nBacktrace:\n{}\n",
+            info.location().map(|l| l.to_string()).unwrap_or_else(|| "<unknown>".into()),
+            info.payload().downcast_ref::<&str>().copied()
+                .or_else(|| info.payload().downcast_ref::<String>().map(|s| s.as_str()))
+                .unwrap_or("<non-string panic payload>"),
+            backtrace),
+    );
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&crash_path, std::fs::Permissions::from_mode(0o600));
+    }
+}));
+```
+
+**No external crash reporting.** No `sentry`, no `panic-handler::log`, no HTTP POST. Local file only.
+
+### CLI Verbosity Parsing
+
+The workspace root has a `bowerbird` CLI binary (`src/main.rs`) — but that's the user-facing CLI (Story 3.2 work). For Story 1.2, the daemon binary lives at `crates/daemon/src/main.rs` with its own `clap` parser:
+
+```rust
+use clap::Parser;
+
+#[derive(Parser)]
+#[command(name = "bowerbird-daemon")]
+struct Args {
+    /// Verbosity: -v info, -vv debug, -vvv trace
+    #[arg(short, action = clap::ArgAction::Count)]
+    verbose: u8,
+}
+```
+
+Add `clap = { workspace = true }` to `crates/daemon/Cargo.toml` if not already present — check first (it's already declared at the workspace level in `Cargo.toml:26`).
+
+### Daemon main.rs Startup Sequence (Exact Order)
+
+The order below is load-bearing. Reordering risks (a) crashes after `axum::serve` starts, before crash hook is installed; or (b) `/readyz` returning 200 before migrations are actually done.
+
+1. Parse CLI args
+2. Compute `bowerbird_dir = ~/.bowerbird/`; create with mode 0700
+3. Install **panic hook** (writes to `bowerbird_dir`) — must be first so any subsequent panic is captured
+4. Initialize **tracing** at the level selected by `-v`/`-vv`
+5. Initialize **`AppState.migrations_complete = AtomicBool::new(false)`** and `shutdown = CancellationToken::new()`
+6. Initialize **`DbPools`** (`init_pools(db_path).await?`) — runs the post-create hooks but doesn't yet migrate
+7. **Run migrations** on the writer pool via `Migrations.to_latest(&conn)`; on success set `migrations_complete = true`; on failure `eprintln!` + `exit(1)`
+8. Emit `EventKind::RecordingStarted` via `projection::session::write()` — this is the first row in the events table on every cold start
+9. **Bind axum listener** on `config.bind_addr`
+10. **Serve** via `axum::serve(listener, router).with_graceful_shutdown(...)`
+11. On signal: emit `EventKind::RecordingEnded`, run `PRAGMA wal_checkpoint(PASSIVE)` once, exit 0
+
+**Sentinel `session_id`:** Use a reserved literal like `"daemon"` (with `source: "daemon"`). [Source: docs/bmad/planning-artifacts/architecture.md#Open Questions — Resolved → OQ#1]
+
+### Tokio Runtime Constraint (Architectural Mandate)
+
+```rust
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> anyhow::Result<()> { ... }
+```
+
+**NOT the default multi-thread runtime.** The architecture mandates `current_thread`:
+- No work-stealing overhead — sufficient for local-tool load
+- All daemon work runs on a single OS thread
+- All SQLite access flows through `deadpool-sqlite` (which `spawn_blocking`s under the hood) — agents must **never** introduce raw `std::thread::spawn` for SQLite work
+
+The 1.1 workspace `Cargo.toml` already has tokio features `rt, rt-multi-thread, macros, net, io-util, sync, time, signal, fs` — keep `rt-multi-thread` enabled because `axum::serve` and integration tests may want it during build, but the production runtime is `current_thread`.
+
+[Source: docs/bmad/planning-artifacts/architecture.md#API & Communication Patterns, #Coherence Validation]
+
+### File Structure to Create
+
+```
+crates/daemon/
+├── Cargo.toml                       # already exists; may need clap added
+├── src/
+│   ├── main.rs                      # OVERWRITE existing stub
+│   ├── error.rs                     # NEW — Error enum + Result
+│   ├── config.rs                    # NEW
+│   ├── state.rs                     # NEW
+│   ├── db/
+│   │   ├── mod.rs                   # NEW — re-exports
+│   │   ├── migrations.rs            # NEW — rusqlite_migration definitions
+│   │   ├── pool.rs                  # NEW — SOLE Connection::open call site
+│   │   └── queries.rs               # NEW — all SQL strings
+│   ├── projection/
+│   │   ├── mod.rs                   # NEW
+│   │   └── session.rs               # NEW — owns the transaction
+│   └── api/
+│       ├── mod.rs                   # NEW — fn router(state) -> Router
+│       └── health.rs                # NEW — /healthz, /readyz
+└── tests/
+    └── contract_daemon.rs           # NEW — all 8 contract tests in Task 8
+```
+
+**Do not** create `ingest/`, `broadcast/`, `auth.rs`, or `api/sessions.rs|events.rs|ws.rs` in this story — those land in Stories 1.3 / 1.5 / 1.7 / 2.x / 3.x respectively, per the directory map.
+
+[Source: docs/bmad/planning-artifacts/architecture.md#Complete Project Directory Structure]
+
+### Anti-Patterns to Avoid (Hard Bans)
+
+- `rusqlite::Connection::open(...)` outside `crates/daemon/src/db/pool.rs` — fails CI lint (Task 9)
+- `unwrap()` or `expect()` outside `#[cfg(test)]` code — fails clippy
+- `eprintln!` or `println!` anywhere except `crates/daemon/src/main.rs` for the migration/dir-creation failure path
+- `anyhow::Context` outside `main.rs` — all internal modules use `thiserror`-based `Error`
+- Splitting the projection UPSERT and event INSERT across two transactions
+- Wrapping the projection transaction inside a larger transaction
+- Adding `deny_unknown_fields` to any outbound (daemon→client) type — preserved from 1.1
+- Importing internal submodule paths from `crates/protocol` (use `protocol::EventKind`, not `protocol::event::EventKind`)
+- Hardcoding `~/.bowerbird/bower.db` outside `config.rs` — all paths flow from `Config`
+- Using `tokio::main` without `flavor = "current_thread"`
+- Adding `#![deny(unsafe_code)]` to daemon source files — workspace `forbid` is already active; redundant attribute fails clippy
+- Adding fixed Unix socket paths in tests — none expected in this story, but flag if tempted
+- Using `process::exit` anywhere except `main.rs` migration/dir-creation failure path
+
+### Testing Standards
+
+- **Unit tests** (`#[cfg(test)]` at bottom of source files): permitted but not required for this story — most behavior is integration-shaped
+- **Contract tests** live in `crates/daemon/tests/contract_daemon.rs` — pre-MVP gates, must all pass
+- **`:memory:` SQLite for tests where possible**; **file-backed via `tempfile::TempDir`** for WAL durability and migration-failure tests (per architecture: "Contract tests testing WAL behavior specifically may use a file-backed SQLite in a `TempDir`")
+- **Never** use a fixed file path in tests — parallel tests would collide. Always `tempfile::TempDir`
+- Use `tokio::test(flavor = "current_thread")` to match production runtime
+- For tests that spawn the daemon binary: use `assert_cmd::Command::cargo_bin("bowerbird-daemon")` — add `assert_cmd` to `[dev-dependencies]` in `crates/daemon/Cargo.toml`. Latest stable as of cutoff: `assert_cmd = "2.0"`
+
+[Source: docs/bmad/planning-artifacts/architecture.md#Structural Conventions, #Process Conventions]
+
+### Sentinel Events: RecordingStarted / RecordingEnded
+
+Per OQ#1 resolution, these are normal events with `source: "daemon"`, `kind: EventKind::RecordingStarted | RecordingEnded`, `reaction: None`, `payload: "{}"` (verbatim JSON). They occupy normal `event_id` slots from AUTOINCREMENT. No special-casing. Story 1.6 (`session projection and hook unreliability tolerance`) builds gap-detection logic on top of these; Story 1.2 just emits them at the right places.
+
+Also write to `recording_sessions` table on each lifecycle:
+- On startup, after the `RecordingStarted` event INSERT: `INSERT INTO recording_sessions (started_event_id, ended_event_id) VALUES (?, NULL)` — pass the just-assigned `event_id`
+- On clean shutdown, after `RecordingEnded` event INSERT: `UPDATE recording_sessions SET ended_event_id = ? WHERE id = (SELECT MAX(id) FROM recording_sessions)` — pairs the most recent open session
+- On crash, `ended_event_id` remains NULL — this is the mechanical fingerprint used by `history_begins_cleanly` in Story 1.6
+
+**Important:** The `recording_sessions` writes are **separate** transactions from the event INSERT — they are bookkeeping, not part of the load-bearing projection transaction. Sequence the `recording_sessions` write **after** the event commit, never before.
+
+[Source: docs/bmad/planning-artifacts/architecture.md#Open Questions — Resolved → OQ#1, OQ#2]
+
+### Previous Story Intelligence (1.1)
+
+**Test placement convention** (established in 1.1): contract tests live in `crates/<name>/tests/contract_<name>.rs`. Follow this for `contract_daemon.rs`.
+
+**Lint config pattern** (established in 1.1): every member crate has `[lints] workspace = true` in its `Cargo.toml`. `crates/daemon/Cargo.toml` already has this (line 27-28).
+
+**Format of dev notes / completion notes** (established in 1.1): use bullet lists with specific file/line references for review findings. Each deferred item gets its own bullet with `[Source: <file>:<line>]`.
+
+**rust-toolchain.toml** is pinned to `1.94.1` with `components = ["rustfmt", "clippy"]` (1.1 patch). Do not modify.
+
+**CI matrix** runs on `macos-latest` and `ubuntu-latest`. Tests must pass on both. SQLite WAL behaves identically across these platforms — no platform-specific code needed.
+
+### Git Intelligence (Recent Commits)
+
+- `293c3d3` — Merge PR #3 (architecture work)
+- `96c083b`, `98b131c`, `c96c100` — Story 1.1 review patches: workspace lint inheritance, CI components, rustfmt pin
+- `f54689e` — Story 1.1 main implementation
+- `7909b66` — `.gitignore` for Rust build artifacts (verify it ignores `target/`, `Cargo.lock` is **NOT** ignored — Cargo.lock IS committed per architecture)
+
+**No SQLite-related code committed yet.** Story 1.2 is the first SQLite touch.
+
+### Latest Tech Information
+
+- **rusqlite 0.38.0** — current production version in workspace. Bundled SQLite ≥ 3.45. `transaction()` API is stable. `last_insert_rowid()` returns `i64` (matches `EventId`).
+- **deadpool-sqlite 0.13.0** — uses `deadpool 0.10`. `Hook::async_fn` signature is `(Object, Metrics) -> impl Future`. The `Object` deref-target is `rusqlite::Connection`. `interact()` returns `Result<T, InteractError>` — wrap appropriately in the daemon `Error` enum.
+- **rusqlite_migration 2.4.1** — `Migrations::new(vec![M::up("CREATE TABLE ...")])`. `to_latest(&mut conn)` runs all pending migrations. Migration scripts run inside a transaction by default. Use a single `M::up(...)` for the V1 bundle (all three tables in one migration) — append-only; future stories add new `M::up()` entries.
+- **axum 0.8.9** — `Router::new().route("/healthz", get(handler))` API. `axum::serve(listener, router).with_graceful_shutdown(future).await` is the canonical shutdown pattern.
+- **tokio-util 0.7.18** — `CancellationToken` for cooperative shutdown.
+
+### Project Structure Notes
+
+- All paths align with the directory map in `docs/bmad/planning-artifacts/architecture.md#Complete Project Directory Structure`. No deviations.
+- New modules (`db/`, `projection/`, `api/`) are nested under `crates/daemon/src/` — match the architecture's directory tree exactly.
+- The workspace root `bowerbird` CLI binary stub (`src/main.rs`) is **unchanged** by this story; Story 1.2 only touches `crates/daemon/` and CI config.
+
+### References
+
+- Story AC: [Source: docs/bmad/planning-artifacts/epics.md#Story 1.2]
+- WAL durability & schema: [Source: docs/bmad/planning-artifacts/architecture.md#Data Architecture]
+- Pool sizing & PRAGMA policy: [Source: docs/bmad/planning-artifacts/architecture.md#Data Architecture]
+- Transaction invariant & projection UPSERT: [Source: docs/bmad/planning-artifacts/architecture.md#Process Conventions]
+- Tokio current_thread mandate: [Source: docs/bmad/planning-artifacts/architecture.md#API & Communication Patterns]
+- Directory structure: [Source: docs/bmad/planning-artifacts/architecture.md#Complete Project Directory Structure]
+- Sentinel events & OQ#1 fire-and-forget: [Source: docs/bmad/planning-artifacts/architecture.md#Open Questions — Resolved]
+- Recording sessions shadow table: [Source: docs/bmad/planning-artifacts/architecture.md#Open Questions — Resolved → OQ#2]
+- NFR6, NFR16, NFR17, NFR21: [Source: docs/bmad/planning-artifacts/prd.md#Reliability & Data Integrity, #Operability, #Implementation Constraints]
+- Naming conventions (snake_case columns, PascalCase enum variants): [Source: docs/bmad/planning-artifacts/architecture.md#Naming Conventions]
+- Error module contract: [Source: docs/bmad/planning-artifacts/architecture.md#Structural Conventions]
+- Anti-patterns list: [Source: docs/bmad/planning-artifacts/architecture.md#Enforcement Guidelines]
+- Story 1.1 dev notes (dependency conflict, lint inheritance): [Source: docs/bmad/implementation-artifacts/1-1-workspace-and-protocol-crate-foundation.md#Debug Log References, #Patches]
+- Workspace Cargo.toml dep pins: [Source: Cargo.toml]
+- Protocol types: [Source: crates/protocol/src/event.rs, crates/protocol/src/reaction.rs]
+
+## Dev Agent Record
+
+### Agent Model Used
+
+_To be filled by dev agent_
+
+### Debug Log References
+
+_To be filled by dev agent_
+
+### Completion Notes List
+
+_To be filled by dev agent_
+
+### File List
+
+_To be filled by dev agent_
+
+## Change Log
+
+- 2026-05-17: Story created via bmad-create-story workflow. Comprehensive context engine analysis completed: epic ACs extracted, architecture sections (Data Architecture, Process Conventions, Directory Structure, OQ#1/#2 resolutions) inlined, Story 1.1 dependency conflict and lint-inheritance learnings carried forward, library-version pins reconciled against actual workspace Cargo.toml, 8 contract tests scoped, anti-patterns and file-structure guardrails enumerated.
