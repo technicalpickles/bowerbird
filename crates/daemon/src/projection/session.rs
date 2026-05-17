@@ -25,6 +25,7 @@ pub struct RecordingStarted {
 /// Inserts one row into `events` and upserts the matching row in
 /// `session_projections` inside a single transaction containing exactly those
 /// two writes — nothing else.
+#[tracing::instrument(skip_all, fields(source = %envelope.source, session_id = %envelope.session_id))]
 pub async fn write(
     writer_pool: &deadpool_sqlite::Pool,
     envelope: EventEnvelope,
