@@ -1,0 +1,8 @@
+// Lint self-test fixture: imported `Connection::open` violation.
+// Demonstrates that the lint catches the imported form too.
+
+use rusqlite::Connection;
+
+fn _violation_imported() {
+    let _ = Connection::open("/tmp/foo");
+}
