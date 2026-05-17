@@ -176,3 +176,88 @@ def format_output(sprint_status: dict, position: dict, story_file: Path | None) 
     lines.append(f"Run: {cmd}" if cmd else "All epics complete. Sprint done.")
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# PocketFlow nodes
+# ---------------------------------------------------------------------------
+
+class ReadProjectState(Node):
+    def prep(self, shared):
+        return shared["project_root"]
+
+    def exec(self, project_root: Path):
+        bmad_config = load_bmad_config(project_root)
+        raw_impl = bmad_config.get(
+            "implementation_artifacts", "docs/bmad/implementation-artifacts"
+        )
+        # Config values may use '{project-root}/' as a template prefix; strip it.
+        impl_rel = raw_impl.replace("{project-root}/", "").replace("{project-root}", "").replace("//", "/").strip("/")
+        impl_path = project_root / impl_rel
+        sprint_status = load_sprint_status(impl_path)
+        story_dir = resolve_story_dir(project_root, sprint_status, bmad_config)
+
+        dev_status = (sprint_status or {}).get("development_status", {})
+        position = determine_position(dev_status, story_dir)
+
+        story_file = None
+        if position.get("story"):
+            story_file = find_story_file(position["story"], story_dir)
+
+        return sprint_status, position, story_file
+
+    def post(self, shared, prep_res, exec_res):
+        sprint_status, position, story_file = exec_res
+        shared["sprint_status"] = sprint_status
+        shared["current_position"] = position
+        shared["story_file"] = story_file
+        return position["step"]
+
+
+class StepAdvisor(Node):
+    def prep(self, shared):
+        return shared["sprint_status"], shared["current_position"], shared["story_file"]
+
+    def exec(self, prep_res):
+        sprint_status, position, story_file = prep_res
+        return format_output(sprint_status or {}, position, story_file)
+
+    def post(self, shared, prep_res, exec_res):
+        print(exec_res)
+        return None  # terminal
+
+
+# ---------------------------------------------------------------------------
+# Flow construction
+# ---------------------------------------------------------------------------
+
+def build_flow() -> Flow:
+    read_state = ReadProjectState()
+    advisor = StepAdvisor()
+
+    for action in SKILL_COMMANDS:
+        read_state - action >> advisor
+
+    return Flow(start=read_state)
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="BMAD Phase 4 status navigator")
+    parser.add_argument("--path", default=".", help="Path to BMAD project root")
+    args = parser.parse_args()
+
+    project_root = Path(args.path).resolve()
+    if not project_root.exists():
+        print(f"Error: {project_root} does not exist", file=sys.stderr)
+        sys.exit(1)
+
+    shared = {"project_root": project_root}
+    build_flow().run(shared)
+
+
+if __name__ == "__main__":
+    main()

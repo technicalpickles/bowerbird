@@ -171,3 +171,44 @@ class TestFormatOutput:
         position = {"step": "all_done", "epic": None, "story": None, "story_status": None}
         output = m.format_output(data, position, story_file=None)
         assert "Sprint done" in output
+
+
+class TestReadProjectState:
+    def test_routes_to_needs_story_creation_for_bowerbird(self, m):
+        """Integration: run against the actual bowerbird project."""
+        project_root = Path(".")
+        shared = {"project_root": project_root}
+        node = m.ReadProjectState()
+        action = node._run(shared)
+        # bowerbird has 1-1 done, 1-2 backlog -> needs_story_creation
+        assert action == "needs_story_creation"
+        assert shared["current_position"]["epic"] == "epic-1"
+        assert shared["current_position"]["story"] == "1-2-daemon-foundation-with-sqlite-persistence"
+
+    def test_populates_sprint_status_in_shared(self, m):
+        project_root = Path(".")
+        shared = {"project_root": project_root}
+        node = m.ReadProjectState()
+        node._run(shared)
+        assert shared["sprint_status"] is not None
+        assert "development_status" in shared["sprint_status"]
+
+    def test_missing_bmad_dir_does_not_crash(self, m, tmp_path):
+        """A dir with no _bmad still returns needs_sprint_planning."""
+        shared = {"project_root": tmp_path}
+        node = m.ReadProjectState()
+        action = node._run(shared)
+        assert action == "needs_sprint_planning"
+
+
+class TestFullFlow:
+    def test_flow_runs_to_completion_on_bowerbird(self, m, capsys):
+        """Full end-to-end: flow prints output and exits cleanly."""
+        project_root = Path(".")
+        shared = {"project_root": project_root}
+        flow = m.build_flow()
+        flow.run(shared)
+        captured = capsys.readouterr()
+        assert "BMAD Phase 4" in captured.out
+        assert "bowerbird" in captured.out.lower()
+        assert "Run:" in captured.out
