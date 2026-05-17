@@ -17,7 +17,7 @@ pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "migrations in progress" })),
+            Json(json!({ "error": "not ready" })),
         )
             .into_response()
     }

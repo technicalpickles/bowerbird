@@ -2,12 +2,6 @@ use rusqlite_migration::{Migrations, M};
 
 use crate::error::{Error, Result};
 
-#[derive(Debug, thiserror::Error)]
-pub enum MigrationError {
-    #[error("migration failed: {0}")]
-    Failed(String),
-}
-
 const V1_UP: &str = "
     CREATE TABLE events (
         event_id   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -28,7 +22,9 @@ const V1_UP: &str = "
     CREATE TABLE recording_sessions (
         id               INTEGER PRIMARY KEY AUTOINCREMENT,
         started_event_id INTEGER NOT NULL,
-        ended_event_id   INTEGER
+        ended_event_id   INTEGER,
+        FOREIGN KEY (started_event_id) REFERENCES events (event_id),
+        FOREIGN KEY (ended_event_id)   REFERENCES events (event_id)
     );
 ";
 

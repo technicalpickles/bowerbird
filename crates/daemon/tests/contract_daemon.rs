@@ -211,7 +211,7 @@ async fn readyz_returns_503_before_migrations_complete() {
     let (_tmp, pools) = fresh_pools().await;
     let migrations_complete = Arc::new(AtomicBool::new(false));
     let state = AppState {
-        db: Arc::new(pools),
+        db: pools,
         migrations_complete: migrations_complete.clone(),
         shutdown: CancellationToken::new(),
     };
@@ -250,7 +250,7 @@ async fn healthz_returns_200_immediately() {
 
     let (_tmp, pools) = fresh_pools().await;
     let state = AppState {
-        db: Arc::new(pools),
+        db: pools,
         // Deliberately leave migrations_complete = false to assert healthz is
         // independent of readiness.
         migrations_complete: Arc::new(AtomicBool::new(false)),
