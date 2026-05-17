@@ -1,6 +1,6 @@
 # Story 1.2: Daemon foundation with SQLite persistence
 
-Status: in-progress
+Status: review
 
 <!-- Validation is optional. Run validate-create-story for a quality check before dev-story. -->
 
@@ -121,18 +121,21 @@ so that I can trust no acknowledged event is ever lost due to unexpected daemon 
 ### Review Findings
 
 - [x] [Review][Defer] AC #1 full SIGKILL/restart durability process test — deferred to Story 3.2 lifecycle/spawnable daemon harness; Story 1.2 keeps the rollback surrogate plus `projection::session::write` happy-path persistence coverage, while the full process-kill/restart acceptance check remains tracked as explicit deferred work.
-- [ ] [Review][Patch] CI lint scripts are not macOS/POSIX-compatible despite the story constraint [scripts/lint-connection-factory.sh:20]
+- [x] [Review][Patch] CI lint scripts are not macOS/POSIX-compatible despite the story constraint [scripts/lint-connection-factory.sh:20]
   - Evidence: `scripts/lint-connection-factory.sh` and `scripts/lint-inline-sql.sh` use `mapfile`, but the story explicitly requires new CI steps to work on macOS-latest and Ubuntu-latest with POSIX shell/macOS bash compatibility; macOS bash 3.2 does not provide `mapfile`.
   - Suggested fix: replace `mapfile -t files < <(...)` with a portable loop such as `files=(); while IFS= read -r f; do files+=("$f"); done < <(git ls-files ...)` if keeping bash, or rewrite the scripts as strictly POSIX `sh` without arrays.
   - Verification: run both lint scripts locally after the change and ensure the existing contract self-tests still pass, especially `lint_self_test_connection_factory` and `lint_self_test_inline_sql`.
-- [ ] [Review][Patch] Connection factory lint does not enforce `rusqlite::Connection::open` in any call form [scripts/lint-connection-factory.sh:33]
+  - Resolution: replaced both `mapfile` reads with portable `while IFS= read -r f; do files+=("$f"); done < <(...)` loops. Removed `set -o pipefail` (kept `set -eu`) since neither script needs pipefail and `-o` flags vary in older bash. Both scripts now run under bash 3.2 conventions. Self-tests pass.
+- [x] [Review][Patch] Connection factory lint does not enforce `rusqlite::Connection::open` in any call form [scripts/lint-connection-factory.sh:33]
   - Evidence: AC #6 says CI must fail on `rusqlite::Connection::open` in any call form, but the current grep only matches the exact contiguous string `rusqlite::Connection::open`; it misses common Rust forms such as `use rusqlite::Connection; Connection::open(path)`, multiline paths, aliases, or `Connection::open_with_flags`.
   - Suggested fix: expand the lint to catch both fully-qualified `rusqlite::Connection::open*` and imported `Connection::open*` calls outside `crates/daemon/src/db/pool.rs`; include fixtures for at least fully-qualified `open`, imported `Connection::open`, and `open_with_flags`.
   - Verification: update the lint self-test fixtures so the script fails for each forbidden call form and still passes for the allowed factory module.
-- [ ] [Review][Patch] Crash reporting only covers panics, not top-level unhandled-error exits [crates/daemon/src/main.rs:42]
+  - Resolution: regex broadened to `(^|[^A-Za-z0-9_:])(rusqlite::)?Connection::open(_[A-Za-z_]+)?[[:space:]]*\(` (catches `open`, `open_with_flags`, `open_in_memory`, and the imported short form). Imported-form matches only fire when the file also has `use rusqlite::Connection` (single or multi-import braces), preventing false positives against unrelated `Connection` types. Three fixtures added (`lint_violation.rs.txt`, `lint_violation_imported.rs.txt`, `lint_violation_open_with_flags.rs.txt`); the `lint_self_test_connection_factory` test exercises each and asserts the lint fails for all three.
+- [x] [Review][Patch] Crash reporting only covers panics, not top-level unhandled-error exits [crates/daemon/src/main.rs:42]
   - Evidence: AC #8 requires a crash report when the daemon panics or exits via an unhandled error, but `crash::install_panic_hook()` only writes reports from the panic hook; `main()` currently prints `daemon failed: {e}` and exits `1` for `run(cli).await` errors without writing a crash report.
   - Suggested fix: expose a non-panicking crash-report helper in `crash.rs` and call it in the `if let Err(e) = run(cli).await` path before `std::process::exit(1)`, including the error message and a backtrace when available.
   - Verification: add a test or smoke path that forces a startup error (for example missing `HOME` or an invalid data directory), then assert a `~/.bowerbird/crash-<unix-ms>.log` file is created where the configured home directory is available; separately keep the panic-hook behavior covered.
+  - Resolution: added `crash::write_error_report(message)` as a non-panicking helper. `main()` now invokes it on `if let Err(e) = run(cli).await` before `exit(1)`. The two intermediate `exit(1)` paths inside `run()` (pool build, migration) were refactored to propagate errors via `Result` so all unhandled-error exits funnel through a single crash-report path. Reports include `kind: unhandled_error` so they're distinguishable from panic reports. Two new unit tests in `crash.rs` cover the happy path (writes a file under `~/.bowerbird/crash-<unix-ms>.log` and contains the message) and the `HOME`-unset best-effort path (returns `None` silently). Manual smoke test: with port 38121 held by `nc`, the daemon exits 1 and `~/.bowerbird/crash-<ts>.log` is written with the bind error and a captured backtrace.
 
 ## Dev Notes
 
@@ -405,9 +408,11 @@ claude-opus-4-7 (Claude Code on the web)
 - `crates/daemon/src/api/mod.rs` — module exports.
 - `crates/daemon/src/api/health.rs` — `/healthz` and `/readyz` handlers + `router()`.
 - `crates/daemon/tests/contract_daemon.rs` — 10 contract tests, using `#[path]` includes to reach daemon internals.
-- `crates/daemon/tests/fixtures/lint_violation.rs.txt` — deliberate-violation fixture for the connection-factory lint self-test.
-- `scripts/lint-connection-factory.sh` — bash lint script (cross-platform; uses `git ls-files` + `grep -E`).
-- `scripts/lint-inline-sql.sh` — bash lint script (same approach).
+- `crates/daemon/tests/fixtures/lint_violation.rs.txt` — deliberate-violation fixture for the connection-factory lint self-test (fully-qualified `rusqlite::Connection::open`).
+- `crates/daemon/tests/fixtures/lint_violation_imported.rs.txt` — fixture for the imported `Connection::open` form.
+- `crates/daemon/tests/fixtures/lint_violation_open_with_flags.rs.txt` — fixture for the `Connection::open_with_flags` form.
+- `scripts/lint-connection-factory.sh` — portable bash lint (no `mapfile`; macOS bash 3.2 + Ubuntu bash 5 compatible). Catches fully-qualified and imported `Connection::open*` forms.
+- `scripts/lint-inline-sql.sh` — portable bash lint (same compatibility).
 
 **Modified files:**
 - `crates/daemon/src/main.rs` — replaced the empty stub with the startup orchestrator (parse CLI, install panic hook, init logging, resolve config, build pools, run migrations, build router, bind TCP, serve with graceful shutdown, drain pools).
@@ -422,3 +427,4 @@ claude-opus-4-7 (Claude Code on the web)
 | Date       | Change                                                                                  |
 |------------|-----------------------------------------------------------------------------------------|
 | 2026-05-17 | Story 1.2 implementation complete: daemon foundation, SQLite persistence, WAL-mode dual-pool topology, schema migrations, projection module, health endpoints, ISO8601 logging, crash handler, CI lints, contract tests. Status: review. |
+| 2026-05-17 | Addressed code review findings — 3 items resolved (Date: 2026-05-17). Made lint scripts macOS bash 3.2 compatible (removed `mapfile`). Broadened connection factory lint to catch imported `Connection::open` and `open_with_flags` forms; added two more fixtures + multi-form self-test. Added `crash::write_error_report` for top-level unhandled-error exits; refactored `run()` to funnel all startup errors through it; added two unit tests + smoke-tested via a deliberately-held port. Status: review. |

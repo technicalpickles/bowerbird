@@ -40,7 +40,12 @@ async fn main() {
     logging::init(cli.verbose);
 
     if let Err(e) = run(cli).await {
-        eprintln!("daemon failed: {e}");
+        let msg = format!("daemon failed: {e}");
+        eprintln!("{msg}");
+        // AC #8: write a crash report for top-level unhandled errors too,
+        // not just panics. Best-effort — failure to write must not abort
+        // the exit path.
+        let _ = crash::write_error_report(&msg);
         std::process::exit(1);
     }
 }
@@ -49,18 +54,13 @@ async fn run(_cli: Cli) -> error::Result<()> {
     let cfg = Config::from_env()?;
     tokio::fs::create_dir_all(&cfg.data_dir).await?;
 
-    let pools = match db::build_pools(&cfg).await {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("pool build failed: {e}");
-            std::process::exit(1);
-        }
-    };
+    let pools = db::build_pools(&cfg)
+        .await
+        .map_err(|e| error::Error::Config(format!("pool build failed: {e}")))?;
 
-    if let Err(e) = db::run_migrations(&pools).await {
-        eprintln!("migration failed: {e}");
-        std::process::exit(1);
-    }
+    db::run_migrations(&pools)
+        .await
+        .map_err(|e| error::Error::Config(format!("migration failed: {e}")))?;
 
     let shutdown = CancellationToken::new();
     let state = Arc::new(AppState {

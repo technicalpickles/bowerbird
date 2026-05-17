@@ -1,7 +1,6 @@
-// Lint self-test fixture. Deliberate violation: a `rusqlite::Connection::open`
-// call that lives OUTSIDE `crates/daemon/src/db/pool.rs`. The CI lint script
-// must reject this file when included in its scan.
+// Lint self-test fixture: fully-qualified path violation.
+// A `rusqlite::Connection::open` call OUTSIDE `crates/daemon/src/db/pool.rs`.
 
-fn _violation() {
+fn _violation_fully_qualified() {
     let _ = rusqlite::Connection::open("/tmp/foo");
 }

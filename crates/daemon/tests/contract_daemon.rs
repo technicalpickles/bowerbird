@@ -420,20 +420,15 @@ async fn readyz_phases() {
 //
 // The lint script lives at `scripts/lint-connection-factory.sh`. It exits 0
 // when the working tree is clean and non-zero when a violation appears. We
-// drive both paths: clean scan must pass; scan with the fixture injected via
-// SCAN_EXTRA must fail. This prevents the lint from rotting silently.
+// exercise three forbidden call forms: the fully-qualified path, the
+// imported `Connection::open`, and `Connection::open_with_flags`. This
+// prevents the lint from rotting silently.
 // ---------------------------------------------------------------------------
 #[test]
 fn lint_self_test_connection_factory() {
     let workspace_root = workspace_root();
     let script = workspace_root.join("scripts/lint-connection-factory.sh");
-    let fixture = workspace_root.join("crates/daemon/tests/fixtures/lint_violation.rs.txt");
     assert!(script.exists(), "lint script must exist at {script:?}");
-    assert!(fixture.exists(), "fixture must exist at {fixture:?}");
-
-    // Sanity: fixture contains the violating pattern.
-    let contents = std::fs::read_to_string(&fixture).expect("fixture");
-    assert!(contents.contains("rusqlite::Connection::open"));
 
     // Clean scan must pass.
     let clean = std::process::Command::new("bash")
@@ -448,19 +443,42 @@ fn lint_self_test_connection_factory() {
         String::from_utf8_lossy(&clean.stderr)
     );
 
-    // Fixture-injected scan must fail.
-    let violating = std::process::Command::new("bash")
-        .arg(&script)
-        .env("SCAN_EXTRA", fixture.to_string_lossy().as_ref())
-        .current_dir(&workspace_root)
-        .output()
-        .expect("run lint script with fixture");
-    assert!(
-        !violating.status.success(),
-        "lint script must fail when fixture is injected; stdout={} stderr={}",
-        String::from_utf8_lossy(&violating.stdout),
-        String::from_utf8_lossy(&violating.stderr)
-    );
+    // Each fixture below represents a distinct forbidden call form. All must
+    // make the lint script fail when injected via SCAN_EXTRA.
+    let fixtures = [
+        (
+            "fully-qualified rusqlite::Connection::open",
+            "crates/daemon/tests/fixtures/lint_violation.rs.txt",
+        ),
+        (
+            "imported Connection::open",
+            "crates/daemon/tests/fixtures/lint_violation_imported.rs.txt",
+        ),
+        (
+            "Connection::open_with_flags",
+            "crates/daemon/tests/fixtures/lint_violation_open_with_flags.rs.txt",
+        ),
+    ];
+
+    for (label, rel_path) in fixtures {
+        let fixture = workspace_root.join(rel_path);
+        assert!(
+            fixture.exists(),
+            "fixture {label} must exist at {fixture:?}"
+        );
+        let violating = std::process::Command::new("bash")
+            .arg(&script)
+            .env("SCAN_EXTRA", fixture.to_string_lossy().as_ref())
+            .current_dir(&workspace_root)
+            .output()
+            .expect("run lint script with fixture");
+        assert!(
+            !violating.status.success(),
+            "lint script must fail for fixture form '{label}'; stdout={} stderr={}",
+            String::from_utf8_lossy(&violating.stdout),
+            String::from_utf8_lossy(&violating.stderr)
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
