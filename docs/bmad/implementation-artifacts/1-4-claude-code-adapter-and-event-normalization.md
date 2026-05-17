@@ -1,6 +1,6 @@
 # Story 1.4: Claude Code Adapter and Event Normalization
 
-Status: review
+Status: done
 
 ## Story
 
@@ -72,7 +72,33 @@ So that my tools receive consistent, predictable data regardless of changes to C
   - [x] `cargo clippy --all-targets --workspace -- -D warnings` — green
   - [x] `cargo test --workspace` — all tests pass including new adapter contract tests
 
-## Dev Notes
+### Review Findings
+
+_Recorded by bmad-code-review on 2026-05-17 (branch `claude/pull-main-bmad-dev-story-dmu55` vs `main`). Three layers ran: Blind Hunter (adversarial), Edge Case Hunter (boundary walk), Acceptance Auditor (AC verification). All 5 ACs pass; findings below are about robustness, hygiene, and one out-of-scope regression._
+
+- [x] [Review][Patch] Daemon startup probe for TOML misconfiguration — resolves D1+D2 (silent fallback on I/O / parse / reaction-string typos). In `crates/daemon/src/main.rs`, after config load, read + parse `config.tool_reactions_path` once and `tracing::warn!` if either step fails. Iterate parsed entries and call `parse_reaction` on each value; warn on any entry that collapses to `Unknown` from a non-`"Unknown"` literal. Keeps `adapter-claude` tracing-free per Dev Notes; catches typo'd paths, malformed TOML, and reaction-string typos at startup with zero per-event cost. Requires a small adapter helper or duplicated parse logic in main.rs [`crates/daemon/src/main.rs`, `crates/adapter-claude/src/normalize.rs:8-26`]
+- [x] [Review][Patch] CI workflow regression: `on: [push, pull_request]` reverts PR #14's duplicate-CI fix [`.github/workflows/ci.yml:3`] — out of scope for story 1.4; restore `push.branches: [main]` scope.
+- [x] [Review][Patch] `raw.to_vec()` allocates twice — replace `String::from_utf8(raw.to_vec()).map_err(...)` with `std::str::from_utf8(raw).map(str::to_owned).map_err(...)` to drop one alloc on the per-event path [`crates/adapter-claude/src/normalize.rs:55`]
+- [x] [Review][Patch] `Error::InvalidUtf8(String)` discards the underlying `FromUtf8Error` — switch to `#[from] std::string::FromUtf8Error` to preserve the source error chain (mirrors how `Json` variant is wired) [`crates/adapter-claude/src/error.rs:4-5`]
+- [x] [Review][Patch] Empty `tool_name` on a `PreToolUse` event is silently accepted — `value.get("tool_name").and_then(|v| v.as_str()).unwrap_or("")` then looks `""` up in TOML (→ Unknown). Inconsistent with how `session_id` is handled (hard error). Return `Error::MissingField("tool_name")` for PreToolUse when tool_name is absent or non-string [`crates/adapter-claude/src/normalize.rs:73-78`]
+- [x] [Review][Patch] `"claude"` source identifier is duplicated in `ClaudeAdapter::meta()` and `normalize.rs` envelope construction — extract `pub(crate) const SOURCE: &str = "claude";` to keep one source of truth [`crates/adapter-claude/src/lib.rs:20-22`, `crates/adapter-claude/src/normalize.rs:80-86`]
+- [x] [Review][Patch] Handler writes raw `{e}` Display to the wire as `400 normalize error: {e}\n` — `serde_json::Error`'s Display can be multi-line, which breaks the line-oriented response framing. Sanitize (replace newlines with spaces) and optionally truncate before writing [`crates/daemon/src/ingest/handler.rs:60-62`]
+- [x] [Review][Patch] Test uses hardcoded absolute path `/nonexistent/path/tool-reactions.toml` and relies on it not existing on the host — flip to `TempDir::new()` + `.path().join("missing.toml")` for hermeticity [`crates/adapter-claude/tests/contract_adapter.rs:142-150`]
+- [x] [Review][Patch] No test coverage for `Reaction::Pause` or `Reaction::Vendor(N)` parse paths — `parse_reaction` ships with two whole branches untested. Add unit tests covering Pause string, Vendor(N) happy path, Vendor(garbage) → Unknown, Vendor(99999) overflow → Unknown [`crates/adapter-claude/tests/contract_adapter.rs`]
+- [x] [Review][Defer] Synchronous `fs::read_to_string` on every PreToolUse in single-threaded async runtime — accepted as spec'd; Dev Notes pre-authorize an mtime-cache / file-watcher mitigation as a follow-up. Single-threaded runtime raises stakes (one blocking read stalls all tasks) but local-FS reads are sub-millisecond; pathological FS conditions (NFS, encrypted mounts) are an unaddressed-but-known tail. Revisit on profiling or a real user report [`crates/adapter-claude/src/normalize.rs:31-44`]
+- [x] [Review][Defer] `hook_kind` defaults to `"PreToolUse"` when absent — spec accepts this for "compat with tests and raw sends" until shim lands in story 1.5; revisit when shim guarantees the field [`crates/daemon/src/ingest/handler.rs:53-57`]
+- [x] [Review][Defer] In-place TOML rewrite race — concurrent edit can cause a transient parse error and a window of `Unknown` reactions; mitigation requires atomic write + mtime cache or file watcher; current graceful degradation is spec'd [`crates/adapter-claude/src/normalize.rs:31-44`]
+- [x] [Review][Defer] TOML file as FIFO/named-pipe/device — `read_to_string` could block; validate file type with `fs::metadata().is_file()` before reading. Operator-misconfig edge, low priority [`crates/adapter-claude/src/normalize.rs:31`]
+- [x] [Review][Defer] Unbounded TOML read size — `read_to_string` will allocate however large the file is; cap with `File::open` + `.take(MAX_TOML_BYTES)`. Operator-misconfig edge [`crates/adapter-claude/src/normalize.rs:31`]
+- [x] [Review][Defer] `session_id` as JSON number/bool currently rejected as missing — tightening to a typed error would require confirming Claude Code's session_id wire type contract; defer until the protocol is documented [`crates/adapter-claude/src/normalize.rs:46-50`]
+- [x] [Review][Defer] `session_id` length unbounded — no per-key size cap; local socket is trusted so DoS surface is small, but a sanity cap (e.g. 256 bytes) would be cheap [`crates/adapter-claude/src/normalize.rs:81-92`]
+- [x] [Review][Defer] Reaction strings with surrounding whitespace or wrong case (`" Continue "`, `"continue"`) silently → Unknown — operator-UX nicety; trim + case-insensitive match. Linked to the `parse_reaction` decision above [`crates/adapter-claude/src/normalize.rs:21-24`]
+- [x] [Review][Defer] TOML duplicate-key behavior unspecified — the `toml` crate errors by default, which `load_reaction` then swallows → Unknown. Document or test the precedence rule [`crates/adapter-claude/src/normalize.rs:18-25`]
+- [x] [Review][Defer] `ClaudeAdapter::new` accepts a relative `PathBuf` with no canonicalization — daemon doesn't chdir today, but a future chdir would change resolution. Validate or canonicalize at construction [`crates/adapter-claude/src/lib.rs:13-18`]
+- [x] [Review][Defer] No test covers the half-written / mid-edit TOML transition — runtime-update test only flips between valid states. Add coverage for the graceful-Unknown fallback during a transient parse error [`crates/adapter-claude/tests/contract_adapter.rs`]
+- [x] [Review][Defer] Spec mismatch: `Error::Io` variant in spec but missing from `error.rs` — code never surfaces I/O errors (load_reaction swallows them to Unknown), so adding the variant would trigger `dead_code`. The omission is cleaner than the spec; either update the spec or add the variant with a tracking comment [`crates/adapter-claude/src/error.rs:1-9`]
+
+
 
 ### Critical Context from Stories 1.1–1.3 (DO NOT REPEAT MISTAKES)
 

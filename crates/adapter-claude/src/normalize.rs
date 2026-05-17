@@ -7,12 +7,14 @@ use serde::Deserialize;
 
 use crate::error::Error;
 
+pub(crate) const SOURCE: &str = "claude";
+
 #[derive(Deserialize)]
 struct ToolReactionsFile {
     tool_reactions: HashMap<String, String>,
 }
 
-fn parse_reaction(s: &str) -> Reaction {
+pub(crate) fn parse_reaction(s: &str) -> Reaction {
     match s {
         "Pause" => Reaction::Pause,
         "Continue" => Reaction::Continue,
@@ -52,7 +54,9 @@ pub(crate) fn normalize(
     hook_kind: &str,
     raw: &[u8],
 ) -> Result<NormalizeResult, Error> {
-    let payload = String::from_utf8(raw.to_vec()).map_err(|e| Error::InvalidUtf8(e.to_string()))?;
+    let payload = std::str::from_utf8(raw)
+        .map_err(Error::InvalidUtf8)?
+        .to_owned();
 
     let value: serde_json::Value = serde_json::from_str(&payload)?;
 
@@ -75,7 +79,7 @@ pub(crate) fn normalize(
             let tool_name = value
                 .get("tool_name")
                 .and_then(|v| v.as_str())
-                .unwrap_or("");
+                .ok_or(Error::MissingField("tool_name"))?;
             Some(load_reaction(toml_path, tool_name))
         }
         _ => None,
@@ -83,11 +87,50 @@ pub(crate) fn normalize(
 
     Ok(NormalizeResult {
         envelope: EventEnvelope {
-            source: "claude".to_string(),
+            source: SOURCE.to_string(),
             session_id,
             kind,
             reaction,
             payload,
         },
     })
+}
+
+// Surface misconfiguration at startup. normalize() itself degrades to Unknown
+// on the same failures; this gives operators a one-shot signal at boot.
+pub(crate) fn validate_config(toml_path: &Path) -> Vec<String> {
+    let mut issues = Vec::new();
+    let contents = match std::fs::read_to_string(toml_path) {
+        Ok(c) => c,
+        Err(e) => {
+            issues.push(format!(
+                "could not read {}: {} (all reactions will be Unknown until fixed)",
+                toml_path.display(),
+                e
+            ));
+            return issues;
+        }
+    };
+    let config: ToolReactionsFile = match toml::from_str(&contents) {
+        Ok(c) => c,
+        Err(e) => {
+            issues.push(format!(
+                "could not parse {}: {} (all reactions will be Unknown until fixed)",
+                toml_path.display(),
+                e
+            ));
+            return issues;
+        }
+    };
+    for (tool, value) in &config.tool_reactions {
+        if value == "Unknown" {
+            continue;
+        }
+        if matches!(parse_reaction(value), Reaction::Unknown) {
+            issues.push(format!(
+                "tool '{tool}' has unrecognized reaction value '{value}' (treated as Unknown)"
+            ));
+        }
+    }
+    issues
 }

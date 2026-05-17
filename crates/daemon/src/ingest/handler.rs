@@ -7,6 +7,15 @@ use tokio::sync::mpsc;
 use adapter_claude::ClaudeAdapter;
 use protocol::{EventEnvelope, SourceAdapter};
 
+// Wire 400 responses are line-framed. Collapse internal newlines and cap
+// length so a multi-line serde_json::Error Display can't desync the client.
+fn sanitize_for_wire(s: &str) -> String {
+    s.chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .take(512)
+        .collect()
+}
+
 #[tracing::instrument(skip_all)]
 pub(super) async fn handle(
     stream: UnixStream,
@@ -35,8 +44,9 @@ pub(super) async fn handle(
         Ok(v) => v,
         Err(e) => {
             tracing::debug!(error = ?e, "ingest: invalid JSON");
+            let sanitized = sanitize_for_wire(&e.to_string());
             let _ = write_half
-                .write_all(format!("400 invalid JSON: {e}\n").as_bytes())
+                .write_all(format!("400 invalid JSON: {sanitized}\n").as_bytes())
                 .await;
             let _ = write_half.flush().await;
             return;
@@ -59,8 +69,9 @@ pub(super) async fn handle(
         Ok(result) => result.envelope,
         Err(e) => {
             tracing::debug!(error = ?e, "ingest: normalize failed");
+            let sanitized = sanitize_for_wire(&e.to_string());
             let _ = write_half
-                .write_all(format!("400 normalize error: {e}\n").as_bytes())
+                .write_all(format!("400 normalize error: {sanitized}\n").as_bytes())
                 .await;
             let _ = write_half.flush().await;
             return;

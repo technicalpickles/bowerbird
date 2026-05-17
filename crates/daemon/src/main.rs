@@ -87,7 +87,14 @@ async fn run(config: Config) -> anyhow::Result<()> {
         "recording started"
     );
 
-    let adapter = Arc::new(ClaudeAdapter::new(config.tool_reactions_path.clone()));
+    let adapter = ClaudeAdapter::new(config.tool_reactions_path.clone());
+    for issue in adapter.validate_config() {
+        tracing::warn!(
+            path = %config.tool_reactions_path.display(),
+            "tool-reactions config: {issue}"
+        );
+    }
+    let adapter = Arc::new(adapter);
 
     let (ingest_tx, ingest_rx) =
         tokio::sync::mpsc::channel::<protocol::EventEnvelope>(config.ingest_channel_capacity);

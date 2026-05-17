@@ -1,7 +1,7 @@
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Error {
     #[error("invalid UTF-8 in payload: {0}")]
-    InvalidUtf8(String),
+    InvalidUtf8(#[from] std::str::Utf8Error),
     #[error("json parse error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("missing required field: {0}")]

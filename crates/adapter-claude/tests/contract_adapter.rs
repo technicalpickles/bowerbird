@@ -139,8 +139,10 @@ fn normalize_missing_session_id_returns_error() {
 
 #[test]
 fn normalize_missing_toml_returns_unknown_reaction() {
-    // TOML file does not exist — should degrade gracefully to Unknown
-    let toml_path = std::path::PathBuf::from("/nonexistent/path/tool-reactions.toml");
+    // TOML file does not exist — should degrade gracefully to Unknown.
+    // Use a TempDir-scoped non-existent path so the test is hermetic.
+    let dir = TempDir::new().unwrap();
+    let toml_path = dir.path().join("does-not-exist.toml");
     let adapter = ClaudeAdapter::new(toml_path);
 
     let result = adapter
@@ -170,4 +172,66 @@ fn normalize_stop_event_no_reaction() {
     let result = adapter.normalize("Stop", payload.as_bytes()).unwrap();
     assert_eq!(result.envelope.kind, EventKind::Stop);
     assert_eq!(result.envelope.reaction, None);
+}
+
+#[test]
+fn normalize_pretooluse_missing_tool_name_returns_error() {
+    let dir = TempDir::new().unwrap();
+    let toml_path = write_toml(&dir, minimal_toml_with_bash());
+    let adapter = ClaudeAdapter::new(toml_path);
+
+    // PreToolUse without tool_name is malformed — adapter must reject, not
+    // silently look up "" in the TOML.
+    let payload = r#"{"session_id": "s1"}"#;
+    let result = adapter.normalize("PreToolUse", payload.as_bytes());
+    assert!(result.is_err(), "missing tool_name should be an error");
+}
+
+#[test]
+fn normalize_pretooluse_pause_reaction() {
+    let dir = TempDir::new().unwrap();
+    let toml_path = write_toml(&dir, "[tool_reactions]\nBash = \"Pause\"\n");
+    let adapter = ClaudeAdapter::new(toml_path);
+
+    let result = adapter
+        .normalize("PreToolUse", BASH_PAYLOAD.as_bytes())
+        .unwrap();
+    assert_eq!(result.envelope.reaction, Some(Reaction::Pause));
+}
+
+#[test]
+fn normalize_pretooluse_vendor_reaction() {
+    let dir = TempDir::new().unwrap();
+    let toml_path = write_toml(&dir, "[tool_reactions]\nBash = \"Vendor(7)\"\n");
+    let adapter = ClaudeAdapter::new(toml_path);
+
+    let result = adapter
+        .normalize("PreToolUse", BASH_PAYLOAD.as_bytes())
+        .unwrap();
+    assert_eq!(result.envelope.reaction, Some(Reaction::Vendor(7)));
+}
+
+#[test]
+fn normalize_pretooluse_vendor_garbage_degrades_to_unknown() {
+    let dir = TempDir::new().unwrap();
+    let toml_path = write_toml(&dir, "[tool_reactions]\nBash = \"Vendor(abc)\"\n");
+    let adapter = ClaudeAdapter::new(toml_path);
+
+    let result = adapter
+        .normalize("PreToolUse", BASH_PAYLOAD.as_bytes())
+        .unwrap();
+    assert_eq!(result.envelope.reaction, Some(Reaction::Unknown));
+}
+
+#[test]
+fn normalize_pretooluse_vendor_overflow_degrades_to_unknown() {
+    let dir = TempDir::new().unwrap();
+    // 99999 doesn't fit in u16
+    let toml_path = write_toml(&dir, "[tool_reactions]\nBash = \"Vendor(99999)\"\n");
+    let adapter = ClaudeAdapter::new(toml_path);
+
+    let result = adapter
+        .normalize("PreToolUse", BASH_PAYLOAD.as_bytes())
+        .unwrap();
+    assert_eq!(result.envelope.reaction, Some(Reaction::Unknown));
 }
