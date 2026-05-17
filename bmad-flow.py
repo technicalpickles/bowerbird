@@ -14,6 +14,8 @@ from pocketflow import Flow, Node
 # ---------------------------------------------------------------------------
 
 def is_epic_key(key: str) -> bool:
+    if not key:
+        return False
     return key.startswith("epic-") and not key.endswith("-retrospective")
 
 

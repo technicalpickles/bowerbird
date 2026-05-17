@@ -6,7 +6,10 @@ from pathlib import Path
 import importlib.util, sys
 
 def load_module():
-    spec = importlib.util.spec_from_file_location("bmad_flow", "bmad-flow.py")
+    spec = importlib.util.spec_from_file_location(
+        "bmad_flow",
+        Path(__file__).parent.parent / "bmad-flow.py"
+    )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
