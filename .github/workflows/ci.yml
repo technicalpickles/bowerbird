@@ -90,12 +90,16 @@ jobs:
               print("No change report — first run on this platform; baseline now seeded.")
           PY
 
-      - name: Fail when baseline missing (must seed from artifact)
+      - name: Warn when baseline missing (first run on this platform)
         if: steps.baseline-check.outputs.exists == 'false'
         shell: bash
         run: |
-          echo "::error::Missing crates/shim/benches/baselines/${{ matrix.baseline }}. Download the criterion-${{ matrix.os }} artifact, copy target/criterion/uds_post_ingest/new/estimates.json into the baseline path, and commit. See crates/shim/benches/README.md."
-          exit 1
+          echo "::warning::No committed baseline at crates/shim/benches/baselines/${{ matrix.baseline }}. This is expected on the first CI run for a new platform. To seed the baseline: download the criterion-${{ matrix.os }} artifact from this run, copy target/criterion/uds_post_ingest/new/estimates.json to crates/shim/benches/baselines/${{ matrix.baseline }}, and commit. See crates/shim/benches/README.md."
+          # Soft-fail: emit a warning and exit 0 so a brand-new platform doesn't
+          # red-light an otherwise-green PR. The committed baseline IS the gate;
+          # missing baseline means the gate is unarmed for this platform, not
+          # that the code is broken.
+          exit 0
 
       - name: Upload criterion output for baseline seeding
         if: always()

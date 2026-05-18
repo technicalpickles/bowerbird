@@ -23,14 +23,22 @@ Each file is a copy of Criterion's `target/criterion/uds_post_ingest/<id>/estima
 2. Copy `target/criterion/uds_post_ingest/initial/estimates.json` into
    `crates/shim/benches/baselines/<host-platform>.json`
    (`macos.json` on macOS, `linux.json` on Linux). Commit.
-3. CI's first run on the *other* platform will fail the gate (no
-   baseline to compare against). Download the `criterion-<runner-os>`
-   artifact from the failed workflow run, copy
+3. CI's first run on the *other* platform will emit a `::warning::`
+   annotation (not a failure) noting the missing baseline. The gate is
+   unarmed for that platform until the baseline lands. Download the
+   `criterion-<runner-os>` artifact from the workflow run, copy
    `target/criterion/uds_post_ingest/new/estimates.json` into the
-   missing baseline file, and commit.
+   missing baseline file, and commit it (separate PR or part of the
+   next one, your choice).
 4. Once both `macos.json` and `linux.json` exist, all subsequent CI
    runs use `--load-baseline` against them and gate at +15% regression
    on the mean change estimate.
+
+**Why soft-fail on missing baseline?** A brand-new platform shouldn't
+red-light an otherwise-green PR. The committed baseline IS the gate;
+missing baseline means the gate is unarmed for that platform, not that
+the code is broken. The warning annotation is loud enough to nag, and
+adding the baseline file is a trivial follow-up commit.
 
 ## Threshold rationale (+15%)
 
