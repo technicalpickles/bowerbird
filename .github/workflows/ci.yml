@@ -42,7 +42,7 @@ jobs:
         run: cargo build --profile release-shim -p bowerbird-shim
 
       - name: Run hot-path bench (save current run)
-        run: cargo bench --profile release-shim -p bowerbird-shim -- --save-baseline ci-current uds_post_ingest
+        run: cargo bench --profile release-shim -p bowerbird-shim --bench hot_path -- --save-baseline ci-current uds_post_ingest
 
       - name: Check baseline file exists
         id: baseline-check
@@ -70,7 +70,7 @@ jobs:
           set -e
           # Re-run the bench, this time loading the committed baseline. Criterion
           # writes a change report under target/criterion/<bench>/change/.
-          cargo bench --profile release-shim -p bowerbird-shim -- \
+          cargo bench --profile release-shim -p bowerbird-shim --bench hot_path -- \
             --load-baseline platform-committed uds_post_ingest \
             2>&1 | tee bench-output.log
 
