@@ -356,3 +356,35 @@ _To be filled in by dev agent_
 ### Completion Notes List
 
 ### File List
+
+### Review Findings
+
+_Code review run: 2026-05-18 against branch `claude/bmad-dev-story-1.5-cwAPx` vs `main`. Layers: Blind Hunter, Edge Case Hunter, Acceptance Auditor (all completed). 4 decision-needed, 6 patch, 9 deferred, 24 dismissed as noise._
+
+**Decision Needed**
+
+- [ ] [Review][Decision] CI bench gate measures `mean`, not `p99` as AC #1 requires — `.github/workflows/ci.yml:67-71` reads `data["mean"]["point_estimate"]` from Criterion's `change/estimates.json` and labels the failure "p99 regressed". Criterion's default JSON exposes mean/median/std_dev, not p99. Either (a) accept gating on mean and amend AC #1 wording, (b) post-process raw sample CSV to compute p99, or (c) configure Criterion to emit percentile estimates. Needs your call before patching.
+- [ ] [Review][Decision] Bench gate is unarmed: no baselines committed + soft-fail on missing baseline — `.github/workflows/ci.yml:76-85` exits 0 when no baseline file is present, and the diff commits no `linux.json` / `macos.json` despite the spec mandating per-platform baselines. AC #1 says "fails CI" on regression; today the gate cannot fail. Confirm whether the soft-fail-until-seeded approach (documented in Task 9 followups) is acceptable, or whether the first green CI artifacts should be committed now to arm the gate.
+- [ ] [Review][Decision] Silent stdin truncation at 1 MiB — `crates/shim/src/main.rs:1188-1194` uses `take(MAX_STDIN_BYTES)` and silently discards bytes beyond 1 MiB. If truncation lands at a syntactically-valid JSON object boundary, the shim forwards an incomplete payload. Spec Task 5 said "1 MiB cap" but did not specify overflow behavior. Choose: silently truncate (status quo), explicit `StdinTooLarge` error → exit 1, or peek-and-reject when `read` would exceed cap.
+- [ ] [Review][Decision] Baseline seeding copies only `estimates.json` — `.github/workflows/ci.yml:42-47` copies a single file into the criterion baseline dir, but Criterion's `--load-baseline` typically expects `sample.json`, `tukey.json`, etc. too. If the load silently fails, the gate prints "first run on this platform" and exits 0. Verify Criterion 0.5.x tolerates a directory containing only `estimates.json`; if not, the gate is broken from the first PR.
+
+**Patch**
+
+- [ ] [Review][Patch] CI `cargo bench | tee` masks failure (no `pipefail`) [`.github/workflows/ci.yml:52-58`] — without `set -o pipefail` or `${PIPESTATUS[0]}` check, a non-zero exit from `cargo bench` is swallowed by `tee`'s success and the gate silently passes.
+- [ ] [Review][Patch] Symlink TOCTOU in `log::append` — use fd-based `file.set_permissions(...)` [`crates/shim/src/log.rs:978-988`] — `OpenOptions::open` + path-based `set_permissions(path, ...)` both follow symlinks. A local actor can swap `~/.bowerbird/shim.log` for a symlink to e.g. `~/.ssh/authorized_keys` between open and chmod. Call `file.set_permissions(Permissions::from_mode(0o600))` on the open `File` to chmod via the fd.
+- [ ] [Review][Patch] AC #5 umask test doesn't exercise chmod-after-create [`crates/shim/tests/contract_shim.rs:1485-1531`] — `umask=0o022` and `0o077` both yield `0o600` via `OpenOptionsExt::mode(0o600)` alone (no chmod needed). To prove the chmod-after-create is doing the work, add a `umask=0o277` variant that strips owner-read — without `set_permissions`, the file would land at `0o400`.
+- [ ] [Review][Patch] AC #3 test doesn't assert socket path in ERROR log line [`crates/shim/tests/contract_shim.rs:1447-1453`] — spec Task 7 line 113 requires the log line to reference the socket path; test currently only checks for the literal "ERROR" and newline count. Strengthen with `assert!(log_contents.contains(bogus_sock.to_str().unwrap()))`.
+- [ ] [Review][Patch] Story doc File List contradicts the diff [`docs/bmad/implementation-artifacts/1-5-shim-binary-with-hot-path-event-delivery.md:2056`] — File List claims `crates/shim/benches/baselines/linux.json` was added, but Task 9 followup commentary says the locally-seeded baseline was removed and the diff contains no such file. Fix the File List to match reality.
+- [ ] [Review][Patch] Bench README references wrong baseline directory name [`crates/shim/benches/README.md` + `.github/workflows/ci.yml:80`] — README/CI message points to `target/criterion/uds_post_ingest/new/estimates.json`, but `--save-baseline ci-current` writes to `…/ci-current/estimates.json`. Correct the path so a dev seeding baselines on first green run isn't sent to a missing dir.
+
+**Deferred**
+
+- [x] [Review][Defer] Aggressive 3 ms read timeout can drop events under CI load [`crates/shim/src/socket.rs:1226-1228`] — deferred, spec-mandated (NFR20 fire-and-forget); track for production observability.
+- [x] [Review][Defer] Concurrent shim invocations: log lines >PIPE_BUF (4 KiB) can interleave [`crates/shim/src/log.rs:978-993`] — deferred, edge case for very long error messages; not Story 1.5-blocking.
+- [x] [Review][Defer] Test mock `captured` buffer accumulates across connections [`crates/shim/tests/contract_shim.rs:1289-1312`] — deferred, test-infra fragility; not currently buggy but invites misuse.
+- [x] [Review][Defer] `civil_from_days` double-corrects negative day counts [`crates/shim/src/log.rs:1016`] — deferred, unreachable from `SystemTime::now()`; defensive bug only.
+- [x] [Review][Defer] `Error::Backpressure(String)` is permanently dead [`crates/shim/src/error.rs:847-850`] — deferred, spec explicitly authorized the variant for future `503 <reason>\n` wire protocol; revisit when daemon adds reason field.
+- [x] [Review][Defer] Multiple `--hook-kind` flags silently last-wins [`crates/shim/src/main.rs:1131-1157`] — deferred, no current invoker emits duplicates; harden if observed in the wild.
+- [x] [Review][Defer] Stdin EPIPE during read mapped to exit 1 (could produce spurious logs during Claude shutdown) [`crates/shim/src/main.rs`] — deferred, race-only, not load-bearing.
+- [x] [Review][Defer] Mock listener thread not joined on drop [`crates/shim/tests/contract_shim.rs:1323-1327`, `crates/shim/benches/hot_path.rs:766-770`] — deferred, flake risk only; no correctness bug.
+- [x] [Review][Defer] E2E test 2-second envelope-receipt timeout may flake on cold builders [`crates/daemon/tests/contract_daemon.rs:566`] — deferred; pre-built `cargo_bin` covers it today.

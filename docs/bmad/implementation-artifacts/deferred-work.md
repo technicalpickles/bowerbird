@@ -45,3 +45,15 @@
 - **`ClaudeAdapter::new` accepts relative `PathBuf` without canonicalization** — `crates/adapter-claude/src/lib.rs:13-18`; daemon doesn't chdir today, but a future chdir would change resolution. Canonicalize or assert absolute at construction
 - **No test for half-written TOML during runtime update** — `crates/adapter-claude/tests/contract_adapter.rs`; the runtime-update test only flips between valid states. Add coverage for the graceful-Unknown fallback on a mid-rewrite parse error
 - **Spec/code mismatch on `Error::Io` variant** — `crates/adapter-claude/src/error.rs:1-9`; spec lists an `Io` variant but the implementation omits it because all I/O errors are absorbed into `Unknown`. Either update the spec, or add the variant with a tracking comment so the silent-swallow boundary is explicit
+
+## Deferred from: code review of 1-5-shim-binary-with-hot-path-event-delivery (2026-05-18)
+
+- **Aggressive 3 ms socket read timeout can drop events under CI/system load** — `crates/shim/src/socket.rs:1226-1228`; spec-mandated fire-and-forget (NFR20) but worth production observability — log + metric on timeout-triggered exits would help diagnose when the budget is under-provisioned.
+- **Concurrent shim invocations: log lines larger than PIPE_BUF (~4 KiB) can interleave** — `crates/shim/src/log.rs:978-993`; reachable with very long error messages (e.g. JSON parse error against a near-1-MiB stdin). Locking or fixed-size truncation would fix; not Story 1.5-blocking.
+- **Test mock `captured` buffer accumulates across accepts** — `crates/shim/tests/contract_shim.rs:1289-1312`; helper invites future misuse since `wait_for_capture` returns on first byte and second invocations get concatenated. Consider per-connection captures or document the constraint.
+- **`civil_from_days` double-corrects negative day counts** — `crates/shim/src/log.rs:1016`; pre-1970 is unreachable from `SystemTime::now()`. Defensive bug, but anyone reusing the helper outside the log path will hit it.
+- **`Error::Backpressure(String)` variant is dead** — `crates/shim/src/error.rs:847-850`; spec authorized it for a future `503 <reason>\n` daemon wire variant. Revisit when daemon adds reason field; until then it clutters exhaustive matches.
+- **Multiple `--hook-kind` flags silently last-wins** — `crates/shim/src/main.rs:1131-1157`; no current invoker emits duplicates. Reject explicitly if observed in the wild.
+- **Stdin EPIPE during read mapped to exit 1** — `crates/shim/src/main.rs`; could produce spurious error logs during Claude Code shutdown. Race-only.
+- **Mock listener thread not joined on drop** — `crates/shim/tests/contract_shim.rs:1323-1327`, `crates/shim/benches/hot_path.rs:766-770`; flake risk only, no correctness bug. Add a `join_handle` field and join in `Drop`.
+- **E2E test 2-second envelope-receipt timeout may flake on cold builders** — `crates/daemon/tests/contract_daemon.rs:566`; pre-built `cargo_bin` covers it today, but a CI matrix change could expose it.
