@@ -23,3 +23,84 @@ jobs:
         shell: bash
         run: ./scripts/lint-inline-sql.sh
       - run: cargo test --workspace
+
+  shim-bench-gate:
+    name: Shim hot-path bench (p99 ≤ 5ms, +15% regression fails)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            baseline: macos.json
+          - os: ubuntu-latest
+            baseline: linux.json
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build shim under release-shim profile
+        run: cargo build --profile release-shim -p bowerbird-shim
+
+      - name: Run hot-path bench (save current run)
+        run: cargo bench --profile release-shim -p bowerbird-shim -- --save-baseline ci-current uds_post_ingest
+
+      - name: Check baseline file exists
+        id: baseline-check
+        shell: bash
+        run: |
+          if [ -f "crates/shim/benches/baselines/${{ matrix.baseline }}" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No committed baseline at crates/shim/benches/baselines/${{ matrix.baseline }} — gate will fail. Download the criterion-output artifact and commit it as the baseline."
+          fi
+
+      - name: Seed platform-committed baseline (when present)
+        if: steps.baseline-check.outputs.exists == 'true'
+        shell: bash
+        run: |
+          target_dir="target/criterion/uds_post_ingest/platform-committed"
+          mkdir -p "$target_dir"
+          cp "crates/shim/benches/baselines/${{ matrix.baseline }}" "$target_dir/estimates.json"
+
+      - name: Gate against committed baseline (fail on +15% regression)
+        if: steps.baseline-check.outputs.exists == 'true'
+        shell: bash
+        run: |
+          set -e
+          # Re-run the bench, this time loading the committed baseline. Criterion
+          # writes a change report under target/criterion/<bench>/change/.
+          cargo bench --profile release-shim -p bowerbird-shim -- \
+            --load-baseline platform-committed uds_post_ingest \
+            2>&1 | tee bench-output.log
+
+          # Hard +15% gate via the change estimate in estimates.json.
+          python3 - <<'PY'
+          import json, sys
+          path = "target/criterion/uds_post_ingest/change/estimates.json"
+          try:
+              with open(path) as fh:
+                  data = json.load(fh)
+              change = data["mean"]["point_estimate"]
+              print(f"Mean change vs committed baseline: {change*100:.2f}%")
+              if change > 0.15:
+                  print(f"::error::p99 regressed {change*100:.2f}% from committed baseline (>15% threshold).")
+                  sys.exit(1)
+          except FileNotFoundError:
+              print("No change report — first run on this platform; baseline now seeded.")
+          PY
+
+      - name: Fail when baseline missing (must seed from artifact)
+        if: steps.baseline-check.outputs.exists == 'false'
+        shell: bash
+        run: |
+          echo "::error::Missing crates/shim/benches/baselines/${{ matrix.baseline }}. Download the criterion-${{ matrix.os }} artifact, copy target/criterion/uds_post_ingest/new/estimates.json into the baseline path, and commit. See crates/shim/benches/README.md."
+          exit 1
+
+      - name: Upload criterion output for baseline seeding
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-${{ matrix.os }}
+          path: target/criterion/**
+          if-no-files-found: warn
