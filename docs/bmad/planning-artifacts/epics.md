@@ -257,7 +257,7 @@ So that I can trust no acknowledged event is ever lost due to unexpected daemon 
 
 **Acceptance Criteria:**
 
-**Given** a running daemon that has acknowledged a `POST /ingest` event with a 200 response
+**Given** a running daemon that has acknowledged an ingest write with a `200` status line
 **When** SIGKILL is sent to the daemon and the daemon is restarted
 **Then** the acknowledged event is present in the event log (NFR6: WAL durability guarantee)
 
@@ -301,12 +301,12 @@ So that only processes running as my OS user can inject events into bowerbird, w
 **When** the ingest socket is created at `~/.bowerbird/ingest.sock`
 **Then** its file mode is 0600 (accessible only to the owning user)
 
-**Given** a well-formed `POST /ingest` request over the Unix socket
+**Given** a well-formed event line on the ingest socket (one `{object}\n` over the Unix socket per [ADR-0002](../../decisions/0002-ingest-wire-framing-and-hook-kind.md))
 **When** the daemon processes it
-**Then** it returns 200 synchronously after accepting the event into the write queue — not after the SQLite commit — and the shim receives the ACK within the 5ms budget
+**Then** it returns `200\n` synchronously after accepting the event into the write queue — not after the SQLite commit — and the shim receives the ACK within the 5ms budget
 
 **Given** the write queue is at maximum capacity (backpressure condition)
-**When** the shim sends `POST /ingest`
+**When** the shim sends an ingest line on the Unix socket
 **Then** the daemon returns 503, the shim logs a warning to `~/.bowerbird/shim.log`, and the shim exits 0 (fire-and-forget per NFR5)
 
 **Given** the daemon is not running (socket does not exist or ECONNREFUSED)
@@ -317,9 +317,9 @@ So that only processes running as my OS user can inject events into bowerbird, w
 **When** its listen backlog is checked
 **Then** it is at minimum 128 (per NFR20)
 
-**Given** a malformed or structurally invalid event payload on `POST /ingest`
+**Given** a malformed or structurally invalid event line on the ingest socket
 **When** the daemon attempts to parse it
-**Then** it returns 400 with a descriptive error and does not insert a partial row into the event log
+**Then** it returns `400 <reason>\n` and does not insert a partial row into the event log
 
 ### Story 1.4: Claude Code adapter and event normalization
 
@@ -444,6 +444,32 @@ So that I can build tools that show current Claude Code session state and recove
 **Given** `GET /sessions/:id/stats` with a valid bearer token
 **When** the response body contains an extra unknown field that was added in a future daemon release
 **Then** a v1.0 client that does not know about that field still deserializes the response without error (additive-compat validation)
+
+### Story 1.8: Tighten daemon `hook_kind` to a required transport field
+
+As a daemon maintainer,
+I want the ingest handler to require `hook_kind` on every payload (no default fallback) now that the shim from Story 1.5 is the only first-party ingest client,
+So that malformed or non-shim writers fail loudly with a `400` instead of silently being interpreted as `PreToolUse`.
+
+Follow-up to [ADR-0002 §Consequences](../../decisions/0002-ingest-wire-framing-and-hook-kind.md#consequences) and the deferred-work entry from the Story 1.4 review (`docs/bmad/implementation-artifacts/deferred-work.md` line 37).
+
+**Acceptance Criteria:**
+
+**Given** an ingest line whose JSON object has no `hook_kind` field
+**When** the daemon parses it
+**Then** the daemon returns `400 missing hook_kind\n` and inserts no row, and the `"PreToolUse"` default at `crates/daemon/src/ingest/handler.rs:53-57` is removed
+
+**Given** an ingest line with `hook_kind` set to a value the adapter does not recognize
+**When** the daemon parses it
+**Then** the daemon returns `400 unknown hook_kind: <value>\n` and inserts no row
+
+**Given** the existing contract test suite (daemon + shim)
+**When** Story 1.8 lands
+**Then** all tests previously relying on the default still pass, either by injecting an explicit `hook_kind` or by asserting the new `400` response
+
+**Given** Story 1.8 is merged
+**When** `docs/bmad/implementation-artifacts/deferred-work.md` is reviewed
+**Then** the line-37 entry ("hook_kind defaults to PreToolUse when absent ...") has been struck with a backlink to the merging PR or commit
 
 ---
 
