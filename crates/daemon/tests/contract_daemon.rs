@@ -672,3 +672,61 @@ async fn ingest_eof_before_newline_is_silent() {
     );
     shutdown.cancel();
 }
+
+// ─── Story 1.5: shim ↔ daemon e2e round-trip ────────────────────────────────
+//
+// Spawns the real `bowerbird-shim` binary via assert_cmd, points it at a temp
+// ingest socket served by the real `ingest::listener::run` loop, and asserts
+// the daemon's mpsc receives one normalized envelope. Chosen location:
+// `crates/daemon/tests/contract_daemon.rs` (over a new `crates/shim/tests/
+// e2e_against_daemon.rs`) so we don't introduce a daemon dev-dep on the shim
+// crate — the daemon already owns the ingest contract.
+
+#[tokio::test(flavor = "current_thread")]
+async fn shim_binary_round_trip_to_daemon_ingest() {
+    let tmp = TempDir::new().expect("tempdir");
+    let log_tmp = TempDir::new().expect("log tmpdir");
+    let log_path = log_tmp.path().join("shim.log");
+    let (shutdown, sock_path, mut rx) = start_ingest_listener(&tmp, 16).await;
+
+    let sock_str = sock_path.to_string_lossy().into_owned();
+    let log_str = log_path.to_string_lossy().into_owned();
+
+    // Mirror crates/adapter-claude/tests/fixtures/pre_tool_use_bash.json.
+    let stdin =
+        br#"{"hook_kind":"PreToolUse","session_id":"test-session-abc123","tool_name":"Bash","tool_input":{"command":"cargo test"}}"#;
+
+    // Run the shim binary on a blocking task — assert_cmd is sync.
+    let shim_result = tokio::task::spawn_blocking(move || {
+        Command::cargo_bin("bowerbird-shim")
+            .expect("cargo_bin shim")
+            .arg("--hook-kind")
+            .arg("PreToolUse")
+            .env("BOWERBIRD_INGEST_SOCK", &sock_str)
+            .env("BOWERBIRD_SHIM_LOG", &log_str)
+            .write_stdin(stdin.to_vec())
+            .output()
+            .expect("shim spawn")
+    })
+    .await
+    .expect("join shim task");
+
+    let code = shim_result.status.code().expect("clean exit");
+    assert_eq!(
+        code,
+        0,
+        "shim should exit 0 against real daemon; stderr: {:?}, stdout: {:?}",
+        String::from_utf8_lossy(&shim_result.stderr),
+        String::from_utf8_lossy(&shim_result.stdout),
+    );
+
+    let envelope = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("timeout waiting for envelope")
+        .expect("channel closed");
+    assert_eq!(envelope.kind, EventKind::PreToolUse);
+    assert_eq!(envelope.source, "claude");
+    assert_eq!(envelope.session_id, "test-session-abc123");
+
+    shutdown.cancel();
+}

@@ -23,3 +23,38 @@ jobs:
         shell: bash
         run: ./scripts/lint-inline-sql.sh
       - run: cargo test --workspace
+
+  shim-bench-gate:
+    name: Shim hot-path bench (p99 ≤ 5ms, +15% regression fails)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            baseline: macos.json
+          - os: ubuntu-latest
+            baseline: linux.json
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build shim under release-shim profile
+        run: cargo build --profile release-shim -p bowerbird-shim
+
+      - name: Run hot-path bench (per-invocation timings → summary JSON)
+        run: cargo bench --profile release-shim -p bowerbird-shim --bench hot_path
+
+      - name: Gate current p99 (absolute 5ms + 15% vs committed baseline)
+        shell: bash
+        run: |
+          python3 scripts/check-shim-bench-p99.py \
+            target/shim-bench-summary.json \
+            crates/shim/benches/baselines/${{ matrix.baseline }}
+
+      - name: Upload bench summary (for baseline seeding)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shim-bench-${{ matrix.os }}
+          path: target/shim-bench-summary.json
+          if-no-files-found: warn

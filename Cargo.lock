@@ -211,7 +211,9 @@ dependencies = [
 name = "bowerbird-shim"
 version = "0.1.0"
 dependencies = [
- "protocol",
+ "assert_cmd",
+ "serde_json",
+ "tempfile",
  "thiserror",
 ]
 
