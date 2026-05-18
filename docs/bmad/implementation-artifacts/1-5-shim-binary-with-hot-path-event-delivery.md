@@ -143,6 +143,33 @@ So that bowerbird is invisible during normal coding sessions and never causes Cl
   - [x] `cargo bench -p bowerbird-shim` — produces a baseline locally; commit the result under `crates/shim/benches/baselines/<platform>.json` (or wait for CI to seed; either works for the first run). **Correction (post-CI first run):** local seeding was withdrawn — see Task 9 above. Both baselines are now seeded exclusively from CI artifacts.
   - [x] Run `grep -rn 'tokio\|async fn\|\.await' crates/shim/src/` — must produce zero matches (this is what AC #6's contract test automates). **Confirmed: 0 matches.**
 
+### Review Findings
+
+- [ ] [Review][Patch] HIGH: Commit per-platform Criterion baselines and make missing baselines fail the bench gate [.github/workflows/ci.yml:47]
+  - **Evidence:** `.github/workflows/ci.yml` checks for `crates/shim/benches/baselines/${{ matrix.baseline }}`, but the branch currently adds only `crates/shim/benches/README.md` and `crates/shim/benches/hot_path.rs`; no `baselines/linux.json` or `baselines/macos.json` exists.
+  - **Why it matters:** AC #1 requires "baselines committed as files, per-platform." With no committed baselines, the new `shim-bench-gate` job warns and exits `0`, so the regression gate is unarmed on both platforms.
+  - **Implementor detail:** Add `crates/shim/benches/baselines/linux.json` and `crates/shim/benches/baselines/macos.json` from GitHub Actions runner artifacts. Then change the missing-baseline branch at `.github/workflows/ci.yml:93-102` to fail the job instead of soft-passing. If a bootstrap flow is still needed, keep it outside the required PR gate rather than making the required gate optional.
+
+- [ ] [Review][Patch] HIGH: Gate p99 latency and absolute p99 <=5ms, not Criterion mean-only regression [.github/workflows/ci.yml:77]
+  - **Evidence:** The workflow reads `data["mean"]["point_estimate"]` from `target/criterion/uds_post_ingest/change/estimates.json` and prints it as a p99 regression. The job title, README, and AC #1 all say the gate is p99-based, and AC #1 also requires absolute p99 latency to be <=5ms per platform.
+  - **Why it matters:** A high-tail regression can pass if the mean stays acceptable. A baseline that is already over 5ms can also pass because the workflow never checks the current run against the absolute 5ms budget.
+  - **Implementor detail:** Update the gate to enforce both conditions: `current_p99 <= 5ms` and `current_p99 <= baseline_p99 * 1.15`. If Criterion's `estimates.json` cannot provide p99 directly, add a small custom timing harness or sidecar script that records per-invocation durations, sorts them, writes `p99_nanos`, and gates against committed baseline JSON in that schema. Update `crates/shim/benches/README.md` so it no longer says the gate uses the "mean change estimate."
+
+- [ ] [Review][Patch] MEDIUM: Reject stdin payloads larger than the 1 MiB cap instead of silently truncating [crates/shim/src/main.rs:123]
+  - **Evidence:** `read_stdin_capped()` uses `stdin.lock().take(MAX_STDIN_BYTES).read_to_end(&mut buf)`. `take()` stops at the cap but does not report whether more bytes existed.
+  - **Why it matters:** If the first 1 MiB is valid JSON, bytes after the cap are silently discarded and the shim can deliver a partial event as if it were complete.
+  - **Implementor detail:** Read `MAX_STDIN_BYTES + 1` bytes. If `buf.len() > MAX_STDIN_BYTES`, return a new `Error::StdinTooLarge` variant mapped to exit `1` and log level `ERROR`. Add a contract test that sends a payload over the cap, asserts nonzero exit, one ERROR log line, and no request captured by the mock ingest server.
+
+- [ ] [Review][Patch] MEDIUM: Include the ingest socket path in connect-failure log output and assert it in the contract test [crates/shim/src/socket.rs:19]
+  - **Evidence:** `socket::send()` maps connect failure to `Error::Connect(std::io::Error)`, and the `Display` implementation for that variant includes only the I/O error. The story's Task 7 says the connection-refused log should reference the socket path, but `shim_exit_nonzero_on_connection_refused` only asserts `ERROR` and one newline.
+  - **Why it matters:** Without the socket path, a user or implementor cannot tell which socket location failed, especially when tests and future install flows can override `BOWERBIRD_INGEST_SOCK`.
+  - **Implementor detail:** Change `Error::Connect` to carry the socket path, for example `Connect { path: PathBuf, source: std::io::Error }`. In `socket::send`, map connect failures with `sock_path.to_path_buf()`. Update `error.rs` sample variants/tests and extend `shim_exit_nonzero_on_connection_refused` to assert that the log line contains the bogus socket path.
+
+- [ ] [Review][Patch] MEDIUM: Remove the unused `protocol` dependency from the shim dependency surface [crates/shim/Cargo.toml:15]
+  - **Evidence:** `crates/shim/Cargo.toml` still lists `protocol = { path = "../protocol" }`, but `crates/shim/src/**` does not use it.
+  - **Why it matters:** Task 1 explicitly says the shim ships with stdlib + `serde_json` + `thiserror` only. Keeping `protocol` widens the hot-path dependency surface and can hide future transitive dependency growth.
+  - **Implementor detail:** Remove the `protocol` dependency from `crates/shim/Cargo.toml`, rebuild to refresh `Cargo.lock`, and verify with `cargo tree -p bowerbird-shim --edges normal` that `protocol` and daemon-side dependencies are absent.
+
 ## Dev Notes
 
 ### Wire Protocol (DO NOT BE MISLED BY THE ARCHITECTURE TEXT)
