@@ -147,7 +147,9 @@ So that bowerbird is invisible during normal coding sessions and never causes Cl
 
 ### Wire Protocol (DO NOT BE MISLED BY THE ARCHITECTURE TEXT)
 
-**The architecture document and PRD both say "POST /ingest via HTTP/1.1 over the Unix domain socket"** (architecture.md:984-985 mark wire framing as "TBD at implementation time"; PRD line 365). **Story 1.3 resolved this as newline-delimited JSON, NOT HTTP.** The shipped daemon at `crates/daemon/src/ingest/handler.rs` reads a single `\n`-terminated line as a JSON object and writes `200\n`, `503\n`, or `400 <reason>\n` back.
+**Authoritative reference: [ADR 0002](../../decisions/0002-ingest-wire-framing-and-hook-kind.md)** — formalizes both the NDJ wire framing and the `hook_kind` injection model described below. Read it first if any of the architecture/PRD text below seems to contradict the daemon's actual behavior.
+
+**The architecture document and PRD both say "POST /ingest via HTTP/1.1 over the Unix domain socket"** (architecture.md:984-985 mark wire framing as "TBD at implementation time"; PRD line 365). **Story 1.3 resolved this as newline-delimited JSON, NOT HTTP**, and ADR 0002 ratifies the choice. The shipped daemon at `crates/daemon/src/ingest/handler.rs` reads a single `\n`-terminated line as a JSON object and writes `200\n`, `503\n`, or `400 <reason>\n` back.
 
 **Wire contract (the source of truth — verified against `crates/daemon/src/ingest/handler.rs`):**
 - **Request:** `<valid JSON object>\n` — ONE object, terminated by ONE LF
@@ -326,6 +328,7 @@ For this story, expect the dev to land:
 
 ### References
 
+- [Source: docs/decisions/0002-ingest-wire-framing-and-hook-kind.md] — **authoritative** wire-framing + `hook_kind` decisions that supersede contradictory PRD/architecture text
 - [Source: docs/bmad/planning-artifacts/epics.md#Story-1.5] — original AC text
 - [Source: docs/bmad/planning-artifacts/architecture.md#OQ#1-Shim-when-daemon-down] — fire-and-forget design (lines 123-138)
 - [Source: docs/bmad/planning-artifacts/architecture.md#Process-Conventions] — exit code semantics (lines 610-627)
