@@ -362,7 +362,7 @@ The ingest path uses a Unix domain socket with filesystem-permission security �
 Reserved (not implemented in v1): `GET /metrics` — Prometheus text format; path reserved now.
 
 **Ingest endpoint (Unix socket):**
-`POST /ingest` via HTTP/1.1 over the Unix domain socket. Returns synchronously after the event is accepted into the write queue — not after it is persisted to SQLite. The shim gets an ACK within the 5ms budget; actual persistence happens asynchronously. Under backpressure (write queue full), the daemon returns `503` and the shim logs to `~/.bowerbird/shim.log` and exits cleanly (exit 0). If the daemon is unreachable (socket does not exist, `ECONNREFUSED`), the shim logs to `~/.bowerbird/shim.log` and exits non-zero — surfacing to Claude Code that the hook failed.
+Newline-delimited JSON over the Unix domain socket — one `{event-object}\n` request, one status-line response (`200\n` on accept, `503\n` under backpressure, `400 <reason>\n` on malformed payload). See [ADR-0002](../../decisions/0002-ingest-wire-framing-and-hook-kind.md) for the wire contract; supersedes the earlier "POST /ingest via HTTP/1.1" wording. The daemon returns the `200` synchronously after the event is accepted into the write queue — not after it is persisted to SQLite. The shim gets an ACK within the 5ms budget; actual persistence happens asynchronously. Under backpressure (`503`), the shim logs to `~/.bowerbird/shim.log` and exits cleanly (exit 0). If the daemon is unreachable (socket does not exist, `ECONNREFUSED`), the shim logs to `~/.bowerbird/shim.log` and exits non-zero — surfacing to Claude Code that the hook failed.
 
 #### WebSocket (TCP, Bearer Auth)
 
