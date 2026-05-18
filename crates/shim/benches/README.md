@@ -12,27 +12,32 @@ invocation latency against a synchronous stdlib UDS mock. CI gates the
 
 Each file is a copy of Criterion's `target/criterion/uds_post_ingest/<id>/estimates.json`.
 
-## Initial seeding (first green run on each platform)
+## Initial seeding (both baselines come from CI)
 
-1. Locally on the dev's machine, after Tasks 1–5 of Story 1.5 are
-   implemented, run:
-   ```sh
-   cargo bench -p bowerbird-shim --profile release-shim -- \
-     --save-baseline initial uds_post_ingest
-   ```
-2. Copy `target/criterion/uds_post_ingest/initial/estimates.json` into
-   `crates/shim/benches/baselines/<host-platform>.json`
-   (`macos.json` on macOS, `linux.json` on Linux). Commit.
-3. CI's first run on the *other* platform will emit a `::warning::`
-   annotation (not a failure) noting the missing baseline. The gate is
-   unarmed for that platform until the baseline lands. Download the
-   `criterion-<runner-os>` artifact from the workflow run, copy
-   `target/criterion/uds_post_ingest/new/estimates.json` into the
-   missing baseline file, and commit it (separate PR or part of the
-   next one, your choice).
-4. Once both `macos.json` and `linux.json` exist, all subsequent CI
-   runs use `--load-baseline` against them and gate at +15% regression
-   on the mean change estimate.
+**Important:** baselines must be seeded from CI runner artifacts, NOT
+from local dev runs. Local hardware (especially Docker / VM dev
+environments) can be 20–40% off from the GitHub Actions runner on this
+workload, easily exceeding the +15% gate threshold. Seeding from a
+local run produces a baseline that fails its own first CI verification.
+
+For each platform (`linux.json` and `macos.json`):
+
+1. Wait for any CI run to complete on a branch that builds the shim
+   (this PR or `main`). The `shim-bench-gate` job emits a
+   `::warning::` annotation noting the missing baseline and uploads
+   `target/criterion/**` as a workflow artifact named
+   `criterion-<runner-os>` (e.g. `criterion-ubuntu-latest`,
+   `criterion-macos-latest`).
+2. Download the artifact from the GitHub Actions run UI.
+3. Copy `target/criterion/uds_post_ingest/new/estimates.json` into
+   `crates/shim/benches/baselines/<platform>.json`
+   (`linux.json` from `criterion-ubuntu-latest`, `macos.json` from
+   `criterion-macos-latest`).
+4. Commit the baseline file. The next CI run will use it as the gate
+   baseline.
+
+Once both baselines exist, every subsequent CI run loads them and
+gates at +15% regression on the mean change estimate.
 
 **Why soft-fail on missing baseline?** A brand-new platform shouldn't
 red-light an otherwise-green PR. The committed baseline IS the gate;
@@ -69,9 +74,9 @@ order of preference):
 ## Refresh procedure (deliberate baseline bump)
 
 1. Open a PR.
-2. Run the bench locally on the matching platform (or pull the
-   `criterion-<runner-os>` artifact from CI after a green run on a
-   different baseline file).
+2. Pull the `criterion-<runner-os>` artifact from a green CI run on
+   the PR (do NOT run the bench locally — CI hardware is the source
+   of truth; see "Initial seeding" above for why).
 3. Copy the new `estimates.json` over the committed baseline.
 4. In the PR description, include:
    - the previous and new p99 numbers,
