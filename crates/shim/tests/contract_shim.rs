@@ -192,6 +192,11 @@ fn shim_exit_nonzero_on_connection_refused() {
         1,
         "expected exactly one log line, got: {log_contents:?}"
     );
+    let sock_str = bogus_sock.to_string_lossy().into_owned();
+    assert!(
+        log_contents.contains(&sock_str),
+        "log line must include the socket path that failed to connect, got: {log_contents:?}"
+    );
 }
 
 // ─── AC #4: 503 → exit 0 with warning log ────────────────────────────────────
@@ -442,6 +447,78 @@ fn shim_preserves_existing_hook_event_name_field() {
         obj.get("hook_kind").and_then(|v| v.as_str()),
         Some("PreToolUse"),
         "hook_kind must be injected by the shim"
+    );
+}
+
+// ─── Stdin > 1 MiB cap → reject, do not silently truncate ────────────────────
+
+#[test]
+fn shim_rejects_stdin_over_1mib_cap() {
+    let tmp = TempDir::new().expect("tempdir");
+    let log_tmp = TempDir::new().expect("log tmpdir");
+    let log = log_tmp.path().join("shim.log");
+    let mock = start_mock_ingest(&tmp, b"200\n");
+
+    // The smoking-gun construction for the silent-truncation hazard: the
+    // first 1 MiB of stdin is a complete, valid JSON object. Anything past
+    // the cap is extra bytes. Under the old `take(1 MiB).read_to_end()` flow
+    // serde_json would happily parse the first 1 MiB and the shim would
+    // deliver a partial event as if it were complete. The fix MUST detect
+    // the overflow before parsing.
+    const ONE_MIB: usize = 1 << 20;
+    let prefix = r#"{"k":""#;
+    let suffix = r#""}"#;
+    let padding = "a".repeat(ONE_MIB - prefix.len() - suffix.len());
+    let mut oversized = String::with_capacity(ONE_MIB + 16);
+    oversized.push_str(prefix);
+    oversized.push_str(&padding);
+    oversized.push_str(suffix);
+    assert_eq!(
+        oversized.len(),
+        ONE_MIB,
+        "first 1 MiB must be exactly a valid JSON object"
+    );
+    // Append a trailing byte so the total exceeds the cap. Anything works;
+    // the shim must reject without inspecting trailing content.
+    oversized.push('X');
+    assert!(oversized.len() > ONE_MIB);
+
+    let out = run_shim_with_env(
+        &mock.sock_path,
+        &log,
+        "PreToolUse",
+        oversized.as_bytes(),
+        None,
+    );
+
+    let code = out.status.code().expect("exited cleanly");
+    assert_ne!(code, 0, "oversized stdin must fail (got exit {code})");
+    assert_ne!(code, 2, "exit code 2 is forbidden");
+
+    let log_contents = std::fs::read_to_string(&log).expect("log should exist");
+    assert!(
+        log_contents.contains("ERROR"),
+        "oversized stdin must log ERROR: {log_contents:?}"
+    );
+    assert_eq!(
+        log_contents.matches('\n').count(),
+        1,
+        "expected exactly one ERROR line, got: {log_contents:?}"
+    );
+    // The log line must reference the cap so a triaging operator can tell
+    // this from generic "stdin parse failed" noise.
+    assert!(
+        log_contents.to_lowercase().contains("too large"),
+        "oversized stdin log should describe the size cap, got: {log_contents:?}"
+    );
+
+    // Sleep briefly to give the mock listener a chance to capture if the shim
+    // (incorrectly) sent anything before bailing.
+    thread::sleep(Duration::from_millis(50));
+    let captured_len = mock.captured.lock().expect("lock").len();
+    assert_eq!(
+        captured_len, 0,
+        "no bytes should reach the daemon when stdin is over the cap, got {captured_len} bytes"
     );
 }
 

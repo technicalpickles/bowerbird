@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use error::{Error, Result};
 
-const MAX_STDIN_BYTES: u64 = 1 << 20; // 1 MiB cap on hook payload
+const MAX_STDIN_BYTES: usize = 1 << 20; // 1 MiB cap on hook payload
 
 fn main() {
     // Resolve log_path BEFORE attempting any work that might need to log.
@@ -121,9 +121,17 @@ fn home_env() -> Result<OsString> {
 }
 
 fn read_stdin_capped() -> Result<Vec<u8>> {
+    // Read one byte past the cap so we can distinguish "payload fits" from
+    // "payload was truncated to the cap." `take()` alone reports neither;
+    // it just stops at the limit.
     let stdin = std::io::stdin();
-    let mut handle = stdin.lock().take(MAX_STDIN_BYTES);
+    let mut handle = stdin.lock().take((MAX_STDIN_BYTES as u64) + 1);
     let mut buf = Vec::with_capacity(4096);
     handle.read_to_end(&mut buf).map_err(Error::Stdin)?;
+    if buf.len() > MAX_STDIN_BYTES {
+        return Err(Error::StdinTooLarge {
+            cap_bytes: MAX_STDIN_BYTES,
+        });
+    }
     Ok(buf)
 }

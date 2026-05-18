@@ -16,7 +16,10 @@ pub(crate) enum Response {
 ///
 /// `wire_bytes` MUST already include the trailing `\n` framing byte.
 pub(crate) fn send(sock_path: &Path, wire_bytes: &[u8]) -> Result<Response> {
-    let stream = UnixStream::connect(sock_path).map_err(Error::Connect)?;
+    let stream = UnixStream::connect(sock_path).map_err(|source| Error::Connect {
+        path: sock_path.to_path_buf(),
+        source,
+    })?;
 
     // Tight per-op timeouts keep the total budget under 5ms even when the
     // daemon is slow to respond. Total = write + read ≤ 5ms in the worst case.

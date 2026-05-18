@@ -41,70 +41,20 @@ jobs:
       - name: Build shim under release-shim profile
         run: cargo build --profile release-shim -p bowerbird-shim
 
-      - name: Run hot-path bench (save current run)
-        run: cargo bench --profile release-shim -p bowerbird-shim --bench hot_path -- --save-baseline ci-current uds_post_ingest
+      - name: Run hot-path bench (per-invocation timings → summary JSON)
+        run: cargo bench --profile release-shim -p bowerbird-shim --bench hot_path
 
-      - name: Check baseline file exists
-        id: baseline-check
+      - name: Gate current p99 (absolute 5ms + 15% vs committed baseline)
         shell: bash
         run: |
-          if [ -f "crates/shim/benches/baselines/${{ matrix.baseline }}" ]; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::No committed baseline at crates/shim/benches/baselines/${{ matrix.baseline }} — gate will fail. Download the criterion-output artifact and commit it as the baseline."
-          fi
+          python3 scripts/check-shim-bench-p99.py \
+            target/shim-bench-summary.json \
+            crates/shim/benches/baselines/${{ matrix.baseline }}
 
-      - name: Seed platform-committed baseline (when present)
-        if: steps.baseline-check.outputs.exists == 'true'
-        shell: bash
-        run: |
-          target_dir="target/criterion/uds_post_ingest/platform-committed"
-          mkdir -p "$target_dir"
-          cp "crates/shim/benches/baselines/${{ matrix.baseline }}" "$target_dir/estimates.json"
-
-      - name: Gate against committed baseline (fail on +15% regression)
-        if: steps.baseline-check.outputs.exists == 'true'
-        shell: bash
-        run: |
-          set -e
-          # Re-run the bench, this time loading the committed baseline. Criterion
-          # writes a change report under target/criterion/<bench>/change/.
-          cargo bench --profile release-shim -p bowerbird-shim --bench hot_path -- \
-            --load-baseline platform-committed uds_post_ingest \
-            2>&1 | tee bench-output.log
-
-          # Hard +15% gate via the change estimate in estimates.json.
-          python3 - <<'PY'
-          import json, sys
-          path = "target/criterion/uds_post_ingest/change/estimates.json"
-          try:
-              with open(path) as fh:
-                  data = json.load(fh)
-              change = data["mean"]["point_estimate"]
-              print(f"Mean change vs committed baseline: {change*100:.2f}%")
-              if change > 0.15:
-                  print(f"::error::p99 regressed {change*100:.2f}% from committed baseline (>15% threshold).")
-                  sys.exit(1)
-          except FileNotFoundError:
-              print("No change report — first run on this platform; baseline now seeded.")
-          PY
-
-      - name: Warn when baseline missing (first run on this platform)
-        if: steps.baseline-check.outputs.exists == 'false'
-        shell: bash
-        run: |
-          echo "::warning::No committed baseline at crates/shim/benches/baselines/${{ matrix.baseline }}. This is expected on the first CI run for a new platform. To seed the baseline: download the criterion-${{ matrix.os }} artifact from this run, copy target/criterion/uds_post_ingest/new/estimates.json to crates/shim/benches/baselines/${{ matrix.baseline }}, and commit. See crates/shim/benches/README.md."
-          # Soft-fail: emit a warning and exit 0 so a brand-new platform doesn't
-          # red-light an otherwise-green PR. The committed baseline IS the gate;
-          # missing baseline means the gate is unarmed for this platform, not
-          # that the code is broken.
-          exit 0
-
-      - name: Upload criterion output for baseline seeding
+      - name: Upload bench summary (for baseline seeding)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: criterion-${{ matrix.os }}
-          path: target/criterion/**
+          name: shim-bench-${{ matrix.os }}
+          path: target/shim-bench-summary.json
           if-no-files-found: warn

@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -11,11 +13,18 @@ pub enum Error {
     #[error("stdin payload was not a JSON object")]
     StdinNotJsonObject,
 
+    #[error("stdin payload too large: exceeds {cap_bytes}-byte cap")]
+    StdinTooLarge { cap_bytes: usize },
+
     #[error("stdin JSON parse failed: {0}")]
     StdinJson(#[source] serde_json::Error),
 
-    #[error("connect to ingest socket failed: {0}")]
-    Connect(#[source] std::io::Error),
+    #[error("connect to ingest socket {} failed: {source}", path.display())]
+    Connect {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 
     #[error("socket I/O failed: {0}")]
     SocketIo(#[source] std::io::Error),
@@ -60,8 +69,9 @@ impl Error {
             Error::Stdin(_)
             | Error::StdinEmpty
             | Error::StdinNotJsonObject
+            | Error::StdinTooLarge { .. }
             | Error::StdinJson(_)
-            | Error::Connect(_)
+            | Error::Connect { .. }
             | Error::LogIo(_)
             | Error::BadArgs(_)
             | Error::NoHome => 1,
@@ -103,8 +113,12 @@ mod tests {
             Error::Stdin(dummy_io()),
             Error::StdinEmpty,
             Error::StdinNotJsonObject,
+            Error::StdinTooLarge { cap_bytes: 1 << 20 },
             Error::StdinJson(dummy_json_err()),
-            Error::Connect(dummy_io()),
+            Error::Connect {
+                path: PathBuf::from("/tmp/nope.sock"),
+                source: dummy_io(),
+            },
             Error::SocketIo(dummy_io()),
             Error::LogIo(dummy_io()),
             Error::BadResponse("x".into()),
