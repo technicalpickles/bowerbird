@@ -29,8 +29,8 @@ import sys
 from pathlib import Path
 
 SCHEMA_VERSION = 1
-ABSOLUTE_BUDGET_NS = 5_000_000  # 5 ms per AC #1
-REGRESSION_THRESHOLD = 1.15  # +15% over committed baseline fails
+DEFAULT_ABSOLUTE_BUDGET_NS = 5_000_000  # AC #1 default per platform; overridable per-baseline
+DEFAULT_REGRESSION_THRESHOLD = 1.15  # +15% over committed baseline fails by default
 
 
 def gh_error(msg: str) -> None:
@@ -92,27 +92,13 @@ def main() -> int:
 
     failed = False
 
-    # Absolute gate — current p99 must respect the AC #1 budget regardless of
-    # whether a baseline exists.
-    if p99_nanos > ABSOLUTE_BUDGET_NS:
-        gh_error(
-            f"AC #1 absolute gate FAILED: current p99 {fmt_ms(p99_nanos)} > 5ms budget. "
-            "If this is intentional, file an ADR per PRD line 181 before merging."
-        )
-        failed = True
-    else:
-        gh_notice(
-            f"AC #1 absolute gate OK: current p99 {fmt_ms(p99_nanos)} <= 5ms budget."
-        )
-
-    # Regression gate — requires a committed baseline. Missing baseline is a
-    # hard fail (the gate is unarmed otherwise). To seed: download the
-    # shim-bench-<runner-os> artifact from this run, copy
-    # target/shim-bench-summary.json into baselines/<platform>.json, commit.
+    # The regression gate needs a baseline; the absolute gate needs the
+    # per-platform budget that lives in the baseline. Load the baseline
+    # first so both gates use consistent policy.
     if not args.baseline_json.exists():
         gh_error(
-            f"No committed baseline at {args.baseline_json}. The regression gate "
-            "is unarmed without it. Download the shim-bench-<runner-os> artifact "
+            f"No committed baseline at {args.baseline_json}. Both gates are "
+            "unarmed without it. Download the shim-bench-<runner-os> artifact "
             "from this run, copy target/shim-bench-summary.json into "
             f"{args.baseline_json}, and commit. See crates/shim/benches/README.md."
         )
@@ -124,23 +110,56 @@ def main() -> int:
         gh_error(f"failed to read committed baseline: {exc}")
         return 2
 
-    baseline_p99 = int(baseline["p99_nanos"])
-    threshold = baseline_p99 * REGRESSION_THRESHOLD
-    delta_pct = (p99_nanos / baseline_p99 - 1.0) * 100.0 if baseline_p99 > 0 else 0.0
-    print(
-        f"Baseline: p99={fmt_ms(baseline_p99)}; current vs baseline delta: {delta_pct:+.2f}%"
-    )
-    if p99_nanos > threshold:
+    # Per-platform policy lives in the baseline file (ADR 0003). Falling back
+    # to the AC #1 defaults preserves behavior for baselines committed before
+    # the policy fields existed.
+    abs_budget_ns = int(baseline.get("absolute_budget_nanos") or DEFAULT_ABSOLUTE_BUDGET_NS)
+    regression_max = baseline.get("regression_max_ratio", DEFAULT_REGRESSION_THRESHOLD)
+
+    # Absolute gate
+    if p99_nanos > abs_budget_ns:
         gh_error(
-            f"p99 regression gate FAILED: current p99 {fmt_ms(p99_nanos)} > "
-            f"baseline {fmt_ms(baseline_p99)} * 1.15 ({fmt_ms(threshold)})."
+            f"absolute gate FAILED: current p99 {fmt_ms(p99_nanos)} > "
+            f"per-platform budget {fmt_ms(abs_budget_ns)}. "
+            "If this is intentional, update the baseline and the related ADR "
+            "before merging."
         )
         failed = True
     else:
         gh_notice(
-            f"p99 regression gate OK: current p99 {fmt_ms(p99_nanos)} within "
-            f"+15% of baseline {fmt_ms(baseline_p99)}."
+            f"absolute gate OK: current p99 {fmt_ms(p99_nanos)} <= "
+            f"{fmt_ms(abs_budget_ns)} budget."
         )
+
+    # Regression gate — skipped when the baseline explicitly opts out via
+    # `regression_max_ratio: null` (ADR 0003: macos-latest noise floor is
+    # wider than any meaningful percentage gate).
+    baseline_p99 = int(baseline["p99_nanos"])
+    delta_pct = (p99_nanos / baseline_p99 - 1.0) * 100.0 if baseline_p99 > 0 else 0.0
+    print(
+        f"Baseline: p99={fmt_ms(baseline_p99)}; current vs baseline delta: {delta_pct:+.2f}%"
+    )
+
+    if regression_max is None:
+        gh_notice(
+            "regression gate disabled by baseline policy (regression_max_ratio: null). "
+            "See ADR 0003 for the per-platform rationale."
+        )
+    else:
+        regression_max_f = float(regression_max)
+        threshold = baseline_p99 * regression_max_f
+        if p99_nanos > threshold:
+            gh_error(
+                f"p99 regression gate FAILED: current p99 {fmt_ms(p99_nanos)} > "
+                f"baseline {fmt_ms(baseline_p99)} * {regression_max_f:.2f} "
+                f"({fmt_ms(threshold)})."
+            )
+            failed = True
+        else:
+            gh_notice(
+                f"p99 regression gate OK: current p99 {fmt_ms(p99_nanos)} within "
+                f"{(regression_max_f - 1) * 100:+.0f}% of baseline {fmt_ms(baseline_p99)}."
+            )
 
     return 1 if failed else 0
 

@@ -16,7 +16,9 @@ gate enforces is a real per-invocation p99.
 - `baselines/macos.json` — committed baseline for `macos-latest` runners.
 - `baselines/linux.json` — committed baseline for `ubuntu-latest` runners.
 
-## Summary schema (committed baseline AND current-run output)
+## Summary schema
+
+The bench writes a minimal current-run summary:
 
 ```json
 {
@@ -27,16 +29,51 @@ gate enforces is a real per-invocation p99.
 }
 ```
 
+The committed baseline adds **per-platform policy fields** (introduced
+by ADR 0003 — see `docs/decisions/0003-shim-p99-budget-on-macos-latest.md`):
+
+```json
+{
+  "schema_version": 1,
+  "p99_nanos": 1102908,
+  "mean_nanos": 819448,
+  "samples": 200,
+  "absolute_budget_nanos": 5000000,
+  "regression_max_ratio": 1.15
+}
+```
+
+- `absolute_budget_nanos` — per-platform p99 ceiling (5 ms for
+  `linux.json`, 15 ms for `macos.json`). Missing field falls back to
+  5 ms.
+- `regression_max_ratio` — multiplier on the committed `p99_nanos`.
+  `null` disables the regression gate (currently set on `macos.json`
+  per ADR 0003; the runner's documented 4.3× noise floor makes no
+  percentage threshold meaningful). Missing field falls back to 1.15.
+
 `scripts/check-shim-bench-p99.py` reads both files and enforces:
 
-1. **Absolute gate:** `current p99_nanos <= 5_000_000` (5 ms per AC #1).
-2. **Regression gate:** `current p99_nanos <= committed p99_nanos * 1.15`.
-3. **Missing baseline = hard fail.** The regression gate is unarmed
-   without a committed baseline; the required CI job exits non-zero
-   until the baseline is committed.
+1. **Absolute gate:** `current p99_nanos <= absolute_budget_nanos`.
+2. **Regression gate:** `current p99_nanos <= committed p99_nanos * regression_max_ratio` (skipped when ratio is `null`).
+3. **Missing baseline = hard fail.** Both gates are unarmed without a
+   committed baseline; the required CI job exits non-zero until the
+   baseline is committed.
 
 Both gates run on every PR via the `shim-bench-gate` job in
 `.github/workflows/ci.yml`.
+
+## Current per-platform policy
+
+| Platform | Absolute budget | Regression gate | Source |
+|---|---|---|---|
+| `linux.json` | 5 ms | +15 % | AC #1 |
+| `macos.json` | 15 ms | disabled | ADR 0003 |
+
+`macos-latest` noise is documented in ADR 0003. The 15 ms ceiling
+absorbs the runner's measured spread (2.66 → 11.35 ms across three
+no-op runs). Regression detection on macOS is deferred to Option D
+follow-up work (rearchitect the shim away from per-invocation
+fork-exec).
 
 ## Bench configuration
 

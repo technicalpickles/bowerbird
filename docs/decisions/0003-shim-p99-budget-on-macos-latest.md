@@ -1,7 +1,7 @@
 # 0003. Shim p99 budget on `macos-latest` is unstable
 
 Date: 2026-05-18
-Status: Proposed (decision deferred — see "Open question")
+Status: Accepted
 Deciders: @pickles
 Related: PRD line 181 ("If the number can't be met cleanly, the right response is an ADR"); Story 1.5 Task 9 acknowledgment; Story 1.5 Review Findings 1 + 2
 Implementation: `.github/workflows/ci.yml` (`shim-bench-gate` job), `crates/shim/benches/hot_path.rs`, `crates/shim/benches/baselines/macos.json`
@@ -13,16 +13,17 @@ Story 1.5 AC #1 requires shim per-invocation p99 ≤ 5 ms on **both** `macos-lat
 
 > Acknowledge: if the first green CI run shows p99 > 5 ms on either platform, do NOT silently raise the threshold. Per PRD line 181, the right response is an ADR documenting the real number.
 
-After Story 1.5 review finding 2 replaced the Criterion-mean gate with a true per-invocation p99 harness (every invocation timed individually with `Instant::now`, sorted, p99 picked from the sorted samples), two back-to-back CI runs on the same code with no caching changes produced the following:
+After Story 1.5 review finding 2 replaced the Criterion-mean gate with a true per-invocation p99 harness (every invocation timed individually with `Instant::now`, sorted, p99 picked from the sorted samples), three back-to-back CI runs on the same code (or no-op text-only changes) with no caching changes produced the following:
 
 | Run | commit | linux p99 | macos p99 |
 |---|---|---|---|
 | 1 | `51e4a2f` | 1.103 ms | 2.664 ms |
-| 2 | `6741e8e` (baseline-seed only) | 1.203 ms (+9 %) | **6.188 ms (+132 %)** |
+| 2 | `6741e8e` (baseline-seed only) | 1.203 ms (+9 %) | 6.188 ms (+132 %) |
+| 3 | `451dd7a` (docs-only) | 1.197 ms (+8.5 %) | **11.345 ms (+326 %)** |
 
-`ubuntu-latest` is stable: the two runs differ by ≈ 9 %, well inside the +15 % regression gate.
+`ubuntu-latest` is stable: three runs all within ±10 % of the seeded baseline, well inside the +15 % regression gate.
 
-`macos-latest` is **not stable**: the same code measured 2.66 ms then 6.19 ms across two consecutive runs. Both numbers are real measurements from the official `macos-latest` GitHub-hosted runner, n=200 invocations each, warmup=20, with the bench harness from `crates/shim/benches/hot_path.rs`. The 6.19 ms run trips **both** halves of the gate: the absolute 5 ms AC #1 budget AND the +15 % regression threshold against the freshly-seeded 2.66 ms baseline.
+`macos-latest` is **not stable**: 2.66 → 6.19 → 11.35 ms on identical-behavior code, a 4.3× spread, with the mean climbing 2.54 → 4.0 → 5.2 ms across the same three runs. Every number is a real measurement from the official `macos-latest` GitHub-hosted runner, n=200 invocations each, warmup=20, with the bench harness from `crates/shim/benches/hot_path.rs`. Run 3 trips **both** halves of the original gate: the absolute 5 ms AC #1 budget AND the +15 % regression threshold against the freshly-seeded 2.66 ms baseline.
 
 This is not a real shim regression — no shim code changed between the two runs. It is `macos-latest`'s noise floor for fork-exec-heavy workloads. Plausible root causes (none confirmed; each is a hypothesis worth testing if the team decides to invest in fixing this):
 
@@ -35,11 +36,29 @@ Hypothesis: a single `macos-latest` run is informative about the day's runner st
 
 ## Decision
 
-**Status: Proposed.** This ADR records the problem and the option space; it does **not** pick a path. The team picks one (or stacks them) in a follow-up.
+**Chosen: Option B (per-platform absolute budget, regression gate disabled on macOS), with Option D kept as a future-work follow-up.**
 
-The implementation as of `6741e8e` is the strict-on-everything gate from Story 1.5 review finding 1: missing baseline = fail, absolute budget violation = fail, +15 % regression = fail. That gate is now correct AND will block PRs on `macos-latest` noise unrelated to shim changes. Something must change before this branch can merge to `main` without leaving a chronically-red required check on every subsequent PR.
+The Story 1.5 review finding 1 + 2 work made the gate truthful: it now measures and enforces a real per-invocation p99. With that gate in place, three CI runs revealed `macos-latest` has a 4.3× p99 spread on unchanged code. The mean climbing across consecutive runs suggests the noise is not a transient first-run effect; it is the shared runner's baseline behavior for fork-exec-heavy workloads.
 
-## Option space
+Per-platform thresholds now live in the committed baseline file itself (`crates/shim/benches/baselines/<platform>.json`). The gate script (`scripts/check-shim-bench-p99.py`) reads two optional fields:
+
+- `absolute_budget_nanos` — per-platform absolute p99 ceiling. Missing field falls back to the original AC #1 default (5_000_000 ns).
+- `regression_max_ratio` — multiplier on the committed `p99_nanos`. Missing or null disables the regression gate. Missing falls back to 1.15.
+
+Committed policy:
+
+| Platform | absolute_budget_nanos | regression_max_ratio | Rationale |
+|---|---|---|---|
+| `linux.json` | `5_000_000` (5 ms) | `1.15` | AC #1 as originally written. `ubuntu-latest` is stable enough that the regression gate is meaningful (three runs within ±10 %). |
+| `macos.json` | `15_000_000` (15 ms) | `null` (disabled) | Worst observed p99 across three runs is 11.345 ms. 15 ms = ≈ 1.32× headroom over worst observed, absorbing the documented runner noise floor while still catching order-of-magnitude regressions. Regression gate disabled because no percentage threshold is meaningful against a baseline whose observed spread is 4.3×. |
+
+Option D (rearchitect the shim away from per-invocation fork-exec) is the path to actually fix this — not absorb it. Recording it as future work, not as a Story 1.5 follow-up:
+
+- Today, every Claude Code hook invokes `bowerbird-shim` as a fresh process.
+- Story 3.1 (`bowerbird install`) is the obvious place to consider an alternative deployment shape — for example, the shim becoming a small UDS client that hands off to a long-running per-session process. That changes the cost model from "fork-exec on every hook" to "fork-exec once per session." Worth designing for if `macos-latest`'s noise remains the bottleneck.
+- Without Option D, the macOS gate is honest about the runner but not informative about shim perf changes on macOS. A real macOS shim regression would need to be enormous to trip the 15 ms ceiling.
+
+## Option space considered
 
 Each option below resolves the immediate blocker for this PR. Trade-offs are spelled out so the team can weigh them.
 
@@ -83,21 +102,16 @@ Crank `SHIM_BENCH_SAMPLES` from 200 to 1000+ and `SHIM_BENCH_WARMUP` from 20 to 
 - **Con:** speculative — there is no evidence yet that warmup-tightening is sufficient. If macOS noise is steady-state (CPU steal mid-run, not cold cache), longer runs don't help.
 - **Cost:** one env-var change, one CI re-push, evaluate.
 
-## Open question
-
-**Pick one (or stack: e.g. E first, A if E doesn't help; B + C; etc.).** The PR cannot merge without one of these landing. Recommend E as a 5-minute experiment first, then either A or B as the durable answer if E doesn't tighten the noise floor.
-
 ## Consequences
 
-Until this is resolved:
-
-- The Story 1.5 PR has `shim-bench-gate (macos-latest)` failing red on every push.
-- Linux gate is honest and operational.
-- The strict-on-missing-baseline design from finding 1 is correct — do NOT roll that back to soft-pass as a workaround. The macOS issue is a budget question, not a gate question.
-- AC #1 is satisfied on `ubuntu-latest` (p99 ≈ 1.1 ms) and **arguably** satisfied on `macos-latest` in clean conditions (p99 ≈ 2.6 ms in run 1). The noise floor is the new datum that wasn't visible under the old mean-only gate.
+- `crates/shim/benches/baselines/macos.json` documents the chosen macOS budget (15 ms) and the disabled regression policy. The baseline `p99_nanos` value (2.66 ms — best observed in run 1) stays as the canonical "good day" reference and is informational only without the regression gate.
+- `crates/shim/benches/baselines/linux.json` keeps the AC #1 5 ms budget and the +15 % regression threshold, explicitly written into the baseline rather than relying on script defaults — so per-platform policy is auditable in version control.
+- AC #1 in the Story 1.5 file ("p99 latency is ≤ 5 ms per platform") is technically amended for `macos-latest` by this ADR; the story file links here as the canonical record rather than rewriting the original AC text.
+- The Story 1.5 PR can land. Both bench-gate jobs should now pass: linux on the strict gate, macOS on the wider absolute budget with regression detection deferred.
+- Option D is the path to fix this if Story 3.1 (or anything else) needs macOS shim perf to be trustworthy. Worth a separate ADR if it gets picked up.
 
 ## Revisit when
 
-- A decision is made on the option-space above (move Status from Proposed → Accepted with the chosen path, or supersede this ADR with one that picks a specific direction).
-- The runner topology changes (GitHub deprecates `macos-latest`, your team adds self-hosted macOS hardware, etc.).
-- Story 3.1 (`bowerbird install`) lands and the shim's deployment model shifts in a way that affects per-invocation cost.
+- A real macOS shim regression slips past the 15 ms budget — at which point Option D moves from "follow-up" to "required" and this ADR is superseded.
+- The runner topology changes (GitHub deprecates `macos-latest`, your team adds self-hosted macOS hardware, etc.) — re-evaluate whether the budget can be tightened.
+- Story 3.1 (`bowerbird install`) lands and the shim's deployment model shifts in a way that affects per-invocation cost — re-examine the macOS budget and whether the regression gate can be re-enabled with a meaningful threshold.
