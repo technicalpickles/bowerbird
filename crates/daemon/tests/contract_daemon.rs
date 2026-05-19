@@ -963,23 +963,37 @@ async fn state_machine_full_sequence_determinism() {
 }
 
 /// AC #2 — Atomicity contract: an `INSERT INTO events` and its matching
-/// `UPSERT INTO session_projections` commit together or not at all. This test
-/// spawns the real daemon binary, sends a valid ingest event, observes the
-/// `200\n` ACK, then SIGKILLs the daemon mid-flight (no graceful shutdown).
-/// On reopen, every `(source, session_id)` in `events` must have a matching
-/// `session_projections` row — or be rebuildable from the event log.
+/// `UPSERT INTO session_projections` commit together or not at all. Per
+/// `project-context.md` lines 291, 589, 700, the validation strategy is a
+/// **SIGKILL during a load run**: push a stream of events through the daemon,
+/// kill it while events are in flight, and prove on restart that the surviving
+/// `events` rows all have matching `session_projections` rows (and vice versa).
+/// Events that were ACK'd but not yet committed at SIGKILL time are expected
+/// to be lost — PRD Journey 4 explicitly accepts this. What matters is "no
+/// half-state": every committed event has a committed projection.
+///
+/// Coverage triangle for AC #2:
+///   - `state_plus_event_atomicity_rollback` — explicit `tx.rollback()` covers
+///     the crash-before-commit path (one transaction, two writes, no commit →
+///     zero rows).
+///   - this test — SIGKILL during real load via the daemon binary covers the
+///     async crash-during-commit-stream path through the WAL.
+///   - the single-transaction discipline in `projection::session::write`
+///     covers the property by construction (one `tx.commit()` for both writes).
 ///
 /// Supersedes the `drop(pool)` surrogate in `wal_durability_after_simulated_crash`
 /// (which exits cleanly through rusqlite's destructor). SIGKILL skips
 /// destructors entirely and exercises a different failure mode.
 #[tokio::test(flavor = "current_thread")]
-async fn state_plus_event_atomicity_under_sigkill() {
+async fn state_plus_event_atomicity_under_sigkill_during_load() {
     use std::io::{Read as _, Write as _};
     use std::os::unix::net::UnixStream as StdUnixStream;
     use std::process::{Command as StdCommand, Stdio};
 
     use nix::sys::signal::{kill, Signal};
     use nix::unistd::Pid;
+
+    const LOAD_EVENT_COUNT: usize = 25;
 
     let tmp = TempDir::new().expect("tempdir");
     let bowerbird_dir = tmp.path().join(".bowerbird");
@@ -1027,33 +1041,59 @@ async fn state_plus_event_atomicity_under_sigkill() {
         panic!("daemon never bound ingest.sock at {}", sock_path.display());
     }
 
-    // Send one valid event over the ingest socket and read the ACK byte.
-    let send_recv = tokio::task::spawn_blocking({
+    // Fire N events as fast as we can, spread across several sessions so the
+    // post-restart orphan check is exercised on a real-shaped projection set.
+    // Each event is its own UDS connection — accept-then-close per line is the
+    // wire shape the shim uses. We do not wait for individual commit; the
+    // point is to have writes in flight when SIGKILL lands.
+    let sender_handle = tokio::task::spawn_blocking({
         let sock_path = sock_path.clone();
-        move || -> std::io::Result<String> {
-            let mut stream = StdUnixStream::connect(&sock_path)?;
-            let line = br#"{"hook_kind":"PreToolUse","session_id":"sess-x","tool_name":"Bash"}"#;
-            stream.write_all(line)?;
-            stream.write_all(b"\n")?;
-            stream.flush()?;
-            stream.shutdown(std::net::Shutdown::Write)?;
-            let mut response = String::new();
-            stream.read_to_string(&mut response)?;
-            Ok(response)
+        move || -> std::io::Result<usize> {
+            let mut ack_count = 0;
+            for i in 0..LOAD_EVENT_COUNT {
+                let session = format!("sess-load-{}", i % 5);
+                let kind = if i % 2 == 0 {
+                    "PreToolUse"
+                } else {
+                    "PostToolUse"
+                };
+                let line = format!(
+                    r#"{{"hook_kind":"{kind}","session_id":"{session}","tool_name":"Bash"}}"#
+                );
+                let mut stream = match StdUnixStream::connect(&sock_path) {
+                    Ok(s) => s,
+                    // Daemon may have been SIGKILLed mid-stream — that's the
+                    // intended condition, stop sending cleanly.
+                    Err(_) => break,
+                };
+                if stream.write_all(line.as_bytes()).is_err() {
+                    break;
+                }
+                if stream.write_all(b"\n").is_err() {
+                    break;
+                }
+                if stream.flush().is_err() {
+                    break;
+                }
+                if stream.shutdown(std::net::Shutdown::Write).is_err() {
+                    break;
+                }
+                let mut response = String::new();
+                if stream.read_to_string(&mut response).is_err() {
+                    break;
+                }
+                if response.starts_with("200") {
+                    ack_count += 1;
+                }
+            }
+            Ok(ack_count)
         }
-    })
-    .await
-    .expect("send task")
-    .expect("send/recv");
-    assert!(
-        send_recv.starts_with("200"),
-        "ingest must ACK 200 before SIGKILL; got {send_recv:?}"
-    );
+    });
 
-    // Give the daemon a beat to commit the row into SQLite. The ACK is
-    // pre-commit by design (architecture.md ingest decoupling), so wait until
-    // the row appears or a small timeout elapses. Polling here, not sleep.
-    let row_visible = async {
+    // Wait until at least one event has actually committed so the SIGKILL
+    // happens against a populated DB (not a vacuous empty one). Polling, not
+    // sleep — same exception as the socket-ready loop above.
+    let committed_some = async {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
             if let Ok(conn) = rusqlite::Connection::open(&db_path) {
@@ -1064,71 +1104,141 @@ async fn state_plus_event_atomicity_under_sigkill() {
                 );
                 if let Ok(n) = n {
                     if n >= 1 {
-                        break true;
+                        break n;
                     }
                 }
             }
             if std::time::Instant::now() >= deadline {
-                break false;
+                break 0;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     };
-    let committed = tokio::time::timeout(Duration::from_secs(3), row_visible)
+    let pre_kill_visible = tokio::time::timeout(Duration::from_secs(3), committed_some)
         .await
         .expect("commit poll must finish within timeout");
 
+    // SIGKILL while the sender task is still pushing events. Some will have
+    // committed, some will be in flight (or never reach the writer task).
     kill(Pid::from_raw(child_pid), Signal::SIGKILL).expect("SIGKILL");
     let _ = tokio::task::spawn_blocking(move || child.wait())
         .await
         .expect("join wait")
         .expect("child wait");
+    // The sender task's UDS connection will get torn down; collect whatever
+    // it managed before the kill.
+    let ack_count = sender_handle.await.expect("sender join").unwrap_or(0);
 
     assert!(
-        committed,
-        "daemon never committed the ingested event before SIGKILL; cannot exercise atomicity"
+        pre_kill_visible >= 1,
+        "daemon never committed any of {LOAD_EVENT_COUNT} events before SIGKILL; \
+         test cannot prove atomicity if zero events landed (ack_count={ack_count})"
     );
 
-    // Reopen the DB through the normal pool path and run rebuild to converge
-    // any missing projections.
+    // Reopen through the normal pool path. Rebuild converges any projections
+    // that were lost to an unclean exit (none, given our single-transaction
+    // discipline — but the call is part of the recovery contract).
     let pools = init_pools(&db_path).await.expect("reopen pools");
     run_migrations(&pools.writer).await.expect("migrate reopen");
-    let _ = projection::session::rebuild_missing_projections(&pools.writer)
+    projection::session::rebuild_missing_projections(&pools.writer)
         .await
         .expect("rebuild");
 
     let reader = pools.reader.get().await.expect("reader get");
-    let orphans: i64 = reader
-        .interact(|c| -> rusqlite::Result<i64> {
-            c.query_row(
+    // No-half-state check, both directions:
+    //   - every event session has a projection row (Task 6 rebuild guarantees this)
+    //   - every non-sentinel projection has at least one event row
+    let (event_orphans, projection_orphans, surviving_events, surviving_projections): (
+        i64,
+        i64,
+        i64,
+        i64,
+    ) = reader
+        .interact(|c| -> rusqlite::Result<(i64, i64, i64, i64)> {
+            let event_orphans: i64 = c.query_row(
                 "SELECT COUNT(*) FROM \
                  (SELECT DISTINCT source, session_id FROM events WHERE source != '__daemon__') e \
                  LEFT JOIN session_projections p USING (source, session_id) \
                  WHERE p.source IS NULL",
                 [],
                 |r| r.get(0),
-            )
+            )?;
+            let projection_orphans: i64 = c.query_row(
+                "SELECT COUNT(*) FROM session_projections p \
+                 WHERE p.source != '__daemon__' \
+                 AND NOT EXISTS ( \
+                     SELECT 1 FROM events e \
+                     WHERE e.source = p.source AND e.session_id = p.session_id \
+                 )",
+                [],
+                |r| r.get(0),
+            )?;
+            let surviving_events: i64 = c.query_row(
+                "SELECT COUNT(*) FROM events WHERE source != '__daemon__'",
+                [],
+                |r| r.get(0),
+            )?;
+            let surviving_projections: i64 = c.query_row(
+                "SELECT COUNT(*) FROM session_projections WHERE source != '__daemon__'",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok((
+                event_orphans,
+                projection_orphans,
+                surviving_events,
+                surviving_projections,
+            ))
         })
         .await
         .expect("interact")
-        .expect("orphan count");
-    assert_eq!(orphans, 0, "every event session must have a projection");
+        .expect("orphan counts");
+    assert_eq!(
+        event_orphans, 0,
+        "every event session must have a matching projection row \
+         (surviving_events={surviving_events}, surviving_projections={surviving_projections})"
+    );
+    assert_eq!(
+        projection_orphans, 0,
+        "no projection row may exist without at least one event in the log"
+    );
+    assert!(
+        surviving_events >= 1,
+        "load run must leave at least one event in the table"
+    );
 
-    let state_json: String = reader
+    // Confirm at least one surviving state JSON parses cleanly as SessionState
+    // — the projection's wire shape is verified across the SIGKILL boundary.
+    let any_state_json: String = reader
         .interact(|c| -> rusqlite::Result<String> {
             c.query_row(
-                "SELECT state FROM session_projections WHERE source = 'claude' AND session_id = 'sess-x'",
+                "SELECT state FROM session_projections WHERE source != '__daemon__' LIMIT 1",
                 [],
                 |r| r.get(0),
             )
         })
         .await
         .expect("interact")
-        .expect("projection row");
+        .expect("surviving projection row");
     let parsed: SessionState =
-        serde_json::from_str(&state_json).expect("post-SIGKILL state JSON must parse cleanly");
-    assert_eq!(parsed.current_state, SessionCurrentState::Working);
-    assert_eq!(parsed.last_event_kind, EventKind::PreToolUse);
+        serde_json::from_str(&any_state_json).expect("post-SIGKILL state JSON must parse cleanly");
+    assert!(
+        matches!(
+            parsed.current_state,
+            SessionCurrentState::Working | SessionCurrentState::Idle
+        ),
+        "load events are PreToolUse/PostToolUse only — final state must be \
+         Working or Idle, got {:?}",
+        parsed.current_state
+    );
+    assert!(
+        matches!(
+            parsed.last_event_kind,
+            EventKind::PreToolUse | EventKind::PostToolUse
+        ),
+        "last_event_kind must reflect a load event, got {:?}",
+        parsed.last_event_kind
+    );
 }
 
 /// AC #5 — Deleting the projection rows and calling `rebuild_missing_projections`

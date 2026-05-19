@@ -63,9 +63,13 @@ pub(crate) fn transition(
 /// not mutate the stored row — the storage layer remains a pure function of
 /// the event sequence (AC #5).
 pub fn current_state_for_read(stored: &SessionState, now_ms: i64) -> SessionCurrentState {
-    if stored.current_state == SessionCurrentState::Working
-        && now_ms - stored.last_event_at_ms > STALE_WORKING_MS
-    {
+    // `saturating_sub` so a future-dated `last_event_at_ms` (clock skew, corrupted
+    // row, dev fixture) cannot panic on overflow in debug builds. A future
+    // timestamp saturates to `i64::MIN`, which is not `> STALE_WORKING_MS`, so we
+    // surface the stored state unchanged — i.e., future timestamps are treated
+    // as "fresh," never as "stale."
+    let age_ms = now_ms.saturating_sub(stored.last_event_at_ms);
+    if stored.current_state == SessionCurrentState::Working && age_ms > STALE_WORKING_MS {
         SessionCurrentState::Idle
     } else {
         stored.current_state
@@ -183,6 +187,28 @@ mod tests {
         assert_eq!(
             current_state_for_read(&stored, now),
             SessionCurrentState::WaitingInput
+        );
+    }
+
+    #[test]
+    fn current_state_for_read_does_not_panic_on_future_timestamp() {
+        // Clock skew or corrupted persisted data can leave a stored timestamp
+        // greater than `now_ms`. The read path must tolerate it without
+        // overflowing — see `saturating_sub` rationale in source.
+        let stored = SessionState {
+            current_state: SessionCurrentState::Working,
+            last_event_kind: EventKind::PreToolUse,
+            last_event_at_ms: i64::MAX,
+        };
+        assert_eq!(
+            current_state_for_read(&stored, 0),
+            SessionCurrentState::Working,
+            "future-dated timestamps are treated as fresh, not stale"
+        );
+        assert_eq!(
+            current_state_for_read(&stored, i64::MIN),
+            SessionCurrentState::Working,
+            "extreme negative now must not panic"
         );
     }
 
