@@ -31,6 +31,7 @@ serde_json         = { workspace = true }
 [dev-dependencies]
 tempfile   = { workspace = true }
 assert_cmd = { workspace = true }
+nix        = { workspace = true }
 tokio      = { workspace = true }
 tower      = { workspace = true, features = ["util"] }
 

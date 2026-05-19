@@ -11,7 +11,7 @@ use bowerbird_daemon::db::queries::{
 use bowerbird_daemon::db::{init_pools, run_migrations, DbPools};
 use bowerbird_daemon::projection;
 use bowerbird_daemon::state::AppState;
-use protocol::{EventEnvelope, EventKind};
+use protocol::{EventEnvelope, EventKind, SessionCurrentState, SessionState};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
@@ -729,4 +729,474 @@ async fn shim_binary_round_trip_to_daemon_ingest() {
     assert_eq!(envelope.session_id, "test-session-abc123");
 
     shutdown.cancel();
+}
+
+// -----------------------------------------------------------------------------
+// Story 1.6 — session projection + hook unreliability tolerance
+// -----------------------------------------------------------------------------
+
+/// Mirror of `projection::state::STALE_WORKING_MS` (pub(crate)). Kept in sync
+/// by code review; if these diverge, the boundary test in `projection::state`
+/// will still catch the actual production threshold.
+const TEST_STALE_WORKING_MS: i64 = 300_000;
+
+async fn read_session_state(
+    pool: &deadpool_sqlite::Pool,
+    source: &str,
+    session_id: &str,
+) -> String {
+    let conn = pool.get().await.expect("reader get");
+    let src = source.to_string();
+    let sid = session_id.to_string();
+    conn.interact(move |c| -> rusqlite::Result<String> {
+        c.query_row(
+            "SELECT state FROM session_projections WHERE source = ? AND session_id = ?",
+            rusqlite::params![src, sid],
+            |row| row.get(0),
+        )
+    })
+    .await
+    .expect("interact")
+    .expect("state row")
+}
+
+async fn count_session_projections(pool: &deadpool_sqlite::Pool, filter: &str) -> i64 {
+    let conn = pool.get().await.expect("reader get");
+    let sql = format!("SELECT COUNT(*) FROM session_projections WHERE {filter}");
+    conn.interact(move |c| -> rusqlite::Result<i64> { c.query_row(&sql, [], |r| r.get(0)) })
+        .await
+        .expect("interact")
+        .expect("count")
+}
+
+fn envelope_for(source: &str, session_id: &str, kind: EventKind) -> EventEnvelope {
+    EventEnvelope {
+        source: source.to_string(),
+        session_id: session_id.to_string(),
+        kind,
+        reaction: None,
+        payload: "{}".to_string(),
+    }
+}
+
+/// AC #3 — Two sessions sharing a `session_id` but differing in `source` must
+/// have independent projection rows.
+#[tokio::test(flavor = "current_thread")]
+async fn source_session_id_collision_safety() {
+    let (_tmp, pools) = fresh_pools().await;
+
+    projection::session::write(
+        &pools.writer,
+        envelope_for("claude", "sess-shared", EventKind::PreToolUse),
+    )
+    .await
+    .expect("write claude");
+    projection::session::write(
+        &pools.writer,
+        envelope_for("codex", "sess-shared", EventKind::PreToolUse),
+    )
+    .await
+    .expect("write codex");
+
+    let count = count_session_projections(&pools.reader, "session_id = 'sess-shared'").await;
+    assert_eq!(count, 2, "two distinct (source, session_id) rows expected");
+
+    // Capture the pre-second-write codex state for inequality assertion.
+    let codex_state_before = read_session_state(&pools.reader, "codex", "sess-shared").await;
+    let codex_updated_at_before: i64 = {
+        let conn = pools.reader.get().await.expect("reader get");
+        conn.interact(|c| -> rusqlite::Result<i64> {
+            c.query_row(
+                "SELECT updated_at FROM session_projections WHERE source = 'codex' AND session_id = 'sess-shared'",
+                [],
+                |r| r.get(0),
+            )
+        })
+        .await
+        .expect("interact")
+        .expect("updated_at row")
+    };
+
+    // Mutate only the claude session.
+    projection::session::write(
+        &pools.writer,
+        envelope_for("claude", "sess-shared", EventKind::PostToolUse),
+    )
+    .await
+    .expect("write claude#2");
+
+    let claude_state = read_session_state(&pools.reader, "claude", "sess-shared").await;
+    let codex_state_after = read_session_state(&pools.reader, "codex", "sess-shared").await;
+    let codex_updated_at_after: i64 = {
+        let conn = pools.reader.get().await.expect("reader get");
+        conn.interact(|c| -> rusqlite::Result<i64> {
+            c.query_row(
+                "SELECT updated_at FROM session_projections WHERE source = 'codex' AND session_id = 'sess-shared'",
+                [],
+                |r| r.get(0),
+            )
+        })
+        .await
+        .expect("interact")
+        .expect("updated_at row")
+    };
+    assert_eq!(
+        codex_state_before, codex_state_after,
+        "codex row state must not be mutated by a claude write"
+    );
+    assert_eq!(
+        codex_updated_at_before, codex_updated_at_after,
+        "codex row updated_at must not be touched by a claude write"
+    );
+    let claude_parsed: SessionState =
+        serde_json::from_str(&claude_state).expect("claude state parses");
+    let codex_parsed: SessionState =
+        serde_json::from_str(&codex_state_after).expect("codex state parses");
+    assert_eq!(claude_parsed.current_state, SessionCurrentState::Idle);
+    assert_eq!(codex_parsed.current_state, SessionCurrentState::Working);
+    assert_ne!(claude_state, codex_state_after, "states must diverge");
+
+    // Event log is also segregated.
+    let reader = pools.reader.get().await.expect("reader get");
+    let (claude_events, codex_events): (i64, i64) = reader
+        .interact(|c| -> rusqlite::Result<(i64, i64)> {
+            let a: i64 = c.query_row(
+                "SELECT COUNT(*) FROM events WHERE source = 'claude' AND session_id = 'sess-shared'",
+                [],
+                |r| r.get(0),
+            )?;
+            let b: i64 = c.query_row(
+                "SELECT COUNT(*) FROM events WHERE source = 'codex' AND session_id = 'sess-shared'",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok((a, b))
+        })
+        .await
+        .expect("interact")
+        .expect("counts");
+    assert_eq!(claude_events, 2);
+    assert_eq!(codex_events, 1);
+}
+
+/// AC #1, #4 — a `PreToolUse` without a matching `PostToolUse` does not stay
+/// stuck in `Working` once the stale-Working threshold elapses. Also verifies
+/// that a `Stop` hook naturally clears `Working` at the storage layer.
+#[tokio::test(flavor = "current_thread")]
+async fn hook_unreliability_tolerance_pretooluse_without_posttooluse() {
+    let (_tmp, pools) = fresh_pools().await;
+
+    projection::session::write(
+        &pools.writer,
+        envelope_for("claude", "sess-lonely", EventKind::PreToolUse),
+    )
+    .await
+    .expect("write PreToolUse");
+
+    let stored_json = read_session_state(&pools.reader, "claude", "sess-lonely").await;
+    let stored: SessionState = serde_json::from_str(&stored_json).expect("state parses");
+    assert_eq!(stored.current_state, SessionCurrentState::Working);
+    assert_eq!(stored.last_event_kind, EventKind::PreToolUse);
+
+    let now_ms_late = stored.last_event_at_ms + TEST_STALE_WORKING_MS + 1;
+    let surfaced = projection::current_state_for_read(&stored, now_ms_late);
+    assert_eq!(
+        surfaced,
+        SessionCurrentState::Idle,
+        "read-time stale check must surface Idle past the threshold"
+    );
+
+    // Sub-case: a Stop hook clears Working at the storage layer.
+    projection::session::write(
+        &pools.writer,
+        envelope_for("claude", "sess-lonely", EventKind::Stop),
+    )
+    .await
+    .expect("write Stop");
+    let stored_after_stop = read_session_state(&pools.reader, "claude", "sess-lonely").await;
+    let parsed: SessionState =
+        serde_json::from_str(&stored_after_stop).expect("post-Stop state parses");
+    assert_eq!(parsed.current_state, SessionCurrentState::Idle);
+    // Byte-for-byte: the wire string for SessionCurrentState::Idle is `"Idle"`.
+    // A literal substring check guards against silent rename_all drift.
+    assert!(
+        stored_after_stop.contains(r#""current_state":"Idle""#),
+        "stored state JSON must contain literal \"current_state\":\"Idle\" — got {stored_after_stop}"
+    );
+}
+
+/// AC #4 — Drive a session through a mixed event sequence and assert the
+/// stored `current_state` matches the documented transition table at each step.
+#[tokio::test(flavor = "current_thread")]
+async fn state_machine_full_sequence_determinism() {
+    let (_tmp, pools) = fresh_pools().await;
+    let session_id = "sess-determinism";
+
+    let cases: &[(EventKind, SessionCurrentState)] = &[
+        (EventKind::PreToolUse, SessionCurrentState::Working),
+        (EventKind::PostToolUse, SessionCurrentState::Idle),
+        (EventKind::PreToolUse, SessionCurrentState::Working),
+        (EventKind::Notification, SessionCurrentState::WaitingInput),
+        (EventKind::PreToolUse, SessionCurrentState::Working),
+        (EventKind::Stop, SessionCurrentState::Idle),
+    ];
+
+    for (kind, expected) in cases {
+        projection::session::write(
+            &pools.writer,
+            envelope_for("claude", session_id, kind.clone()),
+        )
+        .await
+        .expect("write");
+        let stored = read_session_state(&pools.reader, "claude", session_id).await;
+        let parsed: SessionState = serde_json::from_str(&stored).expect("parse");
+        assert_eq!(
+            parsed.current_state, *expected,
+            "after {kind:?} current_state must be {expected:?}, got {:?}",
+            parsed.current_state
+        );
+        assert_eq!(
+            parsed.last_event_kind, *kind,
+            "last_event_kind must always reflect the latest event"
+        );
+    }
+}
+
+/// AC #2 — Atomicity contract: an `INSERT INTO events` and its matching
+/// `UPSERT INTO session_projections` commit together or not at all. This test
+/// spawns the real daemon binary, sends a valid ingest event, observes the
+/// `200\n` ACK, then SIGKILLs the daemon mid-flight (no graceful shutdown).
+/// On reopen, every `(source, session_id)` in `events` must have a matching
+/// `session_projections` row — or be rebuildable from the event log.
+///
+/// Supersedes the `drop(pool)` surrogate in `wal_durability_after_simulated_crash`
+/// (which exits cleanly through rusqlite's destructor). SIGKILL skips
+/// destructors entirely and exercises a different failure mode.
+#[tokio::test(flavor = "current_thread")]
+async fn state_plus_event_atomicity_under_sigkill() {
+    use std::io::{Read as _, Write as _};
+    use std::os::unix::net::UnixStream as StdUnixStream;
+    use std::process::{Command as StdCommand, Stdio};
+
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+
+    let tmp = TempDir::new().expect("tempdir");
+    let bowerbird_dir = tmp.path().join(".bowerbird");
+    std::fs::create_dir_all(&bowerbird_dir).expect("mkdir");
+    let sock_path = bowerbird_dir.join("ingest.sock");
+    let db_path = bowerbird_dir.join("bower.db");
+
+    let bin = assert_cmd::cargo::cargo_bin("bowerbird-daemon");
+    let mut child = StdCommand::new(&bin)
+        .env("HOME", tmp.path())
+        .env("BOWERBIRD_INGEST_SOCK", &sock_path)
+        .env("RUST_LOG", "warn")
+        // Inherit PATH so dyld can find linked libs on macOS.
+        .env(
+            "PATH",
+            std::env::var_os("PATH").unwrap_or_else(|| std::ffi::OsString::from("")),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn daemon");
+    let child_pid = child.id() as i32;
+
+    // Bounded poll for ingest socket creation. project-context line 642 forbids
+    // real sleep() for synchronization, but socket bind has no signal-style
+    // signal — this is the documented exception (Story 1.6 Task 7 Dev Notes).
+    let socket_ready = async {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if std::fs::metadata(&sock_path).is_ok() {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    let ready = tokio::time::timeout(Duration::from_secs(6), socket_ready)
+        .await
+        .expect("poll loop must finish within timeout");
+    if !ready {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("daemon never bound ingest.sock at {}", sock_path.display());
+    }
+
+    // Send one valid event over the ingest socket and read the ACK byte.
+    let send_recv = tokio::task::spawn_blocking({
+        let sock_path = sock_path.clone();
+        move || -> std::io::Result<String> {
+            let mut stream = StdUnixStream::connect(&sock_path)?;
+            let line = br#"{"hook_kind":"PreToolUse","session_id":"sess-x","tool_name":"Bash"}"#;
+            stream.write_all(line)?;
+            stream.write_all(b"\n")?;
+            stream.flush()?;
+            stream.shutdown(std::net::Shutdown::Write)?;
+            let mut response = String::new();
+            stream.read_to_string(&mut response)?;
+            Ok(response)
+        }
+    })
+    .await
+    .expect("send task")
+    .expect("send/recv");
+    assert!(
+        send_recv.starts_with("200"),
+        "ingest must ACK 200 before SIGKILL; got {send_recv:?}"
+    );
+
+    // Give the daemon a beat to commit the row into SQLite. The ACK is
+    // pre-commit by design (architecture.md ingest decoupling), so wait until
+    // the row appears or a small timeout elapses. Polling here, not sleep.
+    let row_visible = async {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                let n: rusqlite::Result<i64> = conn.query_row(
+                    "SELECT COUNT(*) FROM events WHERE source != '__daemon__'",
+                    [],
+                    |r| r.get(0),
+                );
+                if let Ok(n) = n {
+                    if n >= 1 {
+                        break true;
+                    }
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    let committed = tokio::time::timeout(Duration::from_secs(3), row_visible)
+        .await
+        .expect("commit poll must finish within timeout");
+
+    kill(Pid::from_raw(child_pid), Signal::SIGKILL).expect("SIGKILL");
+    let _ = tokio::task::spawn_blocking(move || child.wait())
+        .await
+        .expect("join wait")
+        .expect("child wait");
+
+    assert!(
+        committed,
+        "daemon never committed the ingested event before SIGKILL; cannot exercise atomicity"
+    );
+
+    // Reopen the DB through the normal pool path and run rebuild to converge
+    // any missing projections.
+    let pools = init_pools(&db_path).await.expect("reopen pools");
+    run_migrations(&pools.writer).await.expect("migrate reopen");
+    let _ = projection::session::rebuild_missing_projections(&pools.writer)
+        .await
+        .expect("rebuild");
+
+    let reader = pools.reader.get().await.expect("reader get");
+    let orphans: i64 = reader
+        .interact(|c| -> rusqlite::Result<i64> {
+            c.query_row(
+                "SELECT COUNT(*) FROM \
+                 (SELECT DISTINCT source, session_id FROM events WHERE source != '__daemon__') e \
+                 LEFT JOIN session_projections p USING (source, session_id) \
+                 WHERE p.source IS NULL",
+                [],
+                |r| r.get(0),
+            )
+        })
+        .await
+        .expect("interact")
+        .expect("orphan count");
+    assert_eq!(orphans, 0, "every event session must have a projection");
+
+    let state_json: String = reader
+        .interact(|c| -> rusqlite::Result<String> {
+            c.query_row(
+                "SELECT state FROM session_projections WHERE source = 'claude' AND session_id = 'sess-x'",
+                [],
+                |r| r.get(0),
+            )
+        })
+        .await
+        .expect("interact")
+        .expect("projection row");
+    let parsed: SessionState =
+        serde_json::from_str(&state_json).expect("post-SIGKILL state JSON must parse cleanly");
+    assert_eq!(parsed.current_state, SessionCurrentState::Working);
+    assert_eq!(parsed.last_event_kind, EventKind::PreToolUse);
+}
+
+/// AC #5 — Deleting the projection rows and calling `rebuild_missing_projections`
+/// reproduces byte-identical state JSON, proving the event log is the source of
+/// truth and the projection is a deterministic derivative.
+#[tokio::test(flavor = "current_thread")]
+async fn projection_rebuild_from_event_log_is_byte_identical() {
+    let (_tmp, pools) = fresh_pools().await;
+
+    let a_seq = [
+        EventKind::PreToolUse,
+        EventKind::PostToolUse,
+        EventKind::PreToolUse,
+        EventKind::Notification,
+        EventKind::Stop,
+    ];
+    let b_seq = [
+        EventKind::PreToolUse,
+        EventKind::PostToolUse,
+        EventKind::Stop,
+    ];
+    for kind in a_seq {
+        projection::session::write(&pools.writer, envelope_for("claude", "sess-A", kind))
+            .await
+            .expect("write A");
+    }
+    for kind in b_seq {
+        projection::session::write(&pools.writer, envelope_for("claude", "sess-B", kind))
+            .await
+            .expect("write B");
+    }
+
+    let baseline_a = read_session_state(&pools.reader, "claude", "sess-A").await;
+    let baseline_b = read_session_state(&pools.reader, "claude", "sess-B").await;
+
+    // Wipe non-sentinel projection rows.
+    let writer = pools.writer.get().await.expect("writer get");
+    writer
+        .interact(|c| -> rusqlite::Result<usize> {
+            c.execute(
+                "DELETE FROM session_projections WHERE source != '__daemon__'",
+                [],
+            )
+        })
+        .await
+        .expect("interact")
+        .expect("delete");
+    drop(writer);
+
+    let remaining = count_session_projections(&pools.reader, "source != '__daemon__'").await;
+    assert_eq!(remaining, 0, "non-sentinel projection rows must be cleared");
+
+    let rebuilt = projection::session::rebuild_missing_projections(&pools.writer)
+        .await
+        .expect("rebuild");
+    assert_eq!(rebuilt, 2, "exactly two sessions must be rebuilt");
+
+    // Byte-for-byte: serde preserves struct-field order; if it ever changes,
+    // this assertion will surface immediately. SessionCurrentState/EventKind
+    // are PascalCase by-variant-name, no rename_all involved.
+    let result_a = read_session_state(&pools.reader, "claude", "sess-A").await;
+    let result_b = read_session_state(&pools.reader, "claude", "sess-B").await;
+    assert_eq!(
+        result_a, baseline_a,
+        "sess-A rebuild must be byte-identical"
+    );
+    assert_eq!(
+        result_b, baseline_b,
+        "sess-B rebuild must be byte-identical"
+    );
 }

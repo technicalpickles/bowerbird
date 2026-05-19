@@ -12,8 +12,8 @@
 
 ## Deferred from: code review of 1-2-daemon-foundation-with-sqlite-persistence (2026-05-17)
 
-- **SIGKILL / `exit(1)` paths skip the `RecordingEnded` sentinel + WAL checkpoint** — covered by Story 1.6's gap-detection design; revisit when implementing recovery
-- **`event_kind_as_str` ↔ serde equivalence untested** — `crates/daemon/src/db/queries.rs` `event_kind_as_str` hand-mirrors `protocol::EventKind` serde; add exhaustive equivalence test so renames stay in sync
+- ~~**SIGKILL / `exit(1)` paths skip the `RecordingEnded` sentinel + WAL checkpoint** — covered by Story 1.6's gap-detection design; revisit when implementing recovery~~ **Resolved by Story 1.6 (Task 6):** `rebuild_missing_projections` on daemon startup converges any `events` row whose matching projection was lost to an unclean exit. See `crates/daemon/src/projection/session.rs::rebuild_missing_projections`.
+- ~~**`event_kind_as_str` ↔ serde equivalence untested** — `crates/daemon/src/db/queries.rs` `event_kind_as_str` hand-mirrors `protocol::EventKind` serde; add exhaustive equivalence test so renames stay in sync~~ **Resolved by Story 1.6 (Task 5):** `event_kind_from_db_str` is the round-trip inverse; the `event_kind_db_string_round_trip_all_variants` unit test in `crates/daemon/src/db/queries.rs` covers every `EventKind` variant.
 - **Migration idempotency on a populated DB is untested** — `crates/daemon/src/db/migrations.rs` `run_migrations` only tested on a fresh tempdir; add a re-run-on-populated test
 - **`Pool::interact` errors collapse to opaque strings, losing cause chain** — `crates/daemon/src/db/migrations.rs:648`, `crates/daemon/src/projection/session.rs:1145`; preserve the deadpool error chain for diagnostics
 - **`migration_failure_exits_nonzero` could hang for 20s if a regression lets the daemon survive** — `crates/daemon/tests/contract_daemon.rs:1347-1352`; tighten or assert quick exit
@@ -21,7 +21,7 @@
 - **CLI surface: no `--db-path`, `--bind-addr`, `--config`, `--version`** — `crates/daemon/src/main.rs:904-910`; explicitly out of scope for Story 1.2
 - **`init_pools` does not validate `db_path` parent exists / is writable** — `crates/daemon/src/db/pool.rs`; SQLite returns a reasonable error at first checkout, so cosmetic
 - **`i64::try_from(u128)` timestamp overflow at year 292278994 AD** — `crates/daemon/src/projection/session.rs`; far-future, but the patch in this round will surface it as a typed error so the deferred work is just a test
-- **`wal_durability_after_simulated_crash` uses `drop(pool)` not a true subprocess crash** — `crates/daemon/tests/contract_daemon.rs:60-95`; AC#1 acknowledges this. Follow-up: spawn-then-kill subprocess test
+- ~~**`wal_durability_after_simulated_crash` uses `drop(pool)` not a true subprocess crash** — `crates/daemon/tests/contract_daemon.rs:60-95`; AC#1 acknowledges this. Follow-up: spawn-then-kill subprocess test~~ **Resolved by Story 1.6 (Task 7):** real subprocess + SIGKILL test `state_plus_event_atomicity_under_sigkill` in `crates/daemon/tests/contract_daemon.rs`. The original `drop(pool)` test is retained alongside — it exercises a different failure mode (clean destructor path vs. kernel-level kill).
 - **`migration_failure_exits_nonzero` TempDir cleanup vs daemon panic-write race** — `crates/daemon/tests/contract_daemon.rs:148-176`; narrow but a flaky-test source
 - **`scripts/lint-db-access.sh` bypassable via aliased imports / BSD grep symlink behavior** — `scripts/lint-db-access.sh`; spec already calls out a clippy-based replacement as follow-up
 - **`tokio::signal::unix::signal(...)` registration failure is not logged** — `crates/daemon/src/main.rs` `shutdown_signal`; on a sandboxed/non-unix env the daemon would silently lose SIGTERM
