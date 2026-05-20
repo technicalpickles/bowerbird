@@ -1,4 +1,7 @@
-use protocol::{ClientMessage, EventId, EventKind, HelloFrame, Reaction, ServerMessage};
+use protocol::{
+    ClientMessage, EventId, EventKind, HelloFrame, Reaction, ServerMessage, SessionCurrentState,
+    SessionState,
+};
 
 #[test]
 fn event_kind_serializes_pascal_case() {
@@ -82,6 +85,45 @@ fn outbound_type_accepts_unknown_fields() {
 fn inbound_type_rejects_unknown_fields() {
     let with_unknown = r#"{"op":"subscribe","topic":"events.*","unknown_field":"bad"}"#;
     assert!(serde_json::from_str::<ClientMessage>(with_unknown).is_err());
+}
+
+#[test]
+fn session_current_state_serializes_pascal_case() {
+    assert_eq!(
+        serde_json::to_string(&SessionCurrentState::Idle).unwrap(),
+        "\"Idle\""
+    );
+    assert_eq!(
+        serde_json::to_string(&SessionCurrentState::Working).unwrap(),
+        "\"Working\""
+    );
+    assert_eq!(
+        serde_json::to_string(&SessionCurrentState::WaitingInput).unwrap(),
+        "\"WaitingInput\""
+    );
+}
+
+#[test]
+fn session_state_round_trips() {
+    let state = SessionState {
+        current_state: SessionCurrentState::Working,
+        last_event_kind: EventKind::PreToolUse,
+        last_event_at_ms: 1_747_574_400_000,
+    };
+    let json = serde_json::to_string(&state).unwrap();
+    let parsed: SessionState = serde_json::from_str(&json).unwrap();
+    assert_eq!(state, parsed);
+}
+
+#[test]
+fn session_state_accepts_unknown_fields() {
+    // SessionState is an outbound type — additive forward-compat per
+    // crates/protocol's asymmetric serde policy (no deny_unknown_fields).
+    let json = r#"{"current_state":"Idle","last_event_kind":"PreToolUse","last_event_at_ms":1234,"future_field":"ignored"}"#;
+    let parsed: SessionState = serde_json::from_str(json).unwrap();
+    assert_eq!(parsed.current_state, SessionCurrentState::Idle);
+    assert_eq!(parsed.last_event_kind, EventKind::PreToolUse);
+    assert_eq!(parsed.last_event_at_ms, 1234);
 }
 
 #[test]

@@ -1,10 +1,10 @@
 # 0003. Shim p99 budget on `macos-latest` is unstable
 
-Date: 2026-05-18
+Date: 2026-05-18 (original); 2026-05-20 (Linux update — see bottom)
 Status: Accepted
 Deciders: @pickles
-Related: PRD line 181 ("If the number can't be met cleanly, the right response is an ADR"); Story 1.5 Task 9 acknowledgment; Story 1.5 Review Findings 1 + 2
-Implementation: `.github/workflows/ci.yml` (`shim-bench-gate` job), `crates/shim/benches/hot_path.rs`, `crates/shim/benches/baselines/macos.json`
+Related: PRD line 181 ("If the number can't be met cleanly, the right response is an ADR"); Story 1.5 Task 9 acknowledgment; Story 1.5 Review Findings 1 + 2; Story 1.6 PR #19 bench-gate failure
+Implementation: `.github/workflows/ci.yml` (`shim-bench-gate` job), `crates/shim/benches/hot_path.rs`, `crates/shim/benches/baselines/macos.json`, `crates/shim/benches/baselines/linux.json`
 Affects context.md sections: "Shim hot-path discipline" (line 334)
 
 ## Context
@@ -115,3 +115,39 @@ Crank `SHIM_BENCH_SAMPLES` from 200 to 1000+ and `SHIM_BENCH_WARMUP` from 20 to 
 - A real macOS shim regression slips past the 15 ms budget — at which point Option D moves from "follow-up" to "required" and this ADR is superseded.
 - The runner topology changes (GitHub deprecates `macos-latest`, your team adds self-hosted macOS hardware, etc.) — re-evaluate whether the budget can be tightened.
 - Story 3.1 (`bowerbird install`) lands and the shim's deployment model shifts in a way that affects per-invocation cost — re-examine the macOS budget and whether the regression gate can be re-enabled with a meaningful threshold.
+
+## Update 2026-05-20: Linux runner-image drift
+
+Story 1.6 (PR #19) tripped the Linux gate twice on a branch whose shim diff is empty (`crates/shim/` is unchanged from main; only `nix` + `cfg_aliases` were added to Cargo.lock, neither in the shim's dep tree). The same-day main run on `b5b798d` (docs-only, no code change) measured p99 1.195 ms, +8.31 % over the original seeded baseline of 1.103 ms.
+
+| Run | commit | linux p99 | linux mean |
+|---|---|---|---|
+| Original seed | `51e4a2f` | 1.103 ms | 0.819 ms |
+| Main today | `b5b798d` (docs only) | 1.195 ms (+8.3 %) | 1.027 ms (+25 %) |
+| Branch run 1 | `4f0abaa` | 1.566 ms (+42 %) | 1.072 ms (+31 %) |
+| Branch run 2 | `4f0abaa` (rerun) | 1.353 ms (+23 %) | 1.085 ms (+32 %) |
+
+Mean spread across the three same-day runs is 5.6 % (1.027 → 1.085 ms) — well inside any reasonable regression band. p99 spread is 31 % (1.195 → 1.566 ms). The original ADR concluded `ubuntu-latest` was stable based on a 3-run sample with ±10 % variance; today's same-day 3-run sample shows the runner-image generation has a wider noise floor than that. The shim binary itself is unchanged, so this is infrastructure drift, not a real regression.
+
+The same option-B pattern applies here as it did for macOS: reseed the baseline from the freshest stable observation and loosen `regression_max_ratio` enough to absorb the observed noise floor while still catching order-of-magnitude regressions.
+
+Updated Linux policy (committed in `crates/shim/benches/baselines/linux.json`):
+
+| Field | Old value | New value | Rationale |
+|---|---|---|---|
+| `p99_nanos` | 1,102,908 (1.103 ms) | 1,194,533 (1.195 ms) | Reseeded from main `b5b798d` CI artifact — same pattern as the original seed commit `6741e8e`. Freshest "good day" reference. |
+| `mean_nanos` | 819,448 | 1,027,350 | Same source. |
+| `absolute_budget_nanos` | 5,000,000 (5 ms) | unchanged | AC #1 ceiling holds. Plenty of headroom (current p99 is ~24 % of budget). |
+| `regression_max_ratio` | 1.15 (+15 %) | 1.35 (+35 %) | Absorbs the demonstrated 31 % same-day p99 spread with modest headroom. Anything that ~doubles p99 or trips the 5 ms absolute still fails the gate, so it remains a meaningful detector of real regressions. |
+
+New gate ceiling: 1.195 × 1.35 ≈ 1.61 ms (vs old ceiling of 1.268 ms). Both observed branch runs (1.353, 1.566) would pass under the new policy.
+
+### Why not Option D (rearchitect) for Linux
+
+Option D in the original ADR proposed rearchitecting the shim away from per-invocation fork-exec. For Linux that's not yet warranted — the absolute p99 is ~1.5 ms even on noisy runs, well under the 5 ms AC #1 budget. Linux fork-exec is fast and the shim's runtime cost on real user machines is fine. The fix is the gate, not the shim.
+
+### Revisit when (Linux-specific)
+
+- The reseeded baseline goes stale again — Linux runner image rolls forward and the same-day mean climbs another 25 %. Then reseed (cheap) or invest in trend-tracking (more involved).
+- Story 3.1 changes the shim's deployment model — re-examine both platforms at once.
+- A real shim regression of >35 % on Linux gets shipped without being caught — at which point the gate's effectiveness needs a more careful look (rolling average baseline, multi-run sampling per CI invocation, etc.).

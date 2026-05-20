@@ -49,7 +49,15 @@ async fn main() {
     }
     set_crash_dir(bowerbird_dir.clone());
 
-    let config = Config::with_bowerbird_dir(&bowerbird_dir);
+    let mut config = Config::with_bowerbird_dir(&bowerbird_dir);
+    // Honor BOWERBIRD_INGEST_SOCK as a path override so tests can run an
+    // isolated daemon without colliding with `~/.bowerbird/ingest.sock` (mirrors
+    // the shim's resolve_sock_path pattern).
+    if let Some(p) = std::env::var_os("BOWERBIRD_INGEST_SOCK") {
+        if !p.is_empty() {
+            config.ingest_sock_path = PathBuf::from(p);
+        }
+    }
     if let Err(e) = run(config).await {
         let msg = format!("{e:#}");
         tracing::error!(error = msg, "daemon exited with error");
@@ -77,6 +85,17 @@ async fn run(config: Config) -> anyhow::Result<()> {
         .context("schema migration failed")?;
     migrations_complete.store(true, Ordering::Release);
     tracing::info!("migrations complete");
+
+    // Rebuild any session_projections rows missing for sessions that exist in
+    // `events`. Runs before the ingest listener is spawned so no concurrent
+    // writes can interleave. Best-effort: a rebuild failure does not block
+    // startup — the daemon must come up for sessions whose projections are
+    // intact (Story 1.6 Task 6).
+    match projection::session::rebuild_missing_projections(&pools.writer).await {
+        Ok(n) if n > 0 => tracing::info!(count = n, "rebuilt missing session projections"),
+        Ok(_) => {}
+        Err(e) => tracing::error!(error = ?e, "rebuild_missing_projections failed; continuing"),
+    }
 
     let started = projection::session::write_recording_started(&pools.writer)
         .await
