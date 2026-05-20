@@ -1,6 +1,6 @@
 # Story 1.7: REST Query API
 
-Status: review
+Status: done
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -934,4 +934,3 @@ claude-opus-4-7 (1M context)
 | ---------- | ------------------------------------------------------------------------------------------------------------------------------------- | ------------ |
 | 2026-05-20 | Story 1.7 created (sprint-status promoted to ready-for-dev).                                                                          | bmad         |
 | 2026-05-20 | Story 1.7 implemented: bearer auth + 5 REST endpoints + `/readyz` DB probe; 114 tests green; deferred-work + protocol-changelog kept in sync. | claude-opus-4-7 |
-
