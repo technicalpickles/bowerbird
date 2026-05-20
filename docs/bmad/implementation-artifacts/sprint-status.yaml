@@ -1,5 +1,5 @@
 # generated: 2026-05-16
-# last_updated: 2026-05-20 (epic 1 complete, retrospective done)
+# last_updated: 2026-05-20 (story 2.1 created, epic 2 in-progress)
 # project: bowerbird
 # project_key: NOKEY
 # tracking_system: file-system
@@ -55,8 +55,8 @@ development_status:
   epic-1-retrospective: done
 
   # Epic 2: Live event streaming to multiple simultaneous tools
-  epic-2: backlog
-  2-1-websocket-connection-and-topic-subscription: backlog
+  epic-2: in-progress
+  2-1-websocket-connection-and-topic-subscription: ready-for-dev
   2-2-real-time-event-and-state-broadcast-to-multiple-tools: backlog
   2-3-new-session-discovery-and-state-snapshot-on-connect: backlog
   2-4-lagged-consumer-recovery-with-dropped-frame: backlog
