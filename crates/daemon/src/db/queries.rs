@@ -72,6 +72,15 @@ pub const SELECT_LAST_EVENT: &str = "SELECT event_id, created_at FROM events \
      WHERE source != '__daemon__' \
      ORDER BY event_id DESC LIMIT 1";
 
+/// `/readyz` DB-liveness probe.
+///
+/// `WHERE 1=0` makes the planner short-circuit before scanning any rows, so
+/// latency is sub-millisecond on any DB size. The query validates three
+/// things at once: pool checkout succeeds, the connection is alive, and the
+/// `events` table exists (a corrupt-schema state would otherwise pass a bare
+/// `SELECT 1`).
+pub const PROBE_DB_READY: &str = "SELECT 1 FROM events WHERE 1=0";
+
 /// Stable wire string for an [`EventKind`] used by the daemon's SQLite storage.
 ///
 /// Delegates to the protocol's serde representation so storage stays in lockstep

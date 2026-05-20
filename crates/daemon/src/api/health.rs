@@ -6,6 +6,7 @@ use axum::response::{IntoResponse, Json};
 use deadpool_sqlite::Pool;
 use serde_json::json;
 
+use crate::db::queries::PROBE_DB_READY;
 use crate::state::AppState;
 
 pub async fn healthz() -> impl IntoResponse {
@@ -36,22 +37,19 @@ fn not_ready() -> axum::response::Response {
         .into_response()
 }
 
-/// `SELECT 1 FROM events WHERE 1=0` validates three things at once:
+/// Probe the reader pool with [`PROBE_DB_READY`].
 ///
-/// - reader-pool checkout succeeds within the 5s wait timeout;
-/// - the connection is alive;
-/// - the `events` table exists ("no such table" → corrupt schema).
-///
-/// The `WHERE 1=0` clause makes the query exit before scanning a row, so
-/// latency is sub-millisecond on any DB size. `QueryReturnedNoRows` is the
-/// success path; only a real sqlite or pool error returns `Err`.
+/// `QueryReturnedNoRows` is the success path (the query returns no rows by
+/// design); only a real sqlite or pool error returns `Err`. Validates that
+/// pool checkout succeeds within the 5s wait timeout, the connection is
+/// alive, and the `events` table exists.
 async fn probe_db(reader: &Pool) -> Result<(), ()> {
     let conn = reader.get().await.map_err(|e| {
         tracing::warn!(error = %e, "readyz: reader pool checkout failed");
     })?;
     let interact = conn
         .interact(|c| -> rusqlite::Result<()> {
-            match c.query_row::<i64, _, _>("SELECT 1 FROM events WHERE 1=0", [], |r| r.get(0)) {
+            match c.query_row::<i64, _, _>(PROBE_DB_READY, [], |r| r.get(0)) {
                 Ok(_) => Ok(()),
                 Err(rusqlite::Error::QueryReturnedNoRows) => Ok(()),
                 Err(other) => Err(other),
