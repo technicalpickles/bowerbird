@@ -60,12 +60,11 @@ pub(crate) fn normalize(
 
     let value: serde_json::Value = serde_json::from_str(&payload)?;
 
-    let session_id = value
-        .get("session_id")
-        .and_then(|v| v.as_str())
-        .ok_or(Error::MissingField("session_id"))?
-        .to_string();
-
+    // Match hook_kind BEFORE extracting other payload fields. Story 1.8 review
+    // finding: an unknown hook_kind must surface as InvalidHookKind regardless
+    // of whether session_id / tool_name are also missing or wrong-type, so the
+    // daemon emits `400 unknown hook_kind: <value>` and not the generic
+    // `400 normalize error: missing required field: session_id`.
     let kind = match hook_kind {
         "PreToolUse" => EventKind::PreToolUse,
         "PostToolUse" => EventKind::PostToolUse,
@@ -73,6 +72,12 @@ pub(crate) fn normalize(
         "Notification" => EventKind::Notification,
         other => return Err(Error::InvalidHookKind(other.to_string())),
     };
+
+    let session_id = value
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .ok_or(Error::MissingField("session_id"))?
+        .to_string();
 
     let reaction = match kind {
         EventKind::PreToolUse => {

@@ -60,13 +60,33 @@ pub(super) async fn handle(
         return;
     }
 
-    let hook_kind = value
-        .get("hook_kind")
-        .and_then(|v| v.as_str())
-        .unwrap_or("PreToolUse");
+    // Story 1.8: hook_kind is required. The shim injects it via --hook-kind on every
+    // payload. Absence or wrong JSON type (e.g. number, null) is malformed input — the
+    // `as_str()` chain coalesces both into `None`, which we intentionally treat as the
+    // same "missing" wire response. See ADR-0002 §Consequences and AC #1/#3.
+    let hook_kind = match value.get("hook_kind").and_then(|v| v.as_str()) {
+        Some(k) => k,
+        None => {
+            tracing::debug!("ingest: missing hook_kind");
+            let _ = write_half.write_all(b"400 missing hook_kind\n").await;
+            let _ = write_half.flush().await;
+            return;
+        }
+    };
 
     let envelope = match adapter.normalize(hook_kind, trimmed.as_bytes()) {
         Ok(result) => result.envelope,
+        Err(protocol::Error::UnknownHookKind(k)) => {
+            tracing::debug!(hook_kind = %k, "ingest: unknown hook_kind");
+            // Echo the user-supplied bogus kind (not the formatted error message)
+            // through sanitize_for_wire to preserve the one-line wire invariant.
+            let sanitized = sanitize_for_wire(&k);
+            let _ = write_half
+                .write_all(format!("400 unknown hook_kind: {sanitized}\n").as_bytes())
+                .await;
+            let _ = write_half.flush().await;
+            return;
+        }
         Err(e) => {
             tracing::debug!(error = ?e, "ingest: normalize failed");
             let sanitized = sanitize_for_wire(&e.to_string());
