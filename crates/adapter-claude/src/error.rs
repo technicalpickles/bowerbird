@@ -12,6 +12,9 @@ pub(crate) enum Error {
 
 impl From<Error> for protocol::Error {
     fn from(e: Error) -> Self {
-        protocol::Error::Serde(e.to_string())
+        match e {
+            Error::InvalidHookKind(k) => protocol::Error::UnknownHookKind(k),
+            other => protocol::Error::Serde(other.to_string()),
+        }
     }
 }

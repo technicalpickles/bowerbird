@@ -235,3 +235,24 @@ fn normalize_pretooluse_vendor_overflow_degrades_to_unknown() {
         .unwrap();
     assert_eq!(result.envelope.reaction, Some(Reaction::Unknown));
 }
+
+// Story 1.8: the adapter's internal `Error::InvalidHookKind` must convert into
+// the typed `protocol::Error::UnknownHookKind` (not a stringly-typed `Serde`
+// variant). The daemon `match`es on this variant to emit the dedicated
+// `400 unknown hook_kind: ...` wire response. The internal `Error` enum is
+// `pub(crate)`, so this test exercises the boundary via the public `normalize`
+// API rather than constructing the variant directly.
+#[test]
+fn normalize_unknown_hook_kind_yields_protocol_unknown_hook_kind() {
+    let dir = TempDir::new().unwrap();
+    let toml_path = write_toml(&dir, minimal_toml_with_bash());
+    let adapter = ClaudeAdapter::new(toml_path);
+
+    let payload = r#"{"session_id": "s1", "tool_name": "Bash"}"#;
+    let result = adapter.normalize("BogusKind", payload.as_bytes());
+    match result {
+        Err(protocol::Error::UnknownHookKind(k)) => assert_eq!(k, "BogusKind"),
+        Err(other) => panic!("expected protocol::Error::UnknownHookKind, got Err({other:?})"),
+        Ok(_) => panic!("expected Err, got Ok"),
+    }
+}

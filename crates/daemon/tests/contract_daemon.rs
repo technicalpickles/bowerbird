@@ -540,7 +540,7 @@ async fn ingest_200_on_valid_json_object() {
 
     let resp = send_line_recv_response(
         &sock_path,
-        b"{\"session_id\":\"s1\",\"tool_name\":\"Test\"}\n",
+        b"{\"hook_kind\":\"PreToolUse\",\"session_id\":\"s1\",\"tool_name\":\"Test\"}\n",
     )
     .await;
     assert!(resp.starts_with("200"), "expected 200, got: {resp:?}");
@@ -554,7 +554,7 @@ async fn ingest_event_reaches_channel_after_200() {
 
     let resp = send_line_recv_response(
         &sock_path,
-        b"{\"session_id\":\"s1\",\"tool_name\":\"Test\"}\n",
+        b"{\"hook_kind\":\"PreToolUse\",\"session_id\":\"s1\",\"tool_name\":\"Test\"}\n",
     )
     .await;
     assert!(resp.starts_with("200"), "expected 200, got: {resp:?}");
@@ -579,7 +579,7 @@ async fn ingest_200_is_ack_before_db_commit() {
 
     let resp = send_line_recv_response(
         &sock_path,
-        b"{\"session_id\":\"s1\",\"tool_name\":\"Test\"}\n",
+        b"{\"hook_kind\":\"PreToolUse\",\"session_id\":\"s1\",\"tool_name\":\"Test\"}\n",
     )
     .await;
     // The response was received synchronously (before DB commit) as long as it
@@ -597,7 +597,7 @@ async fn ingest_503_on_full_queue() {
     // First event fills the capacity-1 channel.
     let resp1 = send_line_recv_response(
         &sock_path,
-        b"{\"session_id\":\"s1\",\"tool_name\":\"Test\"}\n",
+        b"{\"hook_kind\":\"PreToolUse\",\"session_id\":\"s1\",\"tool_name\":\"Test\"}\n",
     )
     .await;
     assert!(
@@ -608,7 +608,7 @@ async fn ingest_503_on_full_queue() {
     // Don't consume from rx — channel is now full. Second send → 503.
     let resp2 = send_line_recv_response(
         &sock_path,
-        b"{\"session_id\":\"s2\",\"tool_name\":\"Test\"}\n",
+        b"{\"hook_kind\":\"PreToolUse\",\"session_id\":\"s2\",\"tool_name\":\"Test\"}\n",
     )
     .await;
     assert!(
@@ -686,13 +686,250 @@ async fn ingest_eof_before_newline_is_silent() {
     tokio::time::sleep(Duration::from_millis(20)).await;
     let resp = send_line_recv_response(
         &sock_path,
-        b"{\"session_id\":\"s1\",\"tool_name\":\"Test\"}\n",
+        b"{\"hook_kind\":\"PreToolUse\",\"session_id\":\"s1\",\"tool_name\":\"Test\"}\n",
     )
     .await;
     assert!(
         resp.starts_with("200"),
         "daemon should still work after EOF client, got: {resp:?}"
     );
+    shutdown.cancel();
+}
+
+// ─── Story 1.8: strict hook_kind enforcement ────────────────────────────────
+//
+// The daemon previously coalesced missing/non-string `hook_kind` into a silent
+// `"PreToolUse"` default. After Story 1.8, the field is required and unknown
+// values get their own typed wire response. See ADR-0002 §Consequences and the
+// story's AC #1, #2, #3, #6.
+
+#[tokio::test(flavor = "current_thread")]
+async fn ingest_400_on_missing_hook_kind() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (shutdown, sock_path, _rx) = start_ingest_listener(&tmp, 16).await;
+
+    let resp = send_line_recv_response(
+        &sock_path,
+        b"{\"session_id\":\"s1\",\"tool_name\":\"Test\"}\n",
+    )
+    .await;
+    // AC #1 specifies the exact wire response. Using exact equality (not
+    // `starts_with`) catches regressions that append extra detail after the
+    // status line. The structural assertions below stay as belt-and-braces.
+    assert_eq!(
+        resp, "400 missing hook_kind\n",
+        "expected exact 400 missing hook_kind, got: {resp:?}"
+    );
+    assert_eq!(
+        resp.matches('\n').count(),
+        1,
+        "response must be exactly one line: {resp:?}"
+    );
+    assert!(
+        resp.ends_with('\n'),
+        "response must end in newline: {resp:?}"
+    );
+    assert!(
+        resp.len() <= 64,
+        "missing-hook_kind response must stay short (got {} bytes): {resp:?}",
+        resp.len()
+    );
+    shutdown.cancel();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ingest_400_on_unknown_hook_kind() {
+    let tmp = TempDir::new().expect("tempdir");
+    let (shutdown, sock_path, _rx) = start_ingest_listener(&tmp, 16).await;
+
+    let resp = send_line_recv_response(
+        &sock_path,
+        b"{\"hook_kind\":\"BogusKind\",\"session_id\":\"s1\",\"tool_name\":\"Test\"}\n",
+    )
+    .await;
+    assert_eq!(
+        resp, "400 unknown hook_kind: BogusKind\n",
+        "expected exact 400 unknown hook_kind, got: {resp:?}"
+    );
+    shutdown.cancel();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ingest_400_on_non_string_hook_kind() {
+    // AC #3: non-string hook_kind (number, bool, null, array, object) is
+    // malformed in the same way as absent; same wire response.
+    let tmp = TempDir::new().expect("tempdir");
+    let (shutdown, sock_path, _rx) = start_ingest_listener(&tmp, 16).await;
+
+    let resp = send_line_recv_response(
+        &sock_path,
+        b"{\"hook_kind\":42,\"session_id\":\"s1\",\"tool_name\":\"Test\"}\n",
+    )
+    .await;
+    assert_eq!(
+        resp, "400 missing hook_kind\n",
+        "expected exact 400 missing hook_kind for non-string hook_kind, got: {resp:?}"
+    );
+    shutdown.cancel();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ingest_400_on_unknown_hook_kind_with_missing_session_id() {
+    // Story 1.8 review finding: an unknown hook_kind must surface as the
+    // dedicated `400 unknown hook_kind: <value>` wire response even when
+    // other required adapter fields (session_id, tool_name) are absent or
+    // wrong-type. Without ordering hook_kind validation before session_id
+    // extraction in the adapter, this payload would hit MissingField and
+    // emit `400 normalize error: missing required field: session_id` instead.
+    let tmp = TempDir::new().expect("tempdir");
+    let (shutdown, sock_path, _rx) = start_ingest_listener(&tmp, 16).await;
+
+    let resp = send_line_recv_response(
+        &sock_path,
+        b"{\"hook_kind\":\"BogusKind\",\"tool_name\":\"Test\"}\n",
+    )
+    .await;
+    assert_eq!(
+        resp, "400 unknown hook_kind: BogusKind\n",
+        "expected exact 400 unknown hook_kind (no normalize error: prefix), got: {resp:?}"
+    );
+
+    let resp2 = send_line_recv_response(
+        &sock_path,
+        b"{\"hook_kind\":\"BogusKind\",\"session_id\":42,\"tool_name\":\"Test\"}\n",
+    )
+    .await;
+    assert_eq!(
+        resp2, "400 unknown hook_kind: BogusKind\n",
+        "expected exact 400 unknown hook_kind for non-string session_id, got: {resp2:?}"
+    );
+    shutdown.cancel();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ingest_400_on_unknown_hook_kind_sanitizes_newlines() {
+    // AC #6: any user-supplied string flowing into the 400 line must pass
+    // through sanitize_for_wire so embedded \n / \r can't desync the client.
+    let tmp = TempDir::new().expect("tempdir");
+    let (shutdown, sock_path, _rx) = start_ingest_listener(&tmp, 16).await;
+
+    let resp = send_line_recv_response(
+        &sock_path,
+        b"{\"hook_kind\":\"Bad\\nKind\",\"session_id\":\"s1\",\"tool_name\":\"Test\"}\n",
+    )
+    .await;
+    assert!(
+        resp.contains("Bad Kind"),
+        "embedded \\n must be replaced with a space: {resp:?}"
+    );
+    assert_eq!(
+        resp.matches('\n').count(),
+        1,
+        "response must contain exactly one newline (the terminator): {resp:?}"
+    );
+    shutdown.cancel();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ingest_no_db_row_on_missing_hook_kind() {
+    // Story 1.8 review finding: `start_ingest_listener` alone only wires the
+    // listener to an in-memory mpsc — the writer is not plumbed to the test's
+    // DB pool, so a `COUNT(*)` against `pools.reader` would pass even if a
+    // malformed payload were accidentally queued. This harness wires
+    // `listener::run` and `writer::run` together through the same channel and
+    // the same `pools.writer`, so the DB assertion actually exercises the
+    // ingest-to-persistence path. To prove the harness is meaningful, the
+    // test then sends a valid payload and asserts the row count goes up.
+    let (_tmp, pools) = fresh_pools().await;
+    let sock_tmp = TempDir::new().expect("tempdir");
+    let sock_path = sock_tmp.path().join("ingest.sock");
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<EventEnvelope>(16);
+    let shutdown = CancellationToken::new();
+    let adapter = Arc::new(ClaudeAdapter::new(
+        sock_tmp.path().join("nonexistent-tool-reactions.toml"),
+    ));
+
+    let listener_path = sock_path.clone();
+    let listener_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        let _ =
+            bowerbird_daemon::ingest::listener::run(listener_path, tx, listener_shutdown, adapter)
+                .await;
+    });
+
+    let writer_pool = pools.writer.clone();
+    let writer_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        bowerbird_daemon::ingest::writer::run(rx, writer_pool, writer_shutdown).await;
+    });
+
+    // Give the listener a moment to bind and chmod.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // 1. Malformed payload must yield exact `400 missing hook_kind\n`.
+    let resp = send_line_recv_response(
+        &sock_path,
+        b"{\"session_id\":\"s1\",\"tool_name\":\"Test\"}\n",
+    )
+    .await;
+    assert_eq!(
+        resp, "400 missing hook_kind\n",
+        "expected exact 400 missing hook_kind, got: {resp:?}"
+    );
+
+    // Allow a window for any erroneously queued write to reach the DB.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let conn = pools.reader.get().await.expect("reader");
+    let count_after_400: i64 = conn
+        .interact(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM events WHERE source != '__daemon__'",
+                [],
+                |r| r.get(0),
+            )
+        })
+        .await
+        .expect("interact")
+        .expect("count");
+    assert_eq!(
+        count_after_400, 0,
+        "missing hook_kind must not produce a DB row"
+    );
+
+    // 2. Valid payload must persist — proves the writer is plumbed to
+    //    `pools.writer`, so the assertion above is meaningful.
+    let valid_resp = send_line_recv_response(
+        &sock_path,
+        b"{\"hook_kind\":\"PreToolUse\",\"session_id\":\"s1\",\"tool_name\":\"Test\"}\n",
+    )
+    .await;
+    assert!(
+        valid_resp.starts_with("200"),
+        "expected 200 for valid payload, got: {valid_resp:?}"
+    );
+
+    // Wait for the writer to persist before re-querying.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let conn2 = pools.reader.get().await.expect("reader");
+    let count_after_valid: i64 = conn2
+        .interact(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM events WHERE source != '__daemon__'",
+                [],
+                |r| r.get(0),
+            )
+        })
+        .await
+        .expect("interact")
+        .expect("count");
+    assert_eq!(
+        count_after_valid, 1,
+        "valid payload must persist exactly one event row (harness sanity check)"
+    );
+
     shutdown.cancel();
 }
 
