@@ -4,11 +4,15 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use bowerbird_daemon::{
-    api,
+    api::{
+        self,
+        token::{self, TokenSource},
+    },
     config::Config,
     db::{init_pools, run_migrations, DbPools},
     ensure_bowerbird_dir, ingest, init_tracing, install_panic_hook, projection, set_crash_dir,
     state::AppState,
+    time::current_unix_millis,
     write_error_report,
 };
 use clap::Parser;
@@ -76,6 +80,26 @@ async fn run(config: Config) -> anyhow::Result<()> {
     let migrations_complete = Arc::new(AtomicBool::new(false));
     let shutdown = CancellationToken::new();
 
+    // Load the bearer token before anything else REST-related is constructed.
+    // A `Generated` source warrants a WARN line so operators running without
+    // `$BOWERBIRD_TOKEN` set realize the ephemeral token has been minted and
+    // is visible only in this log stream (the token value itself is never
+    // logged — `secrecy::SecretString` redacts `Debug`/`Display`).
+    let (bearer, token_source) = token::load_or_generate();
+    match token_source {
+        TokenSource::Env => {
+            tracing::info!("bearer token loaded from $BOWERBIRD_TOKEN");
+        }
+        TokenSource::Generated => {
+            tracing::warn!(
+                "daemon generated ephemeral bearer token; set $BOWERBIRD_TOKEN to control it (token value not logged)"
+            );
+        }
+    }
+
+    let started_at_ms =
+        current_unix_millis().context("failed to read startup wall-clock for AppState")?;
+
     let pools = init_pools(&config.db_path)
         .await
         .with_context(|| format!("failed to init pools at {}", config.db_path.display()))?;
@@ -140,6 +164,8 @@ async fn run(config: Config) -> anyhow::Result<()> {
         db: pools.clone(),
         migrations_complete: migrations_complete.clone(),
         shutdown: shutdown.clone(),
+        bearer,
+        started_at_ms,
     };
     let router = api::router(state);
     let listener = tokio::net::TcpListener::bind(config.bind_addr)

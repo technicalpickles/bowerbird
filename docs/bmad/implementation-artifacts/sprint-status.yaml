@@ -1,5 +1,5 @@
 # generated: 2026-05-16
-# last_updated: 2026-05-19 (story 1.6 review)
+# last_updated: 2026-05-20 (story 1.7 review)
 # project: bowerbird
 # project_key: NOKEY
 # tracking_system: file-system
@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-05-16
-last_updated: 2026-05-19
+last_updated: 2026-05-20
 project: bowerbird
 project_key: NOKEY
 tracking_system: file-system
@@ -50,7 +50,7 @@ development_status:
   1-4-claude-code-adapter-and-event-normalization: done
   1-5-shim-binary-with-hot-path-event-delivery: done
   1-6-session-projection-and-hook-unreliability-tolerance: review
-  1-7-rest-query-api: backlog
+  1-7-rest-query-api: done
   1-8-tighten-daemon-hook-kind: backlog
   epic-1-retrospective: optional
 
