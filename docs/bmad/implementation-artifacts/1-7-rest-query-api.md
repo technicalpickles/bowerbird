@@ -1,6 +1,6 @@
 # Story 1.7: REST Query API
 
-Status: ready-for-dev
+Status: review
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -30,19 +30,19 @@ so that I can build tools that show current Claude Code session state and recove
 
 ## Tasks / Subtasks
 
-- [ ] **Task 1: Add bearer-token type + loader to daemon** (AC: #7)
-  - [ ] Add `secrecy = { workspace = true }` to `crates/daemon/Cargo.toml` `[dependencies]` (workspace already pins `secrecy = "0.10.3"` per `architecture.md:328`). Add `subtle = "2.6"` to workspace deps **and** to daemon deps — required for constant-time comparison; this is a new dep, document the rationale in the commit. (`subtle` is the canonical Rust crate for timing-safe primitives, no_std, ~0 KB. The author considered hand-rolling — rejected: cryptographic primitives are not the place to invent.)
-  - [ ] Create `crates/daemon/src/api/token.rs` with:
+- [x] **Task 1: Add bearer-token type + loader to daemon** (AC: #7)
+  - [x] Add `secrecy = { workspace = true }` to `crates/daemon/Cargo.toml` `[dependencies]` (workspace already pins `secrecy = "0.10.3"` per `architecture.md:328`). Add `subtle = "2.6"` to workspace deps **and** to daemon deps — required for constant-time comparison; this is a new dep, document the rationale in the commit. (`subtle` is the canonical Rust crate for timing-safe primitives, no_std, ~0 KB. The author considered hand-rolling — rejected: cryptographic primitives are not the place to invent.)
+  - [x] Create `crates/daemon/src/api/token.rs` with:
     - `pub struct BearerToken(secrecy::SecretString);` deriving `Clone`. Implement `pub fn new(s: String) -> Self`, `pub fn generate_uuid4() -> Self` (uses `uuid::Uuid::new_v4().to_string()`), and `pub fn verify(&self, candidate: &str) -> bool` doing a constant-time compare via `subtle::ConstantTimeEq` on the raw bytes (extract the inner string via `secrecy::ExposeSecret::expose_secret`). Do NOT implement `Debug` or `Display` — `secrecy::SecretString` already redacts; do NOT add a `pub fn expose(&self) -> &str` on `BearerToken` (the only legitimate caller is `verify`, which lives in this module).
     - `pub fn load_or_generate() -> (BearerToken, TokenSource)` where `TokenSource` is `enum { Env, Generated }`. Resolution order for V1:
       1. `BOWERBIRD_TOKEN` env var: if set and non-empty, use it; `TokenSource::Env`.
       2. Generate a fresh UUID4; `TokenSource::Generated`.
     - **Out of scope for 1.7:** system keychain primary lookup and `~/.bowerbird/config.toml` file fallback. Story 3.3 (Bearer token auth with keychain storage) wires the full chain: `keychain → env → file`. Story 1.7 ships the *validation* layer and a minimal-but-correct token source so REST ACs hold today; 3.3 swaps in the issuance + storage chain without changing the validation surface.
-  - [ ] Wire it into `crates/daemon/src/main.rs::run`: call `token::load_or_generate()` **after** `init_tracing` and **before** any router construction. If `TokenSource::Generated`, log at WARN (mirror the bind-addr WARN pattern from `main.rs:130-132`) — the operationally important fact ("the daemon generated an ephemeral token; if you have no `BOWERBIRD_TOKEN`, you cannot make authenticated calls without reading this log line") must be visible at the default `error` verbosity. **Do NOT** log the token value itself; log only `"daemon generated ephemeral bearer token; set $BOWERBIRD_TOKEN to control it (see docs)"`.
-  - [ ] **Critical security invariant** (`architecture.md:444-446`): the ingest path **never** reads the bearer token. Verify by inspection that `crates/daemon/src/ingest/listener.rs` and `crates/daemon/src/ingest/handler.rs` do not import `BearerToken` or `crate::api::token`. Add a brief grep-style comment at the top of `api/token.rs` reminding future contributors of this rule.
+  - [x] Wire it into `crates/daemon/src/main.rs::run`: call `token::load_or_generate()` **after** `init_tracing` and **before** any router construction. If `TokenSource::Generated`, log at WARN (mirror the bind-addr WARN pattern from `main.rs:130-132`) — the operationally important fact ("the daemon generated an ephemeral token; if you have no `BOWERBIRD_TOKEN`, you cannot make authenticated calls without reading this log line") must be visible at the default `error` verbosity. **Do NOT** log the token value itself; log only `"daemon generated ephemeral bearer token; set $BOWERBIRD_TOKEN to control it (see docs)"`.
+  - [x] **Critical security invariant** (`architecture.md:444-446`): the ingest path **never** reads the bearer token. Verify by inspection that `crates/daemon/src/ingest/listener.rs` and `crates/daemon/src/ingest/handler.rs` do not import `BearerToken` or `crate::api::token`. Add a brief grep-style comment at the top of `api/token.rs` reminding future contributors of this rule.
 
-- [ ] **Task 2: Update `AppState` with the new fields** (AC: #3, #4, #7)
-  - [ ] Modify `crates/daemon/src/state.rs`:
+- [x] **Task 2: Update `AppState` with the new fields** (AC: #3, #4, #7)
+  - [x] Modify `crates/daemon/src/state.rs`:
     ```rust
     pub struct AppState {
         pub db: DbPools,
@@ -52,13 +52,13 @@ so that I can build tools that show current Claude Code session state and recove
         pub started_at_ms: i64,          // NEW — for /status uptime
     }
     ```
-  - [ ] `BearerToken: Clone` so `AppState: Clone` continues to hold (axum routers require it).
-  - [ ] `started_at_ms` is set to `current_unix_millis()` (same helper as `projection::session::current_unix_millis`) at daemon startup, BEFORE `AppState` is constructed. The value is immutable for the daemon's lifetime; cloning `AppState` propagates the value unchanged.
-  - [ ] Update every `AppState { ... }` construction site: `crates/daemon/src/main.rs::run` (one site) and every test fixture in `crates/daemon/tests/contract_daemon.rs` that constructs `AppState` (e.g. `readyz_returns_503_before_migrations_complete`, `healthz_returns_200_immediately`). Add a small test helper `fn make_test_state(pools: DbPools, migrations_complete: Arc<AtomicBool>) -> AppState` if the construction noise gets repetitive — but keep it scoped to the test file, do not put it in `bowerbird_daemon::state`.
-  - [ ] No new `Error` variants are needed. Existing `Error::Pool`, `Error::Sqlite`, `Error::Clock` cover all new failure paths.
+  - [x] `BearerToken: Clone` so `AppState: Clone` continues to hold (axum routers require it).
+  - [x] `started_at_ms` is set to `current_unix_millis()` (same helper as `projection::session::current_unix_millis`) at daemon startup, BEFORE `AppState` is constructed. The value is immutable for the daemon's lifetime; cloning `AppState` propagates the value unchanged.
+  - [x] Update every `AppState { ... }` construction site: `crates/daemon/src/main.rs::run` (one site) and every test fixture in `crates/daemon/tests/contract_daemon.rs` that constructs `AppState` (e.g. `readyz_returns_503_before_migrations_complete`, `healthz_returns_200_immediately`). Add a small test helper `fn make_test_state(pools: DbPools, migrations_complete: Arc<AtomicBool>) -> AppState` if the construction noise gets repetitive — but keep it scoped to the test file, do not put it in `bowerbird_daemon::state`.
+  - [x] No new `Error` variants are needed. Existing `Error::Pool`, `Error::Sqlite`, `Error::Clock` cover all new failure paths.
 
-- [ ] **Task 3: Implement bearer auth middleware** (AC: #7)
-  - [ ] Create `crates/daemon/src/api/auth.rs` exporting `pub async fn require_bearer<B>(State(state): State<AppState>, req: Request<B>, next: Next) -> Response`. Implementation outline:
+- [x] **Task 3: Implement bearer auth middleware** (AC: #7)
+  - [x] Create `crates/daemon/src/api/auth.rs` exporting `pub async fn require_bearer<B>(State(state): State<AppState>, req: Request<B>, next: Next) -> Response`. Implementation outline:
     ```rust
     use axum::extract::{Request, State};
     use axum::http::StatusCode;
@@ -90,7 +90,7 @@ so that I can build tools that show current Claude Code session state and recove
         }
     }
     ```
-  - [ ] Use `axum::middleware::from_fn_with_state` to wire it. The router shape becomes:
+  - [x] Use `axum::middleware::from_fn_with_state` to wire it. The router shape becomes:
     ```rust
     // crates/daemon/src/api/mod.rs
     let unauthenticated = Router::new()
@@ -111,11 +111,11 @@ so that I can build tools that show current Claude Code session state and recove
         .with_state(state)
     ```
     **Note:** axum 0.8 uses `{id}` not `:id` for path params (changed in 0.8). Verify by inspection at `crates/daemon/src/api/mod.rs` if any existing route uses `:id` — none currently exist, but architecture.md text still says `:id`; the implementation must use `{id}`. Add a one-line dev note in api/mod.rs explaining axum 0.8 path-param syntax for the next contributor.
-  - [ ] **Timing-safe comparison** is non-negotiable. `subtle::ConstantTimeEq::ct_eq(left, right)` returns a `Choice` (u8 wrapper); call `.into()` to get `bool`. Wrong-length tokens still take O(min(left.len(), right.len())) time — this is what `subtle` provides. Do NOT short-circuit on length mismatch outside `subtle`'s contract — the entire comparison must run the same number of cycles regardless of token shape.
-  - [ ] Add `tower-http::trace::TraceLayer::new_for_http()` and `tower_http::request_id::SetRequestIdLayer` + `PropagateRequestIdLayer` **out of scope for 1.7** — those land in a future hardening story per `project-context.md:495`. This story does *not* expand the middleware chain beyond the bearer auth layer.
+  - [x] **Timing-safe comparison** is non-negotiable. `subtle::ConstantTimeEq::ct_eq(left, right)` returns a `Choice` (u8 wrapper); call `.into()` to get `bool`. Wrong-length tokens still take O(min(left.len(), right.len())) time — this is what `subtle` provides. Do NOT short-circuit on length mismatch outside `subtle`'s contract — the entire comparison must run the same number of cycles regardless of token shape.
+  - [x] Add `tower-http::trace::TraceLayer::new_for_http()` and `tower_http::request_id::SetRequestIdLayer` + `PropagateRequestIdLayer` **out of scope for 1.7** — those land in a future hardening story per `project-context.md:495`. This story does *not* expand the middleware chain beyond the bearer auth layer.
 
-- [ ] **Task 4: Add `/sessions` list endpoint** (AC: #3)
-  - [ ] Add protocol type to `crates/protocol/src/rest.rs`:
+- [x] **Task 4: Add `/sessions` list endpoint** (AC: #3)
+  - [x] Add protocol type to `crates/protocol/src/rest.rs`:
     ```rust
     use crate::state::{SessionCurrentState, SessionState};
 
@@ -130,8 +130,8 @@ so that I can build tools that show current Claude Code session state and recove
     }
     ```
     No `#[serde(deny_unknown_fields)]` — this is an outbound type; the asymmetric serde rule (`architecture.md:606-608`) requires permissive deserialization. Add a snapshot test in `crates/protocol/tests/contract_protocol.rs` round-tripping a `SessionListItem` with an extra unknown JSON field, asserting parse success (mirrors Story 1.6's pattern for `SessionState`).
-  - [ ] Update `crates/protocol/src/lib.rs` re-exports: add `SessionListItem` next to the existing `EventListResponse, SessionStats`.
-  - [ ] Add SQL constant `SELECT_NON_SENTINEL_SESSIONS` in `crates/daemon/src/db/queries.rs`:
+  - [x] Update `crates/protocol/src/lib.rs` re-exports: add `SessionListItem` next to the existing `EventListResponse, SessionStats`.
+  - [x] Add SQL constant `SELECT_NON_SENTINEL_SESSIONS` in `crates/daemon/src/db/queries.rs`:
     ```rust
     pub const SELECT_NON_SENTINEL_SESSIONS: &str =
         "SELECT source, session_id, state, updated_at FROM session_projections \
@@ -139,18 +139,18 @@ so that I can build tools that show current Claude Code session state and recove
          ORDER BY updated_at DESC, source ASC, session_id ASC";
     ```
     The `__daemon__` literal is duplicated from `projection::session.rs::DAEMON_SENTINEL_SOURCE`. **Do not** import the constant into `queries.rs` (that would couple the SQL strings module to the projection module). Add a single-line comment at the SQL site cross-referencing `projection::session::DAEMON_SENTINEL_SOURCE` so a future rename of the sentinel breaks loudly in code review.
-  - [ ] Create `crates/daemon/src/api/sessions.rs` with `pub async fn list(State(state): State<AppState>) -> Response`:
+  - [x] Create `crates/daemon/src/api/sessions.rs` with `pub async fn list(State(state): State<AppState>) -> Response`:
     1. Acquire a reader-pool connection via `state.db.reader.get().await`. On pool error, return `500 { "error": "<sanitized>" }` (do not leak internal pool error text; log the original via `tracing::error!` and surface a generic message).
     2. Inside `conn.interact`, prepare `SELECT_NON_SENTINEL_SESSIONS` and `query_map` into rows of `(String /* source */, String /* session_id */, String /* state JSON */, i64 /* updated_at */)`.
     3. For each row: deserialize `state` via `serde_json::from_str::<SessionState>()`. On parse error, log at `error` level and **skip the row** (do not 500 the whole list — one bad projection row should not blank the entire response). This matches the same defensive policy in `projection::session::write` for stored-state deserialization (Story 1.6 Task 3).
     4. Compute `current_state = projection::state::current_state_for_read(&stored, now_ms)` for each row.
     5. Construct `SessionListItem { source, session_id, current_state, last_event_kind: stored.last_event_kind, last_event_at_ms: stored.last_event_at_ms, updated_at }`.
     6. Return `Json(items)` (axum auto-serializes to `application/json`).
-  - [ ] **Read-time stale fallback (AC #3 invariant)**: this is the single place where Story 1.6's `current_state_for_read` is wired into a public surface. Story 1.6 added the pure function; Story 1.7 wires the first caller. Do NOT mutate the stored row.
-  - [ ] **Pagination:** out of scope for V1. Even at 10k sessions the response is ~1MB JSON — well under any reasonable limit for a developer-tool. Track as deferred work for a future "many sessions" hardening pass.
+  - [x] **Read-time stale fallback (AC #3 invariant)**: this is the single place where Story 1.6's `current_state_for_read` is wired into a public surface. Story 1.6 added the pure function; Story 1.7 wires the first caller. Do NOT mutate the stored row.
+  - [x] **Pagination:** out of scope for V1. Even at 10k sessions the response is ~1MB JSON — well under any reasonable limit for a developer-tool. Track as deferred work for a future "many sessions" hardening pass.
 
-- [ ] **Task 5: Add `/sessions/:id` detail endpoint** (AC: #4)
-  - [ ] Add protocol type `SessionDetail` to `crates/protocol/src/rest.rs`:
+- [x] **Task 5: Add `/sessions/:id` detail endpoint** (AC: #4)
+  - [x] Add protocol type `SessionDetail` to `crates/protocol/src/rest.rs`:
     ```rust
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct SessionDetail {
@@ -161,7 +161,7 @@ so that I can build tools that show current Claude Code session state and recove
     }
     ```
     Re-export from `lib.rs`. Add round-trip snapshot test in `contract_protocol.rs`.
-  - [ ] Add SQL constant `SELECT_SESSION_BY_ID` in `queries.rs`:
+  - [x] Add SQL constant `SELECT_SESSION_BY_ID` in `queries.rs`:
     ```rust
     pub const SELECT_SESSION_BY_ID: &str =
         "SELECT source, session_id, state, updated_at FROM session_projections \
@@ -169,17 +169,17 @@ so that I can build tools that show current Claude Code session state and recove
          ORDER BY updated_at DESC LIMIT 1";
     ```
     The `ORDER BY updated_at DESC LIMIT 1` handles the hypothetical `(source, session_id)` collision case (two sources, same `session_id`) by returning the most-recently-updated row. V1 only has the `"claude"` source, so the ordering never matters in practice. Document this in a comment at the SQL site.
-  - [ ] In `crates/daemon/src/api/sessions.rs`, add `pub async fn detail(State(state): State<AppState>, Path(id): Path<String>) -> Response`:
+  - [x] In `crates/daemon/src/api/sessions.rs`, add `pub async fn detail(State(state): State<AppState>, Path(id): Path<String>) -> Response`:
     1. Reader-pool checkout.
     2. `interact` → `query_row(SELECT_SESSION_BY_ID, [&id])` → tuple `(String, String, String, i64)`. If `QueryReturnedNoRows`, return `404 { "error": "session not found" }`. Any other rusqlite error → `500` (log).
     3. Deserialize `state` JSON to `SessionState`. On parse error: log at `error` and return `500` (a single-row corruption is not silent-skippable here the way it is in the list endpoint — the user explicitly asked for *this* row; surfacing 200-with-no-state would lie).
     4. Apply `current_state_for_read` to the stored state for the read-time fallback. **However**: `SessionDetail.state` is `SessionState`, not just `current_state` — the wire shape exposes `last_event_kind` and `last_event_at_ms` too. The cleanest implementation: construct a new `SessionState` where `current_state` is the fallback value but `last_event_kind` and `last_event_at_ms` are pulled verbatim from the stored row. This mirrors what `current_state_for_read` would return if it were structured to update an entire `SessionState` (and the function is intentionally narrower — see Story 1.6 rationale).
     5. Return `Json(SessionDetail { source, session_id, state: derived, updated_at })`.
-  - [ ] **Path-param disambiguation deferred-work entry:** add an entry to `deferred-work.md`: "REST `/sessions/{id}` does not include `source` in the path or as a query param; when a second adapter ships (Codex, OpenCode), the path needs to grow to `/sources/{source}/sessions/{id}` or accept `?source=` — Story 1.7 picks the most-recently-updated row as a stopgap." Include the file path and a one-line rationale.
+  - [x] **Path-param disambiguation deferred-work entry:** add an entry to `deferred-work.md`: "REST `/sessions/{id}` does not include `source` in the path or as a query param; when a second adapter ships (Codex, OpenCode), the path needs to grow to `/sources/{source}/sessions/{id}` or accept `?source=` — Story 1.7 picks the most-recently-updated row as a stopgap." Include the file path and a one-line rationale.
 
-- [ ] **Task 6: Add `/sessions/:id/events?since=<cursor>` history endpoint** (AC: #5, #6)
-  - [ ] `protocol::EventListResponse` already exists with the right shape (`events: Vec<Event>, cursor: Option<EventId>, oldest_available_event_id: EventId`) — do NOT modify the wire type. Do verify that `protocol::Event` includes `created_at: i64` (NFR22 — already present, see `crates/protocol/src/event.rs:30-38`).
-  - [ ] Add SQL constants in `queries.rs`:
+- [x] **Task 6: Add `/sessions/:id/events?since=<cursor>` history endpoint** (AC: #5, #6)
+  - [x] `protocol::EventListResponse` already exists with the right shape (`events: Vec<Event>, cursor: Option<EventId>, oldest_available_event_id: EventId`) — do NOT modify the wire type. Do verify that `protocol::Event` includes `created_at: i64` (NFR22 — already present, see `crates/protocol/src/event.rs:30-38`).
+  - [x] Add SQL constants in `queries.rs`:
     ```rust
     pub const SELECT_EVENTS_FOR_SESSION_SINCE: &str =
         "SELECT event_id, source, session_id, kind, reaction, payload, created_at \
@@ -191,7 +191,7 @@ so that I can build tools that show current Claude Code session state and recove
         "SELECT MIN(event_id) FROM events WHERE source != '__daemon__'";
     ```
     The `MIN` query returns `Option<i64>`: `None` when the events table is empty (or only has sentinels); the daemon then surfaces `i64::MAX` per the protocol contract (`architecture.md:427`).
-  - [ ] Create `crates/daemon/src/api/events.rs` with `pub async fn list(State(state): State<AppState>, Path(id): Path<String>, Query(params): Query<EventsParams>) -> Response`:
+  - [x] Create `crates/daemon/src/api/events.rs` with `pub async fn list(State(state): State<AppState>, Path(id): Path<String>, Query(params): Query<EventsParams>) -> Response`:
     1. Define a `#[derive(serde::Deserialize)] struct EventsParams { #[serde(default)] since: i64 }`. **Inbound type**: add `#[serde(deny_unknown_fields)]` per architecture.md:606 — this is a strict-inbound surface. Unknown query params produce a `400`. (Axum's `Query` extractor surfaces deserialization errors as `400` automatically.)
     2. Reader-pool checkout.
     3. `interact`:
@@ -201,13 +201,13 @@ so that I can build tools that show current Claude Code session state and recove
         - Execute `SELECT_MIN_EVENT_ID`. Map `Some(min) → EventId(min)`, `None → EventId(i64::MAX)`.
         - Compute `cursor = events.last().map(|e| e.event_id)`.
     4. Return `Json(EventListResponse { events, cursor, oldest_available_event_id })`.
-  - [ ] **Cursor semantics:** `cursor = Some(events.last().event_id)` when events non-empty; `None` when empty. Presenters use it as the next `?since=`. This matches the standard "tailing cursor" idiom and is the implicit contract from `architecture.md:142-144` (the type exists; this story defines its semantics). Document the contract in a Rust doc-comment on `EventListResponse` in `crates/protocol/src/rest.rs` so future authors don't reinvent it.
-  - [ ] **Page size:** no internal limit in V1. The single-developer load profile and SQLite read performance mean even 100k events serializes in under a second. Track as deferred-work for the "many events" hardening pass: "Add `&limit=` query param + `cursor = Some(last_returned_id)` when the limit is reached, else `None`."
-  - [ ] **Per-session vs global `oldest_available_event_id`?** Global. The protocol contract (`architecture.md:142-145`) is about the entire event log; a presenter holding a cursor for session A wants to know "is event_id 10 still on disk anywhere?" not "is event_id 10 still on disk for session A?" Truncation policy is global (delete-the-DB-or-bust in V1; `bowerbird gc` post-V1), so the answer is also global. Document this in a Rust doc-comment on `EventListResponse.oldest_available_event_id`.
+  - [x] **Cursor semantics:** `cursor = Some(events.last().event_id)` when events non-empty; `None` when empty. Presenters use it as the next `?since=`. This matches the standard "tailing cursor" idiom and is the implicit contract from `architecture.md:142-144` (the type exists; this story defines its semantics). Document the contract in a Rust doc-comment on `EventListResponse` in `crates/protocol/src/rest.rs` so future authors don't reinvent it.
+  - [x] **Page size:** no internal limit in V1. The single-developer load profile and SQLite read performance mean even 100k events serializes in under a second. Track as deferred-work for the "many events" hardening pass: "Add `&limit=` query param + `cursor = Some(last_returned_id)` when the limit is reached, else `None`."
+  - [x] **Per-session vs global `oldest_available_event_id`?** Global. The protocol contract (`architecture.md:142-145`) is about the entire event log; a presenter holding a cursor for session A wants to know "is event_id 10 still on disk anywhere?" not "is event_id 10 still on disk for session A?" Truncation policy is global (delete-the-DB-or-bust in V1; `bowerbird gc` post-V1), so the answer is also global. Document this in a Rust doc-comment on `EventListResponse.oldest_available_event_id`.
 
-- [ ] **Task 7: Add `/sessions/:id/stats` endpoint** (AC: #8)
-  - [ ] `protocol::SessionStats` already exists with the right shape (`source, session_id, event_count, first_event_at, last_event_at`). Do NOT modify the wire type.
-  - [ ] Add SQL constant `SELECT_STATS_FOR_SESSION` in `queries.rs`:
+- [x] **Task 7: Add `/sessions/:id/stats` endpoint** (AC: #8)
+  - [x] `protocol::SessionStats` already exists with the right shape (`source, session_id, event_count, first_event_at, last_event_at`). Do NOT modify the wire type.
+  - [x] Add SQL constant `SELECT_STATS_FOR_SESSION` in `queries.rs`:
     ```rust
     pub const SELECT_STATS_FOR_SESSION: &str =
         "SELECT source, COUNT(*) as event_count, MIN(created_at) as first_event_at, \
@@ -218,14 +218,14 @@ so that I can build tools that show current Claude Code session state and recove
          ORDER BY MAX(created_at) DESC LIMIT 1";
     ```
     Returns `(String /* source */, i64, Option<i64>, Option<i64>)`. `MIN`/`MAX` on `created_at` are `NULL` only when no rows match the WHERE — which is filtered out by `GROUP BY ... LIMIT 1` producing zero result rows. So in practice `first_event_at` and `last_event_at` are non-NULL when the query returns a row. The Option<i64> in `SessionStats` is for the *case where the projection exists but the events table has been purged* — a far-future scenario that V1 doesn't address; the wire type carries it forward for forward-compat.
-  - [ ] In `crates/daemon/src/api/sessions.rs`, add `pub async fn stats(State(state): State<AppState>, Path(id): Path<String>) -> Response`:
+  - [x] In `crates/daemon/src/api/sessions.rs`, add `pub async fn stats(State(state): State<AppState>, Path(id): Path<String>) -> Response`:
     1. Reader-pool checkout.
     2. `interact` → `query_row(SELECT_STATS_FOR_SESSION, [&id])`. `QueryReturnedNoRows` → `404`. Other errors → `500`.
     3. Return `Json(SessionStats { source, session_id: id, event_count, first_event_at, last_event_at })`.
-  - [ ] **404 semantics consistency:** `/sessions/:id` returns 404 from `session_projections`; `/sessions/:id/stats` returns 404 from `events`. These two tables can diverge transiently (the projection writes happen first inside the transaction, then the event INSERT — see `projection::session::write` Task 3 of Story 1.6). The probability of a request landing exactly between the two writes is ~zero on a single-writer pool, but the inconsistency is theoretically observable. Document this in a Dev Note: the two 404 sources are not synchronized; the answer is "consult the projection (`/sessions/:id`) if you need authoritative session existence; consult stats only after that returns 200."
+  - [x] **404 semantics consistency:** `/sessions/:id` returns 404 from `session_projections`; `/sessions/:id/stats` returns 404 from `events`. These two tables can diverge transiently (the projection writes happen first inside the transaction, then the event INSERT — see `projection::session::write` Task 3 of Story 1.6). The probability of a request landing exactly between the two writes is ~zero on a single-writer pool, but the inconsistency is theoretically observable. Document this in a Dev Note: the two 404 sources are not synchronized; the answer is "consult the projection (`/sessions/:id`) if you need authoritative session existence; consult stats only after that returns 200."
 
-- [ ] **Task 8: Add `/status` endpoint** (AC: ancillary — listed in epic AC #7 endpoint list, no specific behavioral AC; matches PRD line 356)
-  - [ ] Add protocol type `DaemonStatus` to `crates/protocol/src/rest.rs`:
+- [x] **Task 8: Add `/status` endpoint** (AC: ancillary — listed in epic AC #7 endpoint list, no specific behavioral AC; matches PRD line 356)
+  - [x] Add protocol type `DaemonStatus` to `crates/protocol/src/rest.rs`:
     ```rust
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct DaemonStatus {
@@ -239,7 +239,7 @@ so that I can build tools that show current Claude Code session state and recove
     }
     ```
     Re-export from `lib.rs`. Add round-trip snapshot test in `contract_protocol.rs` including an extra unknown JSON field.
-  - [ ] Add SQL constant `SELECT_LAST_EVENT` in `queries.rs`:
+  - [x] Add SQL constant `SELECT_LAST_EVENT` in `queries.rs`:
     ```rust
     pub const SELECT_LAST_EVENT: &str =
         "SELECT event_id, created_at FROM events \
@@ -247,16 +247,16 @@ so that I can build tools that show current Claude Code session state and recove
          ORDER BY event_id DESC LIMIT 1";
     ```
     Returns `Option<(i64, i64)>` — `None` when the events table is empty or only has sentinels.
-  - [ ] Create `crates/daemon/src/api/status.rs` with `pub async fn get(State(state): State<AppState>) -> Response`:
+  - [x] Create `crates/daemon/src/api/status.rs` with `pub async fn get(State(state): State<AppState>) -> Response`:
     1. Reader-pool checkout.
     2. Compute `now_ms = current_unix_millis()` (reuse the projection helper — if it's not exposed publicly today, move it to `crates/daemon/src/db/queries.rs` or a new `crates/daemon/src/time.rs` so both modules can use it. Do NOT duplicate the function — that's a "two clocks divergence" bug waiting to happen).
     3. `interact` → optional `(event_id, created_at)` via `SELECT_LAST_EVENT`. Map to `(Option<EventId>, Option<i64>)`.
     4. Return `Json(DaemonStatus { daemon_version: env!("CARGO_PKG_VERSION").to_string(), protocol_version: "1.0".to_string(), started_at_ms: state.started_at_ms, uptime_ms: now_ms - state.started_at_ms, last_event_at_ms, last_event_id })`.
-  - [ ] Add `pub mod status;` to `crates/daemon/src/api/mod.rs`.
-  - [ ] **Where does `current_unix_millis` live now?** Currently a private fn at `crates/daemon/src/projection/session.rs:187-194`. Story 1.7 needs to share it between `projection` and `api::status`. Cleanest move: extract to `crates/daemon/src/time.rs` as a `pub(crate) fn current_unix_millis() -> Result<i64>`, update the one existing call site, and let `api::status` and the auth init path both use it. **Do NOT** add a new dep (`chrono`, `time`) — the existing `SystemTime::now()` approach is the project pattern (Story 1.5 Dev Notes explicitly justify this; ditto Story 1.6 Anti-Patterns).
+  - [x] Add `pub mod status;` to `crates/daemon/src/api/mod.rs`.
+  - [x] **Where does `current_unix_millis` live now?** Currently a private fn at `crates/daemon/src/projection/session.rs:187-194`. Story 1.7 needs to share it between `projection` and `api::status`. Cleanest move: extract to `crates/daemon/src/time.rs` as a `pub(crate) fn current_unix_millis() -> Result<i64>`, update the one existing call site, and let `api::status` and the auth init path both use it. **Do NOT** add a new dep (`chrono`, `time`) — the existing `SystemTime::now()` approach is the project pattern (Story 1.5 Dev Notes explicitly justify this; ditto Story 1.6 Anti-Patterns).
 
-- [ ] **Task 9: Strengthen `/readyz` with DB probe** (AC: #2)
-  - [ ] Modify `crates/daemon/src/api/health.rs::readyz`:
+- [x] **Task 9: Strengthen `/readyz` with DB probe** (AC: #2)
+  - [x] Modify `crates/daemon/src/api/health.rs::readyz`:
     ```rust
     pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
         if !state.migrations_complete.load(Ordering::Acquire) {
@@ -282,12 +282,12 @@ so that I can build tools that show current Claude Code session state and recove
     }
     ```
     The `WHERE 1=0` literal makes the query exit before scanning any rows — sub-millisecond on any DB size. The probe validates: (a) pool checkout succeeds within the 5s timeout; (b) the connection is alive; (c) the `events` table exists (would fail with "no such table" otherwise — catches a corrupt-schema state that bare `SELECT 1` would miss).
-  - [ ] **Story 1.2 deferred-work item resolution:** strike line 32 in `docs/bmad/implementation-artifacts/deferred-work.md` (`/readyz` does not probe the database) with a backlink to the Story 1.7 commit. Use the same strike convention used by Story 1.6 (Task 12 of 1.6 strikes the WAL-durability surrogate entry).
-  - [ ] **Shutdown drain invariant** (`crates/daemon/src/main.rs:152-154`): the daemon flips `migrations_complete.store(false)` during graceful shutdown so a probe in flight observes 503. With the new DB-probe layer, this still works because the migrations_complete check runs FIRST — drain semantics are preserved.
-  - [ ] **What `/readyz` does NOT probe:** broadcaster initialization (Epic 2), socket binding (Epic 1.3 already enforces), config validity. The probe is intentionally narrow: "DB is reachable; schema is sane; migrations have applied." Anything else belongs in `/status` or a future `/checks` endpoint.
+  - [x] **Story 1.2 deferred-work item resolution:** strike line 32 in `docs/bmad/implementation-artifacts/deferred-work.md` (`/readyz` does not probe the database) with a backlink to the Story 1.7 commit. Use the same strike convention used by Story 1.6 (Task 12 of 1.6 strikes the WAL-durability surrogate entry).
+  - [x] **Shutdown drain invariant** (`crates/daemon/src/main.rs:152-154`): the daemon flips `migrations_complete.store(false)` during graceful shutdown so a probe in flight observes 503. With the new DB-probe layer, this still works because the migrations_complete check runs FIRST — drain semantics are preserved.
+  - [x] **What `/readyz` does NOT probe:** broadcaster initialization (Epic 2), socket binding (Epic 1.3 already enforces), config validity. The probe is intentionally narrow: "DB is reachable; schema is sane; migrations have applied." Anything else belongs in `/status` or a future `/checks` endpoint.
 
-- [ ] **Task 10: Wire the new router** (AC: #1, #3, #4, #5, #6, #7, #8)
-  - [ ] Replace `crates/daemon/src/api/mod.rs` body with the merged unauthenticated/authenticated router (see Task 3 layout). Top of the file:
+- [x] **Task 10: Wire the new router** (AC: #1, #3, #4, #5, #6, #7, #8)
+  - [x] Replace `crates/daemon/src/api/mod.rs` body with the merged unauthenticated/authenticated router (see Task 3 layout). Top of the file:
     ```rust
     pub mod auth;
     pub mod events;
@@ -320,14 +320,14 @@ so that I can build tools that show current Claude Code session state and recove
             .with_state(state)
     }
     ```
-  - [ ] **Axum path-param syntax (axum 0.8):** `/sessions/{id}` (curly braces). Architecture text uses `:id`; that is axum 0.7 syntax. Pin the curly-brace form by inspection at build time — if `cargo check` fails with "invalid route pattern", the syntax is wrong.
+  - [x] **Axum path-param syntax (axum 0.8):** `/sessions/{id}` (curly braces). Architecture text uses `:id`; that is axum 0.7 syntax. Pin the curly-brace form by inspection at build time — if `cargo check` fails with "invalid route pattern", the syntax is wrong.
 
-- [ ] **Task 11: Contract test — `/healthz` smoke under new router shape** (AC: #1)
-  - [ ] Keep the existing `healthz_returns_200_immediately` test (`crates/daemon/tests/contract_daemon.rs:382`). Add an assertion that the JSON body is `{ "status": "ok" }` — the existing test only checks status code, not body shape. Use `axum::body::to_bytes` to read the response body and compare.
+- [x] **Task 11: Contract test — `/healthz` smoke under new router shape** (AC: #1)
+  - [x] Keep the existing `healthz_returns_200_immediately` test (`crates/daemon/tests/contract_daemon.rs:382`). Add an assertion that the JSON body is `{ "status": "ok" }` — the existing test only checks status code, not body shape. Use `axum::body::to_bytes` to read the response body and compare.
 
-- [ ] **Task 12: Contract test — `/readyz` DB-probe behavior** (AC: #2)
-  - [ ] Keep the existing `readyz_returns_503_before_migrations_complete` test as-is — it still validates the migrations branch.
-  - [ ] Add `readyz_returns_503_when_db_unreachable`:
+- [x] **Task 12: Contract test — `/readyz` DB-probe behavior** (AC: #2)
+  - [x] Keep the existing `readyz_returns_503_before_migrations_complete` test as-is — it still validates the migrations branch.
+  - [x] Add `readyz_returns_503_when_db_unreachable`:
     1. `fresh_pools()` → fresh DB, then set `migrations_complete = true`.
     2. **How to simulate "DB unreachable" without taking down the whole tempfile?** Two options:
        - **Option A (preferred):** point the daemon at a deliberately-bad path. Use a fresh `init_pools` with a path that exists but is not a SQLite DB (e.g., write 16 bytes of garbage to `tmp/junk.db`). On first probe, `SELECT 1 FROM events WHERE 1=0` errors with "file is not a database" — `probe_db` returns Err — `/readyz` returns 503.
@@ -335,61 +335,61 @@ so that I can build tools that show current Claude Code session state and recove
     3. Use Option A. Build a corrupted-DB path, construct an `AppState` against it, hit `/readyz`, assert 503.
     4. Document in the test why Option A is preferred over Option B.
 
-- [ ] **Task 13: Contract test — `/sessions` listing + read-time fallback** (AC: #3)
-  - [ ] `sessions_list_returns_known_sessions_with_read_time_state`:
+- [x] **Task 13: Contract test — `/sessions` listing + read-time fallback** (AC: #3)
+  - [x] `sessions_list_returns_known_sessions_with_read_time_state`:
     1. `fresh_pools()`. Insert two envelopes for `("claude", "sess-a")` (PreToolUse → stored Working) and `("claude", "sess-b")` (PostToolUse → stored Idle).
     2. Insert a sentinel via `write_recording_started` to verify it's filtered out.
     3. `GET /sessions` with a valid bearer. Assert: response is a 2-element JSON array (sentinel excluded); both items have `source == "claude"`; first item is `sess-b` (more recent `updated_at`? or `sess-a`? — depends on insertion order; assert by sort order, not array position).
     4. Verify `current_state` per item. For sess-a (Working, fresh), `current_state == "Working"`. For sess-b (Idle), `current_state == "Idle"`.
-  - [ ] `sessions_list_applies_stale_working_fallback`:
+  - [x] `sessions_list_applies_stale_working_fallback`:
     1. `fresh_pools()`. Write a `PreToolUse` for `("claude", "sess-old")` then manually UPDATE the `last_event_at_ms` field inside the stored JSON to a value `STALE_WORKING_MS + 1` in the past. (Or: write the event, sleep 5min — DO NOT do this; deterministic-test discipline forbids real sleep. The manual JSON tweak is the right pattern.)
     2. `GET /sessions`. Assert the item for sess-old has `current_state == "Idle"` (stale-Working fallback applied at read time).
     3. **However**, that test reaches into the stored JSON to age it artificially — an alternative is to expose `current_state_for_read` as a unit test in `projection/state.rs` (Story 1.6 already does this) and trust that the integration test catches only the wiring. Pragmatic choice: do the JSON tweak in this integration test so the AC ("the handler calls current_state_for_read") is genuinely covered, not just unit-tested.
 
-- [ ] **Task 14: Contract test — `/sessions/:id` detail + 404** (AC: #4)
-  - [ ] `sessions_detail_returns_projection_state`:
+- [x] **Task 14: Contract test — `/sessions/:id` detail + 404** (AC: #4)
+  - [x] `sessions_detail_returns_projection_state`:
     1. `fresh_pools()`. Write a PreToolUse for `("claude", "sess-x")`.
     2. `GET /sessions/sess-x`. Assert 200; body parses as `SessionDetail`; `state.current_state == "Working"`; `state.last_event_kind == "PreToolUse"`.
-  - [ ] `sessions_detail_returns_404_when_unknown`:
+  - [x] `sessions_detail_returns_404_when_unknown`:
     1. `fresh_pools()` (empty).
     2. `GET /sessions/does-not-exist`. Assert 404; body is `{ "error": "session not found" }`.
 
-- [ ] **Task 15: Contract test — `/sessions/:id/events?since=<cursor>`** (AC: #5)
-  - [ ] `events_list_returns_all_in_ascending_order`:
+- [x] **Task 15: Contract test — `/sessions/:id/events?since=<cursor>`** (AC: #5)
+  - [x] `events_list_returns_all_in_ascending_order`:
     1. `fresh_pools()`. Write 5 PreToolUse events for `("claude", "sess-y")`.
     2. `GET /sessions/sess-y/events?since=0` with valid bearer. Assert 200; `events.len() == 5`; ascending by `event_id`; each row carries `created_at` (NFR22 surface check); `cursor == Some(events[4].event_id)`; `oldest_available_event_id == events[0].event_id`.
-  - [ ] `events_list_returns_empty_with_none_cursor`:
+  - [x] `events_list_returns_empty_with_none_cursor`:
     1. `fresh_pools()`. Do NOT write any non-sentinel events.
     2. `GET /sessions/sess-y/events?since=0`. Assert 200; `events.len() == 0`; `cursor == None`; `oldest_available_event_id == EventId(i64::MAX)`.
-  - [ ] `events_list_respects_since_cursor`:
+  - [x] `events_list_respects_since_cursor`:
     1. `fresh_pools()`. Write 10 events for sess-y (event_ids 2..=11 after the startup sentinel takes event_id 1).
     2. `GET /sessions/sess-y/events?since=6`. Assert events returned have `event_id > 6` (so 4 events); ascending order.
 
-- [ ] **Task 16: Contract test — gap-detection mechanical fact** (AC: #6)
-  - [ ] `events_list_oldest_available_after_purge`:
+- [x] **Task 16: Contract test — gap-detection mechanical fact** (AC: #6)
+  - [x] `events_list_oldest_available_after_purge`:
     1. `fresh_pools()`. Write 5 events for sess-y. Read the stored event_ids.
     2. Manually `DELETE FROM events WHERE event_id <= <middle>` against the writer pool — simulates a future `bowerbird gc` purge.
     3. `GET /sessions/sess-y/events?since=0`. Assert `oldest_available_event_id == <surviving_min>`. Assert `events.len()` matches the surviving count.
     4. Verify the presenter can mechanically infer the gap: `assert!(0 < oldest_available_event_id)` — that's the Axiom-4-style inference, not a daemon-emitted flag.
 
-- [ ] **Task 17: Contract test — bearer auth (401 invariants)** (AC: #7)
-  - [ ] `authenticated_routes_reject_missing_header`:
+- [x] **Task 17: Contract test — bearer auth (401 invariants)** (AC: #7)
+  - [x] `authenticated_routes_reject_missing_header`:
     1. `fresh_pools()`. Build state with `BearerToken::new("test-token".to_string())`.
     2. For each authenticated route (`/sessions`, `/sessions/foo`, `/sessions/foo/events`, `/sessions/foo/stats`, `/status`): make a request with NO `Authorization` header; assert 401; assert body is `{ "error": "unauthorized" }`.
-  - [ ] `authenticated_routes_reject_wrong_bearer`:
+  - [x] `authenticated_routes_reject_wrong_bearer`:
     1. Same setup; bearer header `Authorization: Bearer wrong-token`; assert 401.
-  - [ ] `unauthenticated_routes_accept_missing_header`:
+  - [x] `unauthenticated_routes_accept_missing_header`:
     1. `GET /healthz` and `GET /readyz` with no header; assert non-401 status (200 or 503 depending on readyz state).
-  - [ ] `authenticated_routes_accept_correct_bearer`:
+  - [x] `authenticated_routes_accept_correct_bearer`:
     1. With `Authorization: Bearer test-token`, assert non-401 status on every authenticated route.
-  - [ ] `authenticated_routes_reject_empty_bearer`:
+  - [x] `authenticated_routes_reject_empty_bearer`:
     1. `Authorization: Bearer ` (trailing space, empty token); assert 401. Tests the `is_empty()` guard in the middleware.
-  - [ ] `authenticated_routes_reject_wrong_scheme`:
+  - [x] `authenticated_routes_reject_wrong_scheme`:
     1. `Authorization: Basic dGVzdA==`; assert 401. Tests the `strip_prefix("Bearer ")` guard.
-  - [ ] **Timing-safe property (light-touch):** add a comment-only sanity check in `auth.rs` near the `subtle::ConstantTimeEq` call referencing the `subtle` crate as the authoritative implementation. A real timing-side-channel test would require statistical analysis (multiple runs, timing histogram) — out of scope. The crate choice IS the test.
+  - [x] **Timing-safe property (light-touch):** add a comment-only sanity check in `auth.rs` near the `subtle::ConstantTimeEq` call referencing the `subtle` crate as the authoritative implementation. A real timing-side-channel test would require statistical analysis (multiple runs, timing histogram) — out of scope. The crate choice IS the test.
 
-- [ ] **Task 18: Contract test — additive forward-compat on `SessionStats`** (AC: #8)
-  - [ ] Add a unit test to `crates/protocol/tests/contract_protocol.rs`:
+- [x] **Task 18: Contract test — additive forward-compat on `SessionStats`** (AC: #8)
+  - [x] Add a unit test to `crates/protocol/tests/contract_protocol.rs`:
     ```rust
     #[test]
     fn session_stats_accepts_unknown_fields() {
@@ -408,8 +408,8 @@ so that I can build tools that show current Claude Code session state and recove
     ```
     This asserts the asymmetric serde policy holds for `SessionStats`. Add equivalent unit tests for `SessionListItem`, `SessionDetail`, and `DaemonStatus` (the three new outbound types this story adds).
 
-- [ ] **Task 19: Protocol changelog entry** (AC: #3, #4, #8)
-  - [ ] Open `docs/protocol-changelog.md` (created by Story 1.6 Task 1). Add a new entry below the 1.6 schema entry, same `## v1.0 → v1.x` section header:
+- [x] **Task 19: Protocol changelog entry** (AC: #3, #4, #8)
+  - [x] Open `docs/protocol-changelog.md` (created by Story 1.6 Task 1). Add a new entry below the 1.6 schema entry, same `## v1.0 → v1.x` section header:
     ```
     - **Added:** `protocol::rest::SessionListItem` — list-shaped row for `GET /sessions` responses.
     - **Added:** `protocol::rest::SessionDetail` — detail-shaped row for `GET /sessions/{id}` responses.
@@ -419,10 +419,10 @@ so that I can build tools that show current Claude Code session state and recove
     ```
     Type: `schema` for the first three; type: `behavioral` for the `/readyz` line. Use whatever entry format Story 1.6 established.
 
-- [ ] **Task 20: Sprint hygiene — strike resolved deferred-work entries**
-  - [ ] Open `docs/bmad/implementation-artifacts/deferred-work.md`.
-  - [ ] Find the line: "`/readyz` does not probe the database" (Story 1.2 review, currently line 32). Strike it: `~~/readyz does not probe...~~ **Resolved by Story 1.7 (Task 9):** hybrid `migrations_complete && db_probe_ok` per AC #2.` Use the same convention as Story 1.6.
-  - [ ] Add a new entry under a new section header `## Deferred from: Story 1.7 (REST query API) (2026-05-20)`:
+- [x] **Task 20: Sprint hygiene — strike resolved deferred-work entries**
+  - [x] Open `docs/bmad/implementation-artifacts/deferred-work.md`.
+  - [x] Find the line: "`/readyz` does not probe the database" (Story 1.2 review, currently line 32). Strike it: `~~/readyz does not probe...~~ **Resolved by Story 1.7 (Task 9):** hybrid `migrations_complete && db_probe_ok` per AC #2.` Use the same convention as Story 1.6.
+  - [x] Add a new entry under a new section header `## Deferred from: Story 1.7 (REST query API) (2026-05-20)`:
     - **`/sessions/{id}` lacks `source` in path or query** — V1 picks most-recently-updated row by natural key; multi-source disambiguation needed when a second adapter (Codex, OpenCode) ships. Path candidates: `/sources/{source}/sessions/{id}` (REST nesting) or `?source=` (query param). [`crates/daemon/src/api/sessions.rs::detail`]
     - **No page-size limit on `GET /sessions/{id}/events`** — V1 returns the entire history slice. At ~100k events the response is ~10MB and the SQLite query holds a reader for the duration. Add a `&limit=` query param + `cursor = Some(last_returned_id)` semantics when the limit is reached. [`crates/daemon/src/api/events.rs::list`]
     - **No pagination on `GET /sessions`** — same shape; ~10k sessions becomes ~1MB JSON. [`crates/daemon/src/api/sessions.rs::list`]
@@ -432,14 +432,14 @@ so that I can build tools that show current Claude Code session state and recove
     - **Inconsistent 404 source between `/sessions/{id}` and `/sessions/{id}/stats`** — the former 404s on `session_projections`, the latter on `events`. Transient mid-transaction window can produce divergence. Document the contract: `/sessions/{id}` is authoritative for existence. [Task 7 dev note]
     - **Bearer-token timing-safe compare unverified by integration test** — relies on `subtle::ConstantTimeEq` crate guarantee. A statistical timing test would land in a future security-hardening story. [`crates/daemon/src/api/auth.rs::require_bearer`]
 
-- [ ] **Task 21: Final checks**
-  - [ ] `cargo fmt --check` — green
-  - [ ] `cargo clippy --all-targets --workspace -- -D warnings` — green
-  - [ ] `cargo test --workspace` — all tests pass. Expected: ~4 protocol-level (round-trip tests for SessionListItem, SessionDetail, DaemonStatus, SessionStats forward-compat) + ~14 daemon contract tests (one per Task 11-17 block, multiple per block).
-  - [ ] `cargo build --workspace` — zero warnings.
-  - [ ] `grep -rn 'subtle::ConstantTimeEq\|secrecy::ExposeSecret' crates/daemon/src/` — should appear ONLY in `api/auth.rs` and `api/token.rs`. If grep shows otherwise, fix; the token must not leak into handlers.
-  - [ ] `grep -rn 'BearerToken\|bearer\b' crates/daemon/src/ingest/` — should produce ZERO matches. The ingest path **never** reads the bearer token (architecture.md:444-446 invariant; this is a release blocker).
-  - [ ] Manually start the daemon (`HOME=$(mktemp -d) cargo run -p bowerbird-daemon -- -vv`). Read the bind address and token from logs. With `curl`:
+- [x] **Task 21: Final checks**
+  - [x] `cargo fmt --check` — green
+  - [x] `cargo clippy --all-targets --workspace -- -D warnings` — green
+  - [x] `cargo test --workspace` — all tests pass. Expected: ~4 protocol-level (round-trip tests for SessionListItem, SessionDetail, DaemonStatus, SessionStats forward-compat) + ~14 daemon contract tests (one per Task 11-17 block, multiple per block).
+  - [x] `cargo build --workspace` — zero warnings.
+  - [x] `grep -rn 'subtle::ConstantTimeEq\|secrecy::ExposeSecret' crates/daemon/src/` — should appear ONLY in `api/auth.rs` and `api/token.rs`. If grep shows otherwise, fix; the token must not leak into handlers.
+  - [x] `grep -rn 'BearerToken\|bearer\b' crates/daemon/src/ingest/` — should produce ZERO matches. The ingest path **never** reads the bearer token (architecture.md:444-446 invariant; this is a release blocker).
+  - [x] Manually start the daemon (`HOME=$(mktemp -d) cargo run -p bowerbird-daemon -- -vv`). Read the bind address and token from logs. With `curl`:
     ```
     curl -i http://127.0.0.1:<port>/healthz
     curl -i http://127.0.0.1:<port>/readyz
@@ -448,8 +448,8 @@ so that I can build tools that show current Claude Code session state and recove
     curl -i http://127.0.0.1:<port>/status                                       # 401
     ```
     Document expected output in a one-line code comment somewhere obvious if useful, or omit (manual smoke-test, not a perpetual deliverable).
-  - [ ] Verify `protocol-changelog.md` has the entry from Task 19.
-  - [ ] Verify `deferred-work.md` has Story 1.2 line 32 struck AND the new Story 1.7 deferred items appended (Task 20).
+  - [x] Verify `protocol-changelog.md` has the entry from Task 19.
+  - [x] Verify `deferred-work.md` has Story 1.2 line 32 struck AND the new Story 1.7 deferred items appended (Task 20).
 
 ## Dev Notes
 
@@ -869,12 +869,69 @@ Add the three new types to the existing re-export line. Callers always import fr
 
 ### Agent Model Used
 
-{{agent_model_name_version}}
+claude-opus-4-7 (1M context)
 
 ### Debug Log References
 
+- Rebased the story-1.7 branch onto `origin/main` mid-flight after discovering Story 1.6 had landed but the local branch was still based on `b5b798d` (pre-1.6). Conflict in `sprint-status.yaml` was a routine three-way merge between "story 1.6 review" (main) and "story 1.7 ready-for-dev" (this branch); resolved by promoting 1.6→review and 1.7→in-progress.
+- `cargo fmt` reflowed several handlers and the rest module after the initial implementation pass; no semantic changes.
+- Manual smoke test (binary launched against `$(mktemp -d)`, `BOWERBIRD_TOKEN=smoke-token-42`):
+  - `GET /healthz` → 200 `{"status":"ok"}`
+  - `GET /readyz` → 200 `{"status":"ready"}` (migrations done + DB probe ok)
+  - `GET /sessions` no header → 401 `{"error":"unauthorized"}`
+  - `GET /sessions` wrong token → 401 `{"error":"unauthorized"}`
+  - `GET /sessions` correct token → 200 `[]`
+  - `GET /status` correct token → 200 with `daemon_version`, `protocol_version: "1.0"`, `started_at_ms`, `uptime_ms`, `last_event_at_ms: null`, `last_event_id: null` (only sentinel present)
+  - Token value never appeared in the log stream; the `Env` source got an `info` line, not the `Generated` WARN.
+  - Graceful shutdown wrote `RecordingEnded` cleanly.
+
 ### Completion Notes List
+
+- All 8 ACs are satisfied with passing contract tests (114 total tests, 20 new daemon contract tests + 5 new protocol round-trip / forward-compat tests, plus the existing `/healthz` body assertion under the new router shape).
+- `subtle::ConstantTimeEq` and `secrecy::ExposeSecret` are touched only inside `crates/daemon/src/api/token.rs` (`grep -rn 'subtle::\\|secrecy::ExposeSecret' crates/daemon/src/` confirms — `crates/daemon/src/api/auth.rs` and `crates/daemon/src/main.rs` only reference them in doc comments).
+- The ingest path is bearer-free: `grep -rn 'BearerToken\\|bearer\\b' crates/daemon/src/ingest/` returns zero matches.
+- `current_unix_millis` was extracted from `crates/daemon/src/projection/session.rs` to a new `crates/daemon/src/time.rs` so the projection layer and `api::status` share one wall-clock source (no `chrono`/`time` dep added).
+- `/readyz` retains the migrations-first ordering so the existing drain-on-shutdown invariant (`migrations_complete.store(false)` during graceful shutdown) keeps causing 503s; the DB probe runs only when migrations are complete.
+- Forward-compat additive serde is asserted for `SessionStats`, `SessionListItem`, `SessionDetail`, and `DaemonStatus`.
+- Cursor-gap-detection (`oldest_available_event_id` after purge) is exercised end-to-end in `events_list_oldest_available_after_purge`, which satisfies `project-context.md:591`.
+- A `reaction_from_db_string` inverse helper was added next to `reaction_as_db_string` to mirror Story 1.6's `event_kind_from_db_str` pattern.
+- `EventsParams` uses `#[serde(deny_unknown_fields)]`; the contract test `events_endpoint_rejects_unknown_query_param` verifies axum surfaces unknown query params as 400.
+- Existing 89 daemon/protocol tests continue to pass with no regressions.
 
 ### File List
 
+**Created**
+
+- `crates/daemon/src/api/auth.rs`
+- `crates/daemon/src/api/events.rs`
+- `crates/daemon/src/api/sessions.rs`
+- `crates/daemon/src/api/status.rs`
+- `crates/daemon/src/api/token.rs`
+- `crates/daemon/src/time.rs`
+
+**Modified**
+
+- `Cargo.toml` (added `subtle = "2.6"` to `[workspace.dependencies]`)
+- `crates/daemon/Cargo.toml` (added `secrecy` + `subtle` to `[dependencies]`)
+- `crates/daemon/src/api/health.rs` (`/readyz` now probes DB)
+- `crates/daemon/src/api/mod.rs` (new merged unauth + auth router; new `pub mod` declarations)
+- `crates/daemon/src/db/queries.rs` (six new SQL constants + `reaction_from_db_string`)
+- `crates/daemon/src/lib.rs` (added `pub mod time`)
+- `crates/daemon/src/main.rs` (token loader, `started_at_ms`, AppState construction)
+- `crates/daemon/src/projection/session.rs` (removed local `current_unix_millis`; imports from `crate::time`)
+- `crates/daemon/src/state.rs` (added `bearer: BearerToken` and `started_at_ms: i64`)
+- `crates/daemon/tests/contract_daemon.rs` (test helper + 20 new contract tests + updated existing AppState fixtures + new `/healthz` body assertion)
+- `crates/protocol/src/lib.rs` (re-exported the three new outbound types)
+- `crates/protocol/src/rest.rs` (added `SessionListItem`, `SessionDetail`, `DaemonStatus`; doc-comments on `EventListResponse`)
+- `crates/protocol/tests/contract_protocol.rs` (5 new forward-compat / round-trip tests)
+- `docs/bmad/implementation-artifacts/sprint-status.yaml` (1-7 → in-progress → review)
+- `docs/bmad/implementation-artifacts/deferred-work.md` (struck Story 1.2 `/readyz` entry; added Story 1.7 deferred section)
+- `docs/protocol-changelog.md` (v1.0 → v1.1 schema + behavioral entries for the three new outbound types, five new endpoints, tightened `/readyz`, and token resolution chain)
+
 ## Change Log
+
+| Date       | Change                                                                                                                                | Author       |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------- | ------------ |
+| 2026-05-20 | Story 1.7 created (sprint-status promoted to ready-for-dev).                                                                          | bmad         |
+| 2026-05-20 | Story 1.7 implemented: bearer auth + 5 REST endpoints + `/readyz` DB probe; 114 tests green; deferred-work + protocol-changelog kept in sync. | claude-opus-4-7 |
+

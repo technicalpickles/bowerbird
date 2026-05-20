@@ -5,6 +5,7 @@ pub mod error;
 pub mod ingest;
 pub mod projection;
 pub mod state;
+pub mod time;
 
 pub use error::{Error, Result};
 

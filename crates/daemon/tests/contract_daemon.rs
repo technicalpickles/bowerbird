@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use assert_cmd::Command;
 use bowerbird_daemon::api;
+use bowerbird_daemon::api::token::BearerToken;
 use bowerbird_daemon::db::migrations::migrations;
 use bowerbird_daemon::db::queries::{
     event_kind_as_str, SELECT_EVENT_BY_ID, UPSERT_SESSION_PROJECTION,
@@ -23,6 +24,18 @@ async fn fresh_pools() -> (TempDir, DbPools) {
     let pools = init_pools(&db_path).await.expect("init_pools");
     run_migrations(&pools.writer).await.expect("migrate");
     (tmp, pools)
+}
+
+const TEST_BEARER: &str = "test-bearer-token-1.7";
+
+fn make_test_state(pools: DbPools, migrations_complete: Arc<AtomicBool>) -> AppState {
+    AppState {
+        db: pools,
+        migrations_complete,
+        shutdown: CancellationToken::new(),
+        bearer: BearerToken::new(TEST_BEARER.to_string()),
+        started_at_ms: 0,
+    }
 }
 
 async fn assert_pragmas(pool: &deadpool_sqlite::Pool) {
@@ -347,11 +360,7 @@ async fn readyz_returns_503_before_migrations_complete() {
 
     let (_tmp, pools) = fresh_pools().await;
     let migrations_complete = Arc::new(AtomicBool::new(false));
-    let state = AppState {
-        db: pools,
-        migrations_complete: migrations_complete.clone(),
-        shutdown: CancellationToken::new(),
-    };
+    let state = make_test_state(pools, migrations_complete.clone());
     let app = api::router(state);
 
     let resp = app
@@ -386,16 +395,13 @@ async fn healthz_returns_200_immediately() {
     use tower::ServiceExt;
 
     let (_tmp, pools) = fresh_pools().await;
-    let state = AppState {
-        db: pools,
-        // Deliberately leave migrations_complete = false to assert healthz is
-        // independent of readiness.
-        migrations_complete: Arc::new(AtomicBool::new(false)),
-        shutdown: CancellationToken::new(),
-    };
+    // Deliberately leave migrations_complete = false to assert healthz is
+    // independent of readiness.
+    let state = make_test_state(pools, Arc::new(AtomicBool::new(false)));
     let app = api::router(state);
 
     let resp = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri("/healthz")
@@ -405,6 +411,23 @@ async fn healthz_returns_200_immediately() {
         .await
         .expect("oneshot");
     assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+    // AC #1 also requires the body shape to be exactly `{"status":"ok"}` —
+    // verify under the new router shape introduced by Story 1.7.
+    let resp_body = app
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("oneshot");
+    let body_bytes = axum::body::to_bytes(resp_body.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).expect("parse body");
+    assert_eq!(parsed, serde_json::json!({ "status": "ok" }));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1309,4 +1332,610 @@ async fn projection_rebuild_from_event_log_is_byte_identical() {
         result_b, baseline_b,
         "sess-B rebuild must be byte-identical"
     );
+}
+
+// =====================================================================
+// Story 1.7 — REST query API contract tests
+// =====================================================================
+
+mod story_1_7_rest {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{header, Request, StatusCode};
+    use bowerbird_daemon::api::token::BearerToken;
+    use protocol::{
+        DaemonStatus, EventKind, EventListResponse, SessionCurrentState, SessionDetail,
+        SessionListItem, SessionStats,
+    };
+    use tower::ServiceExt;
+
+    fn bearer_header() -> String {
+        format!("Bearer {}", super::TEST_BEARER)
+    }
+
+    fn ready_state(pools: DbPools) -> AppState {
+        let mc = Arc::new(AtomicBool::new(true));
+        super::make_test_state(pools, mc)
+    }
+
+    async fn json_body<T: serde::de::DeserializeOwned>(resp: axum::response::Response) -> T {
+        let bytes = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        serde_json::from_slice(&bytes).expect("parse json")
+    }
+
+    fn auth_get(uri: &str) -> Request<Body> {
+        Request::builder()
+            .uri(uri)
+            .header(header::AUTHORIZATION, bearer_header())
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    // ----- Task 12 -----
+    #[tokio::test(flavor = "current_thread")]
+    async fn readyz_returns_503_when_db_unreachable() {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+
+        // Option A (preferred over pool starvation): write garbage bytes to a
+        // path, then point init_pools at it. The connection opens, but PRAGMA
+        // journal_mode = WAL or SELECT 1 FROM events fails because the file
+        // is not a SQLite database. probe_db catches the error and returns
+        // 503 — exactly what the AC needs.
+        //
+        // Option B (pool starvation by holding all readers) would take ~5s due
+        // to the wait timeout — too slow for the PR test loop.
+        let tmp = TempDir::new().expect("tempdir");
+        let bad_path = tmp.path().join("not-a-db.bin");
+        let mut f = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&bad_path)
+            .expect("open bad path");
+        f.write_all(b"this is not a sqlite database")
+            .expect("write garbage");
+        drop(f);
+
+        let pools = init_pools(&bad_path)
+            .await
+            .expect("build pool over a non-db file (lazy connection)");
+        // Mark migrations complete so the probe branch is the one that fails.
+        let migrations_complete = Arc::new(AtomicBool::new(true));
+        let state = super::make_test_state(pools, migrations_complete);
+        let app = api::router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // ----- Task 13 -----
+    #[tokio::test(flavor = "current_thread")]
+    async fn sessions_list_returns_known_sessions_with_read_time_state() {
+        let (_tmp, pools) = fresh_pools().await;
+        // Sentinel — must be filtered out of /sessions.
+        projection::session::write_recording_started(&pools.writer)
+            .await
+            .expect("recording started");
+        // sess-a: PreToolUse → stored Working.
+        projection::session::write(
+            &pools.writer,
+            EventEnvelope {
+                source: "claude".to_string(),
+                session_id: "sess-a".to_string(),
+                kind: EventKind::PreToolUse,
+                reaction: None,
+                payload: "{}".to_string(),
+            },
+        )
+        .await
+        .expect("write sess-a");
+        // sess-b: PostToolUse → stored Idle.
+        projection::session::write(
+            &pools.writer,
+            EventEnvelope {
+                source: "claude".to_string(),
+                session_id: "sess-b".to_string(),
+                kind: EventKind::PostToolUse,
+                reaction: None,
+                payload: "{}".to_string(),
+            },
+        )
+        .await
+        .expect("write sess-b");
+
+        let app = api::router(ready_state(pools));
+        let resp = app.oneshot(auth_get("/sessions")).await.expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let items: Vec<SessionListItem> = json_body(resp).await;
+        assert_eq!(items.len(), 2, "sentinel must be filtered out");
+        for it in &items {
+            assert_eq!(it.source, "claude");
+        }
+        let by_id: std::collections::HashMap<_, _> =
+            items.iter().map(|i| (i.session_id.as_str(), i)).collect();
+        assert_eq!(
+            by_id["sess-a"].current_state,
+            SessionCurrentState::Working,
+            "fresh PreToolUse should surface as Working"
+        );
+        assert_eq!(by_id["sess-a"].last_event_kind, EventKind::PreToolUse);
+        assert_eq!(
+            by_id["sess-b"].current_state,
+            SessionCurrentState::Idle,
+            "PostToolUse surfaces as Idle"
+        );
+        assert_eq!(by_id["sess-b"].last_event_kind, EventKind::PostToolUse);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sessions_list_applies_stale_working_fallback() {
+        let (_tmp, pools) = fresh_pools().await;
+        projection::session::write(
+            &pools.writer,
+            EventEnvelope {
+                source: "claude".to_string(),
+                session_id: "sess-old".to_string(),
+                kind: EventKind::PreToolUse,
+                reaction: None,
+                payload: "{}".to_string(),
+            },
+        )
+        .await
+        .expect("write sess-old");
+
+        // Manually age the stored last_event_at_ms inside the projection JSON.
+        // Real sleep is forbidden (project-context.md:642 deterministic-test
+        // discipline) — JSON tweak is the right pattern.
+        let writer = pools.writer.get().await.expect("writer get");
+        writer
+            .interact(|c| -> rusqlite::Result<usize> {
+                c.execute(
+                    "UPDATE session_projections SET state = ? WHERE source = ? AND session_id = ?",
+                    rusqlite::params![
+                        r#"{"current_state":"Working","last_event_kind":"PreToolUse","last_event_at_ms":0}"#,
+                        "claude",
+                        "sess-old"
+                    ],
+                )
+            })
+            .await
+            .expect("interact")
+            .expect("update");
+        drop(writer);
+
+        let app = api::router(ready_state(pools));
+        let resp = app.oneshot(auth_get("/sessions")).await.expect("oneshot");
+        let items: Vec<SessionListItem> = json_body(resp).await;
+        let it = items
+            .iter()
+            .find(|i| i.session_id == "sess-old")
+            .expect("sess-old must appear");
+        assert_eq!(
+            it.current_state,
+            SessionCurrentState::Idle,
+            "Working older than STALE_WORKING_MS must surface as Idle at read time"
+        );
+    }
+
+    // ----- Task 14 -----
+    #[tokio::test(flavor = "current_thread")]
+    async fn sessions_detail_returns_projection_state() {
+        let (_tmp, pools) = fresh_pools().await;
+        projection::session::write(
+            &pools.writer,
+            EventEnvelope {
+                source: "claude".to_string(),
+                session_id: "sess-x".to_string(),
+                kind: EventKind::PreToolUse,
+                reaction: None,
+                payload: "{}".to_string(),
+            },
+        )
+        .await
+        .expect("write sess-x");
+
+        let app = api::router(ready_state(pools));
+        let resp = app
+            .oneshot(auth_get("/sessions/sess-x"))
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let detail: SessionDetail = json_body(resp).await;
+        assert_eq!(detail.source, "claude");
+        assert_eq!(detail.session_id, "sess-x");
+        assert_eq!(detail.state.current_state, SessionCurrentState::Working);
+        assert_eq!(detail.state.last_event_kind, EventKind::PreToolUse);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sessions_detail_returns_404_when_unknown() {
+        let (_tmp, pools) = fresh_pools().await;
+        let app = api::router(ready_state(pools));
+        let resp = app
+            .oneshot(auth_get("/sessions/does-not-exist"))
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body: serde_json::Value = json_body(resp).await;
+        assert_eq!(body, serde_json::json!({ "error": "session not found" }));
+    }
+
+    // ----- Task 15 -----
+    #[tokio::test(flavor = "current_thread")]
+    async fn events_list_returns_all_in_ascending_order() {
+        let (_tmp, pools) = fresh_pools().await;
+        for _ in 0..5 {
+            projection::session::write(
+                &pools.writer,
+                EventEnvelope {
+                    source: "claude".to_string(),
+                    session_id: "sess-y".to_string(),
+                    kind: EventKind::PreToolUse,
+                    reaction: None,
+                    payload: "{}".to_string(),
+                },
+            )
+            .await
+            .expect("write");
+        }
+        let app = api::router(ready_state(pools));
+        let resp = app
+            .oneshot(auth_get("/sessions/sess-y/events?since=0"))
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: EventListResponse = json_body(resp).await;
+        assert_eq!(body.events.len(), 5);
+        for w in body.events.windows(2) {
+            assert!(
+                w[0].event_id < w[1].event_id,
+                "events must be in ascending event_id order"
+            );
+            // NFR22 surface check: created_at must be non-zero on every row.
+            assert!(w[0].created_at > 0);
+        }
+        let last_id = body.events.last().unwrap().event_id;
+        assert_eq!(body.cursor, Some(last_id), "cursor follows last event_id");
+        assert_eq!(
+            body.oldest_available_event_id, body.events[0].event_id,
+            "oldest_available_event_id should match earliest stored row"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn events_list_returns_empty_with_none_cursor() {
+        let (_tmp, pools) = fresh_pools().await;
+        // Do not write any non-sentinel events; the session simply doesn't exist.
+        let app = api::router(ready_state(pools));
+        let resp = app
+            .oneshot(auth_get("/sessions/no-such/events?since=0"))
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: EventListResponse = json_body(resp).await;
+        assert!(body.events.is_empty());
+        assert_eq!(body.cursor, None);
+        assert_eq!(body.oldest_available_event_id.0, i64::MAX);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn events_list_respects_since_cursor() {
+        let (_tmp, pools) = fresh_pools().await;
+        let mut written_ids: Vec<i64> = Vec::new();
+        for _ in 0..10 {
+            let id = projection::session::write(
+                &pools.writer,
+                EventEnvelope {
+                    source: "claude".to_string(),
+                    session_id: "sess-y".to_string(),
+                    kind: EventKind::PreToolUse,
+                    reaction: None,
+                    payload: "{}".to_string(),
+                },
+            )
+            .await
+            .expect("write");
+            written_ids.push(id.0);
+        }
+        let cutoff = written_ids[4]; // strictly > cutoff means last 5 returned.
+
+        let app = api::router(ready_state(pools));
+        let resp = app
+            .oneshot(auth_get(&format!("/sessions/sess-y/events?since={cutoff}")))
+            .await
+            .expect("oneshot");
+        let body: EventListResponse = json_body(resp).await;
+        assert_eq!(body.events.len(), 5);
+        for ev in &body.events {
+            assert!(
+                ev.event_id.0 > cutoff,
+                "event_id {:?} must be > since={cutoff}",
+                ev.event_id
+            );
+        }
+    }
+
+    // ----- Task 16 -----
+    #[tokio::test(flavor = "current_thread")]
+    async fn events_list_oldest_available_after_purge() {
+        let (_tmp, pools) = fresh_pools().await;
+        let mut written: Vec<i64> = Vec::new();
+        for _ in 0..5 {
+            let id = projection::session::write(
+                &pools.writer,
+                EventEnvelope {
+                    source: "claude".to_string(),
+                    session_id: "sess-y".to_string(),
+                    kind: EventKind::PreToolUse,
+                    reaction: None,
+                    payload: "{}".to_string(),
+                },
+            )
+            .await
+            .expect("write");
+            written.push(id.0);
+        }
+        let middle = written[2];
+        let writer = pools.writer.get().await.expect("writer get");
+        writer
+            .interact(move |c| -> rusqlite::Result<usize> {
+                c.execute(
+                    "DELETE FROM events WHERE event_id <= ?",
+                    rusqlite::params![middle],
+                )
+            })
+            .await
+            .expect("interact")
+            .expect("delete");
+        drop(writer);
+        let surviving_min = written[3];
+
+        let app = api::router(ready_state(pools));
+        let resp = app
+            .oneshot(auth_get("/sessions/sess-y/events?since=0"))
+            .await
+            .expect("oneshot");
+        let body: EventListResponse = json_body(resp).await;
+        assert_eq!(
+            body.oldest_available_event_id.0, surviving_min,
+            "oldest_available reflects the post-purge minimum"
+        );
+        assert_eq!(body.events.len(), 2);
+        // Axiom-4-style mechanical gap inference at the presenter layer:
+        let since = 0_i64;
+        assert!(
+            since < body.oldest_available_event_id.0,
+            "presenter can infer a gap from since < oldest_available_event_id"
+        );
+    }
+
+    // ----- Task 17 -----
+    const PROTECTED_ROUTES: &[&str] = &[
+        "/sessions",
+        "/sessions/foo",
+        "/sessions/foo/events",
+        "/sessions/foo/stats",
+        "/status",
+    ];
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authenticated_routes_reject_missing_header() {
+        let (_tmp, pools) = fresh_pools().await;
+        let app = api::router(ready_state(pools));
+        for route in PROTECTED_ROUTES {
+            let resp = app
+                .clone()
+                .oneshot(Request::builder().uri(*route).body(Body::empty()).unwrap())
+                .await
+                .expect("oneshot");
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "route {route}");
+            let body: serde_json::Value = json_body(resp).await;
+            assert_eq!(body, serde_json::json!({ "error": "unauthorized" }));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authenticated_routes_reject_wrong_bearer() {
+        let (_tmp, pools) = fresh_pools().await;
+        let app = api::router(ready_state(pools));
+        for route in PROTECTED_ROUTES {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(*route)
+                        .header(header::AUTHORIZATION, "Bearer wrong-token")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .expect("oneshot");
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "route {route}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authenticated_routes_accept_correct_bearer() {
+        let (_tmp, pools) = fresh_pools().await;
+        let app = api::router(ready_state(pools));
+        for route in PROTECTED_ROUTES {
+            let resp = app.clone().oneshot(auth_get(route)).await.expect("oneshot");
+            assert_ne!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "route {route} must pass auth"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unauthenticated_routes_accept_missing_header() {
+        let (_tmp, pools) = fresh_pools().await;
+        let app = api::router(ready_state(pools));
+        for route in ["/healthz", "/readyz"] {
+            let resp = app
+                .clone()
+                .oneshot(Request::builder().uri(route).body(Body::empty()).unwrap())
+                .await
+                .expect("oneshot");
+            assert_ne!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "route {route} must not require auth"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authenticated_routes_reject_empty_bearer() {
+        let (_tmp, pools) = fresh_pools().await;
+        let app = api::router(ready_state(pools));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions")
+                    .header(header::AUTHORIZATION, "Bearer ")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authenticated_routes_reject_wrong_scheme() {
+        let (_tmp, pools) = fresh_pools().await;
+        let app = api::router(ready_state(pools));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions")
+                    .header(header::AUTHORIZATION, "Basic dGVzdA==")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ----- /stats happy path + 404 -----
+    #[tokio::test(flavor = "current_thread")]
+    async fn sessions_stats_returns_stats_for_known_session() {
+        let (_tmp, pools) = fresh_pools().await;
+        for _ in 0..3 {
+            projection::session::write(
+                &pools.writer,
+                EventEnvelope {
+                    source: "claude".to_string(),
+                    session_id: "sess-s".to_string(),
+                    kind: EventKind::PreToolUse,
+                    reaction: None,
+                    payload: "{}".to_string(),
+                },
+            )
+            .await
+            .expect("write");
+        }
+        let app = api::router(ready_state(pools));
+        let resp = app
+            .oneshot(auth_get("/sessions/sess-s/stats"))
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let stats: SessionStats = json_body(resp).await;
+        assert_eq!(stats.source, "claude");
+        assert_eq!(stats.session_id, "sess-s");
+        assert_eq!(stats.event_count, 3);
+        assert!(stats.first_event_at.is_some());
+        assert!(stats.last_event_at.is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sessions_stats_returns_404_when_unknown() {
+        let (_tmp, pools) = fresh_pools().await;
+        let app = api::router(ready_state(pools));
+        let resp = app
+            .oneshot(auth_get("/sessions/missing/stats"))
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ----- /status -----
+    #[tokio::test(flavor = "current_thread")]
+    async fn status_returns_uptime_and_last_event() {
+        let (_tmp, pools) = fresh_pools().await;
+        projection::session::write(
+            &pools.writer,
+            EventEnvelope {
+                source: "claude".to_string(),
+                session_id: "sess-z".to_string(),
+                kind: EventKind::PreToolUse,
+                reaction: None,
+                payload: "{}".to_string(),
+            },
+        )
+        .await
+        .expect("write");
+
+        // Use a non-zero started_at_ms so uptime is meaningful.
+        let mc = Arc::new(AtomicBool::new(true));
+        let state = AppState {
+            db: pools,
+            migrations_complete: mc,
+            shutdown: CancellationToken::new(),
+            bearer: BearerToken::new(super::TEST_BEARER.to_string()),
+            started_at_ms: 1,
+        };
+        let app = api::router(state);
+        let resp = app.oneshot(auth_get("/status")).await.expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: DaemonStatus = json_body(resp).await;
+        assert_eq!(body.protocol_version, "1.0");
+        assert_eq!(body.started_at_ms, 1);
+        assert!(body.uptime_ms >= 0);
+        assert!(body.last_event_id.is_some());
+        assert!(body.last_event_at_ms.is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn status_returns_none_last_event_when_only_sentinels() {
+        let (_tmp, pools) = fresh_pools().await;
+        projection::session::write_recording_started(&pools.writer)
+            .await
+            .expect("sentinel");
+        let app = api::router(ready_state(pools));
+        let resp = app.oneshot(auth_get("/status")).await.expect("oneshot");
+        let body: DaemonStatus = json_body(resp).await;
+        assert!(
+            body.last_event_id.is_none(),
+            "sentinel rows should not surface as last_event_id"
+        );
+        assert!(body.last_event_at_ms.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn events_endpoint_rejects_unknown_query_param() {
+        // EventsParams has #[serde(deny_unknown_fields)]; axum surfaces the
+        // deserialization failure as a 400.
+        let (_tmp, pools) = fresh_pools().await;
+        let app = api::router(ready_state(pools));
+        let resp = app
+            .oneshot(auth_get("/sessions/sess-y/events?since=0&tool=bash"))
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
 }

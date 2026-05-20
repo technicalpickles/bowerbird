@@ -30,6 +30,48 @@ pub const SELECT_EVENT_KINDS_FOR_SESSION: &str =
     "SELECT kind, created_at FROM events WHERE source = ? AND session_id = ? \
      ORDER BY event_id ASC";
 
+// Story 1.7 — REST query API SQL constants.
+//
+// The `__daemon__` literal is the sentinel source used by lifecycle markers
+// (`RecordingStarted` / `RecordingEnded`). Kept in lockstep with
+// `projection::session::DAEMON_SENTINEL_SOURCE`; a future rename of that
+// constant must update these strings too.
+
+pub const SELECT_NON_SENTINEL_SESSIONS: &str =
+    "SELECT source, session_id, state, updated_at FROM session_projections \
+     WHERE source != '__daemon__' \
+     ORDER BY updated_at DESC, source ASC, session_id ASC";
+
+// V1 only has the `"claude"` source, so the `ORDER BY ... LIMIT 1` ordering
+// never matters in practice. When a second adapter ships (Codex, OpenCode),
+// callers should disambiguate with an explicit `?source=` query param or by
+// nesting `/sources/{source}/sessions/{id}`. See deferred-work.md.
+pub const SELECT_SESSION_BY_ID: &str =
+    "SELECT source, session_id, state, updated_at FROM session_projections \
+     WHERE session_id = ? AND source != '__daemon__' \
+     ORDER BY updated_at DESC LIMIT 1";
+
+pub const SELECT_EVENTS_FOR_SESSION_SINCE: &str =
+    "SELECT event_id, source, session_id, kind, reaction, payload, created_at \
+     FROM events \
+     WHERE source != '__daemon__' AND session_id = ? AND event_id > ? \
+     ORDER BY event_id ASC";
+
+pub const SELECT_MIN_EVENT_ID: &str =
+    "SELECT MIN(event_id) FROM events WHERE source != '__daemon__'";
+
+pub const SELECT_STATS_FOR_SESSION: &str =
+    "SELECT source, COUNT(*) as event_count, MIN(created_at) as first_event_at, \
+            MAX(created_at) as last_event_at \
+     FROM events \
+     WHERE source != '__daemon__' AND session_id = ? \
+     GROUP BY source \
+     ORDER BY MAX(created_at) DESC LIMIT 1";
+
+pub const SELECT_LAST_EVENT: &str = "SELECT event_id, created_at FROM events \
+     WHERE source != '__daemon__' \
+     ORDER BY event_id DESC LIMIT 1";
+
 /// Stable wire string for an [`EventKind`] used by the daemon's SQLite storage.
 ///
 /// Delegates to the protocol's serde representation so storage stays in lockstep
@@ -65,6 +107,14 @@ pub fn reaction_as_db_string(r: &Reaction) -> String {
         s.remove(0);
     }
     s
+}
+
+/// Inverse of [`reaction_as_db_string`]: parses an `events.reaction` TEXT
+/// column value back into a [`Reaction`]. Returns a parse-error message
+/// string on unknown values; callers map to their preferred error type.
+pub fn reaction_from_db_string(s: &str) -> Result<Reaction, String> {
+    let quoted = format!("\"{s}\"");
+    serde_json::from_str::<Reaction>(&quoted).map_err(|e| format!("unknown Reaction {s:?}: {e}"))
 }
 
 #[cfg(test)]

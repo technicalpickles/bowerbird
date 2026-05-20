@@ -353,11 +353,4 @@ pub async fn rebuild_missing_projections(writer_pool: &deadpool_sqlite::Pool) ->
     Ok(rebuilt)
 }
 
-fn current_unix_millis() -> Result<i64> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| Error::Clock(format!("system time before UNIX_EPOCH: {e}")))?
-        .as_millis();
-    i64::try_from(now_ms).map_err(|_| Error::Clock(format!("timestamp overflows i64: {now_ms}")))
-}
+use crate::time::current_unix_millis;
