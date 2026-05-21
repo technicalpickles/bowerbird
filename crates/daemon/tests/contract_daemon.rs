@@ -3084,19 +3084,33 @@ mod story_2_2_publish {
         State { session_id: &'static str },
     }
 
-    fn build_probe(kind: ProbeKind) -> BroadcastEnvelope {
+    /// Per-attempt probe identifier. Each `wait_subscribe_live*` loop
+    /// iteration generates a fresh token, encodes it into the probe
+    /// envelope, and only returns once subscribers have observed at
+    /// least that token. Because `tokio::sync::broadcast` preserves
+    /// per-channel order, a subscriber that has seen token `N` cannot
+    /// receive a probe with token `< N` later — eliminating the stale
+    /// probe race the v2 review caught.
+    fn build_probe_with_token(kind: ProbeKind, token: u64) -> BroadcastEnvelope {
+        let token_str = format!("__probe-{token}__");
         match kind {
             ProbeKind::Event { source } => BroadcastEnvelope::Event(Event {
                 event_id: EventId(0),
                 source: source.to_string(),
-                session_id: "__probe__".to_string(),
+                // Token rides in `session_id` so source-filtered Event
+                // subscriptions (`events.<source>.*`) still match while
+                // the field stays uniquely identifiable per attempt.
+                session_id: token_str,
                 kind: EventKind::PreToolUse,
                 reaction: None,
                 payload: "{}".to_string(),
                 created_at: 0,
             }),
             ProbeKind::State { session_id } => BroadcastEnvelope::State {
-                source: "__probe__".to_string(),
+                // Token rides in `source` so wildcard or session-keyed
+                // State subscriptions still match by `session_id` while
+                // the marker stays uniquely identifiable per attempt.
+                source: token_str,
                 session_id: session_id.to_string(),
                 state: SessionState {
                     current_state: SessionCurrentState::Idle,
@@ -3107,7 +3121,32 @@ mod story_2_2_publish {
         }
     }
 
-    fn is_probe_frame(msg: &Message) -> bool {
+    /// Parse a probe token off any probe frame (Event or State). Returns
+    /// `None` for real (non-probe) frames.
+    fn extract_probe_token(msg: &Message) -> Option<u64> {
+        let text = match msg {
+            Message::Text(t) => t.as_str(),
+            _ => return None,
+        };
+        let server: ServerMessage = serde_json::from_str(text).ok()?;
+        let marker = match server {
+            ServerMessage::Event(f) => f.event.session_id,
+            ServerMessage::State(f) => f.source,
+            _ => return None,
+        };
+        marker
+            .strip_prefix("__probe-")
+            .and_then(|rest| rest.strip_suffix("__"))
+            .and_then(|num| num.parse::<u64>().ok())
+    }
+
+    /// True if `msg` is a probe of the same kind currently being probed
+    /// for. Frames from the prior (different-kind) probe call are also
+    /// probes — they get drained but do NOT advance readiness for the
+    /// current kind. The match keeps `wait_subscribe_live` honest when
+    /// the same client is woken twice (e.g. event + state subs back to
+    /// back, as the cross-topic ordering test does).
+    fn probe_matches_kind(msg: &Message, kind: ProbeKind) -> bool {
         let text = match msg {
             Message::Text(t) => t.as_str(),
             _ => return false,
@@ -3116,91 +3155,75 @@ mod story_2_2_publish {
             Ok(s) => s,
             Err(_) => return false,
         };
-        match server {
-            ServerMessage::Event(f) => f.event.session_id == "__probe__",
-            ServerMessage::State(f) => f.source == "__probe__",
-            _ => false,
-        }
+        matches!(
+            (server, kind),
+            (ServerMessage::Event(_), ProbeKind::Event { .. })
+                | (ServerMessage::State(_), ProbeKind::State { .. })
+        )
     }
 
     /// Block until a previously-sent `Subscribe` is live on the daemon
-    /// side. Publishes synthetic probe envelopes matching the target
-    /// topic and reads frames until one of ours arrives, then drains any
-    /// trailing probes so the stream is clean for the test's real
-    /// assertions. Bounded by a 2s deadline.
+    /// side. Publishes uniquely-tokened probe envelopes and returns only
+    /// after the subscriber has observed the latest published token —
+    /// broadcast ordering then proves no older probe can arrive later,
+    /// closing the stale-probe race the v2 review caught.
     ///
-    /// Replaces the fixed `tokio::time::sleep(20ms)` pattern flagged in
-    /// the story 2.2 review. The sleeps that remain here live inside this
-    /// explicit bounded retry loop, not as unconditional synchronization.
+    /// Sleeps used here live inside this explicit bounded retry loop, not
+    /// as unconditional synchronization.
     async fn wait_subscribe_live(ws: &mut WsStream, state: &AppState, probe: ProbeKind) {
-        let envelope = build_probe(probe);
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            if std::time::Instant::now() >= deadline {
-                panic!("subscribe never went live within 2s deadline");
-            }
-            state.broadcaster.publish(envelope.clone());
-            match tokio::time::timeout(Duration::from_millis(50), ws.next()).await {
-                Ok(Some(Ok(msg))) => {
-                    if !is_probe_frame(&msg) {
-                        panic!("unexpected non-probe frame during readiness: {msg:?}");
-                    }
-                    // Drain trailing probes published by prior retry
-                    // iterations that the daemon caught up on after our
-                    // subscribe was processed. Bounded short timeout — a
-                    // non-probe frame here would mean the test ordering
-                    // is wrong.
-                    while let Ok(Some(Ok(more))) =
-                        tokio::time::timeout(Duration::from_millis(10), ws.next()).await
-                    {
-                        if !is_probe_frame(&more) {
-                            panic!("non-probe frame during readiness drain: {more:?}");
-                        }
-                    }
-                    return;
-                }
-                Ok(Some(Err(e))) => panic!("ws error during readiness: {e:?}"),
-                Ok(None) => panic!("ws closed during readiness"),
-                Err(_) => continue, // retry by re-publishing.
-            }
-        }
+        wait_subscribe_live_all(&mut [ws], state, probe).await
     }
 
-    /// Multi-client variant of `wait_subscribe_live`. Subscribes on
-    /// every client may complete at different times, AND a probe published
-    /// during one client's wait is broadcast to all subscribers — so a
-    /// per-client wait + drain leaks probes back to clients that have
-    /// already returned from their own wait. This helper publishes a
-    /// probe per iteration and drains EVERY client's queue to empty per
-    /// iteration, exiting only when all clients have observed at least
-    /// one probe AND no client has trailing frames. Bounded by a 2s
-    /// deadline.
+    /// Multi-client variant of `wait_subscribe_live`. Each iteration
+    /// mints a fresh probe token, publishes one probe to the hub, and
+    /// drains every client's WS queue. A client is considered ready when
+    /// its observed max-probe-token is `>=` the latest published token;
+    /// once all clients meet that bar, every per-connection task has
+    /// drained the channel up to that point and no older probe can
+    /// arrive later (tokio broadcast preserves per-channel order).
     async fn wait_subscribe_live_all(
         clients: &mut [&mut WsStream],
         state: &AppState,
         probe: ProbeKind,
     ) {
-        let envelope = build_probe(probe);
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        let mut ready = vec![false; clients.len()];
-        while !ready.iter().all(|&b| b) {
+        // A global atomic keeps the token unique across parallel `cargo
+        // test` workers running their own daemons; the bare value is
+        // irrelevant — only its monotonic order within one helper
+        // invocation matters.
+        static TOKEN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let mut max_seen: Vec<Option<u64>> = vec![None; clients.len()];
+        let mut latest_token: u64 = 0;
+        loop {
             if std::time::Instant::now() >= deadline {
-                panic!("not all clients went live within 2s deadline (ready={ready:?})");
+                panic!(
+                    "not all clients went live within 2s deadline \
+                     (max_seen={max_seen:?}, latest_token={latest_token})"
+                );
             }
-            state.broadcaster.publish(envelope.clone());
+            latest_token = TOKEN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            state
+                .broadcaster
+                .publish(build_probe_with_token(probe, latest_token));
+
             for (i, ws) in clients.iter_mut().enumerate() {
-                // Drain everything currently queued on this client. Mark
-                // it ready on first probe seen; keep draining trailing
-                // probes so the stream is clean.
+                // Drain everything currently queued on this client.
+                // Probes of `probe`'s kind advance `max_seen`; probes of
+                // a different kind (e.g. left over from an earlier
+                // `wait_subscribe_live` for the other topic in this same
+                // client — the cross-topic ordering test does this) are
+                // valid probes and get discarded without panicking.
                 loop {
                     match tokio::time::timeout(Duration::from_millis(20), ws.next()).await {
                         Ok(Some(Ok(msg))) => {
-                            if is_probe_frame(&msg) {
-                                ready[i] = true;
-                            } else {
-                                panic!(
-                                    "unexpected non-probe frame on client #{i} during readiness: {msg:?}"
-                                );
+                            let token = extract_probe_token(&msg).unwrap_or_else(|| {
+                                panic!("non-probe frame on client #{i} during readiness: {msg:?}")
+                            });
+                            if probe_matches_kind(&msg, probe) {
+                                max_seen[i] = Some(match max_seen[i] {
+                                    Some(prev) => prev.max(token),
+                                    None => token,
+                                });
                             }
                         }
                         Ok(Some(Err(e))) => {
@@ -3210,6 +3233,13 @@ mod story_2_2_publish {
                         Err(_) => break, // queue currently empty — move on
                     }
                 }
+            }
+
+            let all_caught_up = max_seen
+                .iter()
+                .all(|m| matches!(m, Some(t) if *t >= latest_token));
+            if all_caught_up {
+                return;
             }
         }
     }
@@ -3754,6 +3784,146 @@ mod story_2_2_publish {
         let frame = read_text_frame_or_close(&mut ws).await;
         let event = parse_event_frame(&frame);
         assert_eq!(event.session_id, "sess-alive");
+
+        state.shutdown.cancel();
+    }
+
+    /// End-to-end: a hook line delivered over the Unix ingest socket
+    /// must round-trip through `ingest::writer::run` →
+    /// `projection::session::write` and reach a WS subscriber as an
+    /// `Event` frame. This is the only test that exercises the *full*
+    /// production wiring story 2.2 introduced; the per-AC tests publish
+    /// via `projection::session::write` directly and would miss a
+    /// regression that swapped the writer task's broadcaster handle for
+    /// the wrong one or `None`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ingest_socket_event_reaches_ws_subscriber() {
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        let (_dbtmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 4);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        // Wire up the ingest stack against the same `AppState`. The
+        // listener spawns inside `start_ingest_listener`; we add a
+        // sibling `writer::run` consuming the channel and writing
+        // through `state.db.writer` + `state.broadcaster` so any wiring
+        // mistake on the broadcaster handle would be observable here.
+        let sock_tmp = TempDir::new().expect("ingest tempdir");
+        let (ingest_shutdown, sock_path, rx) = super::start_ingest_listener(&sock_tmp, 16).await;
+        let writer_handle = tokio::spawn(bowerbird_daemon::ingest::writer::run(
+            rx,
+            state.db.writer.clone(),
+            Arc::clone(&state.broadcaster),
+            ingest_shutdown.clone(),
+        ));
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"events.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+        wait_subscribe_live(&mut ws, &state, ProbeKind::Event { source: "claude" }).await;
+
+        // Send a real hook line. Adapter is the same `ClaudeAdapter`
+        // pointed at a nonexistent reactions TOML (degrades to
+        // `Unknown`), so envelope.kind ends up `PreToolUse` and source
+        // is `"claude"`.
+        let resp = super::send_line_recv_response(
+            &sock_path,
+            b"{\"hook_kind\":\"PreToolUse\",\"session_id\":\"sess-ingest-broadcast\",\"tool_name\":\"Test\"}\n",
+        )
+        .await;
+        assert!(resp.starts_with("200"), "expected 200 ack, got: {resp:?}");
+
+        let frame = read_text_frame_or_close(&mut ws).await;
+        let event = parse_event_frame(&frame);
+        assert_eq!(event.source, "claude");
+        assert_eq!(event.session_id, "sess-ingest-broadcast");
+
+        ingest_shutdown.cancel();
+        // Closing the listener drops the sender; await the writer so
+        // any tail publishes complete before the test tears down.
+        let _ = writer_handle.await;
+        state.shutdown.cancel();
+    }
+
+    /// AC #1 + AC #2 combined — a single client subscribed to BOTH
+    /// `events.*` and `state.session.*` must observe the resulting
+    /// frames in the documented order: `Event` before `State`. A
+    /// regression that reverses the two publishes in
+    /// `projection::session::write` would still pass the AC-specific
+    /// tests (which split events- and state-only subscribers) but break
+    /// the presenter mental model the write doc-comment promises.
+    #[tokio::test(flavor = "current_thread")]
+    async fn event_published_before_state_to_dual_subscriber() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 4);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"events.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe events.*");
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe state.session.*");
+
+        // Wait for BOTH topic classes to be live. The token-based helper
+        // tolerates probes of the prior kind queued on the same client
+        // (drained without panic, just not counted toward this call's
+        // readiness).
+        wait_subscribe_live(&mut ws, &state, ProbeKind::Event { source: "claude" }).await;
+        wait_subscribe_live(
+            &mut ws,
+            &state,
+            ProbeKind::State {
+                session_id: "__probe__",
+            },
+        )
+        .await;
+
+        let id = publish_via_projection(
+            &state,
+            "claude",
+            "sess-order",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+
+        // Exactly two frames in this order: Event first, then State.
+        let f1 = read_text_frame_or_close(&mut ws).await;
+        let event = parse_event_frame(&f1);
+        assert_eq!(event.event_id, id, "frame 1 must be the published event");
+        assert_eq!(event.source, "claude");
+        assert_eq!(event.session_id, "sess-order");
+
+        let f2 = read_text_frame_or_close(&mut ws).await;
+        let st = parse_state_frame(&f2);
+        assert_eq!(
+            st.source, "claude",
+            "frame 2 must be the state update for the same session"
+        );
+        assert_eq!(st.session_id, "sess-order");
+
+        // No trailing frames within a short timeout — the publish
+        // produced exactly the pair.
+        let timed = tokio::time::timeout(Duration::from_millis(200), ws.next()).await;
+        assert!(
+            timed.is_err(),
+            "unexpected trailing frame after Event+State pair: {timed:?}"
+        );
 
         state.shutdown.cancel();
     }
