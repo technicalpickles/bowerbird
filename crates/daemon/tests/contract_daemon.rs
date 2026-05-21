@@ -5,13 +5,14 @@ use std::time::Duration;
 use assert_cmd::Command;
 use bowerbird_daemon::api;
 use bowerbird_daemon::api::token::BearerToken;
+use bowerbird_daemon::broadcast::BroadcastHub;
 use bowerbird_daemon::db::migrations::migrations;
 use bowerbird_daemon::db::queries::{
     event_kind_as_str, SELECT_EVENT_BY_ID, UPSERT_SESSION_PROJECTION,
 };
 use bowerbird_daemon::db::{init_pools, run_migrations, DbPools};
 use bowerbird_daemon::projection;
-use bowerbird_daemon::state::AppState;
+use bowerbird_daemon::state::{AppState, WsConfig};
 use protocol::{EventEnvelope, EventKind, SessionCurrentState, SessionState};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -29,12 +30,34 @@ async fn fresh_pools() -> (TempDir, DbPools) {
 const TEST_BEARER: &str = "test-bearer-token-1.7";
 
 fn make_test_state(pools: DbPools, migrations_complete: Arc<AtomicBool>) -> AppState {
+    make_test_state_with_ws(
+        pools,
+        migrations_complete,
+        4,
+        Duration::from_secs(30),
+        Duration::from_secs(10),
+    )
+}
+
+fn make_test_state_with_ws(
+    pools: DbPools,
+    migrations_complete: Arc<AtomicBool>,
+    ws_max_conns: usize,
+    ping_interval: Duration,
+    pong_timeout: Duration,
+) -> AppState {
     AppState {
         db: pools,
         migrations_complete,
         shutdown: CancellationToken::new(),
         bearer: BearerToken::new(TEST_BEARER.to_string()),
         started_at_ms: 0,
+        broadcaster: Arc::new(BroadcastHub::new(16)),
+        ws_semaphore: Arc::new(tokio::sync::Semaphore::new(ws_max_conns)),
+        ws_config: WsConfig {
+            ping_interval,
+            pong_timeout,
+        },
     }
 }
 
@@ -2135,6 +2158,12 @@ mod story_1_7_rest {
             shutdown: CancellationToken::new(),
             bearer: BearerToken::new(super::TEST_BEARER.to_string()),
             started_at_ms: 1,
+            broadcaster: Arc::new(BroadcastHub::new(16)),
+            ws_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+            ws_config: WsConfig {
+                ping_interval: Duration::from_secs(30),
+                pong_timeout: Duration::from_secs(10),
+            },
         };
         let app = api::router(state);
         let resp = app.oneshot(auth_get("/status")).await.expect("oneshot");
@@ -2174,5 +2203,799 @@ mod story_1_7_rest {
             .await
             .expect("oneshot");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+}
+
+/// Story 2.1 WebSocket contract tests.
+mod story_2_1_ws {
+    use std::net::SocketAddr;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use bowerbird_daemon::api;
+    use bowerbird_daemon::broadcast::BroadcastEnvelope;
+    use bowerbird_daemon::state::AppState;
+    use futures_util::{SinkExt, StreamExt};
+    use protocol::{Event, EventId};
+    use protocol::{
+        EventKind, HelloFrame, Reaction, ServerMessage, SessionCurrentState, SessionState,
+    };
+    use tokio::task::JoinHandle;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::header;
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+    use tokio_tungstenite::tungstenite::Message;
+
+    use super::{fresh_pools, make_test_state_with_ws};
+
+    const TEST_BEARER: &str = super::TEST_BEARER;
+
+    /// Spawn a real axum server on a random localhost port. Returns the
+    /// bound address and a JoinHandle for the serve task.
+    async fn spawn_test_daemon(state: AppState) -> (SocketAddr, JoinHandle<()>) {
+        let router = api::router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let shutdown = state.shutdown.clone();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, router)
+                .with_graceful_shutdown(async move { shutdown.cancelled().await })
+                .await;
+        });
+        (addr, handle)
+    }
+
+    fn ws_url_header(addr: SocketAddr) -> String {
+        format!("ws://{}/ws", addr)
+    }
+
+    fn ws_url_query(addr: SocketAddr, token: &str) -> String {
+        format!("ws://{}/ws?token={}", addr, token)
+    }
+
+    fn ws_url_header_and_query(addr: SocketAddr, query_token: &str) -> String {
+        format!("ws://{}/ws?token={}", addr, query_token)
+    }
+
+    /// Build a connect request with `Authorization: Bearer <token>`.
+    fn authed_request(url: &str, token: &str) -> tokio_tungstenite::tungstenite::http::Request<()> {
+        let mut req = url.into_client_request().expect("into_client_request");
+        req.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().expect("header"),
+        );
+        req
+    }
+
+    async fn connect_authed(
+        addr: SocketAddr,
+        token: &str,
+    ) -> (
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        tokio_tungstenite::tungstenite::http::Response<Option<Vec<u8>>>,
+    ) {
+        let req = authed_request(&ws_url_header(addr), token);
+        tokio_tungstenite::connect_async(req)
+            .await
+            .expect("ws connect")
+    }
+
+    async fn read_text_frame_or_close(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> Message {
+        tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("recv within 5s")
+            .expect("stream not ended")
+            .expect("recv ok")
+    }
+
+    fn parse_hello(msg: &Message) -> HelloFrame {
+        let text = match msg {
+            Message::Text(t) => t.as_str(),
+            other => panic!("expected text Hello frame, got {other:?}"),
+        };
+        let server: ServerMessage = serde_json::from_str(text).expect("parse ServerMessage");
+        match server {
+            ServerMessage::Hello(h) => h,
+            other => panic!("expected Hello, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_hello_frame_on_connect() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = make_test_state_with_ws(
+            pools,
+            Arc::new(AtomicBool::new(true)),
+            4,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        );
+        let started_at = state.started_at_ms;
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let (mut ws, _resp) = connect_authed(addr, TEST_BEARER).await;
+        let msg = read_text_frame_or_close(&mut ws).await;
+        let hello = parse_hello(&msg);
+        assert_eq!(hello.protocol_version, "1.0");
+        assert_eq!(hello.daemon_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(hello.daemon_started_at, started_at);
+
+        state.shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_hello_frame_query_token_path() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = make_test_state_with_ws(
+            pools,
+            Arc::new(AtomicBool::new(true)),
+            4,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        );
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let url = ws_url_query(addr, TEST_BEARER);
+        let req = url.into_client_request().expect("into_client_request");
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(req)
+            .await
+            .expect("ws connect via query token");
+        let msg = read_text_frame_or_close(&mut ws).await;
+        let hello = parse_hello(&msg);
+        assert_eq!(hello.protocol_version, "1.0");
+
+        state.shutdown.cancel();
+    }
+
+    fn make_state_envelope(session_id: &str) -> BroadcastEnvelope {
+        BroadcastEnvelope::State {
+            source: "claude".to_string(),
+            session_id: session_id.to_string(),
+            state: SessionState {
+                current_state: SessionCurrentState::Working,
+                last_event_kind: EventKind::PreToolUse,
+                last_event_at_ms: 0,
+            },
+        }
+    }
+
+    fn make_event_envelope(source: &str, session_id: &str) -> BroadcastEnvelope {
+        BroadcastEnvelope::Event(Event {
+            event_id: EventId(1),
+            source: source.to_string(),
+            session_id: session_id.to_string(),
+            kind: EventKind::PreToolUse,
+            reaction: Some(Reaction::Continue),
+            payload: "{}".to_string(),
+            created_at: 0,
+        })
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_subscribe_accumulates_then_unsubscribe_removes() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = make_test_state_with_ws(
+            pools,
+            Arc::new(AtomicBool::new(true)),
+            4,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        );
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let (mut ws, _resp) = connect_authed(addr, TEST_BEARER).await;
+        let _hello = read_text_frame_or_close(&mut ws).await;
+
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe state");
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"events.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe events");
+
+        // Yield so the daemon processes the subscribes before publish races.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        state.broadcaster.publish(make_state_envelope("sess-1"));
+        let msg = read_text_frame_or_close(&mut ws).await;
+        let text = match msg {
+            Message::Text(t) => t,
+            other => panic!("expected text frame, got {other:?}"),
+        };
+        let parsed: ServerMessage = serde_json::from_str(text.as_str()).expect("parse");
+        match parsed {
+            ServerMessage::State(s) => assert_eq!(s.session_id, "sess-1"),
+            other => panic!("expected State, got {other:?}"),
+        }
+
+        state
+            .broadcaster
+            .publish(make_event_envelope("claude", "sess-1"));
+        let msg = read_text_frame_or_close(&mut ws).await;
+        let text = match msg {
+            Message::Text(t) => t,
+            other => panic!("expected text frame, got {other:?}"),
+        };
+        let parsed: ServerMessage = serde_json::from_str(text.as_str()).expect("parse");
+        assert!(
+            matches!(parsed, ServerMessage::Event(_)),
+            "expected Event frame, got {parsed:?}"
+        );
+
+        ws.send(Message::Text(
+            r#"{"op":"unsubscribe","topic":"state.session.*"}"#.into(),
+        ))
+        .await
+        .expect("send unsubscribe");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // After unsubscribing from state.*, a state envelope must NOT arrive,
+        // but an events envelope still should.
+        state.broadcaster.publish(make_state_envelope("sess-2"));
+        state
+            .broadcaster
+            .publish(make_event_envelope("claude", "sess-2"));
+
+        let msg = read_text_frame_or_close(&mut ws).await;
+        let text = match msg {
+            Message::Text(t) => t,
+            other => panic!("expected text frame, got {other:?}"),
+        };
+        let parsed: ServerMessage = serde_json::from_str(text.as_str()).expect("parse");
+        assert!(
+            matches!(parsed, ServerMessage::Event(_)),
+            "after unsubscribe(state.session.*), only Event frame should arrive; got {parsed:?}"
+        );
+
+        state.shutdown.cancel();
+    }
+
+    async fn assert_closes_with_1008(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) {
+        // The next message must be a Close frame with code 1008.
+        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("close arrived in time")
+            .expect("stream produced item")
+            .expect("recv ok");
+        match msg {
+            Message::Close(Some(CloseFrame { code, reason })) => {
+                assert_eq!(
+                    u16::from(code),
+                    1008,
+                    "expected 1008 Policy Violation close, got {code:?}"
+                );
+                assert!(
+                    reason.starts_with("bad message:"),
+                    "expected reason to start with 'bad message:', got {reason:?}"
+                );
+            }
+            other => panic!("expected Close(1008), got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_empty_topic_closes_with_policy_violation() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = make_test_state_with_ws(
+            pools,
+            Arc::new(AtomicBool::new(true)),
+            4,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        );
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _hello = read_text_frame_or_close(&mut ws).await;
+        ws.send(Message::Text(r#"{"op":"subscribe","topic":""}"#.into()))
+            .await
+            .expect("send");
+        assert_closes_with_1008(&mut ws).await;
+        state.shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_unknown_op_closes_with_policy_violation() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = make_test_state_with_ws(
+            pools,
+            Arc::new(AtomicBool::new(true)),
+            4,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        );
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _hello = read_text_frame_or_close(&mut ws).await;
+        ws.send(Message::Text(r#"{"op":"bogus","topic":"events.*"}"#.into()))
+            .await
+            .expect("send");
+        assert_closes_with_1008(&mut ws).await;
+        state.shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_extra_field_closes_with_policy_violation() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = make_test_state_with_ws(
+            pools,
+            Arc::new(AtomicBool::new(true)),
+            4,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        );
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _hello = read_text_frame_or_close(&mut ws).await;
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"events.*","extra":1}"#.into(),
+        ))
+        .await
+        .expect("send");
+        assert_closes_with_1008(&mut ws).await;
+        state.shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_binary_message_closes_with_policy_violation() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = make_test_state_with_ws(
+            pools,
+            Arc::new(AtomicBool::new(true)),
+            4,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        );
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _hello = read_text_frame_or_close(&mut ws).await;
+        ws.send(Message::Binary(vec![0u8; 4].into()))
+            .await
+            .expect("send binary");
+        assert_closes_with_1008(&mut ws).await;
+        state.shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_401_when_no_auth() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = make_test_state_with_ws(
+            pools,
+            Arc::new(AtomicBool::new(true)),
+            4,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        );
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let url = ws_url_header(addr);
+        let req = url.into_client_request().expect("into_client_request");
+        let err = tokio_tungstenite::connect_async(req)
+            .await
+            .expect_err("must fail with 401");
+        match err {
+            tokio_tungstenite::tungstenite::Error::Http(resp) => {
+                assert_eq!(resp.status().as_u16(), 401);
+            }
+            other => panic!("expected HTTP 401 error, got {other:?}"),
+        }
+        state.shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_401_when_bad_token() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = make_test_state_with_ws(
+            pools,
+            Arc::new(AtomicBool::new(true)),
+            4,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        );
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let req = authed_request(&ws_url_header(addr), "wrong-token");
+        let err = tokio_tungstenite::connect_async(req)
+            .await
+            .expect_err("must fail with 401");
+        match err {
+            tokio_tungstenite::tungstenite::Error::Http(resp) => {
+                assert_eq!(resp.status().as_u16(), 401);
+            }
+            other => panic!("expected HTTP 401 error, got {other:?}"),
+        }
+        state.shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_header_token_wins_over_query() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = make_test_state_with_ws(
+            pools,
+            Arc::new(AtomicBool::new(true)),
+            4,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        );
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        // Valid header + invalid query → upgrade succeeds.
+        let req = authed_request(
+            &ws_url_header_and_query(addr, "wrong-query-token"),
+            TEST_BEARER,
+        );
+        let (mut ws, _) = tokio_tungstenite::connect_async(req)
+            .await
+            .expect("valid header should win over invalid query");
+        let _hello = read_text_frame_or_close(&mut ws).await;
+
+        // Invalid header + valid query → must fail (header wins; not falling
+        // through to query when header is present but rejected).
+        let req = authed_request(&ws_url_query(addr, TEST_BEARER), "wrong-header-token");
+        let err = tokio_tungstenite::connect_async(req)
+            .await
+            .expect_err("invalid header must not fall through to query");
+        match err {
+            tokio_tungstenite::tungstenite::Error::Http(resp) => {
+                assert_eq!(resp.status().as_u16(), 401);
+            }
+            other => panic!("expected HTTP 401 error, got {other:?}"),
+        }
+
+        state.shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_pre_subscribe_backlog_does_not_leak_to_new_subscription() {
+        // AC #2 review finding: a frame published BEFORE a Subscribe arrives
+        // must not be delivered AFTER the Subscribe is processed, even when
+        // the new topic would match the queued frame.
+        let (_tmp, pools) = fresh_pools().await;
+        let state = make_test_state_with_ws(
+            pools,
+            Arc::new(AtomicBool::new(true)),
+            4,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        );
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _hello = read_text_frame_or_close(&mut ws).await;
+
+        // Publish a state envelope BEFORE any Subscribe has been processed.
+        // The per-connection receiver was subscribed pre-upgrade, so this
+        // envelope is buffered.
+        state.broadcaster.publish(make_state_envelope("sess-1"));
+
+        // Give the daemon a moment to ensure the envelope reaches the
+        // per-connection broadcast receiver buffer.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Subscribe to a topic that WOULD match the pre-published frame.
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+
+        // After subscribing, publish a fresh envelope so we have a known
+        // post-subscribe frame to anchor the assertion.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        state.broadcaster.publish(make_state_envelope("sess-2"));
+
+        // We expect exactly ONE State frame to arrive — for sess-2.
+        // If the pre-subscribe sess-1 frame leaked, we'd see sess-1 first.
+        let msg = read_text_frame_or_close(&mut ws).await;
+        let text = match msg {
+            Message::Text(t) => t,
+            other => panic!("expected text frame, got {other:?}"),
+        };
+        let parsed: ServerMessage = serde_json::from_str(text.as_str()).expect("parse");
+        match parsed {
+            ServerMessage::State(s) => assert_eq!(
+                s.session_id, "sess-2",
+                "pre-subscribe backlog leaked into post-subscribe delivery"
+            ),
+            other => panic!("expected State frame, got {other:?}"),
+        }
+        state.shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_malformed_header_does_not_fall_through_to_query() {
+        // AC #5 review finding: a malformed `Authorization` header (e.g.
+        // `Basic ...` instead of `Bearer ...`, or empty bearer) must NOT
+        // fall through to a valid `?token=` query param. Header presence
+        // (any value) wins.
+        let (_tmp, pools) = fresh_pools().await;
+        let state = make_test_state_with_ws(
+            pools,
+            Arc::new(AtomicBool::new(true)),
+            4,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        );
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        // Case 1: `Basic <correct>` header + valid query token → 401.
+        let url = ws_url_query(addr, TEST_BEARER);
+        let mut req = url.into_client_request().expect("into_client_request");
+        req.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("Basic {}", TEST_BEARER).parse().expect("header"),
+        );
+        let err = tokio_tungstenite::connect_async(req)
+            .await
+            .expect_err("malformed header must NOT fall through");
+        match err {
+            tokio_tungstenite::tungstenite::Error::Http(resp) => {
+                assert_eq!(resp.status().as_u16(), 401);
+            }
+            other => panic!("expected 401, got {other:?}"),
+        }
+
+        // Case 2: `Bearer ` (empty token) header + valid query token → 401.
+        let url = ws_url_query(addr, TEST_BEARER);
+        let mut req = url.into_client_request().expect("into_client_request");
+        req.headers_mut()
+            .insert(header::AUTHORIZATION, "Bearer ".parse().expect("header"));
+        let err = tokio_tungstenite::connect_async(req)
+            .await
+            .expect_err("empty-bearer header must NOT fall through");
+        match err {
+            tokio_tungstenite::tungstenite::Error::Http(resp) => {
+                assert_eq!(resp.status().as_u16(), 401);
+            }
+            other => panic!("expected 401, got {other:?}"),
+        }
+
+        state.shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_257th_connection_rejected_503() {
+        // Use cap of 3 to keep the test cheap. The contract is identical at
+        // any boundary: N connections succeed, the N+1 fails with 503, then
+        // closing one allows another to succeed.
+        let (_tmp, pools) = fresh_pools().await;
+        let state = make_test_state_with_ws(
+            pools,
+            Arc::new(AtomicBool::new(true)),
+            3,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        );
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        // Open 3 connections; keep them alive in the test.
+        let mut alive = Vec::new();
+        for _ in 0..3 {
+            let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+            let _hello = read_text_frame_or_close(&mut ws).await;
+            alive.push(ws);
+        }
+
+        // The 4th attempt must be rejected with 503.
+        let req = authed_request(&ws_url_header(addr), TEST_BEARER);
+        let err = tokio_tungstenite::connect_async(req)
+            .await
+            .expect_err("must fail with 503");
+        match err {
+            tokio_tungstenite::tungstenite::Error::Http(resp) => {
+                assert_eq!(resp.status().as_u16(), 503);
+            }
+            other => panic!("expected HTTP 503, got {other:?}"),
+        }
+
+        // Drop one of the 3 — permit returned on connection task exit.
+        let mut to_close = alive.remove(0);
+        to_close.close(None).await.ok();
+        drop(to_close);
+
+        // Give the daemon a moment to notice the close and release the permit.
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let req = authed_request(&ws_url_header(addr), TEST_BEARER);
+            match tokio_tungstenite::connect_async(req).await {
+                Ok((mut ws, _)) => {
+                    let _hello = read_text_frame_or_close(&mut ws).await;
+                    state.shutdown.cancel();
+                    return;
+                }
+                Err(tokio_tungstenite::tungstenite::Error::Http(resp))
+                    if resp.status().as_u16() == 503 =>
+                {
+                    continue;
+                }
+                Err(e) => panic!("unexpected error on retry: {e:?}"),
+            }
+        }
+        panic!("permit was never returned after dropping a connection");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_ping_within_idle_window() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = make_test_state_with_ws(
+            pools,
+            Arc::new(AtomicBool::new(true)),
+            4,
+            Duration::from_millis(100),
+            Duration::from_millis(500),
+        );
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _hello = read_text_frame_or_close(&mut ws).await;
+
+        // Wait for a Ping frame. tokio-tungstenite will auto-respond with
+        // Pong before yielding the Ping to our stream, but the Ping itself
+        // is visible on the stream.
+        let msg = tokio::time::timeout(Duration::from_millis(500), ws.next())
+            .await
+            .expect("Ping arrived in time")
+            .expect("stream not ended")
+            .expect("recv ok");
+        assert!(
+            matches!(msg, Message::Ping(_)),
+            "expected Ping, got {msg:?}"
+        );
+        state.shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_no_pong_within_timeout_closes() {
+        // AC #8: when no Pong arrives within `pong_timeout`, the daemon
+        // closes the connection, exits the per-connection task, and
+        // releases the semaphore permit.
+        //
+        // tokio-tungstenite's auto-Pong runs in `poll_next`, so a client
+        // that holds the WS stream without polling it will receive the
+        // server's Ping into the TCP buffer but never respond with a Pong.
+        // That exercises the daemon's pong-deadline branch directly.
+        //
+        // To verify the permit was released, we cap the daemon to 1
+        // concurrent connection and assert a second connection succeeds
+        // shortly after the timeout fires.
+        let (_tmp, pools) = fresh_pools().await;
+        let state = make_test_state_with_ws(
+            pools,
+            Arc::new(AtomicBool::new(true)),
+            1, // cap = 1 so we can prove permit release via re-connect
+            Duration::from_millis(60),
+            Duration::from_millis(40),
+        );
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        // Connect, read Hello, then stop polling the stream.
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _hello = read_text_frame_or_close(&mut ws).await;
+
+        // Hold `ws` so the TCP socket stays open, but do NOT poll it.
+        // tokio-tungstenite's auto-Pong needs `poll_next` to run; without
+        // a poll, the daemon's Ping arrives at the OS but no Pong is
+        // ever generated. The daemon should hit the pong-deadline branch
+        // within ~ping_interval + pong_timeout (60 + 40 = 100ms).
+        let _hold = ws;
+
+        // Wait long enough for daemon's pong-deadline to fire AND for the
+        // dropped connection task to release the permit.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        // The permit MUST be released — cap is 1, so a new connection
+        // can only succeed if the dead connection's task exited.
+        let mut succeeded = false;
+        for _ in 0..20 {
+            let req = authed_request(&ws_url_header(addr), TEST_BEARER);
+            match tokio_tungstenite::connect_async(req).await {
+                Ok((mut ws2, _)) => {
+                    let _hello = read_text_frame_or_close(&mut ws2).await;
+                    succeeded = true;
+                    break;
+                }
+                Err(tokio_tungstenite::tungstenite::Error::Http(resp))
+                    if resp.status().as_u16() == 503 =>
+                {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(e) => panic!("unexpected error on reconnect: {e:?}"),
+            }
+        }
+        assert!(
+            succeeded,
+            "pong-deadline did not exit task / release permit within budget"
+        );
+        state.shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_shutdown_token_closes_task() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = make_test_state_with_ws(
+            pools,
+            Arc::new(AtomicBool::new(true)),
+            4,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        );
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _hello = read_text_frame_or_close(&mut ws).await;
+
+        state.shutdown.cancel();
+
+        // Within a generous window the server-side connection task exits
+        // and our client either receives a Close, EOF, or a network error.
+        let close_or_eof = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Close(_))) | None => return,
+                    Some(Err(_)) => return,
+                    Some(Ok(_)) => continue,
+                }
+            }
+        })
+        .await;
+        assert!(
+            close_or_eof.is_ok(),
+            "ws did not close within 2s of shutdown"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn x_request_id_on_healthz() {
+        // AC #10 canary: SetRequestIdLayer is wired and emits an
+        // x-request-id UUID4 on every response. Uses the in-process
+        // `oneshot` path because the full router middleware stack applies
+        // regardless of whether the request travels through TCP.
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let (_tmp, pools) = fresh_pools().await;
+        let state = make_test_state_with_ws(
+            pools,
+            Arc::new(AtomicBool::new(true)),
+            4,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        );
+        let app = api::router(state);
+        let req = Request::builder()
+            .uri("/healthz")
+            .body(Body::empty())
+            .expect("req build");
+        let resp = app.oneshot(req).await.expect("oneshot");
+        assert_eq!(resp.status().as_u16(), 200);
+        let rid = resp
+            .headers()
+            .get("x-request-id")
+            .expect("x-request-id header present")
+            .to_str()
+            .expect("ascii");
+        // UUID4: 36 chars, hyphens at 8, 13, 18, 23.
+        assert_eq!(rid.len(), 36, "x-request-id should be 36 chars; got {rid}");
+        for pos in [8usize, 13, 18, 23] {
+            assert_eq!(
+                rid.as_bytes()[pos] as char,
+                '-',
+                "x-request-id hyphen position {pos} mismatch in {rid}"
+            );
+        }
     }
 }

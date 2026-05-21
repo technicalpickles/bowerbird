@@ -8,10 +8,11 @@ use bowerbird_daemon::{
         self,
         token::{self, TokenSource},
     },
+    broadcast::BroadcastHub,
     config::Config,
     db::{init_pools, run_migrations, DbPools},
     ensure_bowerbird_dir, ingest, init_tracing, install_panic_hook, projection, set_crash_dir,
-    state::AppState,
+    state::{AppState, WsConfig},
     time::current_unix_millis,
     write_error_report,
 };
@@ -160,12 +161,22 @@ async fn run(config: Config) -> anyhow::Result<()> {
         adapter,
     ));
 
+    let broadcaster = Arc::new(BroadcastHub::new(config.ws_broadcast_capacity));
+    let ws_semaphore = Arc::new(tokio::sync::Semaphore::new(config.ws_max_connections));
+    let ws_config = WsConfig {
+        ping_interval: config.ws_ping_interval,
+        pong_timeout: config.ws_pong_timeout,
+    };
+
     let state = AppState {
         db: pools.clone(),
         migrations_complete: migrations_complete.clone(),
         shutdown: shutdown.clone(),
         bearer,
         started_at_ms,
+        broadcaster,
+        ws_semaphore,
+        ws_config,
     };
     let router = api::router(state);
     let listener = tokio::net::TcpListener::bind(config.bind_addr)

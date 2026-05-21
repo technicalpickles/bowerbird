@@ -15,5 +15,6 @@ pub use reaction::Reaction;
 pub use rest::{DaemonStatus, EventListResponse, SessionDetail, SessionListItem, SessionStats};
 pub use state::{SessionCurrentState, SessionState};
 pub use ws::{
-    ClientMessage, CloseFrame, DroppedFrame, EventFrame, HelloFrame, ServerMessage, SyncFrame,
+    ClientMessage, CloseFrame, DroppedFrame, EventFrame, HelloFrame, ServerMessage, StateFrame,
+    SyncFrame,
 };

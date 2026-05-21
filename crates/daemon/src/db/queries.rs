@@ -60,6 +60,36 @@ pub const SELECT_EVENTS_FOR_SESSION_SINCE: &str =
 pub const SELECT_MIN_EVENT_ID: &str =
     "SELECT MIN(event_id) FROM events WHERE source != '__daemon__'";
 
+/// Story 2.1 — Hello frame `history_begins_cleanly` probe.
+///
+/// Returns `1` if there exists a `recording_sessions` row whose
+/// `started_event_id <= MIN(events.event_id) <= ended_event_id`, i.e. the
+/// minimum-available event_id falls inside a known-clean recording window.
+/// `COALESCE(..., 0)` handles the empty-events case (returns `0`, meaning
+/// no clean-window claim — the conservative default for an empty daemon).
+pub const SELECT_HISTORY_BEGINS_CLEANLY: &str =
+    "SELECT EXISTS( \
+       SELECT 1 FROM recording_sessions \
+       WHERE started_event_id <= (SELECT COALESCE(MIN(event_id), 0) FROM events WHERE source != '__daemon__') \
+         AND ended_event_id IS NOT NULL \
+         AND ended_event_id >= (SELECT COALESCE(MIN(event_id), 0) FROM events WHERE source != '__daemon__') \
+     ) AS clean";
+
+/// Story 2.1 — both Hello-frame DB fields in one snapshot.
+///
+/// Returns `(min_event_id, history_begins_cleanly)` from a single SQL
+/// statement so a concurrent commit between the two reads cannot make the
+/// fields disagree. Equivalent to running [`SELECT_MIN_EVENT_ID`] and
+/// [`SELECT_HISTORY_BEGINS_CLEANLY`] inside a read transaction, but cheaper.
+pub const SELECT_HELLO_DB_FIELDS: &str = "SELECT \
+       (SELECT MIN(event_id) FROM events WHERE source != '__daemon__') AS min_event_id, \
+       EXISTS( \
+         SELECT 1 FROM recording_sessions \
+         WHERE started_event_id <= (SELECT COALESCE(MIN(event_id), 0) FROM events WHERE source != '__daemon__') \
+           AND ended_event_id IS NOT NULL \
+           AND ended_event_id >= (SELECT COALESCE(MIN(event_id), 0) FROM events WHERE source != '__daemon__') \
+       ) AS history_begins_cleanly";
+
 pub const SELECT_STATS_FOR_SESSION: &str =
     "SELECT source, COUNT(*) as event_count, MIN(created_at) as first_event_at, \
             MAX(created_at) as last_event_at \
