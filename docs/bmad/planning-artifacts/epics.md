@@ -489,9 +489,11 @@ So that I only receive the agent activity relevant to my tool without filtering 
 **When** the connection is established
 **Then** the daemon sends a `hello` frame immediately containing `protocol_version` and the daemon version string
 
-**Given** a tool sends a subscribe message `{"topics": ["state.session.*", "events.*"]}`
-**When** the daemon processes it
-**Then** subsequent frames are filtered to only those matching the declared topics
+**Given** a tool sends a subscribe message `{"op":"subscribe","topic":"state.session.*"}`, then later `{"op":"subscribe","topic":"events.*"}`
+**When** the daemon processes each one
+**Then** the per-connection subscription set is the union of the declared topics; subsequent server frames are filtered to deliver only matches.
+
+> Wire shape clarified per Story 2.1 creation, 2026-05-20 — single topic per Subscribe message; multi-topic via repeated sends (per `crates/protocol/src/ws.rs::ClientMessage::Subscribe { topic: String }`).
 
 **Given** a tool connects with an invalid or missing bearer token
 **When** the WebSocket upgrade is attempted

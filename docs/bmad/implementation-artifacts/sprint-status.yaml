@@ -1,5 +1,5 @@
 # generated: 2026-05-16
-# last_updated: 2026-05-20 (story 2.1 created, epic 2 in-progress)
+# last_updated: 2026-05-21 (story 2.1 done)
 # project: bowerbird
 # project_key: NOKEY
 # tracking_system: file-system
@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-05-16
-last_updated: 2026-05-20
+last_updated: 2026-05-21
 project: bowerbird
 project_key: NOKEY
 tracking_system: file-system
@@ -56,7 +56,7 @@ development_status:
 
   # Epic 2: Live event streaming to multiple simultaneous tools
   epic-2: in-progress
-  2-1-websocket-connection-and-topic-subscription: ready-for-dev
+  2-1-websocket-connection-and-topic-subscription: done
   2-2-real-time-event-and-state-broadcast-to-multiple-tools: backlog
   2-3-new-session-discovery-and-state-snapshot-on-connect: backlog
   2-4-lagged-consumer-recovery-with-dropped-frame: backlog

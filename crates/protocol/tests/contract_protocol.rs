@@ -254,3 +254,25 @@ fn daemon_status_round_trips_and_accepts_unknown_fields() {
     assert!(parsed.last_event_at_ms.is_none());
     assert!(parsed.last_event_id.is_none());
 }
+
+#[test]
+fn server_message_unknown_variant_round_trips_as_unknown() {
+    // Story 2.1 review finding #9: adding new ServerMessage variants must be
+    // additive at the wire level. With #[serde(other)] Unknown, an older
+    // client deserializing a future-only `op` value should not error — it
+    // should map to ServerMessage::Unknown.
+    let future_json = r#"{"op":"future_variant_we_have_not_built_yet","payload":{"answer":42}}"#;
+    let parsed: protocol::ServerMessage = serde_json::from_str(future_json).unwrap();
+    assert!(
+        matches!(parsed, protocol::ServerMessage::Unknown),
+        "unknown op tag must deserialize to ServerMessage::Unknown, got {parsed:?}"
+    );
+
+    // Known variants must still round-trip normally.
+    let known = r#"{"op":"close","reason":"goodbye"}"#;
+    let parsed: protocol::ServerMessage = serde_json::from_str(known).unwrap();
+    assert!(
+        matches!(parsed, protocol::ServerMessage::Close(_)),
+        "known op must deserialize to its variant, got {parsed:?}"
+    );
+}

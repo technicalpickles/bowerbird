@@ -24,6 +24,7 @@ rusqlite_migration = { workspace = true }
 tokio-util         = { workspace = true }
 tokio-stream       = { workspace = true }
 thiserror          = { workspace = true }
+tower              = { workspace = true }
 clap               = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }
@@ -31,11 +32,13 @@ secrecy            = { workspace = true }
 subtle             = { workspace = true }
 
 [dev-dependencies]
-tempfile   = { workspace = true }
-assert_cmd = { workspace = true }
-nix        = { workspace = true }
-tokio      = { workspace = true }
-tower      = { workspace = true, features = ["util"] }
+tempfile          = { workspace = true }
+assert_cmd        = { workspace = true }
+nix               = { workspace = true }
+tokio             = { workspace = true }
+tower             = { workspace = true, features = ["util"] }
+tokio-tungstenite = { workspace = true }
+futures-util      = "0.3"
 
 [lints]
 workspace = true

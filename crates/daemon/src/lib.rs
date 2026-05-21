@@ -1,4 +1,5 @@
 pub mod api;
+pub mod broadcast;
 pub mod config;
 pub mod db;
 pub mod error;

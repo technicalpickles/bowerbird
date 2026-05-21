@@ -368,10 +368,14 @@ Newline-delimited JSON over the Unix domain socket — one `{event-object}\n` re
 
 Connect: `ws://127.0.0.1:<port>/ws` (bearer token in `Authorization` header or `?token=` query param).
 
-**Subscribe message (client → daemon):**
+**Subscribe / unsubscribe messages (client → daemon):**
 ```json
-{ "topics": ["state.session.*", "events.*"] }
+{ "op": "subscribe", "topic": "state.session.*" }
+{ "op": "subscribe", "topic": "events.*" }
+{ "op": "unsubscribe", "topic": "events.*" }
 ```
+
+One topic per message; multi-topic subscription is "send multiple subscribe messages." Inbound messages use strict `deny_unknown_fields` parsing per `crates/protocol/src/ws.rs::ClientMessage`. Wire shape back-amended for Story 2.1 (2026-05-20).
 
 **Server-sent frame types:**
 

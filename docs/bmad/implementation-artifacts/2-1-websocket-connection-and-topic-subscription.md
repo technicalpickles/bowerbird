@@ -1,6 +1,6 @@
 # Story 2.1: WebSocket connection and topic subscription
 
-Status: ready-for-dev
+Status: done
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -38,14 +38,14 @@ Story 2.1 also lands the deferred-work middleware items the Epic 1 retrospective
 
 ## Tasks / Subtasks
 
-- [ ] **Task 1: Wire axum's WebSocket feature + tower-http middleware features** (AC: #1, #10)
-  - [ ] In `Cargo.toml` workspace deps, change `axum = "0.8.9"` to `axum = { version = "0.8.9", features = ["ws"] }`. Crate-level Cargo.toml in `crates/daemon/Cargo.toml` uses `axum = { workspace = true }` so no per-crate change is needed there. **Do NOT add `tokio-tungstenite` as a direct dep** — axum 0.8's `ws` feature already wraps `tokio-tungstenite-0.27`, and that's the only WS lib we touch. (Retro § "Standards-by-default" / Agreement A1: axum is the standard; tokio-tungstenite is a private transitive dep.)
-  - [ ] In `Cargo.toml` workspace deps, change `tower-http = "0.6.10"` to `tower-http = { version = "0.6.10", features = ["request-id", "trace", "timeout", "limit", "util"] }`. The `util` feature gives `MapRequestLayer`/`MapResponseLayer` if needed; safe default to include. Daemon `Cargo.toml` continues to use `tower-http = { workspace = true }`.
-  - [ ] Add `tokio-tungstenite` to **dev-dependencies** (workspace + daemon) for the contract tests' client side. Pin `tokio-tungstenite = "0.27"` to match what axum 0.8.9 wraps so message-type compatibility is automatic. Rationale: there is no first-class `axum::test_helpers::ws` client; tests need a real WS client to exercise the surface. `tokio-tungstenite` is the canonical Rust WS client. Do NOT also add `tungstenite` (sync) — we only need the async client.
-  - [ ] Run `cargo check --workspace` after the dep changes to confirm clean compile before touching any code.
+- [x] **Task 1: Wire axum's WebSocket feature + tower-http middleware features** (AC: #1, #10)
+  - [x] In `Cargo.toml` workspace deps, change `axum = "0.8.9"` to `axum = { version = "0.8.9", features = ["ws"] }`. Crate-level Cargo.toml in `crates/daemon/Cargo.toml` uses `axum = { workspace = true }` so no per-crate change is needed there. **Do NOT add `tokio-tungstenite` as a direct dep** — axum 0.8's `ws` feature already wraps `tokio-tungstenite-0.27`, and that's the only WS lib we touch. (Retro § "Standards-by-default" / Agreement A1: axum is the standard; tokio-tungstenite is a private transitive dep.)
+  - [x] In `Cargo.toml` workspace deps, change `tower-http = "0.6.10"` to `tower-http = { version = "0.6.10", features = ["request-id", "trace", "timeout", "limit", "util"] }`. The `util` feature gives `MapRequestLayer`/`MapResponseLayer` if needed; safe default to include. Daemon `Cargo.toml` continues to use `tower-http = { workspace = true }`.
+  - [x] Add `tokio-tungstenite` to **dev-dependencies** (workspace + daemon) for the contract tests' client side. Pin `tokio-tungstenite = "0.27"` to match what axum 0.8.9 wraps so message-type compatibility is automatic. Rationale: there is no first-class `axum::test_helpers::ws` client; tests need a real WS client to exercise the surface. `tokio-tungstenite` is the canonical Rust WS client. Do NOT also add `tungstenite` (sync) — we only need the async client.
+  - [x] Run `cargo check --workspace` after the dep changes to confirm clean compile before touching any code.
 
-- [ ] **Task 2: Add WS-related fields to `Config` and `AppState`** (AC: #1, #6, #7, #8, #9)
-  - [ ] Modify `crates/daemon/src/config.rs::Config` to add four new fields (Cargo.toml comments not required; document each in code comments):
+- [x] **Task 2: Add WS-related fields to `Config` and `AppState`** (AC: #1, #6, #7, #8, #9)
+  - [x] Modify `crates/daemon/src/config.rs::Config` to add four new fields (Cargo.toml comments not required; document each in code comments):
     ```rust
     pub struct Config {
         pub db_path: PathBuf,
@@ -61,8 +61,8 @@ Story 2.1 also lands the deferred-work middleware items the Epic 1 retrospective
     }
     ```
     Defaults in `Config::with_bowerbird_dir`: `ws_max_connections: 256`, `ws_ping_interval: Duration::from_secs(30)`, `ws_pong_timeout: Duration::from_secs(10)`, `ws_broadcast_capacity: 1024`.
-  - [ ] Add `use std::time::Duration;` at the top of `config.rs`.
-  - [ ] Modify `crates/daemon/src/state.rs::AppState` to add three new fields:
+  - [x] Add `use std::time::Duration;` at the top of `config.rs`.
+  - [x] Modify `crates/daemon/src/state.rs::AppState` to add three new fields:
     ```rust
     pub struct AppState {
         pub db: DbPools,
@@ -83,19 +83,19 @@ Story 2.1 also lands the deferred-work middleware items the Epic 1 retrospective
     }
     ```
     `WsConfig` is a small `Copy` struct so per-connection tasks don't have to clone the whole `AppState` to read these. `BroadcastHub` is `Arc`-shared. `Semaphore` is `Arc`-shared. Both are constructed once at daemon startup and live for the daemon's lifetime.
-  - [ ] Update every existing `AppState { ... }` construction site:
+  - [x] Update every existing `AppState { ... }` construction site:
     - `crates/daemon/src/main.rs::run` (one site) — constructs the hub via `Arc::new(BroadcastHub::new(config.ws_broadcast_capacity))`, semaphore via `Arc::new(tokio::sync::Semaphore::new(config.ws_max_connections))`, `WsConfig` from `config.ws_ping_interval`/`pong_timeout`.
     - `crates/daemon/tests/contract_daemon.rs::make_test_state` — extend to construct test-friendly defaults (broadcaster with capacity 16, semaphore with permits 4 for cap-edge tests, ping interval 100ms / pong timeout 50ms for fast tests). Add overloads or builder-style helpers if multiple tests need different timings: prefer a single helper `make_test_state_with_ws(pools, migrations_complete, ws_max_conns, ping_interval, pong_timeout)` that the original `make_test_state` calls with defaults.
 
-- [ ] **Task 3: Create `crates/daemon/src/broadcast/` module (scaffolding for 2.2–2.5)** (AC: #2, #3)
-  - [ ] Create `crates/daemon/src/broadcast/mod.rs`:
+- [x] **Task 3: Create `crates/daemon/src/broadcast/` module (scaffolding for 2.2–2.5)** (AC: #2, #3)
+  - [x] Create `crates/daemon/src/broadcast/mod.rs`:
     ```rust
     pub mod event;
     pub mod hub;
     pub use event::{BroadcastEnvelope, Topic};
     pub use hub::BroadcastHub;
     ```
-  - [ ] Create `crates/daemon/src/broadcast/event.rs` defining the **internal** (not wire) broadcast envelope. This is what the broadcast channel carries; per-connection tasks transform it into a wire `ServerMessage` before sending.
+  - [x] Create `crates/daemon/src/broadcast/event.rs` defining the **internal** (not wire) broadcast envelope. This is what the broadcast channel carries; per-connection tasks transform it into a wire `ServerMessage` before sending.
     ```rust
     use protocol::{Event, EventId, ServerMessage, SessionState};
 
@@ -156,7 +156,7 @@ Story 2.1 also lands the deferred-work middleware items the Epic 1 retrospective
 
     `state.session.<id>.current_state` is a strict-subset filter of `StateSession`: when a `State` envelope arrives, **both** `StateSession(id)` and `StateSessionCurrent(id)` match — they don't filter different content in 2.1. Story 2.2 may evolve the per-connection task to project `State` into a smaller wire frame for the `.current_state` subscriber, but that's not 2.1's contract.
 
-  - [ ] Create `crates/daemon/src/broadcast/hub.rs`:
+  - [x] Create `crates/daemon/src/broadcast/hub.rs`:
     ```rust
     use tokio::sync::broadcast;
 
@@ -189,14 +189,14 @@ Story 2.1 also lands the deferred-work middleware items the Epic 1 retrospective
         }
     }
     ```
-  - [ ] Add `pub mod broadcast;` to `crates/daemon/src/lib.rs`.
-  - [ ] Add unit tests in `crates/daemon/src/broadcast/event.rs::tests`:
+  - [x] Add `pub mod broadcast;` to `crates/daemon/src/lib.rs`.
+  - [x] Add unit tests in `crates/daemon/src/broadcast/event.rs::tests`:
     - `parse_events_all`, `parse_events_by_source`, `parse_events_by_source_session`, `parse_state_all`, `parse_state_session`, `parse_state_session_current` — happy paths.
     - `parse_rejects_empty`, `parse_rejects_unknown_prefix`, `parse_rejects_too_few_segments`, `parse_rejects_too_many_segments`, `parse_rejects_trailing_dot`.
     - `matches_events_all_matches_any_event`, `matches_events_by_source_filters_other_sources`, `matches_state_all_matches_any_state_envelope`, `matches_state_session_does_not_match_other_session`, `matches_events_does_not_match_state_envelope` (and inverse).
 
-- [ ] **Task 4: Wire `BroadcastHub` and `Semaphore` into daemon startup** (AC: #1, #6)
-  - [ ] In `crates/daemon/src/main.rs::run`, after `let (bearer, token_source) = token::load_or_generate();` and before the `AppState` construction, build the hub and semaphore:
+- [x] **Task 4: Wire `BroadcastHub` and `Semaphore` into daemon startup** (AC: #1, #6)
+  - [x] In `crates/daemon/src/main.rs::run`, after `let (bearer, token_source) = token::load_or_generate();` and before the `AppState` construction, build the hub and semaphore:
     ```rust
     let broadcaster = Arc::new(bowerbird_daemon::broadcast::BroadcastHub::new(config.ws_broadcast_capacity));
     let ws_semaphore = Arc::new(tokio::sync::Semaphore::new(config.ws_max_connections));
@@ -205,11 +205,11 @@ Story 2.1 also lands the deferred-work middleware items the Epic 1 retrospective
         pong_timeout: config.ws_pong_timeout,
     };
     ```
-  - [ ] Extend the `AppState { ... }` literal with the three new fields.
-  - [ ] No change to graceful-shutdown is required in 2.1; the per-connection task observes `state.shutdown.cancelled()` in its select loop (Task 5). Story 2.5 will refine this to send `CloseFrame` first.
+  - [x] Extend the `AppState { ... }` literal with the three new fields.
+  - [x] No change to graceful-shutdown is required in 2.1; the per-connection task observes `state.shutdown.cancelled()` in its select loop (Task 5). Story 2.5 will refine this to send `CloseFrame` first.
 
-- [ ] **Task 5: Implement the WebSocket handler at `crates/daemon/src/api/ws.rs`** (AC: #1, #2, #3, #4, #5, #6, #7, #8, #9)
-  - [ ] Create `crates/daemon/src/api/ws.rs`. High-level structure:
+- [x] **Task 5: Implement the WebSocket handler at `crates/daemon/src/api/ws.rs`** (AC: #1, #2, #3, #4, #5, #6, #7, #8, #9)
+  - [x] Create `crates/daemon/src/api/ws.rs`. High-level structure:
     ```rust
     use std::time::{Duration, Instant};
 
@@ -244,7 +244,7 @@ Story 2.1 also lands the deferred-work middleware items the Epic 1 retrospective
         headers: HeaderMap,
     ) -> Response { /* ... see body below */ }
     ```
-  - [ ] **Auth resolution** (AC #5): extract the candidate token; **header wins if both present**:
+  - [x] **Auth resolution** (AC #5): extract the candidate token; **header wins if both present**:
     ```rust
     let header_token = headers
         .get(header::AUTHORIZATION)
@@ -265,7 +265,7 @@ Story 2.1 also lands the deferred-work middleware items the Epic 1 retrospective
     }
     ```
     Mirror the constant-time-compare discipline of `api/auth.rs::require_bearer` — same 401 body, same `tracing::instrument(skip_all)`, never log the candidate. The `?token=` value is sensitive too; it goes through the same `verify` path.
-  - [ ] **Semaphore acquire BEFORE upgrade** (AC #6): use `try_acquire_owned` so the permit is owned by the connection task and released on drop:
+  - [x] **Semaphore acquire BEFORE upgrade** (AC #6): use `try_acquire_owned` so the permit is owned by the connection task and released on drop:
     ```rust
     let permit = match state.ws_semaphore.clone().try_acquire_owned() {
         Ok(p) => p,
@@ -279,7 +279,7 @@ Story 2.1 also lands the deferred-work middleware items the Epic 1 retrospective
     };
     ```
     `try_acquire_owned` is non-blocking; AC #6's test for "256 succeed, 257th fails" requires the rejection path to be synchronous. **Do NOT** use `acquire_owned()` (the async, blocking version) — that would queue the 257th client instead of rejecting it.
-  - [ ] **Construct the Hello frame BEFORE returning the upgrade response**, so a same-startup HTTP `/status` snapshot and this WS Hello see consistent values:
+  - [x] **Construct the Hello frame BEFORE returning the upgrade response**, so a same-startup HTTP `/status` snapshot and this WS Hello see consistent values:
     ```rust
     let oldest = compute_oldest_available_event_id(&state.db.reader).await; // helper from §"Hello frame data sources"
     let history_begins_cleanly = compute_history_begins_cleanly(&state.db.reader).await; // helper
@@ -292,13 +292,13 @@ Story 2.1 also lands the deferred-work middleware items the Epic 1 retrospective
     };
     ```
     See Dev Notes "Hello frame data sources" for `compute_oldest_available_event_id` and `compute_history_begins_cleanly`. Both reuse existing SQL constants from Story 1.7 (`SELECT_MIN_EVENT_ID`) where possible; one new SQL constant (`SELECT_LAST_RECORDING_CLEANLY_ENDED`) is added by this story.
-  - [ ] Subscribe to the broadcast hub **before** the upgrade completes:
+  - [x] Subscribe to the broadcast hub **before** the upgrade completes:
     ```rust
     let rx = state.broadcaster.subscribe();
     ```
     The order is intentional: subscribing pre-upgrade guarantees no events committed between subscribe-time and Hello-send can be lost off the broadcast channel. (For 2.1 no one publishes yet, but the discipline matters for 2.2.)
-  - [ ] Return `ws.on_upgrade(move |socket| connection_task(socket, state, rx, hello, permit))`.
-  - [ ] **Per-connection task body** — a `tokio::select!` loop that:
+  - [x] Return `ws.on_upgrade(move |socket| connection_task(socket, state, rx, hello, permit))`.
+  - [x] **Per-connection task body** — a `tokio::select!` loop that:
     1. Sends the `hello` frame as `Message::Text(serde_json::to_string(&ServerMessage::Hello(hello))?)`. If serialization fails (shouldn't), `tracing::error!` and exit; if send fails, exit.
     2. Tracks state:
        - `subscriptions: HashSet<Topic>` (starts empty)
@@ -310,12 +310,12 @@ Story 2.1 also lands the deferred-work middleware items the Epic 1 retrospective
        - **c.** `_ = ping_timer.tick()` (a `tokio::time::interval(state.ws_config.ping_interval)`) — if `awaiting_pong.is_some()` and `now - awaiting_pong > ws_config.pong_timeout`, close the task (AC #8, dead-connection cleanup). Else send `Message::Ping(b"".to_vec())` and set `awaiting_pong = Some(Instant::now())`.
        - **d.** `_ = state.shutdown.cancelled()` (AC #9) — exit the task. (Story 2.5 will refine to send a `Close` frame first.)
 
-  - [ ] **`bad message:` close path** (AC #4): write a single helper `async fn close_with_bad_message(socket: &mut WebSocket, detail: &str)` that sends an axum `Message::Close` with `code: 1008` (Policy Violation) and `reason: sanitize_for_wire_ws(format!("bad message: {}", detail))` where `sanitize_for_wire_ws` strips `\n`/`\r` and caps total bytes at 123 (the WS close-reason limit). Document: this helper is a near-twin of `crates/daemon/src/ingest/handler.rs::sanitize_for_wire` but with a different byte cap. Do NOT reuse the existing helper directly — its 512-byte cap is wrong here.
+  - [x] **`bad message:` close path** (AC #4): write a single helper `async fn close_with_bad_message(socket: &mut WebSocket, detail: &str)` that sends an axum `Message::Close` with `code: 1008` (Policy Violation) and `reason: sanitize_for_wire_ws(format!("bad message: {}", detail))` where `sanitize_for_wire_ws` strips `\n`/`\r` and caps total bytes at 123 (the WS close-reason limit). Document: this helper is a near-twin of `crates/daemon/src/ingest/handler.rs::sanitize_for_wire` but with a different byte cap. Do NOT reuse the existing helper directly — its 512-byte cap is wrong here.
 
-  - [ ] Add `pub mod ws;` to `crates/daemon/src/api/mod.rs`.
+  - [x] Add `pub mod ws;` to `crates/daemon/src/api/mod.rs`.
 
-- [ ] **Task 6: Wire `/ws` route + Story 2.1 middleware** (AC: #1, #5, #6, #10)
-  - [ ] Modify `crates/daemon/src/api/mod.rs::router` to add the `/ws` route on the authenticated side; the auth is hand-rolled in the WS handler (Task 5) because the upgrade requires reading the bearer from EITHER header OR query — `require_bearer` only consults the header. **Do not** apply `require_bearer` as a `route_layer` to `/ws`; the WS handler does its own auth (header-or-query) per AC #5:
+- [x] **Task 6: Wire `/ws` route + Story 2.1 middleware** (AC: #1, #5, #6, #10)
+  - [x] Modify `crates/daemon/src/api/mod.rs::router` to add the `/ws` route on the authenticated side; the auth is hand-rolled in the WS handler (Task 5) because the upgrade requires reading the bearer from EITHER header OR query — `require_bearer` only consults the header. **Do not** apply `require_bearer` as a `route_layer` to `/ws`; the WS handler does its own auth (header-or-query) per AC #5:
     ```rust
     let authenticated = Router::new()
         .route("/sessions", get(sessions::list))
@@ -332,7 +332,7 @@ Story 2.1 also lands the deferred-work middleware items the Epic 1 retrospective
         .route("/ws", get(ws::handle_upgrade));
     ```
     Then merge: `Router::new().merge(unauthenticated).merge(authenticated).merge(ws_only).with_state(state)`.
-  - [ ] Apply the middleware stack — **WS routes must be exempt from the 30s `TimeoutLayer`** (AC #10). Two router-shape options; pick the one with less surface area:
+  - [x] Apply the middleware stack — **WS routes must be exempt from the 30s `TimeoutLayer`** (AC #10). Two router-shape options; pick the one with less surface area:
     - **Option A (preferred):** apply `TimeoutLayer` only to the `unauthenticated` and `authenticated` sub-routers, not to `ws_only`. This is the lowest-risk path because it does not introduce any custom predicate layer.
     - **Option B:** apply `TimeoutLayer` at the top-level merged router with a custom predicate that exempts `/ws` paths. More general but more code; not warranted at 2.1's scope.
     Take Option A. Code shape:
@@ -367,12 +367,12 @@ Story 2.1 also lands the deferred-work middleware items the Epic 1 retrospective
         .with_state(state)
     ```
     `request-id` and `TraceLayer` apply to both HTTP and WS upgrades (the upgrade request is HTTP; request-id is useful for the upgrade log line). `TimeoutLayer` and `RequestBodyLimitLayer` apply to HTTP only — WS does not have a "request body" once upgraded, and a 30s timeout would kill long-lived connections.
-  - [ ] Update doc-comment on `api::mod::router` to describe the layering. Reference AC #10 in the doc-comment by story number ("Story 2.1 AC #10") for traceability.
-  - [ ] **Note** the architecture document (`architecture.md:495-497`) calls for `CatchPanicLayer` too. That is NOT folded into Story 2.1 by the Epic 1 retro action items; defer to a future hardening story rather than expanding 2.1 scope. Add a deferred-work entry: "`CatchPanicLayer` not yet wired (architecture.md:495); panic in a request handler currently bubbles to axum's default tower handling".
+  - [x] Update doc-comment on `api::mod::router` to describe the layering. Reference AC #10 in the doc-comment by story number ("Story 2.1 AC #10") for traceability.
+  - [x] **Note** the architecture document (`architecture.md:495-497`) calls for `CatchPanicLayer` too. That is NOT folded into Story 2.1 by the Epic 1 retro action items; defer to a future hardening story rather than expanding 2.1 scope. Add a deferred-work entry: "`CatchPanicLayer` not yet wired (architecture.md:495); panic in a request handler currently bubbles to axum's default tower handling".
 
-- [ ] **Task 7: Daemon contract tests for the WS surface** (AC: #1, #2, #3, #4, #5, #6, #7, #8, #9, #10)
-  - [ ] All new tests live in `crates/daemon/tests/contract_daemon.rs`, alongside existing tests. Use the `tokio_tungstenite` dev-dep (Task 1) as the client. Tests use `tokio::test(flavor = "current_thread")` to match the existing convention.
-  - [ ] **Test helpers** (add near the top of the test file, after `make_test_state`):
+- [x] **Task 7: Daemon contract tests for the WS surface** (AC: #1, #2, #3, #4, #5, #6, #7, #8, #9, #10)
+  - [x] All new tests live in `crates/daemon/tests/contract_daemon.rs`, alongside existing tests. Use the `tokio_tungstenite` dev-dep (Task 1) as the client. Tests use `tokio::test(flavor = "current_thread")` to match the existing convention.
+  - [x] **Test helpers** (add near the top of the test file, after `make_test_state`):
     ```rust
     async fn spawn_test_daemon(state: AppState) -> (SocketAddr, JoinHandle<()>) {
         let router = api::router(state.clone());
@@ -390,62 +390,62 @@ Story 2.1 also lands the deferred-work middleware items the Epic 1 retrospective
     async fn ws_connect_unauthed(addr: SocketAddr) -> http::Response<...> { /* expects 401 */ }
     ```
     If `cancelled_owned` is not exposed on the daemon's exact `CancellationToken` version, use `let cancel = state.shutdown.clone(); async move { cancel.cancelled().await }` instead.
-  - [ ] **`ws_hello_frame_on_connect`** (AC #1) — connect with valid bearer in `Authorization`, read the first message, assert it is `Text` with `op: "hello"`, `protocol_version: "1.0"`, `daemon_version` equal to `env!("CARGO_PKG_VERSION")` of the daemon crate, and `daemon_started_at == state.started_at_ms`. The `oldest_available_event_id` and `history_begins_cleanly` fields are present (not asserted to specific values — those are tested separately).
-  - [ ] **`ws_hello_frame_query_token_path`** — same as above but with `?token=` instead of `Authorization` header. Asserts AC #5's query-param auth path.
-  - [ ] **`ws_subscribe_accumulates_then_unsubscribe_removes`** (AC #2, #3) — connect, send two Subscribe messages (`state.session.*` and `events.*`), publish synthetic envelopes via `state.broadcaster.publish(...)` (this is the per-connection topic-match path); assert both envelopes round-trip; send Unsubscribe for one; assert the other still matches and the unsubscribed one does not. **Important**: use a small `tokio::time::sleep(Duration::from_millis(10))` between `subscribe` send and `publish` to ensure the daemon's recv loop has processed the subscribe; otherwise the publish races the subscribe-handling. (This is a test-only concern; real clients can also race, which is fine because subscribe-then-publish is idempotent.)
-  - [ ] **`ws_empty_topic_closes_with_policy_violation`** (AC #4) — connect, send `{"op":"subscribe","topic":""}`, assert the daemon closes with WS close code 1008 and reason starts with `"bad message:"`.
-  - [ ] **`ws_unknown_op_closes_with_policy_violation`** (AC #4) — send `{"op":"bogus","topic":"events.*"}`, assert close with 1008.
-  - [ ] **`ws_extra_field_closes_with_policy_violation`** (AC #4) — send `{"op":"subscribe","topic":"events.*","extra":1}`, assert close with 1008 (this exercises `deny_unknown_fields` on `ClientMessage`).
-  - [ ] **`ws_binary_message_closes_with_policy_violation`** (AC #4) — send a binary frame, assert close with 1008.
-  - [ ] **`ws_401_when_no_auth`** (AC #5) — attempt upgrade with no `Authorization` and no `?token=`; assert HTTP `401 {"error":"unauthorized"}` and no WS upgrade.
-  - [ ] **`ws_401_when_bad_token`** (AC #5) — attempt upgrade with `Authorization: Bearer wrong`; assert HTTP `401`.
-  - [ ] **`ws_header_token_wins_over_query`** (AC #5) — attempt upgrade with VALID `Authorization: Bearer <correct>` AND `?token=wrong`; assert upgrade succeeds. The inverse — invalid header, valid query — must FAIL (header wins; failed header is not silently overridden by query). Add this as a second assertion in the same test, in a sub-block, OR as a separate test `ws_invalid_header_does_not_fall_through_to_query`.
-  - [ ] **`ws_257th_connection_rejected_503`** (AC #6) — use a small `ws_max_connections: 3` test state; open 3 connections successfully (await Hello on each, keep them alive); attempt a 4th, expect HTTP `503 {"error":"too many ws clients"}`; close one of the 3, attempt a 4th again, expect success. The "close one → permit returned" half of the test is the regression guard against a permit-leak bug.
-  - [ ] **`ws_ping_within_idle_window`** (AC #7) — use `ws_ping_interval: Duration::from_millis(100), ws_pong_timeout: Duration::from_millis(50)`; connect; do nothing on the client; assert a `Message::Ping` is received within ~200ms (allow 2× slack on CI). Respond with `Pong`; assert the connection remains open for at least one more ping cycle.
-  - [ ] **`ws_no_pong_within_timeout_closes`** (AC #8) — same fast timings; connect; do not respond to the Ping; assert the WS closes within `ping_interval + pong_timeout + slack` (~200ms). Use a `tokio::time::timeout` wrapper around `socket.next().await` to bound the test. Asserts the per-connection task exits.
-  - [ ] **`ws_shutdown_token_closes_task`** (AC #9) — connect; trigger `state.shutdown.cancel()`; assert the WS closes within ~100ms. The test scaffolding's `spawn_test_daemon` must propagate cancellation; if it doesn't, refactor it to take an explicit `shutdown` token argument shared with the AppState.
-  - [ ] **`x_request_id_on_healthz`** (AC #10) — `GET /healthz`; assert `200 OK`, assert an `x-request-id` response header exists and matches a UUID4 shape (36 chars, hyphens at the right positions). This is the canary that `SetRequestIdLayer` is wired. Do NOT assert the *exact* UUID value (it's random); only the shape.
+  - [x] **`ws_hello_frame_on_connect`** (AC #1) — connect with valid bearer in `Authorization`, read the first message, assert it is `Text` with `op: "hello"`, `protocol_version: "1.0"`, `daemon_version` equal to `env!("CARGO_PKG_VERSION")` of the daemon crate, and `daemon_started_at == state.started_at_ms`. The `oldest_available_event_id` and `history_begins_cleanly` fields are present (not asserted to specific values — those are tested separately).
+  - [x] **`ws_hello_frame_query_token_path`** — same as above but with `?token=` instead of `Authorization` header. Asserts AC #5's query-param auth path.
+  - [x] **`ws_subscribe_accumulates_then_unsubscribe_removes`** (AC #2, #3) — connect, send two Subscribe messages (`state.session.*` and `events.*`), publish synthetic envelopes via `state.broadcaster.publish(...)` (this is the per-connection topic-match path); assert both envelopes round-trip; send Unsubscribe for one; assert the other still matches and the unsubscribed one does not. **Important**: use a small `tokio::time::sleep(Duration::from_millis(10))` between `subscribe` send and `publish` to ensure the daemon's recv loop has processed the subscribe; otherwise the publish races the subscribe-handling. (This is a test-only concern; real clients can also race, which is fine because subscribe-then-publish is idempotent.)
+  - [x] **`ws_empty_topic_closes_with_policy_violation`** (AC #4) — connect, send `{"op":"subscribe","topic":""}`, assert the daemon closes with WS close code 1008 and reason starts with `"bad message:"`.
+  - [x] **`ws_unknown_op_closes_with_policy_violation`** (AC #4) — send `{"op":"bogus","topic":"events.*"}`, assert close with 1008.
+  - [x] **`ws_extra_field_closes_with_policy_violation`** (AC #4) — send `{"op":"subscribe","topic":"events.*","extra":1}`, assert close with 1008 (this exercises `deny_unknown_fields` on `ClientMessage`).
+  - [x] **`ws_binary_message_closes_with_policy_violation`** (AC #4) — send a binary frame, assert close with 1008.
+  - [x] **`ws_401_when_no_auth`** (AC #5) — attempt upgrade with no `Authorization` and no `?token=`; assert HTTP `401 {"error":"unauthorized"}` and no WS upgrade.
+  - [x] **`ws_401_when_bad_token`** (AC #5) — attempt upgrade with `Authorization: Bearer wrong`; assert HTTP `401`.
+  - [x] **`ws_header_token_wins_over_query`** (AC #5) — attempt upgrade with VALID `Authorization: Bearer <correct>` AND `?token=wrong`; assert upgrade succeeds. The inverse — invalid header, valid query — must FAIL (header wins; failed header is not silently overridden by query). Add this as a second assertion in the same test, in a sub-block, OR as a separate test `ws_invalid_header_does_not_fall_through_to_query`.
+  - [x] **`ws_257th_connection_rejected_503`** (AC #6) — use a small `ws_max_connections: 3` test state; open 3 connections successfully (await Hello on each, keep them alive); attempt a 4th, expect HTTP `503 {"error":"too many ws clients"}`; close one of the 3, attempt a 4th again, expect success. The "close one → permit returned" half of the test is the regression guard against a permit-leak bug.
+  - [x] **`ws_ping_within_idle_window`** (AC #7) — use `ws_ping_interval: Duration::from_millis(100), ws_pong_timeout: Duration::from_millis(50)`; connect; do nothing on the client; assert a `Message::Ping` is received within ~200ms (allow 2× slack on CI). Respond with `Pong`; assert the connection remains open for at least one more ping cycle.
+  - [x] **`ws_no_pong_within_timeout_closes`** (AC #8) — same fast timings; connect; do not respond to the Ping; assert the WS closes within `ping_interval + pong_timeout + slack` (~200ms). Use a `tokio::time::timeout` wrapper around `socket.next().await` to bound the test. Asserts the per-connection task exits.
+  - [x] **`ws_shutdown_token_closes_task`** (AC #9) — connect; trigger `state.shutdown.cancel()`; assert the WS closes within ~100ms. The test scaffolding's `spawn_test_daemon` must propagate cancellation; if it doesn't, refactor it to take an explicit `shutdown` token argument shared with the AppState.
+  - [x] **`x_request_id_on_healthz`** (AC #10) — `GET /healthz`; assert `200 OK`, assert an `x-request-id` response header exists and matches a UUID4 shape (36 chars, hyphens at the right positions). This is the canary that `SetRequestIdLayer` is wired. Do NOT assert the *exact* UUID value (it's random); only the shape.
 
-- [ ] **Task 8: Update `epics.md` AC text to match the actual `ClientMessage` shape** (AC: #2, retro Agreement A2)
-  - [ ] `docs/bmad/planning-artifacts/epics.md` lines 488-494 (Story 2.1 § Acceptance Criteria, second block) currently say:
+- [x] **Task 8: Update `epics.md` AC text to match the actual `ClientMessage` shape** (AC: #2, retro Agreement A2)
+  - [x] `docs/bmad/planning-artifacts/epics.md` lines 488-494 (Story 2.1 § Acceptance Criteria, second block) currently say:
     > **Given** a tool sends a subscribe message `{"topics": ["state.session.*", "events.*"]}`
     > **When** the daemon processes it
     > **Then** subsequent frames are filtered to only those matching the declared topics
     The actual protocol shape per `crates/protocol/src/ws.rs::ClientMessage` is `Subscribe { topic: String }` — one topic per message, with `op: "subscribe"`. Multi-topic subscription is "send multiple Subscribe messages." Replace the AC text in place with the actual wire shape. Epic 1 retro Agreement A2 mandates that when a story-creation pass resolves an upstream-vs-implementation drift, the upstream doc is back-amended inline. Same applies to the PRD reference (`prd.md:371-374`) which currently shows `{"topics": [...]}`. Update both.
-  - [ ] Wording template — keep the BDD shape; replace the JSON example only:
+  - [x] Wording template — keep the BDD shape; replace the JSON example only:
     > **Given** a tool sends a subscribe message `{"op":"subscribe","topic":"state.session.*"}`, then later `{"op":"subscribe","topic":"events.*"}`
     > **When** the daemon processes each one
     > **Then** the per-connection subscription set is the union of the declared topics; subsequent server frames are filtered to deliver only matches.
-  - [ ] Add a one-line note at the bottom of the Story 2.1 section in `epics.md` ("Wire shape clarified per Story 2.1 creation, 2026-05-20 — single topic per Subscribe message; multi-topic via repeated sends") so future readers see the trail.
-  - [ ] DO NOT change the `ClientMessage` enum to use a `Vec<String>` topics array — additive-only-within-v1.x forbids removing the `topic: String` shape, and we have no consumer of multi-topic-in-one-message yet. The cost of the wire-shape mismatch with the epic text is one find-and-replace in the docs.
+  - [x] Add a one-line note at the bottom of the Story 2.1 section in `epics.md` ("Wire shape clarified per Story 2.1 creation, 2026-05-20 — single topic per Subscribe message; multi-topic via repeated sends") so future readers see the trail.
+  - [x] DO NOT change the `ClientMessage` enum to use a `Vec<String>` topics array — additive-only-within-v1.x forbids removing the `topic: String` shape, and we have no consumer of multi-topic-in-one-message yet. The cost of the wire-shape mismatch with the epic text is one find-and-replace in the docs.
 
-- [ ] **Task 9: Strike resolved deferred-work entries** (AC: #4, #10)
-  - [ ] `docs/bmad/implementation-artifacts/deferred-work.md` line 10 (`ClientMessage empty topic accepted`) — strike with `~~ ... ~~` and append `**Resolved by Story 2.1:** empty-string topics now route to the WS Policy-Violation close path (`crates/daemon/src/api/ws.rs::close_with_bad_message`); see contract test `ws_empty_topic_closes_with_policy_violation`.` Same convention as Stories 1.6/1.7/1.8.
-  - [ ] `deferred-work.md` line 56 (`No request-id middleware, no TraceLayer, no per-request timeout, no body-size limit`) — strike with: `**Resolved by Story 2.1 Task 6:** `SetRequestIdLayer` + `PropagateRequestIdLayer` (request-id), `TraceLayer::new_for_http()` (tracing), `TimeoutLayer::new(30s)` (HTTP only; WS exempt), and `RequestBodyLimitLayer::new(1 MiB)` are wired in `crates/daemon/src/api/mod.rs::router`. Contract test `x_request_id_on_healthz` asserts the request-id surface. `CatchPanicLayer` was not folded into 2.1 — a new deferred-work entry below tracks it.`
-  - [ ] Add a NEW deferred-work entry (under a new `## Deferred from: Story 2.1 ...` section):
+- [x] **Task 9: Strike resolved deferred-work entries** (AC: #4, #10)
+  - [x] `docs/bmad/implementation-artifacts/deferred-work.md` line 10 (`ClientMessage empty topic accepted`) — strike with `~~ ... ~~` and append `**Resolved by Story 2.1:** empty-string topics now route to the WS Policy-Violation close path (`crates/daemon/src/api/ws.rs::close_with_bad_message`); see contract test `ws_empty_topic_closes_with_policy_violation`.` Same convention as Stories 1.6/1.7/1.8.
+  - [x] `deferred-work.md` line 56 (`No request-id middleware, no TraceLayer, no per-request timeout, no body-size limit`) — strike with: `**Resolved by Story 2.1 Task 6:** `SetRequestIdLayer` + `PropagateRequestIdLayer` (request-id), `TraceLayer::new_for_http()` (tracing), `TimeoutLayer::new(30s)` (HTTP only; WS exempt), and `RequestBodyLimitLayer::new(1 MiB)` are wired in `crates/daemon/src/api/mod.rs::router`. Contract test `x_request_id_on_healthz` asserts the request-id surface. `CatchPanicLayer` was not folded into 2.1 — a new deferred-work entry below tracks it.`
+  - [x] Add a NEW deferred-work entry (under a new `## Deferred from: Story 2.1 ...` section):
     > - **`CatchPanicLayer` not yet wired** — `architecture.md:495` lists this as required middleware; Story 2.1 wired request-id, trace, timeout, and body-limit per the Epic 1 retro fold-in but did not expand scope to include panic catching. A handler panic currently bubbles to axum's default tower handling (which closes the connection without a structured 500 body). Wire `tower_http::catch_panic::CatchPanicLayer::custom(...)` with a JSON 500 response in a future hardening story. [`crates/daemon/src/api/mod.rs`]
-  - [ ] Add ONE more new deferred-work entry if applicable, for any incidental gaps the dev encounters during implementation (do not pre-populate; add as discovered). Format follows the existing convention: bullet, **bold** filename/title, file:line, one-line rationale.
+  - [x] Add ONE more new deferred-work entry if applicable, for any incidental gaps the dev encounters during implementation (do not pre-populate; add as discovered). Format follows the existing convention: bullet, **bold** filename/title, file:line, one-line rationale.
 
-- [ ] **Task 10: Update `docs/protocol-changelog.md`** (AC: #1, #2, #4, #5, #6, #7, #10)
-  - [ ] Read the current changelog first to understand the section structure Stories 1.7/1.8 established (entries grouped by `behavioral` / `schema` / `security`).
-  - [ ] Add ONE schema entry (the WS surface is new) and ONE behavioral entry (the HTTP middleware reshape changes observable response headers):
+- [x] **Task 10: Update `docs/protocol-changelog.md`** (AC: #1, #2, #4, #5, #6, #7, #10)
+  - [x] Read the current changelog first to understand the section structure Stories 1.7/1.8 established (entries grouped by `behavioral` / `schema` / `security`).
+  - [x] Add ONE schema entry (the WS surface is new) and ONE behavioral entry (the HTTP middleware reshape changes observable response headers):
 
     **Schema:**
     > - **WebSocket surface live at `GET /ws`** (Story 2.1). Authenticated via bearer token in `Authorization: Bearer <token>` header (preferred) or `?token=<token>` query parameter (fallback for clients that cannot set headers). On upgrade, the daemon sends one `hello` ServerMessage containing `protocol_version`, `daemon_version`, `oldest_available_event_id`, `daemon_started_at`, and `history_begins_cleanly`. Subscribe/Unsubscribe topic filtering accepts the topic strings `events.*`, `events.<source>.*`, `events.<source>.<session_id>`, `state.session.*`, `state.session.<id>`, `state.session.<id>.current_state`. Unknown topics and empty topics close the connection with WS close code 1008 (Policy Violation) and a `bad message: ...` reason string. Concurrent connection cap is 256 (configurable); 257th upgrade returns HTTP 503 without upgrading. Idle ping interval is 30s; pong timeout is 10s; on pong timeout the connection is closed. Event publishing into the broadcast hub is NOT YET wired in this release; Story 2.2 ships that. Tools can connect, subscribe, and observe Hello + lifecycle frames as of this release.
 
     **Behavioral:**
     > - **HTTP surface now emits `x-request-id` and respects a 30s per-request timeout and a 1 MiB request-body limit** (Story 2.1). Every HTTP request (including WS upgrades for trace purposes) receives an `x-request-id` UUID4 header on the response, propagated for cross-cut tracing. HTTP request handlers (NOT WebSocket connections) are bounded by a 30-second wall-clock timeout; requests exceeding it receive HTTP `408 Request Timeout`. Request bodies larger than 1 MiB receive `413 Payload Too Large`. WebSocket connections are exempt from both. Existing clients that completed all v1.0 requests in under 30s and stayed under 1 MiB are unaffected.
-  - [ ] Do NOT include a `security` entry — the auth model (bearer token) is unchanged; the WS surface just adds a second carrier (`?token=`) for the same token.
+  - [x] Do NOT include a `security` entry — the auth model (bearer token) is unchanged; the WS surface just adds a second carrier (`?token=`) for the same token.
 
-- [ ] **Task 11: Full-workspace verification** (AC: all)
-  - [ ] Run `cargo fmt --check` and `cargo clippy --all-targets --workspace -- -D warnings` from the repo root.
-  - [ ] Run `cargo test --workspace`. Expect at least 121 + new tests (count of new WS tests: ~13).
-  - [ ] Run `cargo build --workspace --release`. The release build must remain clean (no new release-only warnings).
-  - [ ] **Bench non-regression**: run `cargo bench --no-run --workspace`. The shim hot-path bench must still compile; no new bench is added in 2.1. If a new bench is wanted for WS hub publish-throughput, defer it — `tokio::sync::broadcast` is a known commodity; benching it on day-one of the broadcaster's existence is speculative optimization (Axiom 3).
-  - [ ] **Smoke test** (manual, optional but recommended): launch the daemon against a `$(mktemp -d)`, then:
-    ```sh
-    # In one terminal, start the daemon:
-    BOWERBIRD_TOKEN=local-dev-token cargo run -p bowerbird-daemon -- -vv
+- [x] **Task 11: Full-workspace verification** (AC: all)
+  - [x] Run `cargo fmt --check` and `cargo clippy --all-targets --workspace -- -D warnings` from the repo root.
+  - [x] Run `cargo test --workspace`. Expect at least 121 + new tests (count of new WS tests: ~13).
+  - [x] Run `cargo build --workspace --release`. The release build must remain clean (no new release-only warnings).
+  - [x] **Bench non-regression**: run `cargo bench --no-run --workspace`. The shim hot-path bench must still compile; no new bench is added in 2.1. If a new bench is wanted for WS hub publish-throughput, defer it — `tokio::sync::broadcast` is a known commodity; benching it on day-one of the broadcaster's existence is speculative optimization (Axiom 3).
+	  - [x] **Smoke test** (manual, optional but recommended): launch the daemon against a `$(mktemp -d)`, then:
+	    ```sh
+	    # In one terminal, start the daemon:
+	    BOWERBIRD_TOKEN=local-dev-token cargo run -p bowerbird-daemon -- -vv
     # In another terminal, connect with websocat:
     websocat 'ws://127.0.0.1:<port>/ws' -H "Authorization: Bearer local-dev-token"
     # Expect: a Hello frame as the first text message.
@@ -453,8 +453,20 @@ Story 2.1 also lands the deferred-work middleware items the Epic 1 retrospective
     # Expect: no further frames yet (Story 2.1 has no publishers).
     # Try: {"op":"subscribe","topic":""}
     # Expect: connection closes with code 1008.
-    ```
-    Port comes from the daemon's WARN log line `addr=... daemon listening`. `websocat` is installable via `brew install websocat` / `cargo install websocat`.
+	    ```
+	    Port comes from the daemon's WARN log line `addr=... daemon listening`. `websocat` is installable via `brew install websocat` / `cargo install websocat`.
+
+### Review Findings
+
+- [x] [Review][Patch] Query-token auth can leak through the default TraceLayer URI span [crates/daemon/src/api/mod.rs:92] — AC #5 and the anti-patterns forbid logging token bytes, but `/ws` accepts `?token=...` and the common stack applies `TraceLayer::new_for_http()` to `/ws`. tower-http's default span records `request.uri()`, including the query string. Replace the default span with one that records method + path only, or otherwise redacts the query before tracing. Add a regression test or tracing-focused unit check if practical.
+- [x] [Review][Patch] Malformed `Authorization` headers can fall through to a valid query token [crates/daemon/src/api/ws.rs:67] — AC #5 says the header wins when both header and query token are present. The current code only treats the header as present after it parses as non-empty `Bearer ...`; `Authorization: Basic ...` or an empty/malformed bearer value plus `?token=<valid>` authenticates via the query fallback. Detect raw header presence first and return the same 401 body when the present header is not a valid bearer candidate.
+- [x] [Review][Patch] Pong timeout is checked on the next ping tick, not at `ws_pong_timeout` [crates/daemon/src/api/ws.rs:246] — AC #8 requires closing when no Pong arrives within `Config::ws_pong_timeout`. The current branch only checks timeout inside `ping_timer.tick()`, so defaults close after roughly 30s + another ping interval instead of 10s; if `ping_interval < pong_timeout`, each tick can reset `awaiting_pong` and keep a dead connection alive indefinitely. Use an independent timeout/deadline while a Pong is outstanding and avoid sending a new Ping until the prior one is resolved.
+- [x] [Review][Patch] No-Pong cleanup test does not exercise the no-Pong branch [crates/daemon/tests/contract_daemon.rs:2755] — AC #8 requires the no-Pong cleanup path and no leaked task to be asserted. `ws_no_pong_within_timeout_closes` currently drops a normal `tokio-tungstenite` client, then reconnects for liveness; comments acknowledge that auto-Pong prevents hitting the `awaiting_pong` timeout branch. Add a raw TCP/WebSocket handshake fixture or equivalent test seam that withholds Pong and asserts connection-task exit/permit release.
+- [x] [Review][Patch] HTTP middleware order does not match AC #10 [crates/daemon/src/api/mod.rs:82] — AC #10 specifies request flow as `SetRequestIdLayer`, `TraceLayer`, `TimeoutLayer`, then `RequestBodyLimitLayer`, then auth. Tower's `ServiceBuilder` calls layers in the order added, and `http_only_stack` adds `RequestBodyLimitLayer` before `TimeoutLayer`, so the request path is reversed for those two layers. Rework the stack to satisfy the AC or update the story/spec if the reversed order is the intended tower-http compromise.
+- [x] [Review][Patch] Broadcast backlog can leak pre-subscribe frames after a later subscribe [crates/daemon/src/api/ws.rs:227] — the receiver subscribes to the hub before upgrade, while the topic set starts empty. Because the biased select polls inbound messages before `rx.recv()`, a frame queued before `Subscribe` can be delivered after the subscription is added if it matches the new topic. AC #2 says only subsequent matching frames should be sent after declared topics. Drain/drop hub backlog under the old subscription state before applying a new subscription, or otherwise stamp deliveries so pre-subscribe frames cannot leak.
+- [x] [Review][Patch] Hello DB fields are not read from one SQLite snapshot [crates/daemon/src/api/ws.rs:137] — AC #1 wants `oldest_available_event_id` and `history_begins_cleanly` to be a consistent startup/history snapshot. `compute_hello_db_fields` runs `SELECT_MIN_EVENT_ID` and `SELECT_HISTORY_BEGINS_CLEANLY` as separate statements outside a read transaction, so a concurrent commit can make the two fields disagree. Query both values in a single statement or wrap the two reads in a read transaction.
+- [x] [Review][Patch] `Topic::parse` accepts wildcard tokens in positions the exact grammar treats as literal source/session IDs [crates/daemon/src/broadcast/event.rs:92] — the story says the grammar is exact and `EventsBySourceSession` is `"events.<source>.<session_id>"` with no wildcards, but strings like `events.*.*`, `events.*.sess-1`, and `state.session.*.current_state` currently parse as literal source/session subscriptions. Reject `*` in literal `<source>`, `<session_id>`, and `<id>` positions and add negative parser tests.
+- [x] [Review][Patch] Protocol changelog overstates additive compatibility for new `ServerMessage` variants [docs/protocol-changelog.md:13] — the changelog and Dev Agent notes say old clients ignore unknown variants under the asymmetric `deny_unknown_fields` policy, but serde internally tagged enums without an `#[serde(other)]` fallback fail on an unknown `op`. Either add an explicit unknown-variant strategy for future `ServerMessage` variants and test it, or correct the changelog/story notes so the v1 compatibility claim is accurate.
 
 ## Dev Notes
 
@@ -671,16 +683,70 @@ This story was created via `bmad-create-story` on 2026-05-20 immediately after E
 
 #### Agent Model Used
 
-(populated by dev-story)
+Claude Opus 4.7 (1M context), via Claude Code.
 
 #### Debug Log References
 
-(populated by dev-story)
+- One clippy fix: `Topic::parse` returns `Result<Self, ()>`; added `#[allow(clippy::result_unit_err)]` with rationale matching Dev Notes ("Typed errors over string-prefix sniffing" — the parse layer doesn't need an error enum because the caller already has the offending string).
+- `TimeoutLayer::new` → `TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, 30s)` to clear the tower-http deprecation warning. Behavior is identical (408 on timeout); the only difference is that `with_status_code` accepts an explicit `StatusCode` argument instead of defaulting it.
+- `RequestBodyLimitLayer` must be the OUTER layer of the HTTP-only stack (above `TimeoutLayer`): the inverse ordering fails to compile because `TimeoutLayer` requires `ResBody: Default` and `RequestBodyLimit` wraps the response in a `ResponseBody` type that does not implement `Default`. Documented in `crates/daemon/src/api/mod.rs` next to the layer construction.
+- The `ws_no_pong_within_timeout_closes` contract test was descoped to a liveness assertion: `tokio-tungstenite` auto-responds to Pings on the client side, so it cannot exercise the pong-timeout branch of `connection_task`. The pong-timeout logic IS present in code (verified by reading), but its direct test is captured as a new deferred-work entry to be revisited with a raw-TCP test fixture in a future story.
 
 #### Completion Notes List
 
-(populated by dev-story)
+- All 10 ACs satisfied: WS upgrade with header-or-query auth (AC #1, #5), Subscribe/Unsubscribe topic filtering with union semantics (AC #2, #3), strict `ClientMessage` parsing with 1008 Close on malformed input (AC #4), 503 over the concurrency cap (AC #6), per-connection ping cadence (AC #7), dead-connection cleanup via send-pipe failure path (AC #8), shutdown via `state.shutdown.cancelled()` in `tokio::select!` (AC #9), full HTTP middleware stack with WS exemption (AC #10).
+- 38 new tests in the first pass; 42 after addressing review findings: 21 unit tests for `Topic::parse`/`Topic::matches`, 17 WS contract tests in `crates/daemon/tests/contract_daemon.rs::story_2_1_ws`, 3 `ws.rs` unit tests for the close-reason sanitizer, and 1 protocol-crate test for the `ServerMessage::Unknown` catch-all. Workspace test count moved from 121 (pre-2.1) to 163 (post-2.1 + review).
+- `BroadcastHub` is in place but has no publishers in Story 2.1 — Story 2.2 will wire `projection::session::write` into it.
+- Protocol crate gained one additive `ServerMessage::State(StateFrame)` variant. The `ServerMessage` enum now carries a `#[serde(other)] Unknown` catch-all so older clients (or third-party bindings) using this crate at an earlier version decode future variants as `Unknown` instead of failing on the tag. This closes the gap the original "additive within v1.x" changelog claim relied on — `deny_unknown_fields` only covers struct fields, not enum variants.
+- New SQL constants in `crates/daemon/src/db/queries.rs`: `SELECT_HISTORY_BEGINS_CLEANLY` (added first pass) and `SELECT_HELLO_DB_FIELDS` (added post-review). The Hello path uses `SELECT_HELLO_DB_FIELDS` to read both DB-derived fields in a single SELECT, so a concurrent commit between the two reads cannot make them disagree. Conservative defaults `(EventId(i64::MAX), false)` are still used on any pool/DB error per Dev Notes.
+- Doc back-amends landed: `docs/bmad/planning-artifacts/epics.md` (AC #2 Subscribe wire shape + 2026-05-20 trail note), `docs/bmad/planning-artifacts/prd.md` (`{"op":"subscribe","topic":...}` example replaces the `{"topics":[...]}` example near line 371-374), `docs/protocol-changelog.md` (one schema + one behavioral entry; updated post-review to document header-presence precedence and the `Unknown` catch-all), `docs/bmad/implementation-artifacts/deferred-work.md` (struck two entries, added three new ones for `CatchPanicLayer`, pong-timeout test fixture, and `state.session.<id>.current_state` projection).
+
+##### Review-Round 1 Resolutions (2026-05-21)
+
+All 9 review findings addressed:
+
+- ✅ **R1 (Patch): TraceLayer URI query token leak** — `TraceLayer::new_for_http().make_span_with(RedactedSpan)` records `method` and `path` only; the URI query (including `?token=...`) is excluded from spans. `crates/daemon/src/api/mod.rs::RedactedSpan`.
+- ✅ **R2 (Patch): Malformed `Authorization` headers falling through to query token** — auth resolution now checks `headers.contains_key(AUTHORIZATION)` BEFORE evaluating the bearer-parse step. Any header presence (including `Basic ...` or empty bearer) wins; the query token is consulted only when no `Authorization` header is present at all. New test `ws_malformed_header_does_not_fall_through_to_query` covers both `Basic` and empty-bearer cases.
+- ✅ **R3 (Patch): Pong timeout granularity** — replaced the per-tick `awaiting_pong.elapsed()` check with an independent `tokio::time::sleep` deadline pinned in the select loop. Sending a Ping arms the deadline; receiving a Pong parks it 24h in the future. The select branch fires exactly when the deadline expires (`pong_timeout` after Ping), not at the next ping-interval boundary. Additionally, the ping tick no longer sends a fresh Ping while a Pong is outstanding — the prior implementation would overwrite the deadline and let a dead connection survive.
+- ✅ **R4 (Patch): No-Pong test exercises the pong branch** — `ws_no_pong_within_timeout_closes` now connects with a cap of 1, holds the WS stream open without polling (so tokio-tungstenite's auto-Pong cannot run), and verifies the daemon released the permit via a re-connect race. The deferred-work entry for a raw-TCP variant is left in place since the test still relies on the "client doesn't poll" trick rather than a hand-rolled handshake.
+- ✅ **R5 (Patch): HTTP middleware order** — replaced `tower_http::timeout::TimeoutLayer` with a custom `axum::middleware::from_fn(timeout_middleware)` and reordered so the request flow now matches AC #10: request-id → trace → timeout → body-limit → auth → handler. The custom-middleware approach sidesteps the `ResBody: Default` bound that previously forced the inverted order.
+- ✅ **R6 (Patch): Pre-subscribe backlog leak** — `handle_text_frame` now calls `drain_backlog_under_state(socket, subscriptions, rx)` BEFORE applying a Subscribe/Unsubscribe. The drain dispatches each queued envelope under the current (pre-change) subscription state, so a frame published before the Subscribe cannot match the new topic. New test `ws_pre_subscribe_backlog_does_not_leak_to_new_subscription` covers it.
+- ✅ **R7 (Patch): Hello DB snapshot consistency** — `SELECT_HELLO_DB_FIELDS` combines the two reads in a single SELECT statement; SQLite executes the entire SELECT in a single read-txn, so the `min_event_id` and `history_begins_cleanly` values can no longer disagree across a concurrent commit.
+- ✅ **R8 (Patch): `Topic::parse` wildcard-in-literal-positions** — `parse` now rejects `*` in any `<source>`, `<session_id>`, or `<id>` segment via a `literal_ok` guard on the match arms. New test `parse_rejects_wildcard_in_literal_positions` covers `events.*.*`, `events.*.sess-1`, and `state.session.*.current_state`.
+- ✅ **R9 (Patch): Protocol changelog accuracy** — `ServerMessage` gained `#[serde(other)] Unknown` so older clients gracefully decode future variants. New test `server_message_unknown_variant_round_trips_as_unknown` in `crates/protocol/tests/contract_protocol.rs` exercises it. The changelog entry was rewritten to describe the actual mechanism (struct fields via permissive deserialize + enum variants via `serde(other)` catch-all) rather than claiming the asymmetric policy alone covered variant additions.
 
 #### File List
 
-(populated by dev-story)
+**Created:**
+- `crates/daemon/src/broadcast/mod.rs`
+- `crates/daemon/src/broadcast/event.rs`
+- `crates/daemon/src/broadcast/hub.rs`
+- `crates/daemon/src/api/ws.rs`
+
+**Modified:**
+- `Cargo.toml` — axum `["ws"]` feature, tower-http `["request-id", "trace", "timeout", "limit", "util"]` features, `tokio-tungstenite = "0.27"` workspace dep
+- `crates/daemon/Cargo.toml` — added `tower` to deps; `tokio-tungstenite` + `futures-util` to dev-deps
+- `crates/daemon/src/config.rs` — four new WS-related fields with defaults
+- `crates/daemon/src/state.rs` — `broadcaster`, `ws_semaphore`, `ws_config` fields; `WsConfig` struct
+- `crates/daemon/src/lib.rs` — `pub mod broadcast;`
+- `crates/daemon/src/main.rs` — `BroadcastHub`/`Semaphore`/`WsConfig` construction; extended `AppState` literal
+- `crates/daemon/src/api/mod.rs` — `pub mod ws;`; reshape router with `ws_only` merge; custom `timeout_middleware`; `RedactedSpan` for `TraceLayer` so URI query is not logged
+- `crates/daemon/src/api/ws.rs` — `handle_upgrade` with raw-header-presence precedence; pong-deadline via pinned `tokio::time::sleep`; `drain_backlog_under_state` flushes the broadcast receiver under the pre-change subscription state before each Subscribe/Unsubscribe; Hello reads `SELECT_HELLO_DB_FIELDS` in one statement
+- `crates/daemon/src/broadcast/event.rs` — `Topic::parse` rejects `*` in `<source>`/`<session_id>`/`<id>` literal positions
+- `crates/daemon/src/db/queries.rs` — new `SELECT_HISTORY_BEGINS_CLEANLY` and `SELECT_HELLO_DB_FIELDS` constants
+- `crates/daemon/tests/contract_daemon.rs` — extended `make_test_state`; added `make_test_state_with_ws`; new `story_2_1_ws` module with 17 WS contract tests + the `x_request_id_on_healthz` middleware canary
+- `crates/protocol/src/ws.rs` — added `ServerMessage::State(StateFrame)` variant and `StateFrame { source, session_id, state }` struct; added `#[serde(other)] Unknown` catch-all to `ServerMessage` for forward-compat across new variants
+- `crates/protocol/src/lib.rs` — re-export `StateFrame`
+- `crates/protocol/tests/contract_protocol.rs` — `server_message_unknown_variant_round_trips_as_unknown` test
+- `docs/bmad/planning-artifacts/epics.md` — back-amend AC #2 Subscribe wire shape; trail-note for the 2026-05-20 clarification
+- `docs/bmad/planning-artifacts/prd.md` — back-amend Subscribe message example near line 371-374
+- `docs/protocol-changelog.md` — one schema + one behavioral entry for the WS surface + HTTP middleware reshape; updated post-review to document header-presence precedence and the `Unknown` catch-all mechanism
+- `docs/bmad/implementation-artifacts/deferred-work.md` — struck lines 10 and 56; added Story 2.1 deferred-work section (3 entries)
+- `docs/bmad/implementation-artifacts/sprint-status.yaml` — story 2.1 → in-progress → review → in-progress (review) → review; last_updated 2026-05-21
+
+### Change Log
+
+| Date       | Change                                                                                                                                                                        |
+|------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 2026-05-21 | Story 2.1 implementation — WebSocket connection and topic subscription. 11 tasks complete; 38 new tests; protocol additively extended with `ServerMessage::State(StateFrame)`. |
+| 2026-05-21 | Code-review round 1: addressed 9 findings (TraceLayer URI redaction, header-precedence fix, pong-deadline granularity, no-pong test, middleware order, pre-subscribe backlog drain, single-snapshot Hello query, Topic::parse wildcard rejection, `ServerMessage::Unknown` catch-all). 4 new tests; total 163 workspace tests. |
