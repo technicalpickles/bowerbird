@@ -46,17 +46,23 @@ pub async fn write(
     broadcaster: &BroadcastHub,
     envelope: EventEnvelope,
 ) -> Result<EventId> {
-    // The ingest path only produces normalized session events. Sentinel
-    // kinds route through `write_recording_started` / `write_recording_ended`
-    // and must never reach this function (architecture.md:634-641).
-    #[cfg(debug_assertions)]
-    debug_assert!(
-        !matches!(
-            envelope.kind,
-            protocol::EventKind::RecordingStarted | protocol::EventKind::RecordingEnded
-        ),
-        "sentinel EventKind reached projection::session::write — use sentinel writers"
-    );
+    // Sentinel kinds route through `write_recording_started` /
+    // `write_recording_ended` and must never reach this function
+    // (architecture.md:634-641). A runtime guard (not just `debug_assert!`)
+    // is required so release builds also cannot publish daemon-lifecycle
+    // sentinels through the user-facing broadcast path (story 2.2 AC #7).
+    // Reject before pool checkout so a misuse cannot insert a row, commit
+    // a transaction, or emit a broadcast envelope.
+    if matches!(
+        envelope.kind,
+        protocol::EventKind::RecordingStarted | protocol::EventKind::RecordingEnded
+    ) {
+        return Err(Error::Projection(format!(
+            "sentinel EventKind ({:?}) cannot be written through projection::session::write; \
+             use write_recording_started / write_recording_ended",
+            envelope.kind
+        )));
+    }
 
     let conn = writer_pool
         .get()

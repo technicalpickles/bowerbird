@@ -2278,7 +2278,7 @@ mod story_2_1_ws {
         (addr, handle)
     }
 
-    fn ws_url_header(addr: SocketAddr) -> String {
+    pub(super) fn ws_url_header(addr: SocketAddr) -> String {
         format!("ws://{}/ws", addr)
     }
 
@@ -2291,7 +2291,10 @@ mod story_2_1_ws {
     }
 
     /// Build a connect request with `Authorization: Bearer <token>`.
-    fn authed_request(url: &str, token: &str) -> tokio_tungstenite::tungstenite::http::Request<()> {
+    pub(super) fn authed_request(
+        url: &str,
+        token: &str,
+    ) -> tokio_tungstenite::tungstenite::http::Request<()> {
         let mut req = url.into_client_request().expect("into_client_request");
         req.headers_mut().insert(
             header::AUTHORIZATION,
@@ -3043,15 +3046,201 @@ mod story_2_2_publish {
     use bowerbird_daemon::broadcast::BroadcastEnvelope;
     use bowerbird_daemon::state::AppState;
     use futures_util::{SinkExt, StreamExt};
-    use protocol::{Event, EventEnvelope, EventId, EventKind, Reaction, ServerMessage, StateFrame};
+    use protocol::{
+        Event, EventEnvelope, EventId, EventKind, Reaction, ServerMessage, SessionCurrentState,
+        SessionState, StateFrame,
+    };
     use tokio_tungstenite::tungstenite::Message;
 
     use super::story_2_1_ws::{
-        connect_authed, parse_hello, read_text_frame_or_close, spawn_test_daemon,
+        authed_request, connect_authed, parse_hello, read_text_frame_or_close, spawn_test_daemon,
+        ws_url_header,
     };
     use super::{fresh_pools, make_test_state_with_ws};
 
     const TEST_BEARER: &str = super::TEST_BEARER;
+
+    type WsStream = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    /// Probe shape for `wait_subscribe_live`. The probe must match the
+    /// subscribed topic AND be distinguishable from real test envelopes
+    /// (so the helper can drain probe frames before returning a clean
+    /// stream).
+    ///
+    /// Convention:
+    /// - **Event probe:** `source` matches the subscription's required
+    ///   source; `session_id` is fixed to `"__probe__"`.
+    /// - **State probe:** `session_id` matches the subscription's required
+    ///   `session_id` (or any value for wildcard subs); `source` is fixed
+    ///   to `"__probe__"`.
+    ///
+    /// Real test envelopes use real `source`/`session_id` values, so the
+    /// `__probe__` magic is reliably distinguishable.
+    #[derive(Clone, Copy)]
+    enum ProbeKind {
+        Event { source: &'static str },
+        State { session_id: &'static str },
+    }
+
+    fn build_probe(kind: ProbeKind) -> BroadcastEnvelope {
+        match kind {
+            ProbeKind::Event { source } => BroadcastEnvelope::Event(Event {
+                event_id: EventId(0),
+                source: source.to_string(),
+                session_id: "__probe__".to_string(),
+                kind: EventKind::PreToolUse,
+                reaction: None,
+                payload: "{}".to_string(),
+                created_at: 0,
+            }),
+            ProbeKind::State { session_id } => BroadcastEnvelope::State {
+                source: "__probe__".to_string(),
+                session_id: session_id.to_string(),
+                state: SessionState {
+                    current_state: SessionCurrentState::Idle,
+                    last_event_kind: EventKind::PreToolUse,
+                    last_event_at_ms: 0,
+                },
+            },
+        }
+    }
+
+    fn is_probe_frame(msg: &Message) -> bool {
+        let text = match msg {
+            Message::Text(t) => t.as_str(),
+            _ => return false,
+        };
+        let server: ServerMessage = match serde_json::from_str(text) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        match server {
+            ServerMessage::Event(f) => f.event.session_id == "__probe__",
+            ServerMessage::State(f) => f.source == "__probe__",
+            _ => false,
+        }
+    }
+
+    /// Block until a previously-sent `Subscribe` is live on the daemon
+    /// side. Publishes synthetic probe envelopes matching the target
+    /// topic and reads frames until one of ours arrives, then drains any
+    /// trailing probes so the stream is clean for the test's real
+    /// assertions. Bounded by a 2s deadline.
+    ///
+    /// Replaces the fixed `tokio::time::sleep(20ms)` pattern flagged in
+    /// the story 2.2 review. The sleeps that remain here live inside this
+    /// explicit bounded retry loop, not as unconditional synchronization.
+    async fn wait_subscribe_live(ws: &mut WsStream, state: &AppState, probe: ProbeKind) {
+        let envelope = build_probe(probe);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if std::time::Instant::now() >= deadline {
+                panic!("subscribe never went live within 2s deadline");
+            }
+            state.broadcaster.publish(envelope.clone());
+            match tokio::time::timeout(Duration::from_millis(50), ws.next()).await {
+                Ok(Some(Ok(msg))) => {
+                    if !is_probe_frame(&msg) {
+                        panic!("unexpected non-probe frame during readiness: {msg:?}");
+                    }
+                    // Drain trailing probes published by prior retry
+                    // iterations that the daemon caught up on after our
+                    // subscribe was processed. Bounded short timeout — a
+                    // non-probe frame here would mean the test ordering
+                    // is wrong.
+                    while let Ok(Some(Ok(more))) =
+                        tokio::time::timeout(Duration::from_millis(10), ws.next()).await
+                    {
+                        if !is_probe_frame(&more) {
+                            panic!("non-probe frame during readiness drain: {more:?}");
+                        }
+                    }
+                    return;
+                }
+                Ok(Some(Err(e))) => panic!("ws error during readiness: {e:?}"),
+                Ok(None) => panic!("ws closed during readiness"),
+                Err(_) => continue, // retry by re-publishing.
+            }
+        }
+    }
+
+    /// Multi-client variant of `wait_subscribe_live`. Subscribes on
+    /// every client may complete at different times, AND a probe published
+    /// during one client's wait is broadcast to all subscribers — so a
+    /// per-client wait + drain leaks probes back to clients that have
+    /// already returned from their own wait. This helper publishes a
+    /// probe per iteration and drains EVERY client's queue to empty per
+    /// iteration, exiting only when all clients have observed at least
+    /// one probe AND no client has trailing frames. Bounded by a 2s
+    /// deadline.
+    async fn wait_subscribe_live_all(
+        clients: &mut [&mut WsStream],
+        state: &AppState,
+        probe: ProbeKind,
+    ) {
+        let envelope = build_probe(probe);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut ready = vec![false; clients.len()];
+        while !ready.iter().all(|&b| b) {
+            if std::time::Instant::now() >= deadline {
+                panic!("not all clients went live within 2s deadline (ready={ready:?})");
+            }
+            state.broadcaster.publish(envelope.clone());
+            for (i, ws) in clients.iter_mut().enumerate() {
+                // Drain everything currently queued on this client. Mark
+                // it ready on first probe seen; keep draining trailing
+                // probes so the stream is clean.
+                loop {
+                    match tokio::time::timeout(Duration::from_millis(20), ws.next()).await {
+                        Ok(Some(Ok(msg))) => {
+                            if is_probe_frame(&msg) {
+                                ready[i] = true;
+                            } else {
+                                panic!(
+                                    "unexpected non-probe frame on client #{i} during readiness: {msg:?}"
+                                );
+                            }
+                        }
+                        Ok(Some(Err(e))) => {
+                            panic!("ws error on client #{i} during readiness: {e:?}")
+                        }
+                        Ok(None) => panic!("client #{i} closed during readiness"),
+                        Err(_) => break, // queue currently empty — move on
+                    }
+                }
+            }
+        }
+    }
+
+    /// Retry `connect_authed` until the daemon accepts the upgrade. A 503
+    /// (ws_semaphore exhausted) is "not ready yet" — retry until success
+    /// or a 2s deadline. Other errors fail the test. Mirrors the pattern
+    /// `story_2_1_ws::ws_257th_connection_rejected_503` uses to verify
+    /// permit release after a graceful close.
+    async fn connect_until_ready(addr: std::net::SocketAddr) -> WsStream {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if std::time::Instant::now() >= deadline {
+                panic!("connect never succeeded within 2s deadline");
+            }
+            let req = authed_request(&ws_url_header(addr), TEST_BEARER);
+            match tokio_tungstenite::connect_async(req).await {
+                Ok((mut ws, _)) => {
+                    let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+                    return ws;
+                }
+                Err(tokio_tungstenite::tungstenite::Error::Http(resp))
+                    if resp.status().as_u16() == 503 =>
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
+                Err(e) => panic!("unexpected error during connect retry: {e:?}"),
+            }
+        }
+    }
 
     fn parse_event_frame(msg: &Message) -> Event {
         let text = match msg {
@@ -3135,8 +3324,14 @@ mod story_2_2_publish {
             .await
             .expect("send subscribe");
         }
-        // Yield so the daemon processes all three subscribes before publish.
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Wait for all three subscribes to go live coordinated so probes
+        // published for one client don't leak into another's stream.
+        wait_subscribe_live_all(
+            &mut [&mut ws1, &mut ws2, &mut ws3],
+            &state,
+            ProbeKind::Event { source: "claude" },
+        )
+        .await;
 
         let id1 = publish_via_projection(
             &state,
@@ -3223,7 +3418,14 @@ mod story_2_2_publish {
         ))
         .await
         .expect("send subscribe");
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        wait_subscribe_live(
+            &mut ws,
+            &state,
+            ProbeKind::State {
+                session_id: "sess-A",
+            },
+        )
+        .await;
 
         // Positive #1: publish for sess-A — expect State frame.
         let _ = publish_via_projection(
@@ -3292,7 +3494,7 @@ mod story_2_2_publish {
         ))
         .await
         .expect("send subscribe");
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        wait_subscribe_live(&mut ws, &state, ProbeKind::Event { source: "claude" }).await;
 
         // Real claude event via the production publish path.
         let id_claude = publish_via_projection(
@@ -3346,7 +3548,14 @@ mod story_2_2_publish {
         ))
         .await
         .expect("send subscribe");
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        wait_subscribe_live(
+            &mut ws,
+            &state,
+            ProbeKind::State {
+                session_id: "__probe__",
+            },
+        )
+        .await;
 
         let order = ["sess-A", "sess-B", "sess-A", "sess-C"];
         for sid in &order {
@@ -3389,16 +3598,19 @@ mod story_2_2_publish {
             .await
             .expect("send subscribe");
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        wait_subscribe_live_all(
+            &mut [&mut ws_a, &mut ws_b],
+            &state,
+            ProbeKind::Event { source: "claude" },
+        )
+        .await;
 
-        // Close A gracefully.
+        // Close A gracefully. B's delivery path is independent of A's
+        // teardown, so we can publish + read on B without waiting; the
+        // semaphore-permit-release check is deferred to the
+        // `connect_until_ready` retry below.
         ws_a.close(None).await.expect("close A");
         drop(ws_a);
-        // Yield so the daemon's per-connection task observes the close and
-        // releases the semaphore permit. No real-clock sleeps for assertion
-        // synchronization elsewhere, but a brief yield here is the same
-        // pattern story 2.1 uses for "let the daemon catch up."
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Publishing now must reach B uninterrupted.
         let _ = publish_via_projection(
@@ -3414,10 +3626,73 @@ mod story_2_2_publish {
         let event = parse_event_frame(&frame);
         assert_eq!(event.session_id, "sess-survives");
 
-        // Probe: with `ws_max_conns = 2` and B still attached, a third
-        // connect succeeds only if A's permit was released on close.
-        let (mut ws_c, _) = connect_authed(addr, TEST_BEARER).await;
-        let _ = parse_hello(&read_text_frame_or_close(&mut ws_c).await);
+        // Probe: with `ws_max_conns = 2` and B still attached, the third
+        // connect succeeds only after A's permit is released on close.
+        // The retry handles the race deterministically — same shape as
+        // `story_2_1_ws::ws_257th_connection_rejected_503`.
+        let _ws_c = connect_until_ready(addr).await;
+
+        state.shutdown.cancel();
+    }
+
+    /// AC #7 (defense in depth) — `projection::session::write` rejects
+    /// sentinel `EventKind`s at runtime in release builds, not just under
+    /// `debug_assert!`. A misuse must not commit a row, must not publish a
+    /// broadcast envelope, and must surface a typed error.
+    #[tokio::test(flavor = "current_thread")]
+    async fn projection_write_rejects_sentinel_kinds_at_runtime() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 4);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"events.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+        wait_subscribe_live(&mut ws, &state, ProbeKind::Event { source: "claude" }).await;
+
+        for kind in [EventKind::RecordingStarted, EventKind::RecordingEnded] {
+            let err = bowerbird_daemon::projection::session::write(
+                &state.db.writer,
+                &state.broadcaster,
+                EventEnvelope {
+                    source: "__daemon__".to_string(),
+                    session_id: "__daemon__".to_string(),
+                    kind: kind.clone(),
+                    reaction: None,
+                    payload: "{}".to_string(),
+                },
+            )
+            .await
+            .expect_err("sentinel kind must be rejected");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("sentinel EventKind"),
+                "error must name sentinel cause; got {msg}"
+            );
+
+            // No broadcast envelope was published — confirm via timeout.
+            let timed = tokio::time::timeout(Duration::from_millis(300), ws.next()).await;
+            assert!(
+                timed.is_err(),
+                "rejected sentinel write must not produce a broadcast frame ({kind:?}); got {timed:?}"
+            );
+        }
+
+        // No event row was inserted either — count must stay zero.
+        let conn = state.db.reader.get().await.expect("reader get");
+        let count: i64 = conn
+            .interact(|c| -> rusqlite::Result<i64> {
+                c.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            })
+            .await
+            .expect("interact")
+            .expect("count");
+        assert_eq!(count, 0, "sentinel-rejected writes must not insert rows");
 
         state.shutdown.cancel();
     }
@@ -3440,7 +3715,7 @@ mod story_2_2_publish {
         ))
         .await
         .expect("send subscribe");
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        wait_subscribe_live(&mut ws, &state, ProbeKind::Event { source: "claude" }).await;
 
         // Sentinel write — must NOT broadcast.
         let started =
