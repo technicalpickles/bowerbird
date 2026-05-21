@@ -110,9 +110,10 @@ async fn wal_durability_after_simulated_crash() {
     let event_id = {
         let pools = init_pools(&db_path).await.expect("init_pools 1");
         run_migrations(&pools.writer).await.expect("migrate 1");
-        let id = projection::session::write(&pools.writer, envelope.clone())
-            .await
-            .expect("write event");
+        let id =
+            projection::session::write(&pools.writer, &BroadcastHub::new(16), envelope.clone())
+                .await
+                .expect("write event");
         // Pools (and their underlying connections) drop here without an explicit
         // wal_checkpoint — simulating a crash where the WAL hasn't been folded
         // back into the main db file.
@@ -205,7 +206,7 @@ async fn state_plus_event_atomicity_rollback() {
         reaction: None,
         payload: "{}".to_string(),
     };
-    let id = projection::session::write(&pools.writer, envelope)
+    let id = projection::session::write(&pools.writer, &BroadcastHub::new(16), envelope)
         .await
         .expect("write");
     assert!(id.0 > 0);
@@ -240,7 +241,7 @@ async fn concurrent_read_during_write() {
                 reaction: None,
                 payload: "{}".to_string(),
             };
-            projection::session::write(&writer, envelope)
+            projection::session::write(&writer, &BroadcastHub::new(16), envelope)
                 .await
                 .expect("write");
         }
@@ -884,7 +885,13 @@ async fn ingest_no_db_row_on_missing_hook_kind() {
     let writer_pool = pools.writer.clone();
     let writer_shutdown = shutdown.clone();
     tokio::spawn(async move {
-        bowerbird_daemon::ingest::writer::run(rx, writer_pool, writer_shutdown).await;
+        bowerbird_daemon::ingest::writer::run(
+            rx,
+            writer_pool,
+            Arc::new(BroadcastHub::new(16)),
+            writer_shutdown,
+        )
+        .await;
     });
 
     // Give the listener a moment to bind and chmod.
@@ -1070,12 +1077,14 @@ async fn source_session_id_collision_safety() {
 
     projection::session::write(
         &pools.writer,
+        &BroadcastHub::new(16),
         envelope_for("claude", "sess-shared", EventKind::PreToolUse),
     )
     .await
     .expect("write claude");
     projection::session::write(
         &pools.writer,
+        &BroadcastHub::new(16),
         envelope_for("codex", "sess-shared", EventKind::PreToolUse),
     )
     .await
@@ -1103,6 +1112,7 @@ async fn source_session_id_collision_safety() {
     // Mutate only the claude session.
     projection::session::write(
         &pools.writer,
+        &BroadcastHub::new(16),
         envelope_for("claude", "sess-shared", EventKind::PostToolUse),
     )
     .await
@@ -1171,6 +1181,7 @@ async fn hook_unreliability_tolerance_pretooluse_without_posttooluse() {
 
     projection::session::write(
         &pools.writer,
+        &BroadcastHub::new(16),
         envelope_for("claude", "sess-lonely", EventKind::PreToolUse),
     )
     .await
@@ -1192,6 +1203,7 @@ async fn hook_unreliability_tolerance_pretooluse_without_posttooluse() {
     // Sub-case: a Stop hook clears Working at the storage layer.
     projection::session::write(
         &pools.writer,
+        &BroadcastHub::new(16),
         envelope_for("claude", "sess-lonely", EventKind::Stop),
     )
     .await
@@ -1227,6 +1239,7 @@ async fn state_machine_full_sequence_determinism() {
     for (kind, expected) in cases {
         projection::session::write(
             &pools.writer,
+            &BroadcastHub::new(16),
             envelope_for("claude", session_id, kind.clone()),
         )
         .await
@@ -1544,14 +1557,22 @@ async fn projection_rebuild_from_event_log_is_byte_identical() {
         EventKind::Stop,
     ];
     for kind in a_seq {
-        projection::session::write(&pools.writer, envelope_for("claude", "sess-A", kind))
-            .await
-            .expect("write A");
+        projection::session::write(
+            &pools.writer,
+            &BroadcastHub::new(16),
+            envelope_for("claude", "sess-A", kind),
+        )
+        .await
+        .expect("write A");
     }
     for kind in b_seq {
-        projection::session::write(&pools.writer, envelope_for("claude", "sess-B", kind))
-            .await
-            .expect("write B");
+        projection::session::write(
+            &pools.writer,
+            &BroadcastHub::new(16),
+            envelope_for("claude", "sess-B", kind),
+        )
+        .await
+        .expect("write B");
     }
 
     let baseline_a = read_session_state(&pools.reader, "claude", "sess-A").await;
@@ -1689,6 +1710,7 @@ mod story_1_7_rest {
         // sess-a: PreToolUse → stored Working.
         projection::session::write(
             &pools.writer,
+            &BroadcastHub::new(16),
             EventEnvelope {
                 source: "claude".to_string(),
                 session_id: "sess-a".to_string(),
@@ -1702,6 +1724,7 @@ mod story_1_7_rest {
         // sess-b: PostToolUse → stored Idle.
         projection::session::write(
             &pools.writer,
+            &BroadcastHub::new(16),
             EventEnvelope {
                 source: "claude".to_string(),
                 session_id: "sess-b".to_string(),
@@ -1742,6 +1765,7 @@ mod story_1_7_rest {
         let (_tmp, pools) = fresh_pools().await;
         projection::session::write(
             &pools.writer,
+            &BroadcastHub::new(16),
             EventEnvelope {
                 source: "claude".to_string(),
                 session_id: "sess-old".to_string(),
@@ -1793,6 +1817,7 @@ mod story_1_7_rest {
         let (_tmp, pools) = fresh_pools().await;
         projection::session::write(
             &pools.writer,
+            &BroadcastHub::new(16),
             EventEnvelope {
                 source: "claude".to_string(),
                 session_id: "sess-x".to_string(),
@@ -1837,6 +1862,7 @@ mod story_1_7_rest {
         for _ in 0..5 {
             projection::session::write(
                 &pools.writer,
+                &BroadcastHub::new(16),
                 EventEnvelope {
                     source: "claude".to_string(),
                     session_id: "sess-y".to_string(),
@@ -1895,6 +1921,7 @@ mod story_1_7_rest {
         for _ in 0..10 {
             let id = projection::session::write(
                 &pools.writer,
+                &BroadcastHub::new(16),
                 EventEnvelope {
                     source: "claude".to_string(),
                     session_id: "sess-y".to_string(),
@@ -1933,6 +1960,7 @@ mod story_1_7_rest {
         for _ in 0..5 {
             let id = projection::session::write(
                 &pools.writer,
+                &BroadcastHub::new(16),
                 EventEnvelope {
                     source: "claude".to_string(),
                     session_id: "sess-y".to_string(),
@@ -2097,6 +2125,7 @@ mod story_1_7_rest {
         for _ in 0..3 {
             projection::session::write(
                 &pools.writer,
+                &BroadcastHub::new(16),
                 EventEnvelope {
                     source: "claude".to_string(),
                     session_id: "sess-s".to_string(),
@@ -2139,6 +2168,7 @@ mod story_1_7_rest {
         let (_tmp, pools) = fresh_pools().await;
         projection::session::write(
             &pools.writer,
+            &BroadcastHub::new(16),
             EventEnvelope {
                 source: "claude".to_string(),
                 session_id: "sess-z".to_string(),
@@ -2233,7 +2263,7 @@ mod story_2_1_ws {
 
     /// Spawn a real axum server on a random localhost port. Returns the
     /// bound address and a JoinHandle for the serve task.
-    async fn spawn_test_daemon(state: AppState) -> (SocketAddr, JoinHandle<()>) {
+    pub(super) async fn spawn_test_daemon(state: AppState) -> (SocketAddr, JoinHandle<()>) {
         let router = api::router(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -2270,7 +2300,7 @@ mod story_2_1_ws {
         req
     }
 
-    async fn connect_authed(
+    pub(super) async fn connect_authed(
         addr: SocketAddr,
         token: &str,
     ) -> (
@@ -2285,7 +2315,7 @@ mod story_2_1_ws {
             .expect("ws connect")
     }
 
-    async fn read_text_frame_or_close(
+    pub(super) async fn read_text_frame_or_close(
         ws: &mut tokio_tungstenite::WebSocketStream<
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
         >,
@@ -2297,7 +2327,7 @@ mod story_2_1_ws {
             .expect("recv ok")
     }
 
-    fn parse_hello(msg: &Message) -> HelloFrame {
+    pub(super) fn parse_hello(msg: &Message) -> HelloFrame {
         let text = match msg {
             Message::Text(t) => t.as_str(),
             other => panic!("expected text Hello frame, got {other:?}"),
@@ -2997,5 +3027,459 @@ mod story_2_1_ws {
                 "x-request-id hyphen position {pos} mismatch in {rid}"
             );
         }
+    }
+}
+
+/// Story 2.2 — `projection::session::write` publishes one
+/// `BroadcastEnvelope::Event` followed by one `BroadcastEnvelope::State`
+/// after `tx.commit()`. These tests exercise the real publish path (not
+/// synthetic `broadcaster.publish` shortcuts) so the wiring from ingest →
+/// projection → broadcast hub → WS is end-to-end verified.
+mod story_2_2_publish {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use bowerbird_daemon::broadcast::BroadcastEnvelope;
+    use bowerbird_daemon::state::AppState;
+    use futures_util::{SinkExt, StreamExt};
+    use protocol::{Event, EventEnvelope, EventId, EventKind, Reaction, ServerMessage, StateFrame};
+    use tokio_tungstenite::tungstenite::Message;
+
+    use super::story_2_1_ws::{
+        connect_authed, parse_hello, read_text_frame_or_close, spawn_test_daemon,
+    };
+    use super::{fresh_pools, make_test_state_with_ws};
+
+    const TEST_BEARER: &str = super::TEST_BEARER;
+
+    fn parse_event_frame(msg: &Message) -> Event {
+        let text = match msg {
+            Message::Text(t) => t.as_str(),
+            other => panic!("expected text Event frame, got {other:?}"),
+        };
+        let server: ServerMessage = serde_json::from_str(text).expect("parse ServerMessage");
+        match server {
+            ServerMessage::Event(f) => f.event,
+            other => panic!("expected Event, got {other:?}"),
+        }
+    }
+
+    fn parse_state_frame(msg: &Message) -> StateFrame {
+        let text = match msg {
+            Message::Text(t) => t.as_str(),
+            other => panic!("expected text State frame, got {other:?}"),
+        };
+        let server: ServerMessage = serde_json::from_str(text).expect("parse ServerMessage");
+        match server {
+            ServerMessage::State(f) => f,
+            other => panic!("expected State, got {other:?}"),
+        }
+    }
+
+    /// Drives the REAL `projection::session::write` path so the broadcast
+    /// envelopes are produced by the production publisher, not a synthetic
+    /// `state.broadcaster.publish(...)` shortcut.
+    async fn publish_via_projection(
+        state: &AppState,
+        source: &str,
+        session_id: &str,
+        kind: EventKind,
+        reaction: Option<Reaction>,
+        payload: &str,
+    ) -> EventId {
+        bowerbird_daemon::projection::session::write(
+            &state.db.writer,
+            &state.broadcaster,
+            EventEnvelope {
+                source: source.to_string(),
+                session_id: session_id.to_string(),
+                kind,
+                reaction,
+                payload: payload.to_string(),
+            },
+        )
+        .await
+        .expect("projection::session::write")
+    }
+
+    fn default_state(pools: bowerbird_daemon::db::DbPools, ws_max_conns: usize) -> AppState {
+        make_test_state_with_ws(
+            pools,
+            Arc::new(AtomicBool::new(true)),
+            ws_max_conns,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        )
+    }
+
+    /// AC #1 — Three subscribers to `events.*` receive byte-identical
+    /// `Event` frames in the same order.
+    #[tokio::test(flavor = "current_thread")]
+    async fn three_subscribers_receive_identical_events_in_order() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 4);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let (mut ws1, _) = connect_authed(addr, TEST_BEARER).await;
+        let (mut ws2, _) = connect_authed(addr, TEST_BEARER).await;
+        let (mut ws3, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws1).await);
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws2).await);
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws3).await);
+
+        for ws in [&mut ws1, &mut ws2, &mut ws3] {
+            ws.send(Message::Text(
+                r#"{"op":"subscribe","topic":"events.*"}"#.into(),
+            ))
+            .await
+            .expect("send subscribe");
+        }
+        // Yield so the daemon processes all three subscribes before publish.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let id1 = publish_via_projection(
+            &state,
+            "claude",
+            "sess-fan",
+            EventKind::PreToolUse,
+            Some(Reaction::Continue),
+            r#"{"tool":"Bash"}"#,
+        )
+        .await;
+        let id2 = publish_via_projection(
+            &state,
+            "claude",
+            "sess-fan",
+            EventKind::PostToolUse,
+            None,
+            r#"{"tool":"Bash"}"#,
+        )
+        .await;
+
+        // Collect two frames per client.
+        let mut texts: Vec<Vec<String>> = Vec::with_capacity(3);
+        for ws in [&mut ws1, &mut ws2, &mut ws3] {
+            let f1 = read_text_frame_or_close(ws).await;
+            let f2 = read_text_frame_or_close(ws).await;
+            let t1 = match f1 {
+                Message::Text(t) => t.to_string(),
+                other => panic!("expected text frame, got {other:?}"),
+            };
+            let t2 = match f2 {
+                Message::Text(t) => t.to_string(),
+                other => panic!("expected text frame, got {other:?}"),
+            };
+            texts.push(vec![t1, t2]);
+        }
+
+        // Byte-identical wire frames across all three clients.
+        assert_eq!(
+            texts[0], texts[1],
+            "client 1 and 2 must see byte-identical frames"
+        );
+        assert_eq!(
+            texts[1], texts[2],
+            "client 2 and 3 must see byte-identical frames"
+        );
+
+        // Event IDs arrive in publication order.
+        let ev1: ServerMessage = serde_json::from_str(&texts[0][0]).expect("parse #1");
+        let ev2: ServerMessage = serde_json::from_str(&texts[0][1]).expect("parse #2");
+        let first_id = match ev1 {
+            ServerMessage::Event(f) => f.event.event_id,
+            other => panic!("expected Event, got {other:?}"),
+        };
+        let second_id = match ev2 {
+            ServerMessage::Event(f) => f.event.event_id,
+            other => panic!("expected Event, got {other:?}"),
+        };
+        assert_eq!(first_id, id1, "first frame must carry the first event_id");
+        assert_eq!(
+            second_id, id2,
+            "second frame must carry the second event_id"
+        );
+        assert!(
+            first_id.0 < second_id.0,
+            "event_ids must be strictly increasing"
+        );
+
+        state.shutdown.cancel();
+    }
+
+    /// AC #2 — `state.session.<id>.current_state` delivers a `State` frame
+    /// only for matching `session_id`s, never for other sessions.
+    #[tokio::test(flavor = "current_thread")]
+    async fn state_current_topic_filters_other_sessions() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 4);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.sess-A.current_state"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Positive #1: publish for sess-A — expect State frame.
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-A",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+        let frame = read_text_frame_or_close(&mut ws).await;
+        let parsed = parse_state_frame(&frame);
+        assert_eq!(parsed.session_id, "sess-A");
+
+        // Negative: publish for sess-B — expect NO frame within 300ms.
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-B",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+        let timed = tokio::time::timeout(Duration::from_millis(300), ws.next()).await;
+        assert!(
+            timed.is_err(),
+            "no state frame should arrive for sess-B; got {timed:?}"
+        );
+
+        // Positive #2: publish for sess-A again — expect State frame.
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-A",
+            EventKind::PostToolUse,
+            None,
+            "{}",
+        )
+        .await;
+        let frame = read_text_frame_or_close(&mut ws).await;
+        let parsed = parse_state_frame(&frame);
+        assert_eq!(parsed.session_id, "sess-A");
+
+        state.shutdown.cancel();
+    }
+
+    /// AC #3 — `events.claude.*` delivers events from `source = "claude"`
+    /// and filters out events from any other source. The other-source
+    /// publish is synthetic (via `state.broadcaster.publish`) since the
+    /// production ingest path only has the `"claude"` source today; this
+    /// is the documented test-only exception to the "publish only from
+    /// `projection::session::write`" rule.
+    #[tokio::test(flavor = "current_thread")]
+    async fn events_source_filter_excludes_other_source() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 4);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"events.claude.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Real claude event via the production publish path.
+        let id_claude = publish_via_projection(
+            &state,
+            "claude",
+            "sess-1",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+        let frame = read_text_frame_or_close(&mut ws).await;
+        let event = parse_event_frame(&frame);
+        assert_eq!(event.source, "claude");
+        assert_eq!(event.event_id, id_claude);
+
+        // Synthetic codex event (simulating a future second-source adapter).
+        state.broadcaster.publish(BroadcastEnvelope::Event(Event {
+            event_id: EventId(99_999),
+            source: "codex".to_string(),
+            session_id: "sess-2".to_string(),
+            kind: EventKind::PreToolUse,
+            reaction: None,
+            payload: "{}".to_string(),
+            created_at: 0,
+        }));
+
+        let timed = tokio::time::timeout(Duration::from_millis(300), ws.next()).await;
+        assert!(
+            timed.is_err(),
+            "events.claude.* must not deliver codex-sourced events; got {timed:?}"
+        );
+
+        state.shutdown.cancel();
+    }
+
+    /// AC #4 — `state.session.*` wildcard delivers one `State` frame per
+    /// publish, each carrying the originating `session_id` with no
+    /// cross-session smearing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn state_wildcard_preserves_session_id_per_frame() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 4);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let order = ["sess-A", "sess-B", "sess-A", "sess-C"];
+        for sid in &order {
+            let _ =
+                publish_via_projection(&state, "claude", sid, EventKind::PreToolUse, None, "{}")
+                    .await;
+        }
+
+        for expected in &order {
+            let frame = read_text_frame_or_close(&mut ws).await;
+            let parsed = parse_state_frame(&frame);
+            assert_eq!(
+                parsed.session_id, *expected,
+                "session_id must match publication order; expected {expected}, got {}",
+                parsed.session_id
+            );
+        }
+
+        state.shutdown.cancel();
+    }
+
+    /// AC #5 — Closing one WS client does not interrupt delivery to the
+    /// other, and the closed client's WS semaphore permit is released
+    /// (verified via a connect-cap probe with `ws_max_conns = 2`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn consumer_independence_and_semaphore_release() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 2); // ws_max_conns = 2 enables the probe.
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let (mut ws_a, _) = connect_authed(addr, TEST_BEARER).await;
+        let (mut ws_b, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws_a).await);
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws_b).await);
+
+        for ws in [&mut ws_a, &mut ws_b] {
+            ws.send(Message::Text(
+                r#"{"op":"subscribe","topic":"events.*"}"#.into(),
+            ))
+            .await
+            .expect("send subscribe");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Close A gracefully.
+        ws_a.close(None).await.expect("close A");
+        drop(ws_a);
+        // Yield so the daemon's per-connection task observes the close and
+        // releases the semaphore permit. No real-clock sleeps for assertion
+        // synchronization elsewhere, but a brief yield here is the same
+        // pattern story 2.1 uses for "let the daemon catch up."
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Publishing now must reach B uninterrupted.
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-survives",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+        let frame = read_text_frame_or_close(&mut ws_b).await;
+        let event = parse_event_frame(&frame);
+        assert_eq!(event.session_id, "sess-survives");
+
+        // Probe: with `ws_max_conns = 2` and B still attached, a third
+        // connect succeeds only if A's permit was released on close.
+        let (mut ws_c, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws_c).await);
+
+        state.shutdown.cancel();
+    }
+
+    /// AC #7 — Sentinel writes (`write_recording_started`,
+    /// `write_recording_ended`) do NOT publish. Subscriber to `events.*`
+    /// receives nothing for the sentinel, then receives a frame for a
+    /// subsequent non-sentinel event (sanity that the channel is alive).
+    #[tokio::test(flavor = "current_thread")]
+    async fn sentinel_writes_are_not_published() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 4);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"events.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Sentinel write — must NOT broadcast.
+        let started =
+            bowerbird_daemon::projection::session::write_recording_started(&state.db.writer)
+                .await
+                .expect("write_recording_started");
+        let timed = tokio::time::timeout(Duration::from_millis(300), ws.next()).await;
+        assert!(
+            timed.is_err(),
+            "sentinel RecordingStarted must not produce a broadcast frame; got {timed:?}"
+        );
+
+        // The other sentinel writer must also not broadcast.
+        let _ = bowerbird_daemon::projection::session::write_recording_ended(
+            &state.db.writer,
+            started.recording_session_id,
+        )
+        .await
+        .expect("write_recording_ended");
+        let timed = tokio::time::timeout(Duration::from_millis(300), ws.next()).await;
+        assert!(
+            timed.is_err(),
+            "sentinel RecordingEnded must not produce a broadcast frame; got {timed:?}"
+        );
+
+        // Sanity: the channel is still alive for non-sentinel events.
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-alive",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+        let frame = read_text_frame_or_close(&mut ws).await;
+        let event = parse_event_frame(&frame);
+        assert_eq!(event.session_id, "sess-alive");
+
+        state.shutdown.cancel();
     }
 }
