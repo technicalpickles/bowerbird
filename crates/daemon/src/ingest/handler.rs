@@ -1,11 +1,18 @@
 use std::sync::Arc;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
 use adapter_claude::ClaudeAdapter;
 use protocol::{EventEnvelope, SourceAdapter};
+
+/// Maximum bytes accepted for a single newline-terminated ingest line,
+/// excluding the trailing newline. Matches `crates/shim/src/main.rs::
+/// MAX_STDIN_BYTES` (1 MiB) so the shim's stdin cap is also the daemon's
+/// wire cap, and so a direct local-socket client cannot push a larger
+/// payload into the broadcast fan-out than the shim ever could.
+const MAX_INGEST_LINE_BYTES: usize = 1 << 20;
 
 // Wire 400 responses are line-framed. Collapse internal newlines and cap
 // length so a multi-line serde_json::Error Display can't desync the client.
@@ -23,7 +30,12 @@ pub(super) async fn handle(
     adapter: Arc<ClaudeAdapter>,
 ) {
     let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
+    // Cap the read at MAX + 1 bytes so a payload of exactly the cap plus
+    // its terminating newline still fits, but anything larger stops short
+    // of the next `\n` and is detectable by `buf.ends_with('\n') == false`.
+    // Mirrors the shim's `stdin.lock().take((MAX + 1) as u64)` pattern.
+    let limited = read_half.take(MAX_INGEST_LINE_BYTES as u64 + 1);
+    let mut reader = BufReader::new(limited);
     let mut buf = String::new();
 
     match reader.read_line(&mut buf).await {
@@ -36,6 +48,26 @@ pub(super) async fn handle(
             return;
         }
         Ok(_) => {}
+    }
+
+    // If the read stopped at the take limit without finding a `\n`, the
+    // line is over the 1 MiB cap. Reject before JSON parse, enqueue, DB
+    // write, or broadcast — a direct socket writer could otherwise bypass
+    // the shim's matching cap and push an oversized payload into the
+    // broadcast ring.
+    if buf.len() > MAX_INGEST_LINE_BYTES && !buf.ends_with('\n') {
+        tracing::debug!(
+            len = buf.len(),
+            cap = MAX_INGEST_LINE_BYTES,
+            "ingest: line exceeded max cap"
+        );
+        let _ = write_half
+            .write_all(
+                format!("400 line exceeds {MAX_INGEST_LINE_BYTES}-byte cap\n").as_bytes(),
+            )
+            .await;
+        let _ = write_half.flush().await;
+        return;
     }
 
     let trimmed = buf.trim_end_matches('\n');

@@ -3918,6 +3918,78 @@ mod story_2_2_publish {
         state.shutdown.cancel();
     }
 
+    /// Defense in depth — an oversized line on the ingest socket must
+    /// be rejected with a 400-style response BEFORE JSON parse, enqueue,
+    /// DB write, or broadcast fan-out. The shim already caps stdin at
+    /// 1 MiB, but a direct local-socket client can bypass the shim, and
+    /// without a daemon-side cap the oversized payload would be cloned
+    /// into the broadcast ring and sent to every matching WS subscriber.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ingest_oversized_line_rejected_before_broadcast() {
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        let (_dbtmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 4);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let sock_tmp = TempDir::new().expect("ingest tempdir");
+        let (ingest_shutdown, sock_path, rx) = super::start_ingest_listener(&sock_tmp, 16).await;
+        let writer_handle = tokio::spawn(bowerbird_daemon::ingest::writer::run(
+            rx,
+            state.db.writer.clone(),
+            Arc::clone(&state.broadcaster),
+            ingest_shutdown.clone(),
+        ));
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"events.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+        wait_subscribe_live(&mut ws, &state, ProbeKind::Event { source: "claude" }).await;
+
+        // Build an oversized line: 1 MiB + 1 byte of payload, no newline
+        // until the very end (which is past the daemon's cap). The shape
+        // is intentionally not valid JSON — the cap fires before parse.
+        const CAP: usize = 1 << 20;
+        let mut oversized = Vec::with_capacity(CAP + 2);
+        oversized.resize(CAP + 1, b'a');
+        oversized.push(b'\n');
+        let resp = super::send_line_recv_response(&sock_path, &oversized).await;
+        assert!(
+            resp.starts_with("400") && resp.contains("cap"),
+            "expected 400 cap rejection, got: {resp:?}"
+        );
+
+        // No WS broadcast for the oversized line.
+        let timed = tokio::time::timeout(Duration::from_millis(300), ws.next()).await;
+        assert!(
+            timed.is_err(),
+            "oversized ingest line must not produce a broadcast frame; got {timed:?}"
+        );
+
+        // No DB row inserted either.
+        let conn = state.db.reader.get().await.expect("reader get");
+        let count: i64 = conn
+            .interact(|c| -> rusqlite::Result<i64> {
+                c.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            })
+            .await
+            .expect("interact")
+            .expect("count");
+        assert_eq!(
+            count, 0,
+            "oversized ingest line must not insert an event row"
+        );
+
+        ingest_shutdown.cancel();
+        let _ = writer_handle.await;
+        state.shutdown.cancel();
+    }
+
     /// AC #1 + AC #2 combined — a single client subscribed to BOTH
     /// `events.*` and `state.session.*` must observe the resulting
     /// frames in the documented order: `Event` before `State`. A
