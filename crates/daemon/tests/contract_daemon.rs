@@ -513,18 +513,28 @@ async fn start_ingest_listener(
     let sock_path = tmp.path().join("ingest.sock");
     let (tx, rx) = tokio::sync::mpsc::channel::<protocol::EventEnvelope>(capacity);
     let shutdown = tokio_util::sync::CancellationToken::new();
-    let path_clone = sock_path.clone();
-    let shutdown_clone = shutdown.clone();
+    // Bind the listener synchronously (mirrors production's bind /
+    // run_bound split in `main.rs::run`). The socket exists and is
+    // chmodded by the time `bind` returns, so no readiness sleep is
+    // needed before callers connect.
+    let listener =
+        bowerbird_daemon::ingest::listener::bind(&sock_path).expect("ingest listener bind");
     // Use a nonexistent TOML path — adapter degrades gracefully to Unknown reactions.
     let adapter = Arc::new(ClaudeAdapter::new(
         tmp.path().join("nonexistent-tool-reactions.toml"),
     ));
+    let path_for_task = sock_path.clone();
+    let shutdown_for_task = shutdown.clone();
     tokio::spawn(async move {
-        let _ =
-            bowerbird_daemon::ingest::listener::run(path_clone, tx, shutdown_clone, adapter).await;
+        let _ = bowerbird_daemon::ingest::listener::run_bound(
+            listener,
+            path_for_task,
+            tx,
+            shutdown_for_task,
+            adapter,
+        )
+        .await;
     });
-    // Give the listener a moment to bind and chmod.
-    tokio::time::sleep(Duration::from_millis(20)).await;
     (shutdown, sock_path, rx)
 }
 
