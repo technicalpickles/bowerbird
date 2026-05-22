@@ -10,6 +10,8 @@ pub enum Error {
     Clock(String),
     #[error("ingest error: {0}")]
     Ingest(String),
+    #[error("projection error: {0}")]
+    Projection(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

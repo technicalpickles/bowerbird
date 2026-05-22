@@ -148,9 +148,14 @@ async fn run(config: Config) -> anyhow::Result<()> {
             config.ingest_sock_path.display()
         )
     })?;
+    // Construct the broadcaster BEFORE the ingest writer spawn so it can be
+    // threaded into the writer task. The same `Arc` lands in `AppState` below
+    // via `broadcaster.clone()`.
+    let broadcaster = Arc::new(BroadcastHub::new(config.ws_broadcast_capacity));
     let ingest_writer_task = tokio::spawn(ingest::writer::run(
         ingest_rx,
         pools.writer.clone(),
+        broadcaster.clone(),
         shutdown.clone(),
     ));
     let ingest_listener_task = tokio::spawn(ingest::listener::run_bound(
@@ -161,7 +166,6 @@ async fn run(config: Config) -> anyhow::Result<()> {
         adapter,
     ));
 
-    let broadcaster = Arc::new(BroadcastHub::new(config.ws_broadcast_capacity));
     let ws_semaphore = Arc::new(tokio::sync::Semaphore::new(config.ws_max_connections));
     let ws_config = WsConfig {
         ping_interval: config.ws_ping_interval,

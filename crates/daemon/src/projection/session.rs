@@ -1,6 +1,7 @@
-use protocol::{EventEnvelope, EventId, SessionState};
+use protocol::{Event, EventEnvelope, EventId, SessionState};
 use rusqlite::OptionalExtension;
 
+use crate::broadcast::{BroadcastEnvelope, BroadcastHub};
 use crate::db::queries::{
     event_kind_as_str, event_kind_from_db_str, reaction_as_db_string, INSERT_EVENT,
     INSERT_RECORDING_SESSION_STARTED, SELECT_DISTINCT_SESSIONS_FROM_EVENTS,
@@ -24,27 +25,44 @@ pub struct RecordingStarted {
     pub recording_session_id: i64,
 }
 
-/// Sole owner of the SQLite write transaction.
+/// Sole owner of the SQLite write transaction AND the sole publisher of
+/// user-facing `BroadcastEnvelope::Event` / `BroadcastEnvelope::State`
+/// frames (per story 2.2).
 ///
 /// Inserts one row into `events` and upserts the matching row in
 /// `session_projections` inside a single transaction containing exactly those
-/// two writes — nothing else.
+/// two writes — nothing else. After `tx.commit()` succeeds, publishes one
+/// `BroadcastEnvelope::Event` followed by one `BroadcastEnvelope::State` so
+/// any WS subscribers see the event before the resulting projection update.
+/// Publishing is gated on commit success: if `interact` or `tx.commit` returns
+/// `Err`, no envelope is published (story 2.2 AC #6).
+///
+/// Sentinel writes (`write_recording_started` / `write_recording_ended`) do
+/// NOT publish — daemon lifecycle is excluded from the user-facing surface
+/// (story 2.2 AC #7).
 #[tracing::instrument(skip_all, fields(source = %envelope.source, session_id = %envelope.session_id))]
 pub async fn write(
     writer_pool: &deadpool_sqlite::Pool,
+    broadcaster: &BroadcastHub,
     envelope: EventEnvelope,
 ) -> Result<EventId> {
-    // The ingest path only produces normalized session events. Sentinel
-    // kinds route through `write_recording_started` / `write_recording_ended`
-    // and must never reach this function (architecture.md:634-641).
-    #[cfg(debug_assertions)]
-    debug_assert!(
-        !matches!(
-            envelope.kind,
-            protocol::EventKind::RecordingStarted | protocol::EventKind::RecordingEnded
-        ),
-        "sentinel EventKind reached projection::session::write — use sentinel writers"
-    );
+    // Sentinel kinds route through `write_recording_started` /
+    // `write_recording_ended` and must never reach this function
+    // (architecture.md:634-641). A runtime guard (not just `debug_assert!`)
+    // is required so release builds also cannot publish daemon-lifecycle
+    // sentinels through the user-facing broadcast path (story 2.2 AC #7).
+    // Reject before pool checkout so a misuse cannot insert a row, commit
+    // a transaction, or emit a broadcast envelope.
+    if matches!(
+        envelope.kind,
+        protocol::EventKind::RecordingStarted | protocol::EventKind::RecordingEnded
+    ) {
+        return Err(Error::Projection(format!(
+            "sentinel EventKind ({:?}) cannot be written through projection::session::write; \
+             use write_recording_started / write_recording_ended",
+            envelope.kind
+        )));
+    }
 
     let conn = writer_pool
         .get()
@@ -54,13 +72,24 @@ pub async fn write(
     let now_ms = current_unix_millis()?;
     let source = envelope.source;
     let session_id = envelope.session_id;
-    let kind_for_transition = envelope.kind.clone();
-    let kind_str = event_kind_as_str(&envelope.kind);
-    let reaction_str = envelope.reaction.as_ref().map(reaction_as_db_string);
+    let kind = envelope.kind;
+    let reaction = envelope.reaction;
     let payload = envelope.payload;
 
+    // The closure moves its captures, so duplicate the fields the post-commit
+    // publish path needs. SessionState is returned out of the closure to avoid
+    // recomputing `transition` against a post-commit DB (which would race with
+    // a future multi-writer world even though today's single-writer pool
+    // serializes writes).
+    let source_for_closure = source.clone();
+    let session_id_for_closure = session_id.clone();
+    let kind_for_transition = kind.clone();
+    let kind_str = event_kind_as_str(&kind);
+    let reaction_str = reaction.as_ref().map(reaction_as_db_string);
+    let payload_for_closure = payload.clone();
+
     let interact_res = conn
-        .interact(move |c| -> rusqlite::Result<i64> {
+        .interact(move |c| -> rusqlite::Result<(i64, SessionState)> {
             let tx = c.transaction()?;
 
             // Read the prior state inside the transaction so a concurrent
@@ -70,7 +99,7 @@ pub async fn write(
             let prev_state: Option<SessionState> = tx
                 .query_row(
                     SELECT_SESSION_PROJECTION_STATE,
-                    rusqlite::params![&source, &session_id],
+                    rusqlite::params![&source_for_closure, &session_id_for_closure],
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?
@@ -97,21 +126,61 @@ pub async fn write(
 
             tx.execute(
                 UPSERT_SESSION_PROJECTION,
-                rusqlite::params![source, session_id, state_json, now_ms],
+                rusqlite::params![
+                    source_for_closure,
+                    session_id_for_closure,
+                    state_json,
+                    now_ms
+                ],
             )?;
             tx.execute(
                 INSERT_EVENT,
-                rusqlite::params![source, session_id, kind_str, reaction_str, payload, now_ms],
+                rusqlite::params![
+                    source_for_closure,
+                    session_id_for_closure,
+                    kind_str,
+                    reaction_str,
+                    payload_for_closure,
+                    now_ms
+                ],
             )?;
             let id = tx.last_insert_rowid();
             tx.commit()?;
-            Ok(id)
+            Ok((id, new_state))
         })
         .await
         .map_err(|e| Error::Pool(format!("interact failed: {e}")))?;
 
-    let event_id = interact_res?;
-    Ok(EventId(event_id))
+    let (event_id_raw, new_state) = interact_res?;
+    let event_id = EventId(event_id_raw);
+
+    // Post-commit publish. Event BEFORE State so a presenter consuming both
+    // topics sees the triggering event before the resulting projection
+    // update. `tokio::sync::broadcast` preserves per-channel order across
+    // sequential publishes, so every subscriber sees Event → State in the
+    // same relative order; different subscribers may see them interleaved
+    // with other publishes but never reversed within their own stream.
+    let event = Event {
+        event_id,
+        source: source.clone(),
+        session_id: session_id.clone(),
+        kind,
+        reaction,
+        payload,
+        created_at: now_ms,
+    };
+    broadcaster.publish(BroadcastEnvelope::Event(event));
+    broadcaster.publish(BroadcastEnvelope::State {
+        source,
+        session_id,
+        state: new_state,
+    });
+    tracing::debug!(
+        event_id = event_id.0,
+        "ws: published event + state envelopes"
+    );
+
+    Ok(event_id)
 }
 
 /// Write the daemon's `RecordingStarted` sentinel atomically with the
