@@ -63,11 +63,14 @@ pub(super) async fn handle(
         Ok(_) => {}
     }
 
-    // If the read stopped at the take limit without finding a `\n`, the
-    // line is over the 1 MiB cap. Reject before JSON parse, enqueue, DB
-    // write, or broadcast — a direct socket writer could otherwise bypass
-    // the shim's matching cap and push an oversized payload into the
-    // broadcast ring.
+    // If the read stopped at the take limit without finding a `\n`,
+    // the line is over the daemon's wire cap (`MAX_INGEST_LINE_BYTES`
+    // = `SHIM_STDIN_CAP_BYTES + 4096`, NOT the shim's raw 1 MiB stdin
+    // cap — the daemon must accept shim-valid payloads slightly above
+    // 1 MiB once framing overhead is added). Reject before JSON parse,
+    // enqueue, DB write, or broadcast — a direct socket writer could
+    // otherwise bypass the shim's stdin cap and push an oversized
+    // payload into the broadcast ring.
     if buf.len() > MAX_INGEST_LINE_BYTES && !buf.ends_with('\n') {
         tracing::debug!(
             len = buf.len(),
