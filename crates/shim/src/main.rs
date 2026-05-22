@@ -8,7 +8,10 @@ use std::path::{Path, PathBuf};
 
 use error::{Error, Result};
 
-const MAX_STDIN_BYTES: usize = 1 << 20; // 1 MiB cap on hook payload
+/// 1 MiB cap on hook payload. Shared with the daemon's ingest wire cap
+/// (`crates/daemon/src/ingest/handler.rs::MAX_INGEST_LINE_BYTES`) via
+/// `protocol::SHIM_STDIN_CAP_BYTES` so the two sides can't drift.
+const MAX_STDIN_BYTES: usize = protocol::SHIM_STDIN_CAP_BYTES;
 
 fn main() {
     // Resolve log_path BEFORE attempting any work that might need to log.

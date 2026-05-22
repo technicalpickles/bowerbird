@@ -113,7 +113,9 @@ mod tests {
             Error::Stdin(dummy_io()),
             Error::StdinEmpty,
             Error::StdinNotJsonObject,
-            Error::StdinTooLarge { cap_bytes: 1 << 20 },
+            Error::StdinTooLarge {
+                cap_bytes: protocol::SHIM_STDIN_CAP_BYTES,
+            },
             Error::StdinJson(dummy_json_err()),
             Error::Connect {
                 path: PathBuf::from("/tmp/nope.sock"),

@@ -8,7 +8,7 @@ mod state;
 mod ws;
 
 pub use adapter::{AdapterMeta, NormalizeResult, SourceAdapter};
-pub use constants::SHIM_BINARY_NAME;
+pub use constants::{SHIM_BINARY_NAME, SHIM_STDIN_CAP_BYTES};
 pub use error::{Error, Result};
 pub use event::{Event, EventEnvelope, EventId, EventKind};
 pub use reaction::Reaction;
