@@ -8,7 +8,6 @@ use bowerbird_daemon::{
         self,
         token::{self, TokenSource},
     },
-    broadcast::BroadcastHub,
     config::Config,
     db::{init_pools, run_migrations, DbPools},
     ensure_bowerbird_dir, ingest, init_tracing, install_panic_hook, projection, set_crash_dir,
@@ -148,16 +147,21 @@ async fn run(config: Config) -> anyhow::Result<()> {
             config.ingest_sock_path.display()
         )
     })?;
-    // Construct the broadcaster BEFORE the ingest writer spawn so it can be
-    // threaded into the writer task. The same `Arc` lands in `AppState` below
-    // via `broadcaster.clone()`.
-    let broadcaster = Arc::new(BroadcastHub::new(config.ws_broadcast_capacity));
-    let ingest_writer_task = tokio::spawn(ingest::writer::run(
+    // `ingest::wire_writer` constructs the `BroadcastHub`, spawns the
+    // ingest writer with it, and returns the same `Arc` so the state
+    // below shares the channel with the writer by construction. The
+    // type rules out a class of regression where main.rs would
+    // otherwise create two hubs by mistake — integration tests call
+    // this same helper, so the production wiring stays exercised.
+    let ingest::IngestWiring {
+        broadcaster,
+        writer_task: ingest_writer_task,
+    } = ingest::wire_writer(
         ingest_rx,
         pools.writer.clone(),
-        broadcaster.clone(),
         shutdown.clone(),
-    ));
+        config.ws_broadcast_capacity,
+    );
     let ingest_listener_task = tokio::spawn(ingest::listener::run_bound(
         ingest_listener,
         config.ingest_sock_path.clone(),

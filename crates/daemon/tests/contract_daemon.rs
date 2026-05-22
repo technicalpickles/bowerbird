@@ -2442,7 +2442,9 @@ mod story_2_1_ws {
         // Yield so the daemon processes the subscribes before publish races.
         tokio::time::sleep(Duration::from_millis(20)).await;
 
-        state.broadcaster.publish_for_tests(make_state_envelope("sess-1"));
+        state
+            .broadcaster
+            .publish_for_tests(make_state_envelope("sess-1"));
         let msg = read_text_frame_or_close(&mut ws).await;
         let text = match msg {
             Message::Text(t) => t,
@@ -2477,7 +2479,9 @@ mod story_2_1_ws {
 
         // After unsubscribing from state.*, a state envelope must NOT arrive,
         // but an events envelope still should.
-        state.broadcaster.publish_for_tests(make_state_envelope("sess-2"));
+        state
+            .broadcaster
+            .publish_for_tests(make_state_envelope("sess-2"));
         state
             .broadcaster
             .publish_for_tests(make_event_envelope("claude", "sess-2"));
@@ -2714,7 +2718,9 @@ mod story_2_1_ws {
         // Publish a state envelope BEFORE any Subscribe has been processed.
         // The per-connection receiver was subscribed pre-upgrade, so this
         // envelope is buffered.
-        state.broadcaster.publish_for_tests(make_state_envelope("sess-1"));
+        state
+            .broadcaster
+            .publish_for_tests(make_state_envelope("sess-1"));
 
         // Give the daemon a moment to ensure the envelope reaches the
         // per-connection broadcast receiver buffer.
@@ -2730,7 +2736,9 @@ mod story_2_1_ws {
         // After subscribing, publish a fresh envelope so we have a known
         // post-subscribe frame to anchor the assertion.
         tokio::time::sleep(Duration::from_millis(20)).await;
-        state.broadcaster.publish_for_tests(make_state_envelope("sess-2"));
+        state
+            .broadcaster
+            .publish_for_tests(make_state_envelope("sess-2"));
 
         // We expect exactly ONE State frame to arrive — for sess-2.
         // If the pre-subscribe sess-1 frame leaked, we'd see sess-1 first.
@@ -3378,6 +3386,81 @@ mod story_2_2_publish {
         )
     }
 
+    /// Production-wiring helper: build an `AppState` whose
+    /// `broadcaster` field came from `ingest::wire_writer` — the same
+    /// helper `main.rs::run` calls. The returned `mpsc::Sender` and
+    /// `JoinHandle` are the ingest writer's channel and task. Tests
+    /// that exercise the ingest -> WS path should use this so a
+    /// `main.rs` regression that creates two hubs would also fail the
+    /// test.
+    async fn default_state_with_wire_writer(
+        pools: bowerbird_daemon::db::DbPools,
+        ws_max_conns: usize,
+        channel_capacity: usize,
+    ) -> (
+        AppState,
+        tokio::sync::mpsc::Sender<protocol::EventEnvelope>,
+        tokio::task::JoinHandle<()>,
+        tokio_util::sync::CancellationToken,
+    ) {
+        use bowerbird_daemon::api::token::BearerToken;
+        use bowerbird_daemon::state::WsConfig;
+        let ingest_shutdown = tokio_util::sync::CancellationToken::new();
+        let (tx, rx) = tokio::sync::mpsc::channel::<protocol::EventEnvelope>(channel_capacity);
+        let wiring = bowerbird_daemon::ingest::wire_writer(
+            rx,
+            pools.writer.clone(),
+            ingest_shutdown.clone(),
+            16,
+        );
+        let state = AppState {
+            db: pools,
+            migrations_complete: Arc::new(AtomicBool::new(true)),
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            bearer: BearerToken::new(TEST_BEARER.to_string()),
+            started_at_ms: 0,
+            broadcaster: wiring.broadcaster,
+            ws_semaphore: Arc::new(tokio::sync::Semaphore::new(ws_max_conns)),
+            ws_config: WsConfig {
+                ping_interval: Duration::from_secs(30),
+                pong_timeout: Duration::from_secs(10),
+            },
+        };
+        (state, tx, wiring.writer_task, ingest_shutdown)
+    }
+
+    /// Spawn the ingest listener with the caller-provided `tx` and
+    /// `shutdown`, so the writer (already spawned by
+    /// [`default_state_with_wire_writer`]) and the listener share the
+    /// same channel.
+    async fn spawn_ingest_listener_with_tx(
+        tmp: &tempfile::TempDir,
+        tx: tokio::sync::mpsc::Sender<protocol::EventEnvelope>,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> (
+        std::path::PathBuf,
+        tokio::task::JoinHandle<bowerbird_daemon::error::Result<()>>,
+    ) {
+        let sock_path = tmp.path().join("ingest.sock");
+        // Bind synchronously so the helper returns only after the
+        // socket exists and has the right mode — no race against a
+        // bounded `sleep` for the listener-running case below.
+        let listener =
+            bowerbird_daemon::ingest::listener::bind(&sock_path).expect("ingest listener bind");
+        let adapter = Arc::new(adapter_claude::ClaudeAdapter::new(
+            tmp.path().join("nonexistent-tool-reactions.toml"),
+        ));
+        let path_for_task = sock_path.clone();
+        let task = tokio::spawn(bowerbird_daemon::ingest::listener::run_bound(
+            listener,
+            path_for_task,
+            tx,
+            shutdown,
+            adapter,
+        ));
+        (sock_path, task)
+    }
+
     /// AC #1 — Three subscribers to `events.*` receive byte-identical
     /// `Event` frames in the same order.
     #[tokio::test(flavor = "current_thread")]
@@ -3593,15 +3676,17 @@ mod story_2_2_publish {
         // — the test-only affordance is the documented entry point for
         // synthetic envelopes that the production publish path cannot
         // produce.
-        state.broadcaster.publish_for_tests(BroadcastEnvelope::Event(Event {
-            event_id: EventId(99_999),
-            source: "codex".to_string(),
-            session_id: "sess-2".to_string(),
-            kind: EventKind::PreToolUse,
-            reaction: None,
-            payload: "{}".to_string(),
-            created_at: 0,
-        }));
+        state
+            .broadcaster
+            .publish_for_tests(BroadcastEnvelope::Event(Event {
+                event_id: EventId(99_999),
+                source: "codex".to_string(),
+                session_id: "sess-2".to_string(),
+                kind: EventKind::PreToolUse,
+                reaction: None,
+                payload: "{}".to_string(),
+                created_at: 0,
+            }));
 
         let timed = tokio::time::timeout(Duration::from_millis(300), ws.next()).await;
         assert!(
@@ -3957,33 +4042,22 @@ mod story_2_2_publish {
     /// End-to-end: a hook line delivered over the Unix ingest socket
     /// must round-trip through `ingest::writer::run` →
     /// `projection::session::write` and reach a WS subscriber as an
-    /// `Event` frame. This is the only test that exercises the *full*
-    /// production wiring story 2.2 introduced; the per-AC tests publish
-    /// via `projection::session::write` directly and would miss a
-    /// regression that swapped the writer task's broadcaster handle for
-    /// the wrong one or `None`.
+    /// `Event` frame. This test exercises the production broadcaster
+    /// wiring via `ingest::wire_writer` — the same helper
+    /// `main.rs::run` calls — so a regression that accidentally
+    /// creates two hubs in `main.rs` would fail here too.
     #[tokio::test(flavor = "current_thread")]
     async fn ingest_socket_event_reaches_ws_subscriber() {
-        use std::sync::Arc;
         use tempfile::TempDir;
 
         let (_dbtmp, pools) = fresh_pools().await;
-        let state = default_state(pools, 4);
+        let (state, ingest_tx, writer_handle, ingest_shutdown) =
+            default_state_with_wire_writer(pools, 4, 16).await;
         let (addr, _server) = spawn_test_daemon(state.clone()).await;
 
-        // Wire up the ingest stack against the same `AppState`. The
-        // listener spawns inside `start_ingest_listener`; we add a
-        // sibling `writer::run` consuming the channel and writing
-        // through `state.db.writer` + `state.broadcaster` so any wiring
-        // mistake on the broadcaster handle would be observable here.
         let sock_tmp = TempDir::new().expect("ingest tempdir");
-        let (ingest_shutdown, sock_path, rx) = super::start_ingest_listener(&sock_tmp, 16).await;
-        let writer_handle = tokio::spawn(bowerbird_daemon::ingest::writer::run(
-            rx,
-            state.db.writer.clone(),
-            Arc::clone(&state.broadcaster),
-            ingest_shutdown.clone(),
-        ));
+        let (sock_path, listener_handle) =
+            spawn_ingest_listener_with_tx(&sock_tmp, ingest_tx, ingest_shutdown.clone()).await;
 
         let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
         let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
@@ -4013,6 +4087,7 @@ mod story_2_2_publish {
         ingest_shutdown.cancel();
         // Closing the listener drops the sender; await the writer so
         // any tail publishes complete before the test tears down.
+        let _ = listener_handle.await;
         let _ = writer_handle.await;
         state.shutdown.cancel();
     }
@@ -4298,21 +4373,16 @@ mod story_2_2_publish {
     /// oversized payload is cloned into the broadcast ring.
     #[tokio::test(flavor = "current_thread")]
     async fn ingest_oversized_line_rejected_before_broadcast() {
-        use std::sync::Arc;
         use tempfile::TempDir;
 
         let (_dbtmp, pools) = fresh_pools().await;
-        let state = default_state(pools, 4);
+        let (state, ingest_tx, writer_handle, ingest_shutdown) =
+            default_state_with_wire_writer(pools, 4, 16).await;
         let (addr, _server) = spawn_test_daemon(state.clone()).await;
 
         let sock_tmp = TempDir::new().expect("ingest tempdir");
-        let (ingest_shutdown, sock_path, rx) = super::start_ingest_listener(&sock_tmp, 16).await;
-        let writer_handle = tokio::spawn(bowerbird_daemon::ingest::writer::run(
-            rx,
-            state.db.writer.clone(),
-            Arc::clone(&state.broadcaster),
-            ingest_shutdown.clone(),
-        ));
+        let (sock_path, listener_handle) =
+            spawn_ingest_listener_with_tx(&sock_tmp, ingest_tx, ingest_shutdown.clone()).await;
 
         let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
         let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
@@ -4378,6 +4448,7 @@ mod story_2_2_publish {
         );
 
         ingest_shutdown.cancel();
+        let _ = listener_handle.await;
         let _ = writer_handle.await;
         state.shutdown.cancel();
     }
@@ -4392,21 +4463,16 @@ mod story_2_2_publish {
     /// these shim-valid payloads.
     #[tokio::test(flavor = "current_thread")]
     async fn ingest_near_shim_cap_line_accepted() {
-        use std::sync::Arc;
         use tempfile::TempDir;
 
         let (_dbtmp, pools) = fresh_pools().await;
-        let state = default_state(pools, 4);
+        let (state, ingest_tx, writer_handle, ingest_shutdown) =
+            default_state_with_wire_writer(pools, 4, 16).await;
         let (addr, _server) = spawn_test_daemon(state.clone()).await;
 
         let sock_tmp = TempDir::new().expect("ingest tempdir");
-        let (ingest_shutdown, sock_path, rx) = super::start_ingest_listener(&sock_tmp, 16).await;
-        let writer_handle = tokio::spawn(bowerbird_daemon::ingest::writer::run(
-            rx,
-            state.db.writer.clone(),
-            Arc::clone(&state.broadcaster),
-            ingest_shutdown.clone(),
-        ));
+        let (sock_path, listener_handle) =
+            spawn_ingest_listener_with_tx(&sock_tmp, ingest_tx, ingest_shutdown.clone()).await;
 
         let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
         let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
@@ -4458,6 +4524,7 @@ mod story_2_2_publish {
         assert_eq!(event.session_id, "sess-near-cap");
 
         ingest_shutdown.cancel();
+        let _ = listener_handle.await;
         let _ = writer_handle.await;
         state.shutdown.cancel();
     }
