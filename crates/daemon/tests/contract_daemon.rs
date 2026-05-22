@@ -2442,7 +2442,7 @@ mod story_2_1_ws {
         // Yield so the daemon processes the subscribes before publish races.
         tokio::time::sleep(Duration::from_millis(20)).await;
 
-        state.broadcaster.publish(make_state_envelope("sess-1"));
+        state.broadcaster.publish_for_tests(make_state_envelope("sess-1"));
         let msg = read_text_frame_or_close(&mut ws).await;
         let text = match msg {
             Message::Text(t) => t,
@@ -2456,7 +2456,7 @@ mod story_2_1_ws {
 
         state
             .broadcaster
-            .publish(make_event_envelope("claude", "sess-1"));
+            .publish_for_tests(make_event_envelope("claude", "sess-1"));
         let msg = read_text_frame_or_close(&mut ws).await;
         let text = match msg {
             Message::Text(t) => t,
@@ -2477,10 +2477,10 @@ mod story_2_1_ws {
 
         // After unsubscribing from state.*, a state envelope must NOT arrive,
         // but an events envelope still should.
-        state.broadcaster.publish(make_state_envelope("sess-2"));
+        state.broadcaster.publish_for_tests(make_state_envelope("sess-2"));
         state
             .broadcaster
-            .publish(make_event_envelope("claude", "sess-2"));
+            .publish_for_tests(make_event_envelope("claude", "sess-2"));
 
         let msg = read_text_frame_or_close(&mut ws).await;
         let text = match msg {
@@ -2714,7 +2714,7 @@ mod story_2_1_ws {
         // Publish a state envelope BEFORE any Subscribe has been processed.
         // The per-connection receiver was subscribed pre-upgrade, so this
         // envelope is buffered.
-        state.broadcaster.publish(make_state_envelope("sess-1"));
+        state.broadcaster.publish_for_tests(make_state_envelope("sess-1"));
 
         // Give the daemon a moment to ensure the envelope reaches the
         // per-connection broadcast receiver buffer.
@@ -2730,7 +2730,7 @@ mod story_2_1_ws {
         // After subscribing, publish a fresh envelope so we have a known
         // post-subscribe frame to anchor the assertion.
         tokio::time::sleep(Duration::from_millis(20)).await;
-        state.broadcaster.publish(make_state_envelope("sess-2"));
+        state.broadcaster.publish_for_tests(make_state_envelope("sess-2"));
 
         // We expect exactly ONE State frame to arrive — for sess-2.
         // If the pre-subscribe sess-1 frame leaked, we'd see sess-1 first.
@@ -3250,7 +3250,7 @@ mod story_2_2_publish {
             latest_token = TOKEN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             state
                 .broadcaster
-                .publish(build_probe_with_token(probe, latest_token));
+                .publish_for_tests(build_probe_with_token(probe, latest_token));
 
             for (i, ws) in clients.iter_mut().enumerate() {
                 // Drain everything currently queued on this client.
@@ -3344,7 +3344,7 @@ mod story_2_2_publish {
 
     /// Drives the REAL `projection::session::write` path so the broadcast
     /// envelopes are produced by the production publisher, not a synthetic
-    /// `state.broadcaster.publish(...)` shortcut.
+    /// `state.broadcaster.publish_for_tests(...)` shortcut.
     async fn publish_via_projection(
         state: &AppState,
         source: &str,
@@ -3587,8 +3587,13 @@ mod story_2_2_publish {
         assert_eq!(event.source, "claude");
         assert_eq!(event.event_id, id_claude);
 
-        // Synthetic codex event (simulating a future second-source adapter).
-        state.broadcaster.publish(BroadcastEnvelope::Event(Event {
+        // Synthetic codex event (simulating a future second-source
+        // adapter). Uses `publish_for_tests` because production
+        // publishes go exclusively through `projection::session::write`
+        // — the test-only affordance is the documented entry point for
+        // synthetic envelopes that the production publish path cannot
+        // produce.
+        state.broadcaster.publish_for_tests(BroadcastEnvelope::Event(Event {
             event_id: EventId(99_999),
             source: "codex".to_string(),
             session_id: "sess-2".to_string(),

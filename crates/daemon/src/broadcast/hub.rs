@@ -64,15 +64,30 @@ impl BroadcastHub {
     }
 
     /// Publish — called by `projection::session::write` for every
-    /// committed event (Story 2.2). Test code may also call this
-    /// directly as a synthetic publisher for topic-filter coverage; the
-    /// production publish path goes exclusively through
-    /// `projection::session::write` to keep publishing commit-gated
-    /// (Story 2.2 AC #6).
-    pub fn publish(&self, envelope: BroadcastEnvelope) {
+    /// committed event (Story 2.2). Crate-private on purpose: the only
+    /// production caller is `projection::session::write`, which keeps
+    /// publishing commit-gated and filtered through the sentinel-kind
+    /// and reserved-source guards (Story 2.2 ACs #6 and #7). External
+    /// crates use [`Self::publish_for_tests`] for synthetic probes.
+    pub(crate) fn publish(&self, envelope: BroadcastEnvelope) {
         // SendError is fine to swallow: it only happens when there are zero
         // subscribers, which is the normal idle daemon state.
         let _ = self.tx.send(envelope);
+    }
+
+    /// Test-only synthetic publisher. Mirrors [`Self::publish`] but is
+    /// reachable from integration tests (which see this crate as
+    /// external). The name is intentionally distinct so a future
+    /// production callsite outside `projection::session::write` cannot
+    /// accidentally bypass commit-gating by reaching for "publish."
+    ///
+    /// Production code MUST NOT call this. The only legitimate uses are
+    /// readiness probes (`wait_subscribe_live`) and topic-filter
+    /// coverage that needs to inject envelopes the production publish
+    /// path cannot produce (e.g. a synthetic non-`claude` event).
+    #[doc(hidden)]
+    pub fn publish_for_tests(&self, envelope: BroadcastEnvelope) {
+        self.publish(envelope);
     }
 }
 
