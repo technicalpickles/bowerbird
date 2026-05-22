@@ -28,8 +28,24 @@ impl BroadcastHub {
     /// pair contract.
     const MIN_CAPACITY: usize = 2;
 
+    /// Construct a hub whose channel capacity is at least
+    /// [`Self::MIN_CAPACITY`] AND rounded up to an even number.
+    ///
+    /// The even-rounding is defense-in-depth for small odd raw
+    /// capacities (`3`, `5`, …). Each committed write publishes the
+    /// Event-then-State pair, so the ring naturally holds whole pairs
+    /// when capacity is even; rounding `3 → 4` makes "two pairs fit
+    /// without `Lagged`" hold true. Even rounding does NOT solve all
+    /// lag-recovery scenarios — once published count exceeds the
+    /// rounded capacity, a lagged receiver can still recover on a
+    /// `State` boundary depending on parity. The full pair-aware
+    /// recovery story lives in Story 2.4's Lagged → `DroppedFrame`
+    /// projection.
     pub fn new(capacity: usize) -> Self {
         let capacity = capacity.max(Self::MIN_CAPACITY);
+        // `% 2` yields 1 for odd capacities and 0 for even ones, so this
+        // rounds odd capacities up by one and leaves even ones alone.
+        let capacity = capacity + (capacity % 2);
         let (tx, _rx) = broadcast::channel(capacity);
         Self { tx }
     }
@@ -100,5 +116,48 @@ mod tests {
                 "raw_capacity={raw_capacity}: expected State, got {second:?}"
             );
         }
+    }
+
+    /// Odd raw capacities (`3`, `5`, …) must be rounded up to even by
+    /// `BroadcastHub::new` so two whole Event+State pairs fit without
+    /// `Lagged`. Without the rounding, raw capacity `3` would evict
+    /// `Event1` after the second pair publishes, leaving a lagged
+    /// subscriber to recover on `State1` (an orphaned state frame).
+    #[tokio::test(flavor = "current_thread")]
+    async fn odd_capacity_rounds_up_to_hold_two_pairs() {
+        let hub = BroadcastHub::new(3); // rounded up to 4 internally
+        let mut rx = hub.subscribe();
+
+        // Publish two pairs without reading. With capacity = 4, the
+        // ring holds all four envelopes and no `Lagged` fires.
+        hub.publish(dummy_event(1));
+        hub.publish(dummy_state());
+        hub.publish(dummy_event(2));
+        hub.publish(dummy_state());
+
+        // The first deliverable envelope must be `Event1` — broadcast
+        // ordering plus pair-fitting capacity guarantees pair-aligned
+        // recovery for this scenario. A raw capacity of `3` (no
+        // rounding) would deliver `State1` here instead.
+        let first = rx.recv().await.expect("first recv");
+        assert!(
+            matches!(first, BroadcastEnvelope::Event(ref e) if e.event_id.0 == 1),
+            "odd-capacity rounding broken: expected Event(1) first, got {first:?}"
+        );
+        let second = rx.recv().await.expect("second recv");
+        assert!(
+            matches!(second, BroadcastEnvelope::State { .. }),
+            "expected State after Event(1), got {second:?}"
+        );
+        let third = rx.recv().await.expect("third recv");
+        assert!(
+            matches!(third, BroadcastEnvelope::Event(ref e) if e.event_id.0 == 2),
+            "expected Event(2) after State1, got {third:?}"
+        );
+        let fourth = rx.recv().await.expect("fourth recv");
+        assert!(
+            matches!(fourth, BroadcastEnvelope::State { .. }),
+            "expected State after Event(2), got {fourth:?}"
+        );
     }
 }
