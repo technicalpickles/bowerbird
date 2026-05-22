@@ -62,9 +62,7 @@ pub(super) async fn handle(
             "ingest: line exceeded max cap"
         );
         let _ = write_half
-            .write_all(
-                format!("400 line exceeds {MAX_INGEST_LINE_BYTES}-byte cap\n").as_bytes(),
-            )
+            .write_all(format!("400 line exceeds {MAX_INGEST_LINE_BYTES}-byte cap\n").as_bytes())
             .await;
         let _ = write_half.flush().await;
         return;

@@ -3070,18 +3070,33 @@ mod story_2_2_publish {
     /// stream).
     ///
     /// Convention:
-    /// - **Event probe:** `source` matches the subscription's required
-    ///   source; `session_id` is fixed to `"__probe__"`.
-    /// - **State probe:** `session_id` matches the subscription's required
-    ///   `session_id` (or any value for wildcard subs); `source` is fixed
-    ///   to `"__probe__"`.
+    /// - **`Event`:** wildcard-style readiness — `source` matches the
+    ///   subscription's required source; `session_id` carries the token
+    ///   marker. Works for `events.*` and `events.<source>.*`
+    ///   subscriptions.
+    /// - **`EventForSession`:** exact-form readiness — `source` AND
+    ///   `session_id` both match the exact subscription
+    ///   `events.<source>.<session_id>`. The token marker rides in
+    ///   `payload` because `session_id` is needed for topic matching.
+    /// - **`State`:** `session_id` matches the subscription's required
+    ///   `session_id` (or any value for wildcard subs); `source` carries
+    ///   the token marker. Works for `state.session.*`,
+    ///   `state.session.<id>`, and `state.session.<id>.current_state`.
     ///
-    /// Real test envelopes use real `source`/`session_id` values, so the
-    /// `__probe__` magic is reliably distinguishable.
+    /// Real test envelopes never use the `__probe-N__` marker form, so
+    /// probe/real disambiguation stays reliable.
     #[derive(Clone, Copy)]
     enum ProbeKind {
-        Event { source: &'static str },
-        State { session_id: &'static str },
+        Event {
+            source: &'static str,
+        },
+        EventForSession {
+            source: &'static str,
+            session_id: &'static str,
+        },
+        State {
+            session_id: &'static str,
+        },
     }
 
     /// Per-attempt probe identifier. Each `wait_subscribe_live*` loop
@@ -3106,6 +3121,22 @@ mod story_2_2_publish {
                 payload: "{}".to_string(),
                 created_at: 0,
             }),
+            ProbeKind::EventForSession { source, session_id } => {
+                BroadcastEnvelope::Event(Event {
+                    event_id: EventId(0),
+                    source: source.to_string(),
+                    // session_id MUST equal the exact subscription's
+                    // session_id so the topic matcher dispatches; the
+                    // token therefore rides in `payload` instead. Real
+                    // test events never put `__probe-N__` in payload, so
+                    // probe/real disambiguation stays clean.
+                    session_id: session_id.to_string(),
+                    kind: EventKind::PreToolUse,
+                    reaction: None,
+                    payload: format!(r#"{{"{token_str}":true}}"#),
+                    created_at: 0,
+                })
+            }
             ProbeKind::State { session_id } => BroadcastEnvelope::State {
                 // Token rides in `source` so wildcard or session-keyed
                 // State subscriptions still match by `session_id` while
@@ -3129,15 +3160,29 @@ mod story_2_2_publish {
             _ => return None,
         };
         let server: ServerMessage = serde_json::from_str(text).ok()?;
-        let marker = match server {
-            ServerMessage::Event(f) => f.event.session_id,
-            ServerMessage::State(f) => f.source,
-            _ => return None,
-        };
-        marker
-            .strip_prefix("__probe-")
-            .and_then(|rest| rest.strip_suffix("__"))
-            .and_then(|num| num.parse::<u64>().ok())
+        match server {
+            ServerMessage::Event(f) => {
+                // Wildcard-event probes carry the token in session_id; the
+                // exact-session variant moves it into payload so the topic
+                // matcher can still dispatch the probe to the subscriber.
+                parse_probe_marker(&f.event.session_id)
+                    .or_else(|| parse_probe_marker(&f.event.payload))
+            }
+            ServerMessage::State(f) => parse_probe_marker(&f.source),
+            _ => None,
+        }
+    }
+
+    /// Find a `__probe-N__` marker anywhere in `s` and return `N`. The
+    /// EventForSession probe encodes it as a key inside a JSON object
+    /// (`{"__probe-5__":true}`); the wildcard probes plant it as a whole
+    /// field value (`"__probe-5__"`). Both cases are covered by a
+    /// substring search bounded by the next `__`.
+    fn parse_probe_marker(s: &str) -> Option<u64> {
+        let start = s.find("__probe-")? + "__probe-".len();
+        let rest = &s[start..];
+        let end = rest.find("__")?;
+        rest[..end].parse::<u64>().ok()
     }
 
     /// True if `msg` is a probe of the same kind currently being probed
@@ -3158,6 +3203,7 @@ mod story_2_2_publish {
         matches!(
             (server, kind),
             (ServerMessage::Event(_), ProbeKind::Event { .. })
+                | (ServerMessage::Event(_), ProbeKind::EventForSession { .. })
                 | (ServerMessage::State(_), ProbeKind::State { .. })
         )
     }
@@ -3915,6 +3961,257 @@ mod story_2_2_publish {
         // Closing the listener drops the sender; await the writer so
         // any tail publishes complete before the test tears down.
         let _ = writer_handle.await;
+        state.shutdown.cancel();
+    }
+
+    /// AC #2 — Every published `State` frame carries the full
+    /// `SessionState { current_state, last_event_kind, last_event_at_ms }`
+    /// plus its originating `source` and `session_id`. A regression that
+    /// reset any field or that confused two concurrent sessions' fields
+    /// would be invisible to the existing tests, which mostly check
+    /// `session_id` alone.
+    #[tokio::test(flavor = "current_thread")]
+    async fn state_frame_carries_full_session_state() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 4);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+        wait_subscribe_live(
+            &mut ws,
+            &state,
+            ProbeKind::State {
+                session_id: "__probe__",
+            },
+        )
+        .await;
+
+        let before_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis() as i64;
+
+        // PreToolUse drives the projection to Working.
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-full",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+        let frame = read_text_frame_or_close(&mut ws).await;
+        let pre = parse_state_frame(&frame);
+        assert_eq!(pre.source, "claude", "PreToolUse: source must be present");
+        assert_eq!(pre.session_id, "sess-full");
+        assert_eq!(
+            pre.state.current_state,
+            SessionCurrentState::Working,
+            "PreToolUse must transition to Working"
+        );
+        assert_eq!(pre.state.last_event_kind, EventKind::PreToolUse);
+        assert!(
+            pre.state.last_event_at_ms >= before_ms,
+            "last_event_at_ms ({}) must reflect publish-time clock, not 0 or older than test start ({before_ms})",
+            pre.state.last_event_at_ms
+        );
+
+        // PostToolUse drives the projection back to Idle. last_event_at_ms
+        // must not go backwards.
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-full",
+            EventKind::PostToolUse,
+            None,
+            "{}",
+        )
+        .await;
+        let frame = read_text_frame_or_close(&mut ws).await;
+        let post = parse_state_frame(&frame);
+        assert_eq!(post.source, "claude");
+        assert_eq!(post.session_id, "sess-full");
+        assert_eq!(
+            post.state.current_state,
+            SessionCurrentState::Idle,
+            "PostToolUse must transition Working -> Idle"
+        );
+        assert_eq!(post.state.last_event_kind, EventKind::PostToolUse);
+        assert!(
+            post.state.last_event_at_ms >= pre.state.last_event_at_ms,
+            "PostToolUse last_event_at_ms ({}) must be >= PreToolUse ({})",
+            post.state.last_event_at_ms,
+            pre.state.last_event_at_ms,
+        );
+
+        state.shutdown.cancel();
+    }
+
+    /// AC #2 + AC #3 — Exact (non-wildcard) topic forms work end-to-end
+    /// through the production publish path. `events.<source>.<session_id>`
+    /// and `state.session.<id>` must each deliver matching events while
+    /// filtering out other sessions on the same source. The other
+    /// existing tests cover wildcards (`events.*`, `events.claude.*`,
+    /// `state.session.*`); this one nails down the exact forms.
+    #[tokio::test(flavor = "current_thread")]
+    async fn exact_event_and_state_topic_forms_match_live() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 4);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"events.claude.sess-exact"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe events exact");
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.sess-exact"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe state exact");
+
+        // Wait for both topic classes to be live. Probes must match the
+        // *exact* subscribed topics, so we use:
+        // - `EventForSession` for `events.claude.sess-exact` — the probe
+        //   plants `source = "claude"` AND `session_id = "sess-exact"`
+        //   (token moves into `payload`).
+        // - `State { session_id = "sess-exact" }` for
+        //   `state.session.sess-exact` — the exact-id state probe
+        //   matches both wildcard and exact state topics.
+        wait_subscribe_live(
+            &mut ws,
+            &state,
+            ProbeKind::EventForSession {
+                source: "claude",
+                session_id: "sess-exact",
+            },
+        )
+        .await;
+        wait_subscribe_live(
+            &mut ws,
+            &state,
+            ProbeKind::State {
+                session_id: "sess-exact",
+            },
+        )
+        .await;
+
+        // Positive case: publish for the exact session — both Event and
+        // State frames must arrive, in that order.
+        let id = publish_via_projection(
+            &state,
+            "claude",
+            "sess-exact",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+        let f1 = read_text_frame_or_close(&mut ws).await;
+        let event = parse_event_frame(&f1);
+        assert_eq!(event.event_id, id);
+        assert_eq!(event.source, "claude");
+        assert_eq!(event.session_id, "sess-exact");
+
+        let f2 = read_text_frame_or_close(&mut ws).await;
+        let st = parse_state_frame(&f2);
+        assert_eq!(st.source, "claude");
+        assert_eq!(st.session_id, "sess-exact");
+
+        // Negative case: publish for a different session on the same
+        // source — neither exact topic matches, so no frame arrives.
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-other",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+        let timed = tokio::time::timeout(Duration::from_millis(300), ws.next()).await;
+        assert!(
+            timed.is_err(),
+            "exact-topic subscriber must not receive frames for a different session_id; got {timed:?}"
+        );
+
+        state.shutdown.cancel();
+    }
+
+    /// AC #5 (abrupt-close variant) — A surviving subscriber continues
+    /// to receive frames in order with NO duplicates when the peer
+    /// client is closed abruptly (TCP drop without a graceful Close
+    /// frame). The existing `consumer_independence_and_semaphore_release`
+    /// uses a graceful close; abrupt close is the harder case because
+    /// the dispatch task only learns the peer is gone once it tries to
+    /// send and fails.
+    #[tokio::test(flavor = "current_thread")]
+    async fn consumer_independence_abrupt_close_no_duplicates() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 4);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let (mut ws_a, _) = connect_authed(addr, TEST_BEARER).await;
+        let (mut ws_b, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws_a).await);
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws_b).await);
+
+        for ws in [&mut ws_a, &mut ws_b] {
+            ws.send(Message::Text(
+                r#"{"op":"subscribe","topic":"events.*"}"#.into(),
+            ))
+            .await
+            .expect("send subscribe");
+        }
+        wait_subscribe_live_all(
+            &mut [&mut ws_a, &mut ws_b],
+            &state,
+            ProbeKind::Event { source: "claude" },
+        )
+        .await;
+
+        // Abrupt close: drop A without sending a graceful Close frame.
+        // The per-conn task only discovers the peer is gone on its next
+        // send attempt — exactly the case AC #5 names.
+        drop(ws_a);
+
+        // Publish three distinct events. Each must arrive on B exactly
+        // once and in publication order.
+        let mut expected_ids = Vec::with_capacity(3);
+        for sid in &["sess-1", "sess-2", "sess-3"] {
+            let id =
+                publish_via_projection(&state, "claude", sid, EventKind::PreToolUse, None, "{}")
+                    .await;
+            expected_ids.push((*sid, id));
+        }
+
+        for (sid, expected_id) in &expected_ids {
+            let frame = read_text_frame_or_close(&mut ws_b).await;
+            let event = parse_event_frame(&frame);
+            assert_eq!(
+                event.event_id, *expected_id,
+                "event_id mismatch for sess={sid}"
+            );
+            assert_eq!(event.session_id, *sid);
+        }
+
+        // No fourth frame — confirms no duplicate delivery to B even
+        // after the peer's abrupt disconnect.
+        let timed = tokio::time::timeout(Duration::from_millis(300), ws_b.next()).await;
+        assert!(
+            timed.is_err(),
+            "surviving subscriber must not receive duplicate or surplus frames after abrupt peer close; got {timed:?}"
+        );
+
         state.shutdown.cancel();
     }
 
