@@ -3727,6 +3727,73 @@ mod story_2_2_publish {
         state.shutdown.cancel();
     }
 
+    /// AC #7 (defense in depth) — `projection::session::write` rejects
+    /// the reserved `source = "__daemon__"` at the same boundary as the
+    /// sentinel-kind guard, so a non-sentinel kind paired with the
+    /// daemon source (e.g. `PreToolUse` from `"__daemon__"`) cannot be
+    /// hidden from REST yet still broadcast to WS subscribers.
+    #[tokio::test(flavor = "current_thread")]
+    async fn projection_write_rejects_daemon_source_at_runtime() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 4);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"events.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+        wait_subscribe_live(&mut ws, &state, ProbeKind::Event { source: "claude" }).await;
+
+        // Non-sentinel kind, daemon-reserved source — must be rejected
+        // before pool checkout.
+        let err = bowerbird_daemon::projection::session::write(
+            &state.db.writer,
+            &state.broadcaster,
+            EventEnvelope {
+                source: "__daemon__".to_string(),
+                session_id: "sess-pretend".to_string(),
+                kind: EventKind::PreToolUse,
+                reaction: None,
+                payload: "{}".to_string(),
+            },
+        )
+        .await
+        .expect_err("daemon-reserved source must be rejected");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("reserved source"),
+            "error must name reserved source as the cause; got {msg}"
+        );
+
+        // No broadcast envelope was published.
+        let timed = tokio::time::timeout(Duration::from_millis(300), ws.next()).await;
+        assert!(
+            timed.is_err(),
+            "rejected daemon-source write must not produce a broadcast frame; got {timed:?}"
+        );
+
+        // No event row was inserted (only the reserved-source check fires;
+        // no transaction is started).
+        let conn = state.db.reader.get().await.expect("reader get");
+        let count: i64 = conn
+            .interact(|c| -> rusqlite::Result<i64> {
+                c.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            })
+            .await
+            .expect("interact")
+            .expect("count");
+        assert_eq!(
+            count, 0,
+            "daemon-source-rejected writes must not insert rows"
+        );
+
+        state.shutdown.cancel();
+    }
+
     /// AC #7 — Sentinel writes (`write_recording_started`,
     /// `write_recording_ended`) do NOT publish. Subscriber to `events.*`
     /// receives nothing for the sentinel, then receives a frame for a

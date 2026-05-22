@@ -64,6 +64,22 @@ pub async fn write(
         )));
     }
 
+    // `__daemon__` is the reserved source for daemon-lifecycle rows
+    // (story 1.7 excludes it from `GET /sessions`, story 2.2 must keep
+    // it off the WS surface). Sentinel-kind callers route through
+    // `write_recording_started` / `write_recording_ended`, but a future
+    // caller could otherwise pass `source = "__daemon__"` paired with a
+    // non-sentinel kind (e.g. `PreToolUse`) — the row would be hidden
+    // from REST but still broadcast to `events.*` and `state.session.*`.
+    // Reject at the same boundary as the sentinel-kind guard.
+    if envelope.source == DAEMON_SENTINEL_SOURCE {
+        return Err(Error::Projection(format!(
+            "reserved source ({:?}) cannot be written through projection::session::write; \
+             use write_recording_started / write_recording_ended for daemon lifecycle",
+            DAEMON_SENTINEL_SOURCE
+        )));
+    }
+
     let conn = writer_pool
         .get()
         .await
