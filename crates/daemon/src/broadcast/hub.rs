@@ -36,8 +36,18 @@ impl BroadcastHub {
     /// pair contract.
     const MIN_CAPACITY: usize = 2;
 
+    /// Upper bound on the normalized broadcast-channel capacity.
+    /// `tokio::sync::broadcast::channel(N)` allocates internal state
+    /// roughly proportional to `N`, and `usize::MAX` (or any
+    /// near-max value) would crash startup with OOM or panic in
+    /// tokio's own size checks. The cap is set well above any
+    /// reasonable production value (`1024` is the default) so the
+    /// guard is invisible to anyone except misconfigurations.
+    const MAX_CAPACITY: usize = 1 << 20;
+
     /// Construct a hub whose channel capacity is at least
-    /// [`Self::MIN_CAPACITY`] AND rounded up to an even number.
+    /// [`Self::MIN_CAPACITY`], at most [`Self::MAX_CAPACITY`], AND
+    /// rounded up to an even number.
     ///
     /// The even-rounding is defense-in-depth for small odd raw
     /// capacities (`3`, `5`, …). Each committed write publishes the
@@ -50,12 +60,26 @@ impl BroadcastHub {
     /// recovery story lives in Story 2.4's Lagged → `DroppedFrame`
     /// projection.
     pub fn new(capacity: usize) -> Self {
-        let capacity = capacity.max(Self::MIN_CAPACITY);
-        // `% 2` yields 1 for odd capacities and 0 for even ones, so this
-        // rounds odd capacities up by one and leaves even ones alone.
-        let capacity = capacity + (capacity % 2);
+        let capacity = Self::normalize_capacity(capacity);
         let (tx, _rx) = broadcast::channel(capacity);
         Self { tx }
+    }
+
+    /// Apply min / max clamps and round up to an even number. Pulled
+    /// out so the normalization can be unit-tested independently of
+    /// channel construction (`tokio::sync::broadcast::channel` would
+    /// allocate state for the test capacity otherwise).
+    ///
+    /// The clamp ORDER matters: cap BEFORE rounding so the `+ (raw %
+    /// 2)` cannot overflow on `usize::MAX` (where `raw % 2 == 1` and
+    /// the add would wrap to `0` in release builds, panic in debug).
+    fn normalize_capacity(raw: usize) -> usize {
+        let floored = raw.max(Self::MIN_CAPACITY);
+        let capped = floored.min(Self::MAX_CAPACITY);
+        // `% 2` yields 1 for odd capacities and 0 for even ones, so
+        // this rounds odd capacities up by one and leaves even ones
+        // alone. After the cap, the add cannot overflow.
+        capped + (capped % 2)
     }
 
     /// Subscribe — every new WS connection calls this once.
@@ -142,6 +166,48 @@ mod tests {
                 "raw_capacity={raw_capacity}: expected State, got {second:?}"
             );
         }
+    }
+
+    /// `normalize_capacity` must be safe for every `usize` input — the
+    /// raw cap-and-round-up could otherwise overflow on `usize::MAX`
+    /// (the add of `% 2 == 1` would wrap to `0` in release, panic in
+    /// debug, leaving `broadcast::channel(0)` to panic with "capacity
+    /// cannot be zero").
+    #[test]
+    fn normalize_capacity_covers_all_relevant_boundaries() {
+        // Below the floor — both clamp up to MIN_CAPACITY (2), already
+        // even, no rounding needed.
+        assert_eq!(BroadcastHub::normalize_capacity(0), 2);
+        assert_eq!(BroadcastHub::normalize_capacity(1), 2);
+        // At the floor — already even, untouched.
+        assert_eq!(BroadcastHub::normalize_capacity(2), 2);
+        // Odd above the floor — rounded up.
+        assert_eq!(BroadcastHub::normalize_capacity(3), 4);
+        assert_eq!(BroadcastHub::normalize_capacity(5), 6);
+        // Normal even value — untouched.
+        assert_eq!(BroadcastHub::normalize_capacity(1024), 1024);
+        // At MAX_CAPACITY — untouched (even by construction).
+        assert_eq!(
+            BroadcastHub::normalize_capacity(BroadcastHub::MAX_CAPACITY),
+            BroadcastHub::MAX_CAPACITY
+        );
+        // Above MAX_CAPACITY — clamped down (the cap is even, so
+        // rounding adds nothing).
+        assert_eq!(
+            BroadcastHub::normalize_capacity(BroadcastHub::MAX_CAPACITY + 1),
+            BroadcastHub::MAX_CAPACITY
+        );
+        // `usize::MAX` (the overflow concern) — clamped to
+        // `MAX_CAPACITY`, no wrap.
+        assert_eq!(
+            BroadcastHub::normalize_capacity(usize::MAX),
+            BroadcastHub::MAX_CAPACITY
+        );
+        // `usize::MAX - 1` (even but still huge) — same clamp.
+        assert_eq!(
+            BroadcastHub::normalize_capacity(usize::MAX - 1),
+            BroadcastHub::MAX_CAPACITY
+        );
     }
 
     /// Odd raw capacities (`3`, `5`, …) must be rounded up to even by
