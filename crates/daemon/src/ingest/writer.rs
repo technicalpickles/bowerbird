@@ -28,6 +28,15 @@ pub async fn run(
                 }
             }
             _ = shutdown.cancelled() => {
+                // Close the receiver BEFORE draining so handlers that
+                // still hold a `tx.clone()` cannot win the race where
+                // `try_send` succeeds (handler returns 200) but the
+                // writer has already exited (event undrained). After
+                // `rx.close()`, every subsequent `tx.try_send` returns
+                // `Err(Closed)` so the handler responds 503 instead.
+                // Sends that completed before `close` remain in the
+                // channel and are drained below.
+                rx.close();
                 // Events accepted before shutdown still commit and publish
                 // during drain so the SQLite + broadcast paths agree about
                 // what was accepted. Whether attached WS clients actually
@@ -36,7 +45,12 @@ pub async fn run(
                 // may already have exited their dispatch loop before the
                 // drain finishes. End-to-end WS flush semantics are
                 // deferred to story 2.5's graceful-shutdown design.
-                while let Ok(envelope) = rx.try_recv() {
+                //
+                // `recv().await` (vs `try_recv`) lets the writer block
+                // until the channel is empty AND closed (all `tx` clones
+                // dropped), so concurrent sends that won the race before
+                // `close` still drain instead of being silently lost.
+                while let Some(envelope) = rx.recv().await {
                     if let Err(e) = projection::session::write(&writer_pool, &broadcaster, envelope).await {
                         tracing::error!(error = ?e, "projection write failed during drain; event dropped");
                     }

@@ -4457,6 +4457,99 @@ mod story_2_2_publish {
         state.shutdown.cancel();
     }
 
+    /// Story 2.2 fifth-round patch (1/8) — the writer's shutdown branch
+    /// must close the receiver BEFORE draining, so a handler that still
+    /// holds `tx.clone()` cannot `try_send` after the writer has
+    /// exited. The safety invariant: any `try_send` that returns `Ok`
+    /// corresponds to an envelope that was committed and published; any
+    /// `try_send` after the writer exits returns `Err`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn writer_shutdown_drains_or_rejects_no_lost_envelopes() {
+        use protocol::EventEnvelope;
+        use std::sync::Arc;
+
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 4);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        // Hand-wire a writer with a dedicated mpsc channel so the test
+        // can hold a `tx.clone()` and try to race the drain boundary.
+        let (tx, rx) = tokio::sync::mpsc::channel::<EventEnvelope>(16);
+        let ingest_shutdown = tokio_util::sync::CancellationToken::new();
+        let writer_handle = tokio::spawn(bowerbird_daemon::ingest::writer::run(
+            rx,
+            state.db.writer.clone(),
+            Arc::clone(&state.broadcaster),
+            ingest_shutdown.clone(),
+        ));
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"events.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+        wait_subscribe_live(&mut ws, &state, ProbeKind::Event { source: "claude" }).await;
+
+        // Pre-shutdown send must succeed and produce a broadcast frame.
+        tx.try_send(EventEnvelope {
+            source: "claude".to_string(),
+            session_id: "sess-pre".to_string(),
+            kind: EventKind::PreToolUse,
+            reaction: None,
+            payload: "{}".to_string(),
+        })
+        .expect("pre-shutdown try_send");
+        let frame = read_text_frame_or_close(&mut ws).await;
+        let event = parse_event_frame(&frame);
+        assert_eq!(event.session_id, "sess-pre");
+
+        // Cancel and wait for the writer to fully exit. After the
+        // writer's task completes, the receiver has been closed and
+        // every remaining envelope has been drained.
+        ingest_shutdown.cancel();
+        writer_handle.await.expect("writer task join");
+
+        // The held `tx` clone now sends into a closed channel.
+        let send_after_exit = tx.try_send(EventEnvelope {
+            source: "claude".to_string(),
+            session_id: "sess-post".to_string(),
+            kind: EventKind::PreToolUse,
+            reaction: None,
+            payload: "{}".to_string(),
+        });
+        assert!(
+            send_after_exit.is_err(),
+            "try_send after writer exit must fail (channel closed); got {send_after_exit:?}"
+        );
+
+        // No `sess-post` event ever reached the broadcast or DB.
+        let timed = tokio::time::timeout(Duration::from_millis(300), ws.next()).await;
+        assert!(
+            timed.is_err(),
+            "no frame must arrive for the rejected post-exit send; got {timed:?}"
+        );
+        let conn = state.db.reader.get().await.expect("reader get");
+        let post_count: i64 = conn
+            .interact(|c| -> rusqlite::Result<i64> {
+                c.query_row(
+                    "SELECT COUNT(*) FROM events WHERE session_id = 'sess-post'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .await
+            .expect("interact")
+            .expect("count");
+        assert_eq!(
+            post_count, 0,
+            "rejected post-exit send must not insert an event row"
+        );
+
+        state.shutdown.cancel();
+    }
+
     /// AC #1 + AC #2 combined — a single client subscribed to BOTH
     /// `events.*` and `state.session.*` must observe the resulting
     /// frames in the documented order: `Event` before `State`. A
