@@ -7,12 +7,25 @@ use tokio::sync::mpsc;
 use adapter_claude::ClaudeAdapter;
 use protocol::{EventEnvelope, SourceAdapter};
 
-/// Maximum bytes accepted for a single newline-terminated ingest line,
-/// excluding the trailing newline. Matches `crates/shim/src/main.rs::
-/// MAX_STDIN_BYTES` (1 MiB) so the shim's stdin cap is also the daemon's
-/// wire cap, and so a direct local-socket client cannot push a larger
-/// payload into the broadcast fan-out than the shim ever could.
-const MAX_INGEST_LINE_BYTES: usize = 1 << 20;
+/// Maximum bytes the shim is allowed to read from stdin (before
+/// `hook_kind` injection and newline framing). Mirrors
+/// `crates/shim/src/main.rs::MAX_STDIN_BYTES`. The daemon doesn't read
+/// stdin — this constant exists so [`MAX_INGEST_LINE_BYTES`] can be
+/// defined relative to the shim's cap rather than as a magic number.
+const SHIM_STDIN_CAP: usize = 1 << 20;
+
+/// Maximum bytes accepted for a single newline-terminated ingest line on
+/// the daemon's local socket, excluding the trailing newline. Larger
+/// than [`SHIM_STDIN_CAP`] by 4 KiB so the shim's `hook_kind` injection
+/// (`,"hook_kind":"<value>"` adds ~30 bytes), JSON whitespace round-trip
+/// (`serde_json::to_vec` is compact but may differ from the stdin form),
+/// and the trailing newline all fit. A shim-accepted stdin payload near
+/// the 1 MiB cap must not be rejected on the daemon side.
+///
+/// A direct local-socket client can still push more bytes than the shim
+/// ever would; this cap rejects those before JSON parse, enqueue, DB
+/// write, or broadcast fan-out — see [`handle`].
+const MAX_INGEST_LINE_BYTES: usize = SHIM_STDIN_CAP + 4096;
 
 // Wire 400 responses are line-framed. Collapse internal newlines and cap
 // length so a multi-line serde_json::Error Display can't desync the client.
@@ -33,7 +46,9 @@ pub(super) async fn handle(
     // Cap the read at MAX + 1 bytes so a payload of exactly the cap plus
     // its terminating newline still fits, but anything larger stops short
     // of the next `\n` and is detectable by `buf.ends_with('\n') == false`.
-    // Mirrors the shim's `stdin.lock().take((MAX + 1) as u64)` pattern.
+    // Mirrors the shim's `stdin.lock().take((MAX + 1) as u64)` pattern,
+    // but with [`MAX_INGEST_LINE_BYTES`] (wire cap with shim overhead),
+    // not the shim's stdin cap.
     let limited = read_half.take(MAX_INGEST_LINE_BYTES as u64 + 1);
     let mut reader = BufReader::new(limited);
     let mut buf = String::new();

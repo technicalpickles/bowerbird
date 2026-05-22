@@ -4217,10 +4217,11 @@ mod story_2_2_publish {
 
     /// Defense in depth — an oversized line on the ingest socket must
     /// be rejected with a 400-style response BEFORE JSON parse, enqueue,
-    /// DB write, or broadcast fan-out. The shim already caps stdin at
-    /// 1 MiB, but a direct local-socket client can bypass the shim, and
-    /// without a daemon-side cap the oversized payload would be cloned
-    /// into the broadcast ring and sent to every matching WS subscriber.
+    /// DB write, or broadcast fan-out. The shim caps stdin at 1 MiB and
+    /// the daemon caps the wire line at `SHIM_STDIN_CAP + 4096`; a
+    /// direct local-socket client that bypasses the shim and pushes
+    /// beyond the daemon's wire cap must be rejected before the
+    /// oversized payload is cloned into the broadcast ring.
     #[tokio::test(flavor = "current_thread")]
     async fn ingest_oversized_line_rejected_before_broadcast() {
         use std::sync::Arc;
@@ -4248,12 +4249,13 @@ mod story_2_2_publish {
         .expect("send subscribe");
         wait_subscribe_live(&mut ws, &state, ProbeKind::Event { source: "claude" }).await;
 
-        // Build an oversized line: 1 MiB + 1 byte of payload, no newline
-        // until the very end (which is past the daemon's cap). The shape
-        // is intentionally not valid JSON — the cap fires before parse.
-        const CAP: usize = 1 << 20;
-        let mut oversized = Vec::with_capacity(CAP + 2);
-        oversized.resize(CAP + 1, b'a');
+        // Build a line that exceeds the daemon's wire cap
+        // (`SHIM_STDIN_CAP + 4096`). The bytes are intentionally not
+        // valid JSON — the cap fires before parse.
+        const SHIM_STDIN_CAP: usize = 1 << 20;
+        const DAEMON_WIRE_CAP: usize = SHIM_STDIN_CAP + 4096;
+        let mut oversized = Vec::with_capacity(DAEMON_WIRE_CAP + 2);
+        oversized.resize(DAEMON_WIRE_CAP + 1, b'a');
         oversized.push(b'\n');
         let resp = super::send_line_recv_response(&sock_path, &oversized).await;
         assert!(
@@ -4281,6 +4283,86 @@ mod story_2_2_publish {
             count, 0,
             "oversized ingest line must not insert an event row"
         );
+
+        ingest_shutdown.cancel();
+        let _ = writer_handle.await;
+        state.shutdown.cancel();
+    }
+
+    /// Story 2.2 fourth-round patch (1/5) — a shim-shaped wire line near
+    /// (but above) the 1 MiB shim stdin cap must be accepted by the
+    /// daemon. The shim's stdin cap is on RAW bytes before it injects
+    /// `hook_kind` and appends a newline, so a shim-accepted stdin
+    /// payload can produce a wire line slightly above 1 MiB. The
+    /// daemon's wire cap (`SHIM_STDIN_CAP + 4096`) is sized to absorb
+    /// that overhead. A tight daemon cap of exactly 1 MiB would reject
+    /// these shim-valid payloads.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ingest_near_shim_cap_line_accepted() {
+        use std::sync::Arc;
+        use tempfile::TempDir;
+
+        let (_dbtmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 4);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let sock_tmp = TempDir::new().expect("ingest tempdir");
+        let (ingest_shutdown, sock_path, rx) = super::start_ingest_listener(&sock_tmp, 16).await;
+        let writer_handle = tokio::spawn(bowerbird_daemon::ingest::writer::run(
+            rx,
+            state.db.writer.clone(),
+            Arc::clone(&state.broadcaster),
+            ingest_shutdown.clone(),
+        ));
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"events.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+        wait_subscribe_live(&mut ws, &state, ProbeKind::Event { source: "claude" }).await;
+
+        // Construct a shim-shaped JSON object whose final wire length is
+        // above 1 MiB but below the daemon's wire cap (1 MiB + 4 KiB).
+        // The prefix and suffix exactly mirror the shape `serde_json::
+        // to_vec` produces from a `Map` of these keys with a long string
+        // filler value. Sizing `filler` so that the total ends at
+        // `target_total` lets the test target a precise wire length
+        // without recomputing the JSON envelope by hand.
+        const SHIM_STDIN_CAP: usize = 1 << 20;
+        let target_total: usize = SHIM_STDIN_CAP + 1024; // 1 KiB above shim cap
+        let prefix = r#"{"hook_kind":"PreToolUse","session_id":"sess-near-cap","tool_name":"Test","filler":""#;
+        let suffix = r#""}"#;
+        let envelope_len = prefix.len() + suffix.len();
+        let filler_len = target_total - envelope_len;
+        let mut wire = Vec::with_capacity(target_total + 1);
+        wire.extend_from_slice(prefix.as_bytes());
+        wire.extend(std::iter::repeat_n(b'a', filler_len));
+        wire.extend_from_slice(suffix.as_bytes());
+        wire.push(b'\n');
+        assert_eq!(
+            wire.len(),
+            target_total + 1,
+            "test setup error: wire length unexpected"
+        );
+        assert!(
+            wire.len() > SHIM_STDIN_CAP + 1,
+            "test is meaningless if it does not exceed the old 1 MiB cap"
+        );
+
+        let resp = super::send_line_recv_response(&sock_path, &wire).await;
+        assert!(
+            resp.starts_with("200"),
+            "near-shim-cap shim-shaped line must be accepted; got: {resp:?}"
+        );
+
+        // The accepted line reaches the WS subscriber.
+        let frame = read_text_frame_or_close(&mut ws).await;
+        let event = parse_event_frame(&frame);
+        assert_eq!(event.source, "claude");
+        assert_eq!(event.session_id, "sess-near-cap");
 
         ingest_shutdown.cancel();
         let _ = writer_handle.await;
