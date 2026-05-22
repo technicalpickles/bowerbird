@@ -28,10 +28,14 @@ pub async fn run(
                 }
             }
             _ = shutdown.cancelled() => {
-                // Events accepted before shutdown drain after `cancelled()`
-                // MUST still publish so any WS clients still attached during
-                // graceful shutdown receive them — consistent with the
-                // story 2.5 graceful-shutdown design.
+                // Events accepted before shutdown still commit and publish
+                // during drain so the SQLite + broadcast paths agree about
+                // what was accepted. Whether attached WS clients actually
+                // observe these drained envelopes is a separate concern:
+                // production WS tasks share this same shutdown token and
+                // may already have exited their dispatch loop before the
+                // drain finishes. End-to-end WS flush semantics are
+                // deferred to story 2.5's graceful-shutdown design.
                 while let Ok(envelope) = rx.try_recv() {
                     if let Err(e) = projection::session::write(&writer_pool, &broadcaster, envelope).await {
                         tracing::error!(error = ?e, "projection write failed during drain; event dropped");
