@@ -3604,6 +3604,28 @@ mod story_2_2_publish {
             "events.claude.* must not deliver codex-sourced events; got {timed:?}"
         );
 
+        // Positive sentinel: a real claude event must arrive next. Broadcast
+        // ordering means a delayed codex frame would land BEFORE this
+        // sentinel and fail the assertion deterministically, instead of the
+        // pure 300ms silence above being the only guard.
+        let id_sentinel = publish_via_projection(
+            &state,
+            "claude",
+            "sess-sentinel",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+        let frame = read_text_frame_or_close(&mut ws).await;
+        let event = parse_event_frame(&frame);
+        assert_eq!(
+            event.event_id, id_sentinel,
+            "next frame after negative window must be the sentinel; a delayed codex frame would have failed this"
+        );
+        assert_eq!(event.source, "claude");
+        assert_eq!(event.session_id, "sess-sentinel");
+
         state.shutdown.cancel();
     }
 
@@ -3822,18 +3844,44 @@ mod story_2_2_publish {
             "rejected daemon-source write must not produce a broadcast frame; got {timed:?}"
         );
 
-        // No event row was inserted (only the reserved-source check fires;
-        // no transaction is started).
+        // Positive sentinel: a real (non-reserved-source) write must
+        // arrive next on the same subscriber. Broadcast ordering means
+        // any delayed daemon-source frame would land BEFORE this
+        // sentinel and fail the assertion.
+        let id_sentinel = publish_via_projection(
+            &state,
+            "claude",
+            "sess-sentinel",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+        let frame = read_text_frame_or_close(&mut ws).await;
+        let event = parse_event_frame(&frame);
+        assert_eq!(event.event_id, id_sentinel);
+        assert_eq!(event.source, "claude");
+        assert_eq!(event.session_id, "sess-sentinel");
+
+        // No event row was inserted from the rejected daemon-source
+        // write — only the reserved-source check fires; no transaction
+        // is started for that path. The sentinel write above DID insert
+        // one row, so the total events count is exactly 1 (the
+        // sentinel), not 2.
         let conn = state.db.reader.get().await.expect("reader get");
-        let count: i64 = conn
+        let daemon_source_count: i64 = conn
             .interact(|c| -> rusqlite::Result<i64> {
-                c.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+                c.query_row(
+                    "SELECT COUNT(*) FROM events WHERE source = '__daemon__'",
+                    [],
+                    |r| r.get(0),
+                )
             })
             .await
             .expect("interact")
             .expect("count");
         assert_eq!(
-            count, 0,
+            daemon_source_count, 0,
             "daemon-source-rejected writes must not insert rows"
         );
 
@@ -4144,6 +4192,27 @@ mod story_2_2_publish {
             "exact-topic subscriber must not receive frames for a different session_id; got {timed:?}"
         );
 
+        // Positive sentinel: publish for `sess-exact` again. The next two
+        // frames must be the sentinel's Event+State pair — broadcast
+        // ordering means a delayed `sess-other` frame would arrive first
+        // and fail the sentinel assertion deterministically.
+        let id_sentinel = publish_via_projection(
+            &state,
+            "claude",
+            "sess-exact",
+            EventKind::PostToolUse,
+            None,
+            "{}",
+        )
+        .await;
+        let f3 = read_text_frame_or_close(&mut ws).await;
+        let event_sentinel = parse_event_frame(&f3);
+        assert_eq!(event_sentinel.event_id, id_sentinel);
+        assert_eq!(event_sentinel.session_id, "sess-exact");
+        let f4 = read_text_frame_or_close(&mut ws).await;
+        let st_sentinel = parse_state_frame(&f4);
+        assert_eq!(st_sentinel.session_id, "sess-exact");
+
         state.shutdown.cancel();
     }
 
@@ -4270,7 +4339,26 @@ mod story_2_2_publish {
             "oversized ingest line must not produce a broadcast frame; got {timed:?}"
         );
 
-        // No DB row inserted either.
+        // Positive sentinel: a valid hook line through the same ingest
+        // socket must produce an event frame for the subscriber.
+        // Broadcast ordering means any delayed frame from the oversized
+        // line would land BEFORE the sentinel and fail the assertion.
+        let resp_ok = super::send_line_recv_response(
+            &sock_path,
+            b"{\"hook_kind\":\"PreToolUse\",\"session_id\":\"sess-sentinel\",\"tool_name\":\"Test\"}\n",
+        )
+        .await;
+        assert!(
+            resp_ok.starts_with("200"),
+            "sentinel hook line must be accepted; got: {resp_ok:?}"
+        );
+        let frame = read_text_frame_or_close(&mut ws).await;
+        let event = parse_event_frame(&frame);
+        assert_eq!(event.source, "claude");
+        assert_eq!(event.session_id, "sess-sentinel");
+
+        // The sentinel inserted one row; only that one must be present
+        // (the rejected oversized line was filtered before any DB write).
         let conn = state.db.reader.get().await.expect("reader get");
         let count: i64 = conn
             .interact(|c| -> rusqlite::Result<i64> {
@@ -4280,8 +4368,8 @@ mod story_2_2_publish {
             .expect("interact")
             .expect("count");
         assert_eq!(
-            count, 0,
-            "oversized ingest line must not insert an event row"
+            count, 1,
+            "exactly the sentinel row must exist; the oversized line must not insert"
         );
 
         ingest_shutdown.cancel();
