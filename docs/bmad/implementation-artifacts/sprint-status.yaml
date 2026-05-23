@@ -1,5 +1,5 @@
 # generated: 2026-05-16
-# last_updated: 2026-05-22 (story 2.3 review)
+# last_updated: 2026-05-23 (story 2.3 done)
 # project: bowerbird
 # project_key: NOKEY
 # tracking_system: file-system
@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-05-16
-last_updated: 2026-05-22
+last_updated: 2026-05-23
 project: bowerbird
 project_key: NOKEY
 tracking_system: file-system
@@ -58,7 +58,7 @@ development_status:
   epic-2: in-progress
   2-1-websocket-connection-and-topic-subscription: done
   2-2-real-time-event-and-state-broadcast-to-multiple-tools: review
-  2-3-new-session-discovery-and-state-snapshot-on-connect: review
+  2-3-new-session-discovery-and-state-snapshot-on-connect: done
   2-4-lagged-consumer-recovery-with-dropped-frame: backlog
   2-5-graceful-shutdown-notification-to-connected-tools: backlog
   epic-2-retrospective: optional
