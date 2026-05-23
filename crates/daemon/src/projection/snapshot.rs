@@ -50,6 +50,30 @@ pub async fn snapshot_for_topic(
         return Ok(Vec::new());
     }
 
+    // Cheap pre-query coverage check. Skip the SQL read entirely when
+    // `pre_existing` already covers every envelope the new topic could
+    // match — every row would be deduped away inside the per-row loop
+    // anyway, so the DB and JSON work would be wasted. Covers:
+    //   - `StateAll` in pre_existing (covers every State envelope)
+    //   - exact `new_topic` already in pre_existing (idempotent re-sub)
+    //   - either of `StateSession(id)` / `StateSessionCurrent(id)` in
+    //     pre_existing when the new topic targets the same id (the two
+    //     variants match identical State envelopes — see
+    //     `Topic::matches` in `crates/daemon/src/broadcast/event.rs`).
+    if pre_existing.contains(&Topic::StateAll) || pre_existing.contains(new_topic) {
+        return Ok(Vec::new());
+    }
+    if let Some(want_sid) = match new_topic {
+        Topic::StateSession(sid) | Topic::StateSessionCurrent(sid) => Some(sid),
+        _ => None,
+    } {
+        let sibling_a = Topic::StateSession(want_sid.clone());
+        let sibling_b = Topic::StateSessionCurrent(want_sid.clone());
+        if pre_existing.contains(&sibling_a) || pre_existing.contains(&sibling_b) {
+            return Ok(Vec::new());
+        }
+    }
+
     let conn = reader_pool
         .get()
         .await
@@ -452,6 +476,70 @@ mod tests {
         )
         .await
         .expect("snapshot ok");
+        assert!(frames.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sibling_state_topic_short_circuits_without_db_read() {
+        // `StateSession("sess-A")` and `StateSessionCurrent("sess-A")`
+        // match identical State envelopes — they're functionally
+        // equivalent. If one is already in `pre_existing`, subscribing
+        // to the other yields zero new frames AND must short-circuit
+        // before the DB read. To prove the short-circuit fires, we
+        // deliberately point the helper at a CLOSED reader pool; a
+        // path that touches SQLite would surface a pool error, while
+        // the short-circuit returns `Ok(vec![])` without ever calling
+        // the pool.
+        let tmp = TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("snap.db");
+        let pools = init_pools(&db_path).await.expect("init_pools");
+        run_migrations(&pools.writer).await.expect("migrate");
+        pools.reader.close();
+
+        let mut pre = HashSet::new();
+        pre.insert(Topic::StateSession("sess-A".to_string()));
+
+        let frames = snapshot_for_topic(
+            &pools.reader,
+            &Topic::StateSessionCurrent("sess-A".to_string()),
+            &pre,
+            1_000,
+        )
+        .await
+        .expect("sibling short-circuit must not touch the (closed) reader pool");
+        assert!(frames.is_empty());
+
+        // Symmetric direction.
+        let mut pre2 = HashSet::new();
+        pre2.insert(Topic::StateSessionCurrent("sess-A".to_string()));
+        let frames2 = snapshot_for_topic(
+            &pools.reader,
+            &Topic::StateSession("sess-A".to_string()),
+            &pre2,
+            1_000,
+        )
+        .await
+        .expect("symmetric sibling short-circuit must not touch the (closed) reader pool");
+        assert!(frames2.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idempotent_re_subscribe_short_circuits_without_db_read() {
+        // Re-subscribing to a topic the connection already holds must
+        // not perform a fresh DB read. Same closed-pool trick as
+        // `sibling_state_topic_short_circuits_without_db_read`.
+        let tmp = TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("snap.db");
+        let pools = init_pools(&db_path).await.expect("init_pools");
+        run_migrations(&pools.writer).await.expect("migrate");
+        pools.reader.close();
+
+        let mut pre = HashSet::new();
+        pre.insert(Topic::StateAll);
+
+        let frames = snapshot_for_topic(&pools.reader, &Topic::StateAll, &pre, 1_000)
+            .await
+            .expect("idempotent re-sub must not touch the (closed) reader pool");
         assert!(frames.is_empty());
     }
 

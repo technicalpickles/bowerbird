@@ -369,9 +369,9 @@ async fn handle_text_frame(
                     }
                 };
 
-                // [C] Build the snapshot. Reader pool/interact/serde
-                //     errors log and yield an empty vec — a transient DB
-                //     issue must not close a healthy connection.
+                // [C] Build the snapshot. On reader pool/interact/serde
+                //     error, log and return early WITHOUT inserting the
+                //     topic — see the retry-safety note below.
                 let snapshot_frames = match crate::projection::snapshot_for_topic(
                     &state.db.reader,
                     &t,
@@ -382,11 +382,23 @@ async fn handle_text_frame(
                 {
                     Ok(v) => v,
                     Err(e) => {
+                        // Transient DB issue. Do NOT close the connection
+                        // (the live publish path may still work for other
+                        // topics on this connection) and do NOT mark the
+                        // topic as subscribed. If we inserted the topic on
+                        // failure, a client retry of the same Subscribe
+                        // would find the topic already in `pre_existing`
+                        // and the dedup logic in `snapshot_for_topic`
+                        // would suppress every matching row — the client
+                        // would be stranded with no snapshot AND no
+                        // future opportunity to fetch one without
+                        // reconnecting. Returning early without insert
+                        // keeps the retry path clean.
                         tracing::error!(
                             error = %e,
-                            "ws snapshot: snapshot_for_topic failed; proceeding with empty snapshot",
+                            "ws snapshot: snapshot_for_topic failed; subscribe NOT applied — client may retry",
                         );
-                        Vec::new()
+                        return true;
                     }
                 };
 

@@ -3949,7 +3949,7 @@ mod story_2_3_snapshot {
 
     use bowerbird_daemon::state::AppState;
     use futures_util::{SinkExt, StreamExt};
-    use protocol::{EventKind, ServerMessage};
+    use protocol::{EventKind, ServerMessage, SessionCurrentState};
     use tokio_tungstenite::tungstenite::Message;
 
     use super::story_2_1_ws::{
@@ -3980,9 +3980,20 @@ mod story_2_3_snapshot {
         connect_until_ready(addr).await
     }
 
-    /// AC #1 — Three pre-existing sessions all surface as snapshot State
-    /// frames before any live event, then a subsequent publish appears as
-    /// a live State frame with a strictly later `last_event_at_ms`.
+    /// AC #1 — Three pre-existing sessions surface as snapshot State
+    /// frames in the documented SQL order (`updated_at DESC, source
+    /// ASC, session_id ASC`) BEFORE any live event. Each frame's
+    /// `(source, session_id, state)` must match the stored projection.
+    /// A subsequent live publish then arrives as a live State frame
+    /// with a strictly later `last_event_at_ms`.
+    ///
+    /// `current_unix_millis` is the source of `updated_at` inside
+    /// `projection::session::write`. To force `updated_at` strictly
+    /// monotone (so the SQL `ORDER BY updated_at DESC` is deterministic
+    /// rather than relying on the secondary `session_id ASC` tiebreaker
+    /// for same-millisecond writes), sleep ~2ms between pre-create
+    /// publishes. `tokio::time::sleep` advances real time even on the
+    /// `current_thread` runtime since the timer is not paused.
     #[tokio::test(flavor = "current_thread")]
     async fn snapshot_three_sessions_arrive_before_live_events() {
         let (_tmp, pools) = fresh_pools().await;
@@ -3990,7 +4001,8 @@ mod story_2_3_snapshot {
         let (addr, _server) = spawn_test_daemon(state.clone()).await;
 
         // Pre-create three sessions BEFORE the WS client connects so the
-        // snapshot read picks them up.
+        // snapshot read picks them up. Sleep between publishes so
+        // updated_at is strictly increasing across the three rows.
         let _ = publish_via_projection(
             &state,
             "claude",
@@ -4000,6 +4012,7 @@ mod story_2_3_snapshot {
             "{}",
         )
         .await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
         let _ = publish_via_projection(
             &state,
             "claude",
@@ -4009,6 +4022,7 @@ mod story_2_3_snapshot {
             "{}",
         )
         .await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
         let _ = publish_via_projection(
             &state,
             "claude",
@@ -4027,32 +4041,73 @@ mod story_2_3_snapshot {
         .await
         .expect("send subscribe");
 
-        // Three snapshot State frames, in any session-id order (SQL
-        // ordering is by updated_at DESC; we only assert set equality).
-        let mut ids = std::collections::HashSet::new();
-        let mut max_snapshot_last_event_at_ms: i64 = i64::MIN;
-        for _ in 0..3 {
-            let frame = read_text_frame_or_close(&mut ws).await;
-            let parsed = parse_state_frame(&frame);
-            ids.insert(parsed.session_id.clone());
-            max_snapshot_last_event_at_ms =
-                max_snapshot_last_event_at_ms.max(parsed.state.last_event_at_ms);
+        // Three snapshot State frames. SQL order is `updated_at DESC,
+        // source ASC, session_id ASC`. Since sess-C was published last,
+        // it has the largest updated_at; sess-A was first, smallest.
+        // Expected wire order: sess-C → sess-B → sess-A.
+        let frame_c = parse_state_frame(&read_text_frame_or_close(&mut ws).await);
+        let frame_b = parse_state_frame(&read_text_frame_or_close(&mut ws).await);
+        let frame_a = parse_state_frame(&read_text_frame_or_close(&mut ws).await);
+
+        assert_eq!(frame_c.session_id, "sess-C", "snapshot order: newest first");
+        assert_eq!(frame_b.session_id, "sess-B");
+        assert_eq!(frame_a.session_id, "sess-A", "snapshot order: oldest last");
+
+        // Full source assertion on every frame.
+        for f in [&frame_c, &frame_b, &frame_a] {
+            assert_eq!(
+                f.source, "claude",
+                "snapshot frame source must match stored row"
+            );
         }
-        let expected: std::collections::HashSet<String> = ["sess-A", "sess-B", "sess-C"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+
+        // Full state assertion per session, matching projection::transition.
+        // sess-A: PreToolUse → Working
+        assert_eq!(frame_a.state.last_event_kind, EventKind::PreToolUse);
         assert_eq!(
-            ids, expected,
-            "snapshot must cover exactly the three pre-existing sessions"
+            frame_a.state.current_state,
+            SessionCurrentState::Working,
+            "sess-A PreToolUse → Working"
         );
+        // sess-B: PostToolUse → Idle
+        assert_eq!(frame_b.state.last_event_kind, EventKind::PostToolUse);
+        assert_eq!(
+            frame_b.state.current_state,
+            SessionCurrentState::Idle,
+            "sess-B PostToolUse → Idle"
+        );
+        // sess-C: PreToolUse → Working
+        assert_eq!(frame_c.state.last_event_kind, EventKind::PreToolUse);
+        assert_eq!(
+            frame_c.state.current_state,
+            SessionCurrentState::Working,
+            "sess-C PreToolUse → Working"
+        );
+
+        // updated_at-strict-monotone check via last_event_at_ms (which
+        // is set from the same `current_unix_millis` value as the
+        // projection's `updated_at`).
+        assert!(
+            frame_c.state.last_event_at_ms > frame_b.state.last_event_at_ms,
+            "sess-C must be newer than sess-B (got C={}, B={})",
+            frame_c.state.last_event_at_ms,
+            frame_b.state.last_event_at_ms
+        );
+        assert!(
+            frame_b.state.last_event_at_ms > frame_a.state.last_event_at_ms,
+            "sess-B must be newer than sess-A (got B={}, A={})",
+            frame_b.state.last_event_at_ms,
+            frame_a.state.last_event_at_ms
+        );
+
+        let max_snapshot_last_event_at_ms = frame_c.state.last_event_at_ms;
 
         // Now publish a live event for sess-A. The subscription is
         // state-only, so the Event envelope is filtered by
         // `dispatch_envelope` and never reaches the wire — only the
         // resulting State frame does. Its `last_event_at_ms` must be
-        // strictly >= the max snapshot timestamp (the new publish
-        // happened later in wall-clock).
+        // strictly later than the snapshot's newest timestamp.
+        tokio::time::sleep(Duration::from_millis(2)).await;
         let _ = publish_via_projection(
             &state,
             "claude",
@@ -4065,10 +4120,12 @@ mod story_2_3_snapshot {
         let f_state = read_text_frame_or_close(&mut ws).await;
         let live = parse_state_frame(&f_state);
         assert_eq!(live.session_id, "sess-A");
+        assert_eq!(live.source, "claude");
         assert_eq!(live.state.last_event_kind, EventKind::PostToolUse);
+        assert_eq!(live.state.current_state, SessionCurrentState::Idle);
         assert!(
-            live.state.last_event_at_ms >= max_snapshot_last_event_at_ms,
-            "live frame must not predate the snapshot (live={}, max snapshot={})",
+            live.state.last_event_at_ms > max_snapshot_last_event_at_ms,
+            "live frame must strictly postdate the snapshot (live={}, max snapshot={})",
             live.state.last_event_at_ms,
             max_snapshot_last_event_at_ms
         );

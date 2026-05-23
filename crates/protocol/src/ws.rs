@@ -43,7 +43,17 @@ pub struct HelloFrame {
     pub history_begins_cleanly: bool,
 }
 
+/// Sync frame carrying the available event-id window.
+///
+/// `#[non_exhaustive]` blocks struct-literal construction from outside
+/// the `protocol` crate, so the daemon (and any future producer) must
+/// go through [`SyncFrame::new`] which enforces `oldest <= latest`.
+/// `Deserialize` is generated inside this crate and is therefore
+/// exempt from the attribute — wire payloads, including ones with
+/// inverted IDs from a hypothetical buggy peer, continue to parse
+/// without validation (asymmetric inbound/outbound policy).
 #[derive(Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SyncFrame {
     pub oldest_available_event_id: EventId,
     pub latest_event_id: EventId,
