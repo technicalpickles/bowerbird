@@ -4785,13 +4785,49 @@ mod story_2_4_dropped {
              first={first:?}, last={last:?})"
         );
 
-        // Socket must stay open per AC #1 — read with a short timeout
-        // and assert no Close frame.
-        if let Ok(Some(Ok(Message::Close(_)))) =
-            tokio::time::timeout(Duration::from_millis(200), ws.next()).await
-        {
-            panic!("socket must stay open after Dropped frame");
+        // AC #1: "the next frame after the dropped frame is the next
+        // legitimate event." Second-round review fix: assert this
+        // explicitly — without it, a regression that emitted two
+        // Dropped frames in a row (or closed the socket) would pass.
+        // Read up to 50 frames hunting for the next non-Dropped,
+        // non-Close message; assert it's an Event (synthetic flood
+        // residuals are all Events).
+        let mut next_legit: Option<ServerMessage> = None;
+        for _ in 0..50 {
+            match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
+                Ok(Some(Ok(Message::Text(t)))) => {
+                    let server: ServerMessage =
+                        serde_json::from_str(t.as_str()).expect("parse ServerMessage");
+                    match server {
+                        ServerMessage::Dropped(_) => {
+                            panic!(
+                                "AC #1 violation: a second Dropped frame followed the \
+                                 first within the coalesce window. Coalescing regressed."
+                            )
+                        }
+                        ServerMessage::Event(_) | ServerMessage::State(_) => {
+                            next_legit = Some(server);
+                            break;
+                        }
+                        _ => continue,
+                    }
+                }
+                Ok(Some(Ok(Message::Close(_)))) => {
+                    panic!("socket must stay open after Dropped frame")
+                }
+                Ok(Some(Ok(_))) => continue,
+                Ok(Some(Err(e))) => panic!("ws recv error after Dropped: {e:?}"),
+                Ok(None) | Err(_) => break,
+            }
         }
+        assert!(
+            matches!(
+                next_legit,
+                Some(ServerMessage::Event(_)) | Some(ServerMessage::State(_))
+            ),
+            "AC #1: the next frame after Dropped must be a legitimate Event \
+             or State frame; got {next_legit:?}"
+        );
 
         state.shutdown.cancel();
     }
@@ -4814,11 +4850,17 @@ mod story_2_4_dropped {
         .expect("send subscribe");
         wait_subscribe_live(&mut ws, &state, ProbeKind::Event { source: "claude" }).await;
 
-        // Trigger lag with a synthetic flood.
+        // Trigger lag with a synthetic flood. Use a synthetic session_id
+        // distinct from `sess-after` AND ids starting at 99_000 to keep
+        // them disjoint from any database-assigned id this test produces.
+        // Second-round review fix: prior synthetic ids `1..=512` could
+        // collide with real ids in a fresh DB, so the post-drop
+        // assertion could pass on residual flood frames instead of real
+        // production events.
         for i in 0..512 {
             state
                 .broadcaster
-                .publish(synthetic_event(i + 1, "sess-flood"));
+                .publish(synthetic_event(99_000 + i + 1, "sess-flood"));
         }
         tokio::task::yield_now().await;
 
@@ -4859,13 +4901,19 @@ mod story_2_4_dropped {
         )
         .await;
 
-        // Drain frames until we collect the three post-drop events. The
-        // channel may have residual flood envelopes; we look for the
-        // specific event_ids we just produced (since they're well past
-        // any synthetic event_id).
-        let mut found_ids: Vec<EventId> = Vec::with_capacity(3);
+        // Drain frames until we collect the three post-drop events.
+        // Match by (event_id, source, session_id, kind) so a stray
+        // synthetic flood envelope can never satisfy the assertion —
+        // the flood publishes use `session_id = "sess-flood"` and a
+        // different id range. Second-round review fix.
+        let mut found: Vec<(EventId, EventKind)> = Vec::with_capacity(3);
+        let expected: Vec<(EventId, EventKind)> = vec![
+            (id1, EventKind::PreToolUse),
+            (id2, EventKind::PostToolUse),
+            (id3, EventKind::PreToolUse),
+        ];
         for _ in 0..2000 {
-            if found_ids.len() == 3 {
+            if found.len() == 3 {
                 break;
             }
             let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
@@ -4881,18 +4929,23 @@ mod story_2_4_dropped {
             let server: ServerMessage =
                 serde_json::from_str(text.as_str()).expect("parse ServerMessage");
             if let ServerMessage::Event(f) = server {
-                if f.event.event_id == id1
-                    || f.event.event_id == id2
-                    || f.event.event_id == id3
+                // Strict matching — must be the production-path event we
+                // just published, not a residual flood envelope.
+                if f.event.source == "claude"
+                    && f.event.session_id == "sess-after"
+                    && (f.event.event_id == id1
+                        || f.event.event_id == id2
+                        || f.event.event_id == id3)
                 {
-                    found_ids.push(f.event.event_id);
+                    found.push((f.event.event_id, f.event.kind));
                 }
             }
         }
         assert_eq!(
-            found_ids,
-            vec![id1, id2, id3],
-            "post-Dropped events must arrive in publication order"
+            found, expected,
+            "post-Dropped events must arrive in publication order with the \
+             matching event_id, source=\"claude\", session_id=\"sess-after\", \
+             and EventKind"
         );
 
         state.shutdown.cancel();
@@ -5028,6 +5081,28 @@ mod story_2_4_dropped {
             !body.events.is_empty(),
             "REST must return events past last_delivered_event_id={id0:?}"
         );
+        // Second-round review fix: assert EVERY produced id > id0 is
+        // present in the response and arrives in publication order.
+        // Without this, the test would pass even if REST recovery
+        // returned a partial set — which would silently corrupt the
+        // presenter's gap recovery.
+        let returned_ids: Vec<EventId> =
+            body.events.iter().map(|e| e.event_id).collect();
+        let expected_ids: Vec<EventId> = produced
+            .iter()
+            .copied()
+            .filter(|id| id.0 > id0.0)
+            .collect();
+        assert!(
+            !expected_ids.is_empty(),
+            "test scaffolding: should have produced events past id0={id0:?}"
+        );
+        assert_eq!(
+            returned_ids, expected_ids,
+            "REST recovery must return every produced event id > \
+             last_delivered_event_id={id0:?}, in publication order. \
+             Missing/reordered events would corrupt presenter gap recovery."
+        );
         // Gap recoverable: oldest_available_event_id <= last_delivered + 1.
         assert!(
             body.oldest_available_event_id.0 <= id0.0 + 1,
@@ -5161,36 +5236,50 @@ mod story_2_4_dropped {
 
         let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
         let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+
+        // Spawn a background publisher that floods the broadcast hub
+        // for 200ms with synthetic events. The flood overlaps with the
+        // snapshot SEND phase ([E]), forcing lag DURING the per-
+        // connection task's socket.send loop. The post-Finding-#1
+        // behaviour: drain at [A] runs under empty subscriptions and
+        // silent-fast-forwards; the main loop at [F] (after [E]) is
+        // the one that sees the residual lag and emits Dropped — the
+        // exact scenario Story 2.3 deferred-work line 79 carried into
+        // 2.4 to verify.
+        let broadcaster = state.broadcaster.clone();
+        let flood = tokio::spawn(async move {
+            let deadline = std::time::Instant::now() + Duration::from_millis(200);
+            let mut event_id: i64 = 1;
+            while std::time::Instant::now() < deadline {
+                for _ in 0..20 {
+                    broadcaster.publish(synthetic_event(event_id, "snap-lag-src"));
+                    event_id += 1;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+
+        // Send Subscribe AFTER the flood task started — the snapshot
+        // send loop runs while the flood is still publishing, so the
+        // channel laps under the new subscription set.
         ws.send(Message::Text(
             r#"{"op":"subscribe","topic":"state.session.*"}"#.into(),
         ))
         .await
         .expect("send subscribe");
 
-        // Flood the broadcast channel with synthetic events. With capacity
-        // 4 and a 50-envelope flood, the channel laps many times over;
-        // either drain ([A]) or main loop ([F]) will surface Lagged
-        // depending on scheduler ordering. Both produce a Dropped frame
-        // via the shared helper.
-        for i in 0..50 {
-            state
-                .broadcaster
-                .publish(synthetic_event(i + 1, "snap-lag-src"));
-        }
-        tokio::task::yield_now().await;
-
-        // Read all frames. Collect counts of State (snapshot) frames and
-        // Dropped frames; allow them to interleave. The order depends on
-        // scheduler timing — [A]drain may emit Dropped before [E]'s
-        // snapshot send, or [F]'s main loop may emit Dropped after [E].
+        // Read all frames. Collect counts of State (snapshot) frames
+        // and Dropped frames. With Finding #1's guard the drain arm
+        // silent-fast-forwards (subscriptions empty at [A]); the main
+        // loop after [E] catches the residual lag and emits.
         let mut snapshot_seen = 0usize;
         let mut dropped_seen = 0usize;
-        for _ in 0..150 {
+        for _ in 0..200 {
             let msg = match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
                 Ok(Some(Ok(m))) => m,
                 Ok(Some(Err(e))) => panic!("ws recv error during snapshot+lag: {e:?}"),
                 Ok(None) => break,
-                Err(_) => break, // no more frames; we have what we have
+                Err(_) => break,
             };
             let text = match msg {
                 Message::Text(t) => t,
@@ -5201,28 +5290,36 @@ mod story_2_4_dropped {
                 serde_json::from_str(text.as_str()).expect("parse ServerMessage");
             match server {
                 ServerMessage::State(_) => snapshot_seen += 1,
-                ServerMessage::Dropped(_) => dropped_seen += 1,
+                ServerMessage::Dropped(_) => {
+                    dropped_seen += 1;
+                    // Break once we've seen the contract pair: snapshot
+                    // delivered AND lag reported. Further frames are
+                    // residual flood-state envelopes which don't
+                    // strengthen the assertion.
+                    if snapshot_seen > 0 {
+                        break;
+                    }
+                }
                 ServerMessage::Event(_) => {
-                    // state.session.* should NOT deliver Event frames per
-                    // dispatch_envelope's topic-match logic. A regression
-                    // here would fail this test loudly.
+                    // state.session.* must NOT deliver Event frames per
+                    // dispatch_envelope's topic-match logic.
                     panic!("Event frame leaked through state.session.* topic filter")
                 }
                 other => panic!("unexpected ServerMessage during snapshot+lag: {other:?}"),
             }
         }
-        // Snapshot must complete — Story 2.3's [C]+[E] is unaffected by
-        // the lag-during-subscribe regression (the test is here precisely
-        // to confirm that).
+        // Stop the flood promptly so the test doesn't pay for any
+        // remaining iterations.
+        flood.abort();
+
         assert!(
             snapshot_seen > 0,
             "expected at least one snapshot State frame; saw 0 (snapshot phase regressed?)"
         );
-        // Lag must be reported — [A] or [F], doesn't matter.
         assert!(
             dropped_seen > 0,
-            "expected at least one Dropped frame from the lag-during-subscribe scenario; \
-             saw 0 (lag-recovery regressed?). snapshot_seen={snapshot_seen}"
+            "expected at least one Dropped frame from lag DURING snapshot send; \
+             saw 0 (lag-during-snapshot recovery regressed?). snapshot_seen={snapshot_seen}"
         );
 
         state.shutdown.cancel();
@@ -5341,6 +5438,191 @@ mod story_2_4_dropped {
             .await
             .expect("second Dropped must arrive after silence + burst 2");
         assert!(second.0 >= 1);
+
+        state.shutdown.cancel();
+    }
+
+    /// Story 2.4 second-round code-review finding #1 — A client that
+    /// connects but never subscribes MUST NOT receive an unsolicited
+    /// `Dropped` frame, even if lag accumulates on the per-connection
+    /// broadcast receiver between connect and the first Subscribe.
+    /// Such a frame would describe a recovery gap for events the
+    /// presenter never asked for. Both lag arms (main `rx.recv()` and
+    /// `drain_backlog_under_state`) gate emission on
+    /// `subscriptions.is_empty() == false`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn lag_before_any_subscription_does_not_emit_dropped() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = state_with_caps(pools, 4, Duration::from_secs(1));
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+
+        // Connected but NOT subscribed. Flood the hub — channel laps.
+        for i in 0..256 {
+            state
+                .broadcaster
+                .publish(synthetic_event(i + 1, "sess-pre-sub"));
+        }
+        tokio::task::yield_now().await;
+
+        // Now subscribe to events.* (drain runs under the OLD set,
+        // which is empty — silent fast-forward of any drain-time lag).
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"events.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+        wait_subscribe_live(&mut ws, &state, ProbeKind::Event { source: "claude" }).await;
+
+        // Publish ONE legitimate event via the production path; we
+        // expect to receive it normally — no preceding Dropped frame
+        // for the pre-subscription flood.
+        let id = publish_via_projection(
+            &state,
+            "claude",
+            "sess-real",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+
+        // Read up to 50 frames. Allowed: probe frames (Event with
+        // session_id starting "__probe-") and the real Event we just
+        // published. Forbidden: any Dropped frame at all.
+        let mut saw_real = false;
+        for _ in 0..50 {
+            let msg = match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
+                Ok(Some(Ok(m))) => m,
+                Ok(None) | Err(_) => break,
+                Ok(Some(Err(e))) => panic!("ws recv error: {e:?}"),
+            };
+            let text = match msg {
+                Message::Text(t) => t,
+                Message::Close(_) => panic!("socket closed unexpectedly"),
+                _ => continue,
+            };
+            let server: ServerMessage =
+                serde_json::from_str(text.as_str()).expect("parse ServerMessage");
+            match server {
+                ServerMessage::Dropped(d) => panic!(
+                    "AC violation (Finding #1): pre-subscription lag must NOT \
+                     produce a Dropped frame; got count={}",
+                    d.count
+                ),
+                ServerMessage::Event(f) if f.event.event_id == id => {
+                    saw_real = true;
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        assert!(
+            saw_real,
+            "expected the post-subscription real Event to arrive"
+        );
+
+        state.shutdown.cancel();
+    }
+
+    /// Story 2.4 second-round code-review finding #1 — After
+    /// unsubscribing from the last topic, a client is in the same
+    /// "no active subscription" state as a fresh connection. Lag
+    /// during that interval MUST be silent fast-forward, not emit a
+    /// Dropped frame against the new (empty) topic set.
+    #[tokio::test(flavor = "current_thread")]
+    async fn lag_after_last_unsubscribe_does_not_emit_dropped() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = state_with_caps(pools, 4, Duration::from_secs(1));
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+
+        // Subscribe events.*, wait live, then immediately unsubscribe —
+        // returns the client to a no-active-subscription state.
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"events.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+        wait_subscribe_live(&mut ws, &state, ProbeKind::Event { source: "claude" }).await;
+        ws.send(Message::Text(
+            r#"{"op":"unsubscribe","topic":"events.*"}"#.into(),
+        ))
+        .await
+        .expect("send unsubscribe");
+        // Give the per-connection task a chance to process the
+        // unsubscribe before flooding (the unsubscribe runs its own
+        // drain under the OLD set events.* — that drain CAN emit
+        // Dropped if lag is present, but we haven't flooded yet).
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Now flood under empty subscriptions. Either lag arm should
+        // silent-fast-forward.
+        for i in 0..256 {
+            state
+                .broadcaster
+                .publish(synthetic_event(i + 1, "sess-post-unsub"));
+        }
+        tokio::task::yield_now().await;
+
+        // Re-subscribe. The drain phase runs under the (still empty)
+        // OLD set; Finding #1's guard skips emission.
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"events.*"}"#.into(),
+        ))
+        .await
+        .expect("send re-subscribe");
+        wait_subscribe_live(&mut ws, &state, ProbeKind::Event { source: "claude" }).await;
+
+        // Publish one legitimate event and assert it arrives without
+        // any preceding Dropped frame.
+        let id = publish_via_projection(
+            &state,
+            "claude",
+            "sess-real-2",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+
+        let mut saw_real = false;
+        for _ in 0..50 {
+            let msg = match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
+                Ok(Some(Ok(m))) => m,
+                Ok(None) | Err(_) => break,
+                Ok(Some(Err(e))) => panic!("ws recv error: {e:?}"),
+            };
+            let text = match msg {
+                Message::Text(t) => t,
+                Message::Close(_) => panic!("socket closed unexpectedly"),
+                _ => continue,
+            };
+            let server: ServerMessage =
+                serde_json::from_str(text.as_str()).expect("parse ServerMessage");
+            match server {
+                ServerMessage::Dropped(d) => panic!(
+                    "AC violation (Finding #1): post-unsubscribe lag must NOT \
+                     produce a Dropped frame against a freshly empty subscription \
+                     set; got count={}",
+                    d.count
+                ),
+                ServerMessage::Event(f) if f.event.event_id == id => {
+                    saw_real = true;
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        assert!(
+            saw_real,
+            "expected the post-resubscription real Event to arrive"
+        );
 
         state.shutdown.cancel();
     }
