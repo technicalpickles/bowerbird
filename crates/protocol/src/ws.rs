@@ -49,6 +49,34 @@ pub struct SyncFrame {
     pub latest_event_id: EventId,
 }
 
+impl SyncFrame {
+    /// Construct a `SyncFrame` with the cursor-ordering invariant enforced.
+    /// Returns `Err(Error::InvalidSyncFrameOrdering)` when `oldest > latest`.
+    /// Equality is permitted (empty event log: both at 0).
+    ///
+    /// `Deserialize` deliberately does NOT route through this constructor —
+    /// wire payloads (including ones from a hypothetical buggy peer with
+    /// inverted IDs) round-trip without validation per the asymmetric
+    /// inbound/outbound policy. The constructor is the daemon-side
+    /// construction-time gate; no Story 2.3 producer activates it yet
+    /// (Story 2.4's lagged-consumer recovery will).
+    pub fn new(
+        oldest_available_event_id: EventId,
+        latest_event_id: EventId,
+    ) -> crate::error::Result<Self> {
+        if oldest_available_event_id > latest_event_id {
+            return Err(crate::error::Error::InvalidSyncFrameOrdering {
+                oldest: oldest_available_event_id,
+                latest: latest_event_id,
+            });
+        }
+        Ok(Self {
+            oldest_available_event_id,
+            latest_event_id,
+        })
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EventFrame {
     pub event: Event,
@@ -77,4 +105,50 @@ pub struct DroppedFrame {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CloseFrame {
     pub reason: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::Error;
+
+    #[test]
+    fn sync_frame_new_accepts_ordered_cursors() {
+        let f = SyncFrame::new(EventId(10), EventId(20)).expect("ordered must succeed");
+        assert_eq!(f.oldest_available_event_id, EventId(10));
+        assert_eq!(f.latest_event_id, EventId(20));
+    }
+
+    #[test]
+    fn sync_frame_new_rejects_inverted_cursors() {
+        let err = SyncFrame::new(EventId(20), EventId(10)).expect_err("inverted must fail");
+        assert!(matches!(
+            err,
+            Error::InvalidSyncFrameOrdering {
+                oldest: EventId(20),
+                latest: EventId(10),
+            }
+        ));
+    }
+
+    #[test]
+    fn sync_frame_new_allows_equal_cursors() {
+        // Empty event log: oldest == latest == 0 is a legitimate state.
+        let f = SyncFrame::new(EventId(5), EventId(5)).expect("equal must succeed");
+        assert_eq!(f.oldest_available_event_id, EventId(5));
+        assert_eq!(f.latest_event_id, EventId(5));
+    }
+
+    #[test]
+    fn sync_frame_deserialize_tolerates_inverted_cursors_from_wire() {
+        // Asymmetric inbound/outbound policy: Deserialize does not call the
+        // constructor, so a hypothetical buggy peer's inverted SyncFrame
+        // still parses cleanly. The construction-side gate is the only
+        // place ordering is enforced.
+        let wire = r#"{"oldest_available_event_id":20,"latest_event_id":10}"#;
+        let f: SyncFrame =
+            serde_json::from_str(wire).expect("wire payload must deserialize unchanged");
+        assert_eq!(f.oldest_available_event_id, EventId(20));
+        assert_eq!(f.latest_event_id, EventId(10));
+    }
 }

@@ -3060,7 +3060,7 @@ mod story_2_2_publish {
 
     const TEST_BEARER: &str = super::TEST_BEARER;
 
-    type WsStream = tokio_tungstenite::WebSocketStream<
+    pub(super) type WsStream = tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >;
 
@@ -3079,7 +3079,7 @@ mod story_2_2_publish {
     /// Real test envelopes use real `source`/`session_id` values, so the
     /// `__probe__` magic is reliably distinguishable.
     #[derive(Clone, Copy)]
-    enum ProbeKind {
+    pub(super) enum ProbeKind {
         Event { source: &'static str },
         State { session_id: &'static str },
     }
@@ -3170,7 +3170,7 @@ mod story_2_2_publish {
     ///
     /// Sleeps used here live inside this explicit bounded retry loop, not
     /// as unconditional synchronization.
-    async fn wait_subscribe_live(ws: &mut WsStream, state: &AppState, probe: ProbeKind) {
+    pub(super) async fn wait_subscribe_live(ws: &mut WsStream, state: &AppState, probe: ProbeKind) {
         wait_subscribe_live_all(&mut [ws], state, probe).await
     }
 
@@ -3181,7 +3181,7 @@ mod story_2_2_publish {
     /// once all clients meet that bar, every per-connection task has
     /// drained the channel up to that point and no older probe can
     /// arrive later (tokio broadcast preserves per-channel order).
-    async fn wait_subscribe_live_all(
+    pub(super) async fn wait_subscribe_live_all(
         clients: &mut [&mut WsStream],
         state: &AppState,
         probe: ProbeKind,
@@ -3249,7 +3249,7 @@ mod story_2_2_publish {
     /// or a 2s deadline. Other errors fail the test. Mirrors the pattern
     /// `story_2_1_ws::ws_257th_connection_rejected_503` uses to verify
     /// permit release after a graceful close.
-    async fn connect_until_ready(addr: std::net::SocketAddr) -> WsStream {
+    pub(super) async fn connect_until_ready(addr: std::net::SocketAddr) -> WsStream {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
             if std::time::Instant::now() >= deadline {
@@ -3272,7 +3272,7 @@ mod story_2_2_publish {
         }
     }
 
-    fn parse_event_frame(msg: &Message) -> Event {
+    pub(super) fn parse_event_frame(msg: &Message) -> Event {
         let text = match msg {
             Message::Text(t) => t.as_str(),
             other => panic!("expected text Event frame, got {other:?}"),
@@ -3284,7 +3284,7 @@ mod story_2_2_publish {
         }
     }
 
-    fn parse_state_frame(msg: &Message) -> StateFrame {
+    pub(super) fn parse_state_frame(msg: &Message) -> StateFrame {
         let text = match msg {
             Message::Text(t) => t.as_str(),
             other => panic!("expected text State frame, got {other:?}"),
@@ -3299,7 +3299,7 @@ mod story_2_2_publish {
     /// Drives the REAL `projection::session::write` path so the broadcast
     /// envelopes are produced by the production publisher, not a synthetic
     /// `state.broadcaster.publish(...)` shortcut.
-    async fn publish_via_projection(
+    pub(super) async fn publish_via_projection(
         state: &AppState,
         source: &str,
         session_id: &str,
@@ -3923,6 +3923,521 @@ mod story_2_2_publish {
         assert!(
             timed.is_err(),
             "unexpected trailing frame after Event+State pair: {timed:?}"
+        );
+
+        state.shutdown.cancel();
+    }
+}
+
+/// Story 2.3 — Snapshot of matching session projections on Subscribe.
+///
+/// Each test sits on top of the Story 2.2 publish path and the Story 2.1
+/// WS surface. The unique behaviour exercised here is the new emission
+/// step in the `ClientMessage::Subscribe` arm: a per-subscribe read of
+/// `session_projections` filtered by the new topic and deduped against
+/// the pre-existing subscription set.
+///
+/// `wait_subscribe_live*` from 2.2 is reused unchanged. The helper
+/// panics on a non-probe frame during readiness — in this module that
+/// is the *desired* behaviour for AC #7's dedup assertion, and every
+/// other test reads its expected snapshot frames explicitly before
+/// calling the helper.
+mod story_2_3_snapshot {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use bowerbird_daemon::state::AppState;
+    use futures_util::{SinkExt, StreamExt};
+    use protocol::{EventKind, ServerMessage};
+    use tokio_tungstenite::tungstenite::Message;
+
+    use super::story_2_1_ws::{
+        connect_authed, parse_hello, read_text_frame_or_close, spawn_test_daemon,
+    };
+    use super::story_2_2_publish::{
+        connect_until_ready, parse_event_frame, parse_state_frame, publish_via_projection,
+        wait_subscribe_live, ProbeKind, WsStream,
+    };
+    use super::{fresh_pools, make_test_state_with_ws};
+
+    const TEST_BEARER: &str = super::TEST_BEARER;
+
+    fn default_state(pools: bowerbird_daemon::db::DbPools, ws_max_conns: usize) -> AppState {
+        make_test_state_with_ws(
+            pools,
+            Arc::new(AtomicBool::new(true)),
+            ws_max_conns,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        )
+    }
+
+    /// Connect via `connect_until_ready` (which parses Hello) and return
+    /// the ready stream. Used by tests that don't need a non-default
+    /// `ws_max_conns` and want to skip the boilerplate.
+    async fn connect_and_skip_hello(addr: std::net::SocketAddr) -> WsStream {
+        connect_until_ready(addr).await
+    }
+
+    /// AC #1 — Three pre-existing sessions all surface as snapshot State
+    /// frames before any live event, then a subsequent publish appears as
+    /// a live State frame with a strictly later `last_event_at_ms`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_three_sessions_arrive_before_live_events() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 4);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        // Pre-create three sessions BEFORE the WS client connects so the
+        // snapshot read picks them up.
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-A",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-B",
+            EventKind::PostToolUse,
+            None,
+            "{}",
+        )
+        .await;
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-C",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+
+        // Three snapshot State frames, in any session-id order (SQL
+        // ordering is by updated_at DESC; we only assert set equality).
+        let mut ids = std::collections::HashSet::new();
+        let mut max_snapshot_last_event_at_ms: i64 = i64::MIN;
+        for _ in 0..3 {
+            let frame = read_text_frame_or_close(&mut ws).await;
+            let parsed = parse_state_frame(&frame);
+            ids.insert(parsed.session_id.clone());
+            max_snapshot_last_event_at_ms =
+                max_snapshot_last_event_at_ms.max(parsed.state.last_event_at_ms);
+        }
+        let expected: std::collections::HashSet<String> = ["sess-A", "sess-B", "sess-C"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            ids, expected,
+            "snapshot must cover exactly the three pre-existing sessions"
+        );
+
+        // Now publish a live event for sess-A. The subscription is
+        // state-only, so the Event envelope is filtered by
+        // `dispatch_envelope` and never reaches the wire — only the
+        // resulting State frame does. Its `last_event_at_ms` must be
+        // strictly >= the max snapshot timestamp (the new publish
+        // happened later in wall-clock).
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-A",
+            EventKind::PostToolUse,
+            None,
+            "{}",
+        )
+        .await;
+        let f_state = read_text_frame_or_close(&mut ws).await;
+        let live = parse_state_frame(&f_state);
+        assert_eq!(live.session_id, "sess-A");
+        assert_eq!(live.state.last_event_kind, EventKind::PostToolUse);
+        assert!(
+            live.state.last_event_at_ms >= max_snapshot_last_event_at_ms,
+            "live frame must not predate the snapshot (live={}, max snapshot={})",
+            live.state.last_event_at_ms,
+            max_snapshot_last_event_at_ms
+        );
+
+        state.shutdown.cancel();
+    }
+
+    /// AC #2 — A brand-new session's first event reaches a wildcard
+    /// subscriber as a live State frame, via Story 2.2's publish path.
+    /// No Story 2.3 code change required; the test exists so a
+    /// regression in 2.2's publish-then-emit ordering surfaces here.
+    #[tokio::test(flavor = "current_thread")]
+    async fn new_session_emits_state_to_wildcard_subscriber() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 4);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let mut ws = connect_and_skip_hello(addr).await;
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+        // No pre-existing sessions, so the snapshot is empty; we use
+        // wait_subscribe_live to confirm the subscribe landed before
+        // publishing the first event.
+        wait_subscribe_live(
+            &mut ws,
+            &state,
+            ProbeKind::State {
+                session_id: "__probe__",
+            },
+        )
+        .await;
+
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-NEW",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+
+        // State-only subscription — the Event envelope is filtered;
+        // only the State frame reaches the wire.
+        let f_state = read_text_frame_or_close(&mut ws).await;
+        let st = parse_state_frame(&f_state);
+        assert_eq!(st.session_id, "sess-NEW");
+
+        state.shutdown.cancel();
+    }
+
+    /// AC #3 — Subscribing to a specific `state.session.<id>` emits a
+    /// snapshot for only that session and does not deliver live state
+    /// frames for other sessions.
+    #[tokio::test(flavor = "current_thread")]
+    async fn specific_id_subscription_excludes_other_sessions() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 4);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-A",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-B",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.sess-A"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+
+        // Exactly one snapshot frame, for sess-A only.
+        let frame = read_text_frame_or_close(&mut ws).await;
+        let parsed = parse_state_frame(&frame);
+        assert_eq!(parsed.session_id, "sess-A");
+
+        // Publish for sess-B — no state frame must arrive on this
+        // connection within 300ms.
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-B",
+            EventKind::PostToolUse,
+            None,
+            "{}",
+        )
+        .await;
+        let timed = tokio::time::timeout(Duration::from_millis(300), ws.next()).await;
+        assert!(
+            timed.is_err(),
+            "sess-B state must not reach sess-A-only subscriber; got {timed:?}"
+        );
+
+        state.shutdown.cancel();
+    }
+
+    /// AC #4 — An empty daemon emits zero snapshot frames and
+    /// transitions straight to live streaming on the first publish.
+    #[tokio::test(flavor = "current_thread")]
+    async fn empty_daemon_no_snapshot_frames() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 4);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let mut ws = connect_and_skip_hello(addr).await;
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+        // The readiness probe panics on any non-probe frame, so if a
+        // real snapshot frame were ever emitted from an empty daemon
+        // (regression), this would catch it.
+        wait_subscribe_live(
+            &mut ws,
+            &state,
+            ProbeKind::State {
+                session_id: "__probe__",
+            },
+        )
+        .await;
+
+        // Publish for a new session — state-only subscription means
+        // the Event envelope is filtered; only the State frame reaches
+        // the wire. Confirms immediate transition to live streaming.
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-NEW",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+        let f_state = read_text_frame_or_close(&mut ws).await;
+        let st = parse_state_frame(&f_state);
+        assert_eq!(st.session_id, "sess-NEW");
+
+        state.shutdown.cancel();
+    }
+
+    /// AC #5 — `state.session.<id>.current_state` emits the same full
+    /// `StateFrame` wire shape as `state.session.<id>` for the snapshot.
+    /// Story 2.1 deliberately did not project a smaller current-state
+    /// frame; this test pins that decision.
+    #[tokio::test(flavor = "current_thread")]
+    async fn current_state_subscription_delivers_snapshot() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 4);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-A",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.sess-A.current_state"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+
+        let frame = read_text_frame_or_close(&mut ws).await;
+        let parsed = parse_state_frame(&frame);
+        assert_eq!(parsed.session_id, "sess-A");
+        assert_eq!(parsed.source, "claude");
+        // Full StateFrame: every SessionState field carries a value.
+        assert_eq!(parsed.state.last_event_kind, EventKind::PreToolUse);
+        assert!(parsed.state.last_event_at_ms > 0);
+
+        state.shutdown.cancel();
+    }
+
+    /// AC #6 — Subscribing to an `events.*`-family topic emits zero
+    /// snapshot frames even when sessions exist.
+    #[tokio::test(flavor = "current_thread")]
+    async fn events_subscription_emits_no_snapshot() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 4);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-A",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+
+        let mut ws = connect_and_skip_hello(addr).await;
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"events.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+        // wait_subscribe_live panics on non-probe frames — if a snapshot
+        // State frame were emitted for an events.* subscription, this
+        // would fail before the probe is observed.
+        wait_subscribe_live(&mut ws, &state, ProbeKind::Event { source: "claude" }).await;
+
+        // Channel is still alive for events — publish and read one
+        // Event frame to confirm live streaming.
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-A",
+            EventKind::PostToolUse,
+            None,
+            "{}",
+        )
+        .await;
+        let frame = read_text_frame_or_close(&mut ws).await;
+        let event = parse_event_frame(&frame);
+        assert_eq!(event.session_id, "sess-A");
+
+        state.shutdown.cancel();
+    }
+
+    /// AC #7 — Overlapping subscriptions do not re-snapshot. After
+    /// `state.session.*` has delivered a snapshot for sess-A, a
+    /// subsequent `state.session.sess-A` subscribe emits zero new
+    /// snapshot frames (the wildcard already covered it).
+    ///
+    /// The assertion is twofold:
+    /// - `wait_subscribe_live` panics on any non-probe frame during
+    ///   readiness, so a regression that re-snapshots sess-A would
+    ///   surface as a `non-probe frame` panic.
+    /// - After the second subscribe is live, a subsequent publish for
+    ///   sess-A yields exactly the live Event + State pair (no
+    ///   leftover snapshot frame in the queue).
+    #[tokio::test(flavor = "current_thread")]
+    async fn overlapping_subscriptions_do_not_re_snapshot() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 4);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-A",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+
+        // First subscribe — wildcard. Read the one snapshot frame.
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe wildcard");
+        let frame = read_text_frame_or_close(&mut ws).await;
+        let parsed = parse_state_frame(&frame);
+        assert_eq!(parsed.session_id, "sess-A");
+
+        // Second subscribe — specific id. The wildcard already covers
+        // sess-A, so the dedup logic must skip it. wait_subscribe_live
+        // confirms readiness via probes; any extra snapshot frame for
+        // sess-A would surface as a non-probe-frame panic.
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.sess-A"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe specific");
+        wait_subscribe_live(
+            &mut ws,
+            &state,
+            ProbeKind::State {
+                session_id: "sess-A",
+            },
+        )
+        .await;
+
+        // Subsequent live publish for sess-A — state-only subscription
+        // filters the Event envelope, leaving exactly one State frame.
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-A",
+            EventKind::PostToolUse,
+            None,
+            "{}",
+        )
+        .await;
+        let f_state = read_text_frame_or_close(&mut ws).await;
+        let live = parse_state_frame(&f_state);
+        assert_eq!(live.session_id, "sess-A");
+        assert_eq!(live.state.last_event_kind, EventKind::PostToolUse);
+
+        // No trailing frame within a short window — the publish
+        // produced exactly one State frame; no leftover snapshot.
+        let timed = tokio::time::timeout(Duration::from_millis(200), ws.next()).await;
+        assert!(
+            timed.is_err(),
+            "no extra frame after live State frame: got {timed:?}"
+        );
+
+        state.shutdown.cancel();
+    }
+
+    /// AC #1 — Sanity check that snapshot frames carry the
+    /// `ServerMessage::State` op so deserialization through the canonical
+    /// path produces a `State` variant. Guards against a regression that
+    /// would emit a sibling op (e.g. `Hello` shape with state fields).
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_frame_wire_shape_is_state_op() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 4);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-A",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+
+        let frame = read_text_frame_or_close(&mut ws).await;
+        let text = match frame {
+            Message::Text(t) => t.to_string(),
+            other => panic!("expected text frame, got {other:?}"),
+        };
+        let parsed: ServerMessage = serde_json::from_str(&text).expect("parse ServerMessage");
+        assert!(
+            matches!(parsed, ServerMessage::State(_)),
+            "snapshot wire shape must be ServerMessage::State; got {parsed:?}"
         );
 
         state.shutdown.cancel();
