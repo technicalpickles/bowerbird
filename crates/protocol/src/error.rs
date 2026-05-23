@@ -7,6 +7,16 @@ pub enum Error {
     Serde(String),
     #[error("unknown hook_kind: {0}")]
     UnknownHookKind(String),
+    // Story 2.3 fold-in from Epic 1 retro (deferred-work.md:8). Surfaced by
+    // `SyncFrame::new` when a caller attempts to construct a frame with
+    // `oldest_available_event_id > latest_event_id`. `Deserialize` does
+    // NOT call the constructor, so wire payloads continue to round-trip
+    // unchanged — the asymmetric inbound/outbound policy.
+    #[error("invalid SyncFrame ordering: oldest={oldest:?} > latest={latest:?}")]
+    InvalidSyncFrameOrdering {
+        oldest: crate::event::EventId,
+        latest: crate::event::EventId,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
