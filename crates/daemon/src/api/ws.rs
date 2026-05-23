@@ -218,7 +218,7 @@ async fn connection_task(
             inbound = socket.recv() => {
                 match inbound {
                     Some(Ok(Message::Text(text))) => {
-                        if !handle_text_frame(&mut socket, &mut subscriptions, &mut rx, text.as_str()).await {
+                        if !handle_text_frame(&mut socket, &mut subscriptions, &mut rx, &state, text.as_str()).await {
                             return;
                         }
                     }
@@ -300,10 +300,16 @@ async fn connection_task(
 /// before the client's Subscribe from being delivered after the new topic
 /// is added (per the review finding for AC #2: "subsequent server frames"
 /// is subsequent to the subscription, not subsequent to processing).
+///
+/// Story 2.3 — `Subscribe` for a `state.*` topic also emits a snapshot
+/// of matching `session_projections` rows BEFORE the connection task's
+/// main loop resumes. See the six-step ordering documented in the
+/// `Subscribe` arm below.
 async fn handle_text_frame(
     socket: &mut WebSocket,
     subscriptions: &mut HashSet<Topic>,
     rx: &mut tokio::sync::broadcast::Receiver<BroadcastEnvelope>,
+    state: &AppState,
     text: &str,
 ) -> bool {
     let msg: ClientMessage = match serde_json::from_str(text) {
@@ -314,12 +320,111 @@ async fn handle_text_frame(
         }
     };
     match msg {
+        // Six-step ordering (Story 2.3):
+        //
+        //   [A] drain pre-existing in-flight envelopes under the OLD
+        //       subscription set (unchanged from Story 2.1)
+        //   [B] read now_ms for the read-time stale-Working fallback
+        //   [C] read the projection table to build the snapshot, filtered
+        //       by the NEW topic AND deduped against the pre-existing
+        //       subscription set
+        //   [D] insert the new topic into the subscription set so the
+        //       main loop dispatches subsequent envelopes under the NEW
+        //       set
+        //   [E] emit each snapshot StateFrame on this connection's socket
+        //   [F] (main loop resumes) `rx.recv()` dispatches buffered live
+        //       envelopes under the NEW set, AFTER snapshot emission
+        //
+        // Window between [C] and [D]: a State envelope published in this
+        // window is buffered in `rx` and dispatched at [F] under the new
+        // set. The client may observe `snapshot(state=v1)` followed by
+        // `live(state=v2)` for the same session — the live frame is the
+        // newer truth. The snapshot is best-effort consistency, not
+        // transactional, because locking the DB and the hub together is
+        // not justified by the loss of strict consistency between two
+        // surfaces that are deliberately decoupled. Do NOT add a second
+        // drain after [D] — that would dispatch buffered envelopes under
+        // the new set BEFORE the snapshot is emitted, reversing the
+        // documented snapshot-first ordering.
         ClientMessage::Subscribe { topic } => match Topic::parse(&topic) {
             Ok(t) => {
+                // [A] Drain pre-existing in-flight envelopes under the
+                //     OLD subscription set.
                 if !drain_backlog_under_state(socket, subscriptions, rx).await {
                     return false;
                 }
+
+                // [B] Best-effort clock read. Failure logs and falls back
+                //     to 0 — `current_state_for_read` then never triggers
+                //     the stale-Working derivation in this rare window;
+                //     the stored `current_state` rides through.
+                let now_ms = match crate::time::current_unix_millis() {
+                    Ok(n) => n,
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "ws snapshot: clock read failed; proceeding without stale-Working fallback",
+                        );
+                        0
+                    }
+                };
+
+                // [C] Build the snapshot. On reader pool/interact/serde
+                //     error, log and emit an EMPTY snapshot — but still
+                //     insert the topic at [D] so live frames flow. The
+                //     trade-off is documented in the Subscribe-arm
+                //     header above: snapshot is best-effort
+                //     initialisation aid; the live stream is the
+                //     primary contract. If the snapshot is essential,
+                //     the client reconnects (which is the canonical WS
+                //     retry mechanism and the only path that gets a
+                //     fresh `pre_existing` set). Returning early
+                //     without inserting the topic would leave the
+                //     client silently unsubscribed for this topic
+                //     because the protocol has no Subscribe ack/error
+                //     frame in V1 (see protocol-changelog.md).
+                let snapshot_frames = match crate::projection::snapshot_for_topic(
+                    &state.db.reader,
+                    &t,
+                    subscriptions,
+                    now_ms,
+                )
+                .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "ws snapshot: snapshot_for_topic failed; emitting empty snapshot, subscription remains live",
+                        );
+                        Vec::new()
+                    }
+                };
+
+                // [D] Insert the new topic. Envelopes published between
+                //     [C] and here stay buffered in rx and dispatch under
+                //     the new set at [F], after snapshot emission.
                 subscriptions.insert(t);
+
+                // [E] Emit snapshot frames. Order is the SQL row order:
+                //     `updated_at DESC, source ASC, session_id ASC`.
+                for frame in snapshot_frames {
+                    let json = match serde_json::to_string(&ServerMessage::State(frame)) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::error!(
+                                error = ?e,
+                                "ws snapshot: failed to serialize StateFrame; dropping",
+                            );
+                            continue;
+                        }
+                    };
+                    if let Err(e) = socket.send(Message::Text(json.into())).await {
+                        tracing::debug!(error = ?e, "ws snapshot: send failed; closing");
+                        return false;
+                    }
+                }
+
                 true
             }
             Err(()) => {
