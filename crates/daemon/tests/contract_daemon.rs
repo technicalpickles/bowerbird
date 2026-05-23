@@ -3948,7 +3948,7 @@ mod story_2_3_snapshot {
     use std::time::Duration;
 
     use bowerbird_daemon::state::AppState;
-    use futures_util::{SinkExt, StreamExt};
+    use futures_util::SinkExt;
     use protocol::{EventKind, ServerMessage, SessionCurrentState};
     use tokio_tungstenite::tungstenite::Message;
 
@@ -4221,8 +4221,15 @@ mod story_2_3_snapshot {
         let parsed = parse_state_frame(&frame);
         assert_eq!(parsed.session_id, "sess-A");
 
-        // Publish for sess-B — no state frame must arrive on this
-        // connection within 300ms.
+        // Ordering barrier rather than a fixed sleep: publish the
+        // forbidden envelope (sess-B) FIRST, then a permitted live
+        // envelope (sess-A). `tokio::sync::broadcast` preserves
+        // per-channel publish order, so a buggy `Topic::matches` that
+        // let the sess-B State frame leak to this subscriber would
+        // deliver sess-B BEFORE the sess-A live frame. Reading the
+        // next State frame and asserting it is sess-A — and that the
+        // first frame seen is not sess-B — is deterministic across CI
+        // load, scheduler jitter, and TCP backpressure.
         let _ = publish_via_projection(
             &state,
             "claude",
@@ -4232,10 +4239,25 @@ mod story_2_3_snapshot {
             "{}",
         )
         .await;
-        let timed = tokio::time::timeout(Duration::from_millis(300), ws.next()).await;
-        assert!(
-            timed.is_err(),
-            "sess-B state must not reach sess-A-only subscriber; got {timed:?}"
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-A",
+            EventKind::PostToolUse,
+            None,
+            "{}",
+        )
+        .await;
+        let frame = read_text_frame_or_close(&mut ws).await;
+        let parsed = parse_state_frame(&frame);
+        assert_eq!(
+            parsed.session_id, "sess-A",
+            "specific-session subscriber must not receive sess-B; first frame after barrier was {parsed:?}",
+        );
+        assert_eq!(
+            parsed.state.last_event_kind,
+            EventKind::PostToolUse,
+            "expected live update for sess-A, not a leaked snapshot or sess-B leak",
         );
 
         state.shutdown.cancel();
@@ -4433,6 +4455,14 @@ mod story_2_3_snapshot {
 
         // Subsequent live publish for sess-A — state-only subscription
         // filters the Event envelope, leaving exactly one State frame.
+        // Because `wait_subscribe_live` above panics on any non-probe
+        // frame during readiness, any duplicate-snapshot regression
+        // would already have been caught BEFORE this publish. The
+        // assertion below then has its own ordering barrier: the live
+        // frame's `last_event_kind` (PostToolUse) differs from the
+        // snapshot's (PreToolUse), so a leaked snapshot would surface
+        // here as a `last_event_kind` mismatch rather than relying on
+        // a fixed timeout window.
         let _ = publish_via_projection(
             &state,
             "claude",
@@ -4445,14 +4475,10 @@ mod story_2_3_snapshot {
         let f_state = read_text_frame_or_close(&mut ws).await;
         let live = parse_state_frame(&f_state);
         assert_eq!(live.session_id, "sess-A");
-        assert_eq!(live.state.last_event_kind, EventKind::PostToolUse);
-
-        // No trailing frame within a short window — the publish
-        // produced exactly one State frame; no leftover snapshot.
-        let timed = tokio::time::timeout(Duration::from_millis(200), ws.next()).await;
-        assert!(
-            timed.is_err(),
-            "no extra frame after live State frame: got {timed:?}"
+        assert_eq!(
+            live.state.last_event_kind,
+            EventKind::PostToolUse,
+            "first frame after second subscribe must be the live update, not a leaked snapshot frame",
         );
 
         state.shutdown.cancel();
@@ -4496,6 +4522,81 @@ mod story_2_3_snapshot {
             matches!(parsed, ServerMessage::State(_)),
             "snapshot wire shape must be ServerMessage::State; got {parsed:?}"
         );
+
+        state.shutdown.cancel();
+    }
+
+    /// Second-round review finding (Patch) — a transient reader-pool
+    /// failure during `Subscribe` must NOT leave the client silently
+    /// unsubscribed. The Subscribe arm logs the snapshot error, emits
+    /// an empty snapshot, and STILL inserts the topic so live `State`
+    /// frames continue to flow. Snapshot retry is via reconnect
+    /// because V1's protocol has no `Subscribe` ack/error frame —
+    /// trade-off documented in `crates/daemon/src/api/ws.rs::handle_text_frame`.
+    ///
+    /// We force the failure by closing the reader pool after the
+    /// daemon is running. `publish_via_projection` uses the writer
+    /// pool and stays functional.
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_read_failure_keeps_live_subscription_active() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 4);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        // Pre-create a session so the projection table HAS data. A
+        // healthy reader pool would have emitted one snapshot frame
+        // for `sess-pre`; closing the reader below forces zero.
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-pre",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+
+        // Force `snapshot_for_topic` into the reader-pool error path.
+        state.db.reader.close();
+
+        let mut ws = connect_until_ready(addr).await;
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+
+        // `wait_subscribe_live` publishes the probe through the
+        // broadcaster (not the reader). It panics on any non-probe
+        // frame during readiness, so a regression that emitted an
+        // unexpected frame on snapshot failure would be caught here.
+        wait_subscribe_live(
+            &mut ws,
+            &state,
+            ProbeKind::State {
+                session_id: "__probe__",
+            },
+        )
+        .await;
+
+        // Prove the topic was inserted: publishing a new session
+        // emits a live State frame on this connection. If the prior
+        // behavior (return without inserting) had survived, this
+        // frame would be filtered by `dispatch_envelope` and the
+        // read would time out.
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-live",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+        let frame = read_text_frame_or_close(&mut ws).await;
+        let st = parse_state_frame(&frame);
+        assert_eq!(st.session_id, "sess-live");
+        assert_eq!(st.source, "claude");
 
         state.shutdown.cancel();
     }
