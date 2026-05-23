@@ -615,9 +615,14 @@ This is the single exception to the derive-based serde pattern.
 - `2` is **forbidden** — exit 2 blocks Claude tool calls, which violates the
   substrate-not-actor axiom
 
-**Shim wire format:** shim writes raw hook JSON verbatim to the Unix socket.
-No normalization in shim. Daemon calls
+**Shim wire format:** newline-delimited JSON over the Unix socket (one
+`{object}\n` line in, one status line out: `200\n` / `503\n` / `400 <reason>\n`).
+The shim writes the hook JSON with one transport-routing field injected
+(`hook_kind`, from the `--hook-kind` CLI flag); Claude Code's original
+`hook_event_name` is preserved verbatim. No interpretive normalization in shim;
+that remains adapter-claude's job. Daemon calls
 `adapter_claude::normalize(hook_kind, raw) -> Result<NormalizeResult>`.
+See [ADR-0002](../../decisions/0002-ingest-wire-framing-and-hook-kind.md).
 
 **Shim hot-path rules (non-negotiable):**
 - No heap allocation on the success path (best-effort; enforced via criterion
@@ -866,7 +871,7 @@ No overlap. No symlinks. Workspace root fixtures are the single authoritative so
 **Ingest boundary (shim → daemon):**
 - `crates/shim/src/socket.rs` — write path, timeout, failure log
 - `crates/daemon/src/ingest/listener.rs` — accept loop (renamed from `socket.rs` to avoid naming collision)
-- Raw hook JSON bytes on the wire; no normalization in shim
+- Newline-delimited JSON wire framing (one `{object}\n` in, one status line out); shim injects `hook_kind` as transport routing but adds no interpretive normalization. See [ADR-0002](../../decisions/0002-ingest-wire-framing-and-hook-kind.md).
 
 **Normalization boundary:**
 - `crates/daemon/src/ingest/handler.rs` calls `adapter_claude::normalize()`
@@ -981,9 +986,9 @@ Boundary descriptions for every inter-crate surface.
 testing mandated. `skip_all` tracing policy. Exit code semantics (0/1/never-2).
 Shim binary name constant in protocol. Named integration test files.
 
-**One deferred implementation detail:** Ingest socket wire framing
-(length-prefixed vs newline-delimited) is TBD at implementation time. This
-does not affect any other component's design.
+**Resolved during Story 1.3 implementation:** Ingest socket wire framing is
+newline-delimited JSON (one `{object}\n` request, one status-line response).
+Ratified by [ADR-0002](../../decisions/0002-ingest-wire-framing-and-hook-kind.md).
 
 ### Architecture Completeness Checklist
 

@@ -1,0 +1,8 @@
+{
+  "hook_kind": "PreToolUse",
+  "session_id": "test-session-xyz789",
+  "tool_name": "UnknownCustomTool",
+  "tool_input": {
+    "args": ["--verbose"]
+  }
+}

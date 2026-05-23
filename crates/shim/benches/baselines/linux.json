@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "p99_nanos": 1194533,
+  "mean_nanos": 1027350,
+  "samples": 200,
+  "absolute_budget_nanos": 5000000,
+  "regression_max_ratio": 1.35
+}
