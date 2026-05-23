@@ -5344,4 +5344,112 @@ mod story_2_4_dropped {
 
         state.shutdown.cancel();
     }
+
+    /// AC #1 / Story 2.4 code-review finding #1 — A state-only
+    /// subscriber MUST NOT have its `last_delivered_event_id` cursor
+    /// advanced by Event envelopes that didn't match its subscription.
+    /// The first `DroppedFrame` after lag must therefore use the
+    /// `EventId(0)` "from the beginning" sentinel (per Dev Notes
+    /// "Cursor tracking only on Event dispatch") — NOT a cursor poisoned
+    /// by unrelated Events that passed through `rx.recv()` but were
+    /// filtered out by `dispatch_envelope`.
+    ///
+    /// Regression scenario the pre-fix code shipped:
+    ///   1. Subscribe to `state.session.*` (state-only).
+    ///   2. Publish 5 events via `publish_via_projection` — each emits
+    ///      one Event envelope + one State envelope on the broadcast
+    ///      hub. The State frames are delivered; the Event frames
+    ///      pass through `rx.recv()` but `dispatch_envelope` returns
+    ///      Filtered (no wire send).
+    ///   3. Pre-fix: `last_delivered_event_id` was advanced to the last
+    ///      Event's id, even though no Event frame ever reached the
+    ///      socket.
+    ///   4. Lag is triggered; the resulting Dropped frame reports
+    ///      `first_dropped_event_id = last_delivered + 1` — a value
+    ///      the presenter never saw, corrupting REST recovery.
+    /// Post-fix: the cursor stays at `EventId(0)` (None internally),
+    /// and the Dropped frame's `first_dropped_event_id` is `EventId(0)`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn state_only_subscriber_does_not_advance_cursor_on_unrelated_events() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = state_with_caps(pools, 16, Duration::from_secs(1));
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+        wait_subscribe_live(
+            &mut ws,
+            &state,
+            ProbeKind::State {
+                session_id: "__probe__",
+            },
+        )
+        .await;
+
+        // Publish 5 real events via the production projection path. Each
+        // produces one Event + one State on the hub. The state-only
+        // subscription matches only the State envelopes; the Event
+        // envelopes pass through rx.recv but `dispatch_envelope` filters
+        // them. Drain the 5 State frames as they arrive so the per-
+        // connection task isn't stuck on socket.send.
+        for i in 0..5 {
+            let _ = publish_via_projection(
+                &state,
+                "claude",
+                "sess-state-only",
+                if i % 2 == 0 {
+                    EventKind::PreToolUse
+                } else {
+                    EventKind::PostToolUse
+                },
+                None,
+                "{}",
+            )
+            .await;
+            let frame = read_text_frame_or_close(&mut ws).await;
+            let server: ServerMessage = match &frame {
+                Message::Text(t) => serde_json::from_str(t.as_str()).expect("parse"),
+                other => panic!("expected State frame, got {other:?}"),
+            };
+            assert!(
+                matches!(server, ServerMessage::State(_)),
+                "state.session.* must only deliver State frames; got {server:?}"
+            );
+        }
+
+        // Now trigger lag — synthetic flood of EVENT envelopes (these
+        // never match `state.session.*` either, so they're all Filtered
+        // dispatch outcomes). The per-connection task will see
+        // RecvError::Lagged on a subsequent rx.recv.
+        for i in 0..256 {
+            state
+                .broadcaster
+                .publish(synthetic_event(i + 1, "sess-state-only"));
+        }
+        tokio::task::yield_now().await;
+
+        // Hunt for Dropped. The frame's first_dropped_event_id MUST be
+        // EventId(0) — the cursor was never advanced because no Event
+        // ever reached the wire on this state-only subscription.
+        let outcome = read_until_dropped(&mut ws, 400)
+            .await
+            .expect("state-only subscriber must still receive Dropped on lag");
+        let (count, _events_before, first, _last) = outcome;
+        assert!(count >= 1);
+        assert_eq!(
+            first,
+            EventId(0),
+            "state-only subscriber's first_dropped_event_id MUST be \
+             EventId(0) sentinel (no prior Event delivery). Got {first:?} \
+             — likely cursor advanced on unrelated Events, regression of \
+             Story 2.4 code-review finding #1."
+        );
+
+        state.shutdown.cancel();
+    }
 }
