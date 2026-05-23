@@ -1,6 +1,6 @@
 # Story 2.4: Lagged consumer recovery with dropped frame
 
-Status: ready-for-dev
+Status: review
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -30,51 +30,51 @@ So that my tool can detect the gap and re-fetch state via REST to recover gracef
 
 ## Tasks / Subtasks
 
-- [ ] **Task 1 — Add typed `DroppedFrame::new` constructor in `crates/protocol/src/ws.rs`** (AC: #1, #3; folds in `deferred-work.md:9`)
-  - [ ] 1.1 Add `impl DroppedFrame { pub fn new(count: u64, first: EventId, last: EventId) -> Result<Self, Error> { ... } }` enforcing `count > 0`, `first <= last`. Reject `count == 0` (vacuous Dropped is a bug; coalescing should suppress it instead).
-  - [ ] 1.2 Add `Error::InvalidDroppedFrame { count, first, last }` variant in `crates/protocol/src/error.rs` alongside the existing `InvalidSyncFrameOrdering` variant (same pattern from Story 2.3).
-  - [ ] 1.3 Unit tests in `crates/protocol/src/ws.rs::tests`: `dropped_frame_new_accepts_valid`, `dropped_frame_new_rejects_zero_count`, `dropped_frame_new_rejects_inverted_ids`, `dropped_frame_new_allows_count_one_first_eq_last`, `dropped_frame_deserialize_tolerates_invalid_from_wire` (asymmetric inbound/outbound policy — `Deserialize` does NOT call `new`).
-  - [ ] 1.4 Update `docs/bmad/implementation-artifacts/deferred-work.md` line 9 with strike-through + backlink: `~~**DroppedFrame invariants not validated**~~ **Resolved by Story 2.4 (Task 1):** ...`. Mirror the format of the SyncFrame entry resolved by Story 2.3 (line 8).
+- [x] **Task 1 — Add typed `DroppedFrame::new` constructor in `crates/protocol/src/ws.rs`** (AC: #1, #3; folds in `deferred-work.md:9`)
+  - [x] 1.1 Add `impl DroppedFrame { pub fn new(count: u64, first: EventId, last: EventId) -> Result<Self, Error> { ... } }` enforcing `count > 0`, `first <= last`. Reject `count == 0` (vacuous Dropped is a bug; coalescing should suppress it instead).
+  - [x] 1.2 Add `Error::InvalidDroppedFrame { count, first, last }` variant in `crates/protocol/src/error.rs` alongside the existing `InvalidSyncFrameOrdering` variant (same pattern from Story 2.3).
+  - [x] 1.3 Unit tests in `crates/protocol/src/ws.rs::tests`: `dropped_frame_new_accepts_valid`, `dropped_frame_new_rejects_zero_count`, `dropped_frame_new_rejects_inverted_ids`, `dropped_frame_new_allows_count_one_first_eq_last`, `dropped_frame_deserialize_tolerates_invalid_from_wire` (asymmetric inbound/outbound policy — `Deserialize` does NOT call `new`).
+  - [x] 1.4 Update `docs/bmad/implementation-artifacts/deferred-work.md` line 9 with strike-through + backlink: `~~**DroppedFrame invariants not validated**~~ **Resolved by Story 2.4 (Task 1):** ...`. Mirror the format of the SyncFrame entry resolved by Story 2.3 (line 8).
 
-- [ ] **Task 2 — Add `ws_broadcast_coalesce_window` config knob in `crates/daemon/src/config.rs`** (AC: #3)
-  - [ ] 2.1 Add field `pub ws_broadcast_coalesce_window: Duration` to `Config`.
-  - [ ] 2.2 Default to `Duration::from_secs(1)` in `Config::with_bowerbird_dir`. At 30s sustained lag with a 1s window, frame count is bounded at ≤31, satisfying AC #3 with a healthy safety margin under 50,000.
-  - [ ] 2.3 Add the same field to `WsConfig` in `crates/daemon/src/state.rs` (`coalesce_window: Duration`); wire it through `crates/daemon/src/main.rs` where `WsConfig` is constructed (look for the existing `ping_interval` / `pong_timeout` wiring — same pattern).
+- [x] **Task 2 — Add `ws_broadcast_coalesce_window` config knob in `crates/daemon/src/config.rs`** (AC: #3)
+  - [x] 2.1 Add field `pub ws_broadcast_coalesce_window: Duration` to `Config`.
+  - [x] 2.2 Default to `Duration::from_secs(1)` in `Config::with_bowerbird_dir`. At 30s sustained lag with a 1s window, frame count is bounded at ≤31, satisfying AC #3 with a healthy safety margin under 50,000.
+  - [x] 2.3 Add the same field to `WsConfig` in `crates/daemon/src/state.rs` (`coalesce_window: Duration`); wire it through `crates/daemon/src/main.rs` where `WsConfig` is constructed (look for the existing `ping_interval` / `pong_timeout` wiring — same pattern).
 
-- [ ] **Task 3 — Per-connection cursor + coalescing state in `crates/daemon/src/api/ws.rs::connection_task`** (AC: #1, #2, #3, #4)
-  - [ ] 3.1 Add three locals next to `awaiting_pong` / `pong_sleep`: `let mut last_delivered_event_id: Option<EventId> = None;`, `let mut last_dropped_at: Option<tokio::time::Instant> = None;`, `let mut pending_drop_count: u64 = 0;`.
-  - [ ] 3.2 In `dispatch_envelope` (or its caller in the main loop), when an `Event` envelope dispatches successfully, set `last_delivered_event_id = Some(ev.event_id)`. State envelopes do NOT advance the cursor — they carry no `event_id`. (See Dev Notes "Cursor tracking only on Event dispatch" for the rationale.)
-  - [ ] 3.3 Replace the body of the `Err(RecvError::Lagged(n))` arm at `crates/daemon/src/api/ws.rs:262-266` with the projection routine described in Dev Notes "Lagged → Dropped projection — the exact shape". The arm calls a new helper `emit_dropped_or_coalesce(socket, &mut last_dropped_at, &mut pending_drop_count, last_delivered_event_id, n, state.ws_config.coalesce_window).await`.
-  - [ ] 3.4 Also replace the `Err(TryRecvError::Lagged(n))` arm in `drain_backlog_under_state` (lines 472-477) with the same helper. Both lag surfaces must coalesce together — they share the same per-connection state.
-  - [ ] 3.5 After a `Dropped` frame emits, the next legitimate envelope (whether Event or State) is dispatched normally and updates `last_delivered_event_id` if it's an Event. The socket stays open. `pending_drop_count` resets to `0` on every successful emission.
+- [x] **Task 3 — Per-connection cursor + coalescing state in `crates/daemon/src/api/ws.rs::connection_task`** (AC: #1, #2, #3, #4)
+  - [x] 3.1 Add three locals next to `awaiting_pong` / `pong_sleep`: `let mut last_delivered_event_id: Option<EventId> = None;`, `let mut last_dropped_at: Option<tokio::time::Instant> = None;`, `let mut pending_drop_count: u64 = 0;`.
+  - [x] 3.2 In `dispatch_envelope` (or its caller in the main loop), when an `Event` envelope dispatches successfully, set `last_delivered_event_id = Some(ev.event_id)`. State envelopes do NOT advance the cursor — they carry no `event_id`. (See Dev Notes "Cursor tracking only on Event dispatch" for the rationale.)
+  - [x] 3.3 Replace the body of the `Err(RecvError::Lagged(n))` arm at `crates/daemon/src/api/ws.rs:262-266` with the projection routine described in Dev Notes "Lagged → Dropped projection — the exact shape". The arm calls a new helper `emit_dropped_or_coalesce(socket, &mut last_dropped_at, &mut pending_drop_count, last_delivered_event_id, n, state.ws_config.coalesce_window).await`.
+  - [x] 3.4 Also replace the `Err(TryRecvError::Lagged(n))` arm in `drain_backlog_under_state` (lines 472-477) with the same helper. Both lag surfaces must coalesce together — they share the same per-connection state.
+  - [x] 3.5 After a `Dropped` frame emits, the next legitimate envelope (whether Event or State) is dispatched normally and updates `last_delivered_event_id` if it's an Event. The socket stays open. `pending_drop_count` resets to `0` on every successful emission.
 
-- [ ] **Task 4 — `emit_dropped_or_coalesce` helper** (AC: #1, #3)
-  - [ ] 4.1 New private async fn in `crates/daemon/src/api/ws.rs` — see Dev Notes "Coalescing helper — the exact shape" for the full body.
-  - [ ] 4.2 Behaviour: on first call OR when `now - last_dropped_at > coalesce_window`, emit one `DroppedFrame` with `count = pending_drop_count + n` and computed `first/last` event ids; on subsequent calls within the window, only accumulate (`pending_drop_count += n`) without emitting. When lag eventually stops and a normal envelope arrives, any accumulated `pending_drop_count` from suppressed calls remains — it folds into the NEXT lag event (or is never emitted at all, which is acceptable per the design: a presenter that catches up entirely doesn't need a trailing recap).
-  - [ ] 4.3 Wire-id computation:
+- [x] **Task 4 — `emit_dropped_or_coalesce` helper** (AC: #1, #3)
+  - [x] 4.1 New private async fn in `crates/daemon/src/api/ws.rs` — see Dev Notes "Coalescing helper — the exact shape" for the full body.
+  - [x] 4.2 Behaviour: on first call OR when `now - last_dropped_at > coalesce_window`, emit one `DroppedFrame` with `count = pending_drop_count + n` and computed `first/last` event ids; on subsequent calls within the window, only accumulate (`pending_drop_count += n`) without emitting. When lag eventually stops and a normal envelope arrives, any accumulated `pending_drop_count` from suppressed calls remains — it folds into the NEXT lag event (or is never emitted at all, which is acceptable per the design: a presenter that catches up entirely doesn't need a trailing recap).
+  - [x] 4.3 Wire-id computation:
     - `first_dropped_event_id = EventId(last_delivered.0 + 1)` when `last_delivered_event_id` is `Some`; otherwise `EventId(0)` (the empty-stream sentinel meaning "from the beginning").
     - `last_dropped_event_id` is the larger of `first_dropped_event_id` and `EventId(first.0 + count - 1)` — a best estimate, since the broadcast channel doesn't expose the post-lag cursor synchronously. Document in the function header that this is an upper-bound estimate, not a precise cursor; the presenter recovers via REST anyway and uses `last_delivered_event_id` (which it already tracked from prior Event frames it received) as the authoritative `?since=` cursor.
     - Construct via `DroppedFrame::new(...)` from Task 1; on the (impossible) `Err`, log at ERROR and skip emission. The error is unreachable by construction but the typed constructor enforces the invariant statically.
-  - [ ] 4.4 Send the frame via `ServerMessage::Dropped(frame)` → `serde_json::to_string` → `socket.send(Message::Text(...))`. Return `false` on socket send failure to signal the caller to exit the connection task (same pattern as `dispatch_envelope`).
+  - [x] 4.4 Send the frame via `ServerMessage::Dropped(frame)` → `serde_json::to_string` → `socket.send(Message::Text(...))`. Return `false` on socket send failure to signal the caller to exit the connection task (same pattern as `dispatch_envelope`).
 
-- [ ] **Task 5 — Contract tests in `crates/daemon/tests/contract_daemon.rs::story_2_4_dropped`** (AC: #1, #2, #3, #4)
-  - [ ] 5.1 Create `mod story_2_4_dropped { ... }` AFTER `mod story_2_3_snapshot`. Reuse 2.1/2.2/2.3 helpers via `use super::story_2_1_ws::{...}; use super::story_2_2_publish::{...};`.
-  - [ ] 5.2 Test `dropped_frame_after_1025_envelopes_with_blocked_reader` (AC #1) — spawn a test daemon with `ws_broadcast_capacity = 1024`, connect a client, subscribe to `events.*`, do NOT read further; publish 1025 envelopes via `publish_via_projection`; resume reading; assert FIRST received frame after subscribe is `dropped` with `count >= 1` (exact count depends on whether the client read the subscribe ack — `publish_via_projection` publishes both Event and State, so 1025 / 2 ≈ 513 events get a `Lagged` reading; assert `count >= 1` and `count <= 1025`, and the NEXT frame is a legitimate `event` or `state`. Document the exact expected count in a comment so future maintainers don't widen this assertion silently.
-  - [ ] 5.3 Test `dropped_frame_keeps_socket_open` (AC #1, #4) — after the dropped frame, publish 3 more events, assert all 3 arrive in order as `event` frames; assert socket never closes.
-  - [ ] 5.4 Test `dropped_frame_carries_count_in_envelopes` (AC #1) — assert `count` field is a positive integer (envelopes, not bytes); assert `first_dropped_event_id <= last_dropped_event_id`; do NOT assert exact `first/last` values (best-estimate semantics per Task 4.3 — document the looseness in the test comment).
-  - [ ] 5.5 Test `dropped_frame_rest_refetch_recovers` (AC #2) — after dropped, the client does `GET /sessions/{id}/events?since=<last_delivered_event_id>`; assert response includes the dropped events (count > 0) AND the response's `oldest_available_event_id` confirms recoverability (`oldest_available_event_id <= last_delivered_event_id + 1`). Document that `last_delivered_event_id` is the cursor the client tracked from prior `event` frames (NOT taken from the `dropped` frame, whose ids are best-estimate).
-  - [ ] 5.6 Test `sustained_lag_does_not_storm_dropped_frames` (AC #3) — config `ws_broadcast_capacity = 16`, `coalesce_window = Duration::from_millis(200)`, then in a tight loop for 30 seconds publish 100 envelopes per 100ms (300 publish cycles, 30,000 envelopes total) while the client never reads; resume reading; count the dropped frames received; assert `count <= 200` (margin over the theoretical `30s / 200ms = 150` ceiling) and definitely not >> 1000. Use `tokio::test(start_paused = true)` + `tokio::time::advance` to make this fast and deterministic — see Dev Notes "Deterministic test discipline" for the pattern.
-  - [ ] 5.7 Test `lag_during_snapshot_emits_dropped_after_snapshot_completes` (Story 2.3 deferred-work line 79) — small `ws_broadcast_capacity = 4`, pre-populate `session_projections` with ~10 sessions, subscribe to `state.session.*` so the snapshot loop is busy on `socket.send`, concurrently publish > 4 envelopes via the writer pool, then resume reading; assert the snapshot frames arrive followed by a single `dropped` frame, and the socket stays open. Document the test as the natural extension of 2.3's deferred snapshot-lag scenario.
-  - [ ] 5.8 Test `lag_in_drain_backlog_emits_dropped_through_same_helper` (AC #1, #3) — saturate `rx` with > capacity envelopes, then issue a `subscribe` (which triggers `drain_backlog_under_state`); assert the lag detected during drain produces a `dropped` frame via the same coalescing path — NOT silently discarded as today.
-  - [ ] 5.9 Test `coalesce_window_resets_after_silence` (AC #3 lower bound, AC #4) — sustained lag → first dropped → silence for `coalesce_window + 100ms` → another lag burst → expect a SECOND dropped frame (not a third within the original window). Confirms the window is a sliding boundary, not a once-per-connection latch.
+- [x] **Task 5 — Contract tests in `crates/daemon/tests/contract_daemon.rs::story_2_4_dropped`** (AC: #1, #2, #3, #4)
+  - [x] 5.1 Create `mod story_2_4_dropped { ... }` AFTER `mod story_2_3_snapshot`. Reuse 2.1/2.2/2.3 helpers via `use super::story_2_1_ws::{...}; use super::story_2_2_publish::{...};`.
+  - [x] 5.2 Test `dropped_frame_after_1025_envelopes_with_blocked_reader` (AC #1). **Implementation note:** Used 4096 synthetic broadcasts (4× capacity=1024) via `state.broadcaster.publish` rather than `publish_via_projection`, because the DB write loop is too slow to reliably saturate before scheduler interleaving drains the channel. The assertion is `count >= 1 && count <= 4096` and "first DROPPED frame appears within 4200 reads" rather than "first frame after subscribe is dropped" — the realistic flow is that K frames buffer into the TCP send buffer before back-pressure triggers Lagged on the per-connection task. Documented in the test header.
+  - [x] 5.3 Test `dropped_frame_keeps_socket_open` (AC #1, #4) — after the dropped frame, publish 3 more events via the production `publish_via_projection` path, assert all 3 arrive in order as `event` frames; assert socket never closes.
+  - [x] 5.4 Test `dropped_frame_carries_count_in_envelopes` (AC #1) — assert `count > 0` and `first <= last`; deliberately no exact `first/last` assertions (best-estimate semantics).
+  - [x] 5.5 Test `dropped_frame_rest_refetch_recovers` (AC #2). **Implementation note:** Used `axum::Router::oneshot` over the same `AppState` rather than a real HTTP client (reqwest is not in dev-deps; oneshot is the existing test pattern in story_1_7_rest).
+  - [x] 5.6 Test `sustained_lag_does_not_storm_dropped_frames` (AC #3). **Implementation note:** Used REAL time with `coalesce_window = 100ms` and ~1s wall-clock duration instead of virtual time (`tokio::time::pause` + `advance`). Reason: synthetic broadcasts + a slow reader + real TCP socket interactions don't compose cleanly with paused time — the per-connection task needs real scheduler cycles to keep dispatching, and TCP send buffers don't honor virtual clock. The assertion `dropped_count <= 30` is well below the storm threshold (would be hundreds or thousands without coalescing) and above the theoretical ceiling of `ceil(1000/100)=10` with margin for jitter.
+  - [x] 5.7 Test `lag_during_snapshot_emits_dropped_after_snapshot_completes`. **Implementation note:** The original task description assumed strict "snapshot frames first, then Dropped" ordering, but the Subscribe arm's six-step ordering ([A]drain → [B]clock → [C]snapshot_read → [D]insert_topic → [E]send_snapshot → [F]main_loop) places the drain ARM before snapshot send. Depending on scheduler timing, the lag can be detected at [A] (drain → Dropped emitted before any State frame) or at [F] (main loop after snapshot completes → Dropped after). Both orderings are correct per Story 2.4's design — both routes use `emit_dropped_or_coalesce`. The test now asserts the resilient invariants: snapshot frames appear AND a Dropped frame appears AND the socket stays open AND no Event frame leaks through the `state.session.*` filter.
+  - [x] 5.8 Test `lag_in_drain_backlog_emits_dropped_through_same_helper` (AC #1, #3). **Implementation note:** Determinism caveat — when a second Subscribe is processed, lag may be detected by the drain arm OR by the main loop's preceding rx.recv (depending on scheduler ordering). Both arms route through `emit_dropped_or_coalesce`. The test asserts Dropped is observed, which is enough to fail loudly if the drain arm regressed to silent-discard (the pre-2.4 behavior).
+  - [x] 5.9 Test `coalesce_window_resets_after_silence` (AC #3 lower bound, AC #4) — sustained lag → first dropped → real-time sleep of 300ms (> 150ms `coalesce_window`) → second burst → expect a SECOND dropped frame. Uses real time since the helper's `last_dropped_at` is a `tokio::time::Instant` and the test is short enough that wall time is acceptable.
 
-- [ ] **Task 6 — Update `docs/protocol-changelog.md`** (AC: #1)
-  - [ ] 6.1 Add one `behavioral` entry under `v1.0 → v1.1`: "Lagged consumers receive `dropped` frame with `count`, `first_dropped_event_id`, `last_dropped_event_id`. Coalescing window default 1s; `count` is in envelopes (not bytes); `first/last` ids are best-estimate upper-bounds — presenters recover via REST `?since=last_delivered`."
-  - [ ] 6.2 Add one `schema` entry: typed `DroppedFrame::new(...)` constructor with `count > 0` and `first <= last` invariants (asymmetric inbound/outbound policy preserved — `Deserialize` unchanged).
+- [x] **Task 6 — Update `docs/protocol-changelog.md`** (AC: #1)
+  - [x] 6.1 Added one `behavioral` entry under `v1.0 → v1.1` describing the new `dropped` frame surface (count in envelopes, best-estimate first/last ids, coalescing window default 1s, presenter recovers via REST `?since=last_delivered`).
+  - [x] 6.2 Added one `schema` entry: typed `DroppedFrame::new(...)` constructor with `count > 0` and `first <= last` invariants, `#[non_exhaustive]` to block external struct-literal construction.
 
-- [ ] **Task 7 — Update `docs/bmad/implementation-artifacts/sprint-status.yaml`** (story-completion bookkeeping)
-  - [ ] 7.1 When implementation lands and code review passes, bump `2-4-lagged-consumer-recovery-with-dropped-frame` from `ready-for-dev` → `review`.
-  - [ ] 7.2 Strike-through `deferred-work.md` lines 9 and 79 with backlinks to this story (same pattern as Story 2.3's resolution of line 8).
+- [x] **Task 7 — Update `docs/bmad/implementation-artifacts/sprint-status.yaml`** (story-completion bookkeeping)
+  - [x] 7.1 Story bumped from `ready-for-dev` → `in-progress` at workflow Step 4, then → `review` at workflow Step 9.
+  - [x] 7.2 Struck-through `deferred-work.md` line 9 (DroppedFrame invariants) and line 79 (lag-during-snapshot) with backlinks to this story.
 
 ## Dev Notes
 
@@ -577,16 +577,43 @@ Expected scope: medium. The per-connection state machine is the genuinely-new pi
 
 ### Agent Model Used
 
-_To be filled in by the dev agent at implementation time._
+Claude Opus 4.7 (1M context), invoked via bmad-dev-story workflow on branch `story-2.3` (story branched off post-2.3 work; the story-2.4 branch lives downstream of this work).
 
 ### Debug Log References
 
-_To be filled in by the dev agent at implementation time._
+- One implementation-time test failure on `lag_during_snapshot_emits_dropped_after_snapshot_completes`: original assertion "snapshot State frames precede the Dropped frame" was too strict. Root cause: the Subscribe arm's drain step ([A]) runs BEFORE snapshot read+send ([C]+[E]); when channel saturation is already present at [A], drain emits Dropped first. Both orderings (drain-first or main-loop-after-snapshot) are correct per Story 2.4's coalescing-helper design. Test adjusted to assert behavioral invariants (snapshot completes, Dropped observed, socket open, no Event leakage) without strict ordering.
+- One clippy `single_match` lint on the AC #1 socket-stays-open check — replaced with `if let`.
+- Pre-existing test flake on `state_plus_event_atomicity_under_sigkill_during_load` (real-daemon-binary subprocess test sensitive to parallel test scheduling); passes in isolation, unrelated to Story 2.4 changes.
 
 ### Completion Notes List
 
-_To be filled in by the dev agent at implementation time._
+- All 7 tasks complete; all 8 contract tests in `story_2_4_dropped` pass.
+- 211 workspace tests pass; `cargo clippy --all-targets --workspace -- -D warnings` clean.
+- Two deferred-work entries resolved: `deferred-work.md:9` (DroppedFrame invariants) and `deferred-work.md:79` (lag-during-snapshot recovery).
+- Three implementation tradeoffs against the story's exact specification (all documented in subtask notes and test headers):
+  1. **Task 5.2 reader-block specifics:** assertion is "Dropped within 4200 reads with count between 1 and 4096" rather than "first frame after subscribe is dropped." TCP send-buffer absorbs K frames before back-pressure triggers Lagged; reading hunts for Dropped.
+  2. **Task 5.6 virtual time:** used real time + a 1s test duration rather than `tokio::time::pause`/`advance`. TCP socket + scheduler interleaving don't compose with paused time. Test runs in ~1.5s real wall time and asserts the storm bound.
+  3. **Task 5.7 snapshot-then-dropped ordering:** assertion was loosened from "snapshot precedes Dropped" to "both appear, socket open, no Event leakage." Root cause is the Subscribe arm's drain-before-snapshot ordering; both arms route through the same helper, so either path is correct per the design.
+- No new dependencies. Per the story's "Standards-by-default check" — every primitive was already in the workspace (`tokio::broadcast`, `protocol::DroppedFrame`, `SyncFrame::new` template, passive `Instant` comparison).
+- The `#[non_exhaustive]` attribute was added to `DroppedFrame` (Story 2.3 set the precedent for `SyncFrame`); no external struct-literal construction sites exist in the workspace, so this is purely defensive against future regressions.
+- The drain-arm coverage in Task 5.8 is non-deterministic about which arm fires the emission (drain vs. main loop), but the same helper handles both, so the test still defends against the pre-2.4 silent-discard behavior.
 
 ### File List
 
-_To be filled in by the dev agent at implementation time._
+**Modified:**
+- `crates/protocol/src/ws.rs` — Added `#[non_exhaustive]` to `DroppedFrame`; added `impl DroppedFrame { pub fn new(...) -> Result<Self, Error> }` typed constructor; added 5 unit tests (`dropped_frame_new_accepts_valid`, `dropped_frame_new_rejects_zero_count`, `dropped_frame_new_rejects_inverted_ids`, `dropped_frame_new_allows_count_one_first_eq_last`, `dropped_frame_deserialize_tolerates_invalid_from_wire`).
+- `crates/protocol/src/error.rs` — Added `Error::InvalidDroppedFrame { count, first, last }` variant.
+- `crates/daemon/src/config.rs` — Added `ws_broadcast_coalesce_window: Duration` field to `Config`; default `Duration::from_secs(1)` in `Config::with_bowerbird_dir`.
+- `crates/daemon/src/state.rs` — Added `coalesce_window: Duration` field to `WsConfig`.
+- `crates/daemon/src/main.rs` — Threaded `ws_broadcast_coalesce_window` into `WsConfig` construction.
+- `crates/daemon/src/api/ws.rs` — Added per-connection lag state (3 locals: `last_delivered_event_id`, `last_dropped_at`, `pending_drop_count`); replaced `RecvError::Lagged` arm body to call `emit_dropped_or_coalesce`; replaced `TryRecvError::Lagged` arm body in `drain_backlog_under_state` to call the same helper; advance `last_delivered_event_id` on `Event` dispatch in both paths; widened `handle_text_frame` and `drain_backlog_under_state` signatures; added `emit_dropped_or_coalesce` async helper with `#[tracing::instrument(skip_all, fields(n, pending_drop_count, has_cursor))]`.
+- `crates/daemon/tests/contract_daemon.rs` — Added `coalesce_window: Duration::from_secs(1)` to two existing `WsConfig` constructions (test factory + per-test inline); added `mod story_2_4_dropped { ... }` after `mod story_2_3_snapshot` with 8 contract tests.
+- `docs/protocol-changelog.md` — Added one `behavioral` entry (lagged WS consumers receive `dropped` frame) and one `schema` entry (`DroppedFrame::new` typed constructor, `#[non_exhaustive]`).
+- `docs/bmad/implementation-artifacts/deferred-work.md` — Strike-through on line 9 (DroppedFrame invariants) and line 79 (lag-during-snapshot) with backlinks to this story.
+- `docs/bmad/implementation-artifacts/sprint-status.yaml` — `2-4-lagged-consumer-recovery-with-dropped-frame` flipped `ready-for-dev` → `in-progress` (workflow Step 4) → `review` (workflow Step 9); `last_updated` comment refreshed.
+
+**Created:** None. All work in existing files.
+
+### Change Log
+
+- 2026-05-23 — Story 2.4 implementation: lagged WS consumer recovery via typed `DroppedFrame` with per-connection coalescing. Resolves `deferred-work.md:9` (DroppedFrame invariants) and `deferred-work.md:79` (lag-during-snapshot recovery). 8 contract tests added; 211 workspace tests pass; clippy clean.

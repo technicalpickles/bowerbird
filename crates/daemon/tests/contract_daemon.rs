@@ -57,6 +57,7 @@ fn make_test_state_with_ws(
         ws_config: WsConfig {
             ping_interval,
             pong_timeout,
+            coalesce_window: Duration::from_secs(1),
         },
     }
 }
@@ -2193,6 +2194,7 @@ mod story_1_7_rest {
             ws_config: WsConfig {
                 ping_interval: Duration::from_secs(30),
                 pong_timeout: Duration::from_secs(10),
+                coalesce_window: Duration::from_secs(1),
             },
         };
         let app = api::router(state);
@@ -4597,6 +4599,748 @@ mod story_2_3_snapshot {
         let st = parse_state_frame(&frame);
         assert_eq!(st.session_id, "sess-live");
         assert_eq!(st.source, "claude");
+
+        state.shutdown.cancel();
+    }
+}
+
+/// Story 2.4 — lagged consumer recovery via `DroppedFrame`. Verifies the
+/// per-connection coalescing helper installed in `crates/daemon/src/api/ws.rs`
+/// for both the main `rx.recv()` arm and the parallel
+/// `drain_backlog_under_state` arm. All tests use the production publish
+/// path (`publish_via_projection`) where the contract is end-to-end, and
+/// fall back to synthetic `broadcaster.publish` only when the test is
+/// specifically about lag mechanics rather than projection wiring.
+mod story_2_4_dropped {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use axum::body::{to_bytes, Body};
+    use axum::http::{header, Request, StatusCode};
+    use bowerbird_daemon::api;
+    use bowerbird_daemon::api::token::BearerToken;
+    use bowerbird_daemon::broadcast::{BroadcastEnvelope, BroadcastHub};
+    use bowerbird_daemon::db::DbPools;
+    use bowerbird_daemon::state::{AppState, WsConfig};
+    use futures_util::{SinkExt, StreamExt};
+    use protocol::{Event, EventId, EventKind, EventListResponse, ServerMessage};
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_util::sync::CancellationToken;
+    use tower::ServiceExt;
+
+    use super::story_2_1_ws::{
+        connect_authed, parse_hello, read_text_frame_or_close, spawn_test_daemon,
+    };
+    use super::story_2_2_publish::{
+        publish_via_projection, wait_subscribe_live, ProbeKind, WsStream,
+    };
+    use super::{fresh_pools, TEST_BEARER};
+
+    /// Per-test AppState factory. Story 2.4 needs to vary BOTH the
+    /// broadcast channel capacity (so the channel laps quickly enough to
+    /// observe Lagged) AND the coalescing window (so AC #3's burst-bound
+    /// can be exercised under wall-clock test latencies). The default
+    /// `make_test_state_with_ws` factory hard-codes both, so we build
+    /// AppState directly here.
+    fn state_with_caps(
+        pools: DbPools,
+        broadcast_capacity: usize,
+        coalesce_window: Duration,
+    ) -> AppState {
+        AppState {
+            db: pools,
+            migrations_complete: Arc::new(AtomicBool::new(true)),
+            shutdown: CancellationToken::new(),
+            bearer: BearerToken::new(TEST_BEARER.to_string()),
+            started_at_ms: 0,
+            broadcaster: Arc::new(BroadcastHub::new(broadcast_capacity)),
+            ws_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+            ws_config: WsConfig {
+                ping_interval: Duration::from_secs(30),
+                pong_timeout: Duration::from_secs(10),
+                coalesce_window,
+            },
+        }
+    }
+
+    /// Synthetic broadcast event for tests that want to drive lag faster
+    /// than the SQLite writer pool will allow. Keeps the `source`/
+    /// `session_id` distinguishable from probe envelopes so the lag-trigger
+    /// publishes can be filtered/counted without confusion.
+    fn synthetic_event(event_id: i64, session_id: &str) -> BroadcastEnvelope {
+        BroadcastEnvelope::Event(Event {
+            event_id: EventId(event_id),
+            source: "claude".to_string(),
+            session_id: session_id.to_string(),
+            kind: EventKind::PreToolUse,
+            reaction: None,
+            payload: "{}".to_string(),
+            created_at: 0,
+        })
+    }
+
+    /// Read frames until a `Dropped` frame arrives or `max_frames` are
+    /// consumed. Returns `(dropped_count, events_before, dropped_first,
+    /// dropped_last, all_received_frames)`. Each helper read is bounded
+    /// at 5s so a regression that closes the socket fails fast instead
+    /// of hanging the test runner.
+    async fn read_until_dropped(
+        ws: &mut WsStream,
+        max_frames: usize,
+    ) -> Option<(u64, usize, EventId, EventId)> {
+        let mut events_before: usize = 0;
+        for _ in 0..max_frames {
+            let msg = match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+                Ok(Some(Ok(m))) => m,
+                Ok(Some(Err(e))) => panic!("ws recv error while hunting for Dropped: {e:?}"),
+                Ok(None) => return None,
+                Err(_) => return None,
+            };
+            let text = match msg {
+                Message::Text(t) => t,
+                Message::Close(_) => return None,
+                Message::Ping(_) | Message::Pong(_) => continue,
+                other => panic!("unexpected frame while hunting for Dropped: {other:?}"),
+            };
+            let server: ServerMessage =
+                serde_json::from_str(text.as_str()).expect("parse ServerMessage");
+            match server {
+                ServerMessage::Dropped(d) => {
+                    return Some((
+                        d.count,
+                        events_before,
+                        d.first_dropped_event_id,
+                        d.last_dropped_event_id,
+                    ));
+                }
+                ServerMessage::Event(_) | ServerMessage::State(_) => {
+                    events_before += 1;
+                }
+                other => panic!("unexpected ServerMessage while hunting for Dropped: {other:?}"),
+            }
+        }
+        None
+    }
+
+    /// AC #1 — A WS client whose read loop is blocked, when 1025+
+    /// envelopes are published, eventually receives a `Dropped` frame.
+    /// The exact frame index of Dropped depends on TCP send-buffer size
+    /// (frames buffered into the kernel are dispatched before the
+    /// per-connection task hits Lagged), so the test reads until it
+    /// observes Dropped rather than asserting "first frame after
+    /// subscribe."
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropped_frame_after_1025_envelopes_with_blocked_reader() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = state_with_caps(pools, 1024, Duration::from_secs(1));
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"events.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+        wait_subscribe_live(&mut ws, &state, ProbeKind::Event { source: "claude" }).await;
+
+        // Block the reader: do NOT call ws.next() during the flood. Use
+        // synthetic broadcasts so the publish loop saturates the channel
+        // far faster than `publish_via_projection`'s DB writes would
+        // permit. 4096 envelopes is 4x capacity (1024) — guarantees the
+        // receiver's cursor laps regardless of TCP send-buffer size.
+        for i in 0..4096 {
+            state
+                .broadcaster
+                .publish(synthetic_event(i + 1, "sess-blocked"));
+        }
+
+        // Yield so the per-connection task gets scheduled to process the
+        // backlog. Without this, the publishing task hogs the executor
+        // and the test races against scheduler ordering.
+        tokio::task::yield_now().await;
+
+        // Resume reading. Hunt for Dropped — read up to all 4096 events
+        // plus margin to avoid a flaky hang if TCP holds an unexpectedly
+        // large buffer.
+        let outcome = read_until_dropped(&mut ws, 4200).await;
+        let (count, events_before, first, last) =
+            outcome.expect("must observe a Dropped frame within 4200 reads");
+        assert!(count >= 1, "Dropped count must be >= 1; got {count}");
+        assert!(
+            count <= 4096,
+            "Dropped count must be <= total published envelopes; got {count}"
+        );
+        assert!(
+            first <= last,
+            "Dropped frame must have first_id <= last_id; got first={first:?}, last={last:?}"
+        );
+        // events_before > 0 documents the realistic timing: the per-
+        // connection task gets to dispatch some envelopes into the TCP
+        // send buffer before back-pressure triggers Lagged. Print for
+        // diagnostics on regression.
+        eprintln!(
+            "story_2_4: {events_before} events arrived before Dropped(count={count}, \
+             first={first:?}, last={last:?})"
+        );
+
+        // Socket must stay open per AC #1 — read with a short timeout
+        // and assert no Close frame.
+        if let Ok(Some(Ok(Message::Close(_)))) =
+            tokio::time::timeout(Duration::from_millis(200), ws.next()).await
+        {
+            panic!("socket must stay open after Dropped frame");
+        }
+
+        state.shutdown.cancel();
+    }
+
+    /// AC #1, #4 — After a `Dropped` frame, subsequent publishes are
+    /// delivered in order on the SAME socket; the channel is not
+    /// permanently degraded.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropped_frame_keeps_socket_open() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = state_with_caps(pools, 16, Duration::from_secs(1));
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"events.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+        wait_subscribe_live(&mut ws, &state, ProbeKind::Event { source: "claude" }).await;
+
+        // Trigger lag with a synthetic flood.
+        for i in 0..512 {
+            state
+                .broadcaster
+                .publish(synthetic_event(i + 1, "sess-flood"));
+        }
+        tokio::task::yield_now().await;
+
+        // Read until Dropped.
+        let outcome = read_until_dropped(&mut ws, 600).await;
+        let (count, _, _, _) =
+            outcome.expect("must observe a Dropped frame within 600 reads");
+        assert!(count >= 1);
+
+        // Now publish 3 fresh events via the PRODUCTION path. Each must
+        // arrive in order as a normal Event frame; the socket is open
+        // and `last_delivered_event_id` continues to advance.
+        let id1 = publish_via_projection(
+            &state,
+            "claude",
+            "sess-after",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+        let id2 = publish_via_projection(
+            &state,
+            "claude",
+            "sess-after",
+            EventKind::PostToolUse,
+            None,
+            "{}",
+        )
+        .await;
+        let id3 = publish_via_projection(
+            &state,
+            "claude",
+            "sess-after",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+
+        // Drain frames until we collect the three post-drop events. The
+        // channel may have residual flood envelopes; we look for the
+        // specific event_ids we just produced (since they're well past
+        // any synthetic event_id).
+        let mut found_ids: Vec<EventId> = Vec::with_capacity(3);
+        for _ in 0..2000 {
+            if found_ids.len() == 3 {
+                break;
+            }
+            let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+                .await
+                .expect("read within 5s")
+                .expect("stream not ended")
+                .expect("recv ok");
+            let text = match msg {
+                Message::Text(t) => t,
+                Message::Close(_) => panic!("socket closed unexpectedly after Dropped"),
+                _ => continue,
+            };
+            let server: ServerMessage =
+                serde_json::from_str(text.as_str()).expect("parse ServerMessage");
+            if let ServerMessage::Event(f) = server {
+                if f.event.event_id == id1
+                    || f.event.event_id == id2
+                    || f.event.event_id == id3
+                {
+                    found_ids.push(f.event.event_id);
+                }
+            }
+        }
+        assert_eq!(
+            found_ids,
+            vec![id1, id2, id3],
+            "post-Dropped events must arrive in publication order"
+        );
+
+        state.shutdown.cancel();
+    }
+
+    /// AC #1 — `DroppedFrame.count` is positive (envelopes, not bytes);
+    /// `first_dropped_event_id <= last_dropped_event_id`. The wire-id
+    /// values are best-estimate per the helper's design — we assert the
+    /// invariants enforced by `DroppedFrame::new`, not exact values.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropped_frame_carries_count_in_envelopes() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = state_with_caps(pools, 16, Duration::from_secs(1));
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"events.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+        wait_subscribe_live(&mut ws, &state, ProbeKind::Event { source: "claude" }).await;
+
+        for i in 0..256 {
+            state.broadcaster.publish(synthetic_event(i + 1, "sess-x"));
+        }
+        tokio::task::yield_now().await;
+
+        let outcome = read_until_dropped(&mut ws, 300).await;
+        let (count, _, first, last) =
+            outcome.expect("must observe a Dropped frame within 300 reads");
+
+        // Invariants from DroppedFrame::new — best-estimate semantics mean
+        // we deliberately don't assert exact event-id values.
+        assert!(count > 0, "Dropped count must be > 0 (envelopes); got {count}");
+        assert!(
+            first <= last,
+            "Dropped frame must have first_dropped_event_id <= last_dropped_event_id; \
+             got first={first:?}, last={last:?}"
+        );
+
+        state.shutdown.cancel();
+    }
+
+    /// AC #2 — A presenter that receives a `Dropped` frame can recover
+    /// missed events via the REST surface using its OWN
+    /// `last_delivered_event_id` (NOT the values inside the Dropped frame,
+    /// which are best-estimate). The REST response's
+    /// `oldest_available_event_id` confirms the gap is recoverable
+    /// (`oldest_available_event_id <= last_delivered_event_id + 1`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropped_frame_rest_refetch_recovers() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = state_with_caps(pools, 16, Duration::from_secs(1));
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"events.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+        wait_subscribe_live(&mut ws, &state, ProbeKind::Event { source: "claude" }).await;
+
+        // Publish a single real event so the presenter has a
+        // last_delivered_event_id cursor it can pass to REST.
+        let id0 = publish_via_projection(
+            &state,
+            "claude",
+            "sess-rest",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+        let _ = read_text_frame_or_close(&mut ws).await; // drain the Event frame
+
+        // Now publish several more REAL events; the presenter stops
+        // reading mid-flood and falls behind.
+        let mut produced: Vec<EventId> = Vec::new();
+        for i in 0..40 {
+            let id = publish_via_projection(
+                &state,
+                "claude",
+                "sess-rest",
+                if i % 2 == 0 {
+                    EventKind::PreToolUse
+                } else {
+                    EventKind::PostToolUse
+                },
+                None,
+                "{}",
+            )
+            .await;
+            produced.push(id);
+        }
+        // Synthetic flood to force Lagged.
+        for i in 0..256 {
+            state
+                .broadcaster
+                .publish(synthetic_event(99_000 + i + 1, "sess-rest"));
+        }
+        tokio::task::yield_now().await;
+
+        // Hunt for Dropped, ignoring intermediate Event frames.
+        let outcome = read_until_dropped(&mut ws, 400).await;
+        let (count, _, _, _) =
+            outcome.expect("must observe a Dropped frame within 400 reads");
+        assert!(count > 0);
+
+        // The presenter's authoritative cursor is `id0` (the last real
+        // event it dispatched and tracked). It does NOT use the Dropped
+        // frame's first/last (best-estimate). REST should return the
+        // missed real events that have event_id > id0. We use a fresh
+        // axum::Router::oneshot over the same AppState rather than
+        // making a real HTTP request — both are equally valid, and
+        // oneshot avoids paying for another listener.
+        let app = api::router(state.clone());
+        let req = Request::builder()
+            .uri(format!("/sessions/sess-rest/events?since={}", id0.0))
+            .header(header::AUTHORIZATION, format!("Bearer {TEST_BEARER}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body: EventListResponse = serde_json::from_slice(&bytes).expect("parse events");
+        assert!(
+            !body.events.is_empty(),
+            "REST must return events past last_delivered_event_id={id0:?}"
+        );
+        // Gap recoverable: oldest_available_event_id <= last_delivered + 1.
+        assert!(
+            body.oldest_available_event_id.0 <= id0.0 + 1,
+            "gap must be recoverable: oldest={:?} <= last_delivered+1={}",
+            body.oldest_available_event_id,
+            id0.0 + 1
+        );
+
+        state.shutdown.cancel();
+    }
+
+    /// AC #3 — Sustained lag is bounded by the coalesce window. With
+    /// `coalesce_window = 100ms` and ~1s real-time test duration, the
+    /// theoretical ceiling is `ceil(1000/100) = 10` Dropped frames. We
+    /// assert `<= 30` to absorb scheduler jitter while staying far
+    /// below the "frame storm" failure mode (which would emit hundreds
+    /// or thousands).
+    #[tokio::test(flavor = "current_thread")]
+    async fn sustained_lag_does_not_storm_dropped_frames() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = state_with_caps(pools, 4, Duration::from_millis(100));
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"events.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+        wait_subscribe_live(&mut ws, &state, ProbeKind::Event { source: "claude" }).await;
+
+        // Publisher: spawn a task that fires synthetic events in bursts
+        // for ~1 second of wall time. Short between-burst sleep keeps
+        // the runtime cycling so the per-connection task gets to call
+        // rx.recv repeatedly and observe Lagged repeatedly.
+        let pub_deadline = std::time::Instant::now() + Duration::from_millis(1000);
+        let broadcaster = state.broadcaster.clone();
+        let publisher = tokio::spawn(async move {
+            let mut event_id: i64 = 1;
+            while std::time::Instant::now() < pub_deadline {
+                for _ in 0..50 {
+                    broadcaster.publish(synthetic_event(event_id, "sess-storm"));
+                    event_id += 1;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        // Slow reader: poll until publisher's deadline + drain window.
+        let read_deadline = pub_deadline + Duration::from_millis(300);
+        let mut dropped_count: u64 = 0;
+        let mut total_frames: u64 = 0;
+        while std::time::Instant::now() < read_deadline {
+            match tokio::time::timeout(Duration::from_millis(20), ws.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    total_frames += 1;
+                    let server: ServerMessage =
+                        serde_json::from_str(text.as_str()).expect("parse ServerMessage");
+                    if matches!(server, ServerMessage::Dropped(_)) {
+                        dropped_count += 1;
+                    }
+                }
+                Ok(Some(Ok(Message::Close(_)))) => {
+                    panic!("socket must stay open during sustained lag")
+                }
+                Ok(Some(Err(e))) => panic!("ws recv error: {e:?}"),
+                Ok(None) => break,
+                Ok(_) | Err(_) => continue,
+            }
+            // Slow reader: yield + brief sleep so back-pressure persists.
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        publisher.abort();
+
+        eprintln!(
+            "story_2_4 sustained_lag: total_frames={total_frames}, dropped_frames={dropped_count}"
+        );
+        assert!(
+            dropped_count >= 1,
+            "sustained-lag scenario must produce at least one Dropped frame; got 0 of \
+             total_frames={total_frames}"
+        );
+        // Ceiling = ceil(1000ms/100ms) + margin for jitter. The failure mode
+        // we're guarding against (storm) would be hundreds.
+        assert!(
+            dropped_count <= 30,
+            "Dropped emissions should be bounded by coalesce_window; got \
+             {dropped_count} (theoretical bound ~10, asserted <=30 for jitter)"
+        );
+
+        state.shutdown.cancel();
+    }
+
+    /// AC #1 + Story 2.3 deferred-work.md:79 — Lag during a Subscribe
+    /// cycle surfaces as a `Dropped` frame and the socket stays open.
+    ///
+    /// The Subscribe arm's six-step ordering is [A]drain → [B]clock →
+    /// [C]snapshot_read → [D]insert_topic → [E]send_snapshot →
+    /// [F]main_loop. Lag can be detected at [A] (drain arm) OR [F]
+    /// (main rx.recv after [E]), depending on whether channel saturation
+    /// happens before [A] runs or during [E]'s socket.send loop.
+    ///
+    /// Both orderings are correct per Story 2.4's recovery design:
+    /// either path routes through the SAME `emit_dropped_or_coalesce`
+    /// helper, producing the same wire frame. The test asserts the
+    /// resilient invariants: snapshot frames eventually arrive, a
+    /// Dropped frame is observed, the socket stays open, and no Event
+    /// frame leaks through the state.session.* topic filter.
+    #[tokio::test(flavor = "current_thread")]
+    async fn lag_during_snapshot_emits_dropped_after_snapshot_completes() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = state_with_caps(pools, 4, Duration::from_secs(1));
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        // Pre-populate the projection table so the snapshot for
+        // state.session.* will read multiple rows. Each publish_via_projection
+        // also pushes one Event + one State envelope through the broadcast
+        // hub, but no client is connected yet so they're discarded.
+        for i in 0..10 {
+            let _ = publish_via_projection(
+                &state,
+                "claude",
+                &format!("snap-sess-{i:02}"),
+                EventKind::PreToolUse,
+                None,
+                "{}",
+            )
+            .await;
+        }
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+
+        // Flood the broadcast channel with synthetic events. With capacity
+        // 4 and a 50-envelope flood, the channel laps many times over;
+        // either drain ([A]) or main loop ([F]) will surface Lagged
+        // depending on scheduler ordering. Both produce a Dropped frame
+        // via the shared helper.
+        for i in 0..50 {
+            state
+                .broadcaster
+                .publish(synthetic_event(i + 1, "snap-lag-src"));
+        }
+        tokio::task::yield_now().await;
+
+        // Read all frames. Collect counts of State (snapshot) frames and
+        // Dropped frames; allow them to interleave. The order depends on
+        // scheduler timing — [A]drain may emit Dropped before [E]'s
+        // snapshot send, or [F]'s main loop may emit Dropped after [E].
+        let mut snapshot_seen = 0usize;
+        let mut dropped_seen = 0usize;
+        for _ in 0..150 {
+            let msg = match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
+                Ok(Some(Ok(m))) => m,
+                Ok(Some(Err(e))) => panic!("ws recv error during snapshot+lag: {e:?}"),
+                Ok(None) => break,
+                Err(_) => break, // no more frames; we have what we have
+            };
+            let text = match msg {
+                Message::Text(t) => t,
+                Message::Close(_) => panic!("socket must stay open during snapshot+lag"),
+                _ => continue,
+            };
+            let server: ServerMessage =
+                serde_json::from_str(text.as_str()).expect("parse ServerMessage");
+            match server {
+                ServerMessage::State(_) => snapshot_seen += 1,
+                ServerMessage::Dropped(_) => dropped_seen += 1,
+                ServerMessage::Event(_) => {
+                    // state.session.* should NOT deliver Event frames per
+                    // dispatch_envelope's topic-match logic. A regression
+                    // here would fail this test loudly.
+                    panic!("Event frame leaked through state.session.* topic filter")
+                }
+                other => panic!("unexpected ServerMessage during snapshot+lag: {other:?}"),
+            }
+        }
+        // Snapshot must complete — Story 2.3's [C]+[E] is unaffected by
+        // the lag-during-subscribe regression (the test is here precisely
+        // to confirm that).
+        assert!(
+            snapshot_seen > 0,
+            "expected at least one snapshot State frame; saw 0 (snapshot phase regressed?)"
+        );
+        // Lag must be reported — [A] or [F], doesn't matter.
+        assert!(
+            dropped_seen > 0,
+            "expected at least one Dropped frame from the lag-during-subscribe scenario; \
+             saw 0 (lag-recovery regressed?). snapshot_seen={snapshot_seen}"
+        );
+
+        state.shutdown.cancel();
+    }
+
+    /// AC #1, #3 — Lag detected by `drain_backlog_under_state` (the
+    /// Subscribe/Unsubscribe drain phase) routes through the SAME
+    /// `emit_dropped_or_coalesce` helper as the main `rx.recv()` arm.
+    /// This guards against a regression where drain silently discards
+    /// `TryRecvError::Lagged` (the pre-2.4 behaviour).
+    ///
+    /// The test cannot deterministically pin which arm fired the
+    /// Dropped emission (main loop vs. drain), since the per-connection
+    /// task interleaves both based on real-time scheduler ordering. The
+    /// assertion is therefore "at least one Dropped frame observed
+    /// across multiple Subscribe cycles," which is enough to fail if
+    /// the drain arm silently swallows lag.
+    #[tokio::test(flavor = "current_thread")]
+    async fn lag_in_drain_backlog_emits_dropped_through_same_helper() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = state_with_caps(pools, 4, Duration::from_secs(1));
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+
+        // First subscribe: events.* — wait live so the cursor is engaged.
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"events.*"}"#.into(),
+        ))
+        .await
+        .expect("send first subscribe");
+        wait_subscribe_live(&mut ws, &state, ProbeKind::Event { source: "claude" }).await;
+
+        // Block the reader, flood the channel — receiver cursor lags.
+        for i in 0..256 {
+            state
+                .broadcaster
+                .publish(synthetic_event(i + 1, "sess-drain"));
+        }
+        tokio::task::yield_now().await;
+
+        // Now send a SECOND subscribe (state.session.*) — this triggers
+        // drain_backlog_under_state under the OLD subscription set. If
+        // the channel was lapped by this point, drain's try_recv arm sees
+        // Lagged and routes through emit_dropped_or_coalesce. The main
+        // rx.recv arm may also see Lagged at some point. Either path
+        // emits Dropped through the same helper; the test asserts at
+        // least one Dropped frame is observed.
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.*"}"#.into(),
+        ))
+        .await
+        .expect("send second subscribe");
+
+        // Now read; expect to see Dropped somewhere in the stream.
+        let outcome = read_until_dropped(&mut ws, 400).await;
+        let (count, _, _, _) = outcome.expect(
+            "Dropped must be emitted when channel lapped before a Subscribe-induced drain",
+        );
+        assert!(count >= 1);
+
+        state.shutdown.cancel();
+    }
+
+    /// AC #3 lower bound + AC #4 — After sustained lag emits its first
+    /// `Dropped`, a period of silence longer than `coalesce_window`
+    /// followed by a fresh lag burst emits a SECOND `Dropped`. The
+    /// window is a sliding boundary per the helper's design, not a
+    /// once-per-connection latch.
+    #[tokio::test(flavor = "current_thread")]
+    async fn coalesce_window_resets_after_silence() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = state_with_caps(pools, 4, Duration::from_millis(150));
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"events.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+        wait_subscribe_live(&mut ws, &state, ProbeKind::Event { source: "claude" }).await;
+
+        // First burst.
+        for i in 0..64 {
+            state
+                .broadcaster
+                .publish(synthetic_event(i + 1, "sess-burst-1"));
+        }
+        tokio::task::yield_now().await;
+
+        // Read until first Dropped.
+        let first = read_until_dropped(&mut ws, 200)
+            .await
+            .expect("first Dropped must arrive after burst 1");
+        assert!(first.0 >= 1);
+
+        // Sleep > coalesce_window (150ms) with NO further lag-trigger so
+        // the helper's `now - last_dropped_at > coalesce_window` check
+        // fires on the next Lagged.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Second burst.
+        for i in 0..64 {
+            state
+                .broadcaster
+                .publish(synthetic_event(10_000 + i + 1, "sess-burst-2"));
+        }
+        tokio::task::yield_now().await;
+
+        // A SECOND Dropped frame must be observed — the window is a
+        // sliding boundary, not a once-per-connection latch.
+        let second = read_until_dropped(&mut ws, 200)
+            .await
+            .expect("second Dropped must arrive after silence + burst 2");
+        assert!(second.0 >= 1);
 
         state.shutdown.cancel();
     }

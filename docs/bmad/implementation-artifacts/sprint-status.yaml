@@ -1,5 +1,5 @@
 # generated: 2026-05-16
-# last_updated: 2026-05-23 (story 2.4 ready-for-dev)
+# last_updated: 2026-05-23 (story 2.4 review)
 # project: bowerbird
 # project_key: NOKEY
 # tracking_system: file-system
@@ -59,7 +59,7 @@ development_status:
   2-1-websocket-connection-and-topic-subscription: done
   2-2-real-time-event-and-state-broadcast-to-multiple-tools: review
   2-3-new-session-discovery-and-state-snapshot-on-connect: done
-  2-4-lagged-consumer-recovery-with-dropped-frame: ready-for-dev
+  2-4-lagged-consumer-recovery-with-dropped-frame: review
   2-5-graceful-shutdown-notification-to-connected-tools: backlog
   epic-2-retrospective: optional
 

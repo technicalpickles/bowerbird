@@ -37,7 +37,9 @@ use std::collections::HashSet;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::OwnedSemaphorePermit;
 
-use protocol::{ClientMessage, EventFrame, EventId, HelloFrame, ServerMessage, StateFrame};
+use protocol::{
+    ClientMessage, DroppedFrame, EventFrame, EventId, HelloFrame, ServerMessage, StateFrame,
+};
 
 use crate::broadcast::{BroadcastEnvelope, Topic};
 use crate::db::queries::SELECT_HELLO_DB_FIELDS;
@@ -201,6 +203,26 @@ async fn connection_task(
     let pong_sleep = tokio::time::sleep(pong_park);
     tokio::pin!(pong_sleep);
 
+    // Story 2.4 — per-connection lag-recovery state.
+    //
+    //   `last_delivered_event_id`: the latest `EventId` this socket
+    //   actually dispatched via `dispatch_envelope` for an Event envelope.
+    //   State envelopes do NOT advance the cursor (they carry no
+    //   `event_id`; see `BroadcastEnvelope::State`).
+    //
+    //   `last_dropped_at`: wall-clock (tokio virtual clock in tests) of
+    //   the most recent `DroppedFrame` emission. `None` until the first
+    //   lag burst.
+    //
+    //   `pending_drop_count`: lag-burst envelopes that were SUPPRESSED
+    //   inside an active coalescing window. Folded into the count of the
+    //   next emission, or never emitted at all if the consumer catches
+    //   up before the window expires (intentional — a fully-recovered
+    //   presenter doesn't need a trailing recap).
+    let mut last_delivered_event_id: Option<EventId> = None;
+    let mut last_dropped_at: Option<tokio::time::Instant> = None;
+    let mut pending_drop_count: u64 = 0;
+
     loop {
         tokio::select! {
             biased;
@@ -218,7 +240,18 @@ async fn connection_task(
             inbound = socket.recv() => {
                 match inbound {
                     Some(Ok(Message::Text(text))) => {
-                        if !handle_text_frame(&mut socket, &mut subscriptions, &mut rx, &state, text.as_str()).await {
+                        if !handle_text_frame(
+                            &mut socket,
+                            &mut subscriptions,
+                            &mut rx,
+                            &state,
+                            text.as_str(),
+                            &mut last_delivered_event_id,
+                            &mut last_dropped_at,
+                            &mut pending_drop_count,
+                        )
+                        .await
+                        {
                             return;
                         }
                     }
@@ -255,14 +288,28 @@ async fn connection_task(
             recv = rx.recv() => {
                 match recv {
                     Ok(env) => {
+                        if let BroadcastEnvelope::Event(ref ev) = env {
+                            last_delivered_event_id = Some(ev.event_id);
+                        }
                         if !dispatch_envelope(&mut socket, &subscriptions, &env).await {
                             return;
                         }
                     }
                     Err(RecvError::Lagged(n)) => {
-                        // Story 2.4 will project this into a `DroppedFrame`.
-                        // Story 2.1 logs and continues; the socket stays open.
-                        tracing::warn!(dropped = n, "ws: broadcast receiver lagged");
+                        // Story 2.4: project lag into a `DroppedFrame` via
+                        // the coalescing helper. Socket stays open per AC #1.
+                        if !emit_dropped_or_coalesce(
+                            &mut socket,
+                            &mut last_dropped_at,
+                            &mut pending_drop_count,
+                            last_delivered_event_id,
+                            n,
+                            state.ws_config.coalesce_window,
+                        )
+                        .await
+                        {
+                            return;
+                        }
                     }
                     Err(RecvError::Closed) => {
                         tracing::debug!("ws: broadcast channel closed; exiting");
@@ -305,12 +352,16 @@ async fn connection_task(
 /// of matching `session_projections` rows BEFORE the connection task's
 /// main loop resumes. See the six-step ordering documented in the
 /// `Subscribe` arm below.
+#[allow(clippy::too_many_arguments)]
 async fn handle_text_frame(
     socket: &mut WebSocket,
     subscriptions: &mut HashSet<Topic>,
     rx: &mut tokio::sync::broadcast::Receiver<BroadcastEnvelope>,
     state: &AppState,
     text: &str,
+    last_delivered_event_id: &mut Option<EventId>,
+    last_dropped_at: &mut Option<tokio::time::Instant>,
+    pending_drop_count: &mut u64,
 ) -> bool {
     let msg: ClientMessage = match serde_json::from_str(text) {
         Ok(m) => m,
@@ -350,7 +401,17 @@ async fn handle_text_frame(
             Ok(t) => {
                 // [A] Drain pre-existing in-flight envelopes under the
                 //     OLD subscription set.
-                if !drain_backlog_under_state(socket, subscriptions, rx).await {
+                if !drain_backlog_under_state(
+                    socket,
+                    subscriptions,
+                    rx,
+                    last_delivered_event_id,
+                    last_dropped_at,
+                    pending_drop_count,
+                    state.ws_config.coalesce_window,
+                )
+                .await
+                {
                     return false;
                 }
 
@@ -434,7 +495,17 @@ async fn handle_text_frame(
         },
         ClientMessage::Unsubscribe { topic } => match Topic::parse(&topic) {
             Ok(t) => {
-                if !drain_backlog_under_state(socket, subscriptions, rx).await {
+                if !drain_backlog_under_state(
+                    socket,
+                    subscriptions,
+                    rx,
+                    last_delivered_event_id,
+                    last_dropped_at,
+                    pending_drop_count,
+                    state.ws_config.coalesce_window,
+                )
+                .await
+                {
                     return false;
                 }
                 subscriptions.remove(&t);
@@ -455,30 +526,144 @@ async fn handle_text_frame(
 /// queued before the change cannot leak across the topic-set update.
 ///
 /// Returns `false` if a downstream send failed and the connection should
-/// exit. `Lagged` is logged at WARN (consistent with the main `rx` branch).
+/// exit. Lag detected during drain goes through the same coalescing helper
+/// as the main `rx.recv()` arm; the per-connection state is shared (Story
+/// 2.4 AC #3 — both lag surfaces coalesce together).
+#[allow(clippy::too_many_arguments)]
 async fn drain_backlog_under_state(
     socket: &mut WebSocket,
     subscriptions: &HashSet<Topic>,
     rx: &mut tokio::sync::broadcast::Receiver<BroadcastEnvelope>,
+    last_delivered_event_id: &mut Option<EventId>,
+    last_dropped_at: &mut Option<tokio::time::Instant>,
+    pending_drop_count: &mut u64,
+    coalesce_window: Duration,
 ) -> bool {
     use tokio::sync::broadcast::error::TryRecvError;
     loop {
         match rx.try_recv() {
             Ok(env) => {
+                if let BroadcastEnvelope::Event(ref ev) = env {
+                    *last_delivered_event_id = Some(ev.event_id);
+                }
                 if !dispatch_envelope(socket, subscriptions, &env).await {
                     return false;
                 }
             }
             Err(TryRecvError::Empty) => return true,
             Err(TryRecvError::Lagged(n)) => {
-                tracing::warn!(
-                    dropped = n,
-                    "ws: broadcast receiver lagged during subscribe drain"
-                );
+                if !emit_dropped_or_coalesce(
+                    socket,
+                    last_dropped_at,
+                    pending_drop_count,
+                    *last_delivered_event_id,
+                    n,
+                    coalesce_window,
+                )
+                .await
+                {
+                    return false;
+                }
             }
             Err(TryRecvError::Closed) => return true,
         }
     }
+}
+
+/// Project a `RecvError::Lagged(n)` / `TryRecvError::Lagged(n)` into the
+/// wire-level `DroppedFrame` shape, with per-connection coalescing.
+///
+/// Behaviour (three rules):
+///
+/// 1. **First lag, or any lag after `coalesce_window` of silence** → emit
+///    one `DroppedFrame` immediately, reset `pending_drop_count`, record
+///    `last_dropped_at = now`.
+/// 2. **Lag within the window** → silently accumulate into
+///    `pending_drop_count`. No wire emission.
+/// 3. **Catch-up (no lag arriving)** → no action. Accumulated
+///    `pending_drop_count` stays parked; it folds into the next lag burst's
+///    count, or is never emitted at all if the connection catches up fully.
+///    Documented behaviour: a fully-recovered presenter doesn't need a
+///    trailing recap.
+///
+/// The window is a passive `Instant`-comparison check on each call; there
+/// is no active timer, no scheduled wake-up. The next `Lagged` arrival is
+/// what triggers the window-expired check. This is deliberate — adding a
+/// `tokio::time::sleep` arm to the connection's `select!` loop would
+/// complicate the loop without any benefit to the AC.
+///
+/// `first_dropped_event_id` is a best-estimate from
+/// `last_delivered_event_id + 1`; `last_dropped_event_id` is
+/// `first + count - 1` (saturating). The broadcast channel doesn't expose
+/// the post-lag cursor, so these are upper-bound informational values.
+/// The presenter recovers via REST with its OWN `last_delivered_event_id`
+/// (the authoritative cursor it tracked from prior `event` frames).
+///
+/// Returns `false` if the socket send failed; the caller should exit.
+#[tracing::instrument(skip_all, fields(n, pending_drop_count = *pending_drop_count, has_cursor = last_delivered_event_id.is_some()))]
+async fn emit_dropped_or_coalesce(
+    socket: &mut WebSocket,
+    last_dropped_at: &mut Option<tokio::time::Instant>,
+    pending_drop_count: &mut u64,
+    last_delivered_event_id: Option<EventId>,
+    n: u64,
+    coalesce_window: Duration,
+) -> bool {
+    let now = tokio::time::Instant::now();
+    let within_window = last_dropped_at
+        .map(|t| now.duration_since(t) <= coalesce_window)
+        .unwrap_or(false);
+
+    if within_window {
+        // Suppress; accumulate. The next emission folds this in.
+        *pending_drop_count = pending_drop_count.saturating_add(n);
+        tracing::debug!(
+            coalesced_into_pending = *pending_drop_count,
+            "ws: dropped frame coalesced"
+        );
+        return true;
+    }
+
+    let count = pending_drop_count.saturating_add(n);
+    let first = match last_delivered_event_id {
+        Some(EventId(id)) => EventId(id.saturating_add(1)),
+        None => EventId(0),
+    };
+    // Best-estimate upper-bound. The broadcast channel doesn't expose the
+    // post-lag cursor; the presenter recovers via REST with its OWN
+    // last_delivered_event_id (which is the authoritative cursor it tracked
+    // from prior `event` frames). The values here are informational and
+    // satisfy the DroppedFrame::new(count > 0, first <= last) invariant.
+    let last_offset = count.saturating_sub(1).min(i64::MAX as u64) as i64;
+    let last = EventId(first.0.saturating_add(last_offset));
+
+    let frame = match DroppedFrame::new(count, first, last) {
+        Ok(f) => f,
+        Err(e) => {
+            // Statically unreachable by construction (count >= 1 from n >= 1,
+            // and last >= first by the saturating_add above). Logged at ERROR
+            // because if we reach here the contract assumptions changed.
+            tracing::error!(error = %e, "ws: DroppedFrame::new rejected; skipping emission");
+            return true;
+        }
+    };
+
+    let json = match serde_json::to_string(&ServerMessage::Dropped(frame)) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = ?e, "ws: failed to serialize DroppedFrame; dropping");
+            return true;
+        }
+    };
+    if let Err(e) = socket.send(Message::Text(json.into())).await {
+        tracing::debug!(error = ?e, "ws: send DroppedFrame failed; closing");
+        return false;
+    }
+
+    *last_dropped_at = Some(now);
+    *pending_drop_count = 0;
+    tracing::warn!(dropped = count, "ws: dropped frame emitted");
+    true
 }
 
 /// Dispatch a broadcast envelope to the client iff any topic in the
