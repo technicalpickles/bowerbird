@@ -26,4 +26,7 @@ pub struct AppState {
 pub struct WsConfig {
     pub ping_interval: Duration,
     pub pong_timeout: Duration,
+    /// Coalescing window for `DroppedFrame` emissions on lag. See
+    /// `Config::ws_broadcast_coalesce_window`.
+    pub coalesce_window: Duration,
 }

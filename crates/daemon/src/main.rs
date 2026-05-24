@@ -170,6 +170,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
     let ws_config = WsConfig {
         ping_interval: config.ws_ping_interval,
         pong_timeout: config.ws_pong_timeout,
+        coalesce_window: config.ws_broadcast_coalesce_window,
     };
 
     let state = AppState {

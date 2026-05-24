@@ -13,6 +13,13 @@ pub struct Config {
     pub ws_ping_interval: Duration,
     pub ws_pong_timeout: Duration,
     pub ws_broadcast_capacity: usize,
+    /// Coalescing window for `DroppedFrame` emissions on a lagging WS
+    /// connection. The first lag, or any lag after `coalesce_window` of
+    /// silence, emits one wire frame; further lag within the window
+    /// accumulates into `pending_drop_count` without emitting. Default
+    /// 1s — at 30s sustained lag the per-connection cap is ≤31 frames,
+    /// satisfying the AC #3 "no frame storm" contract with healthy margin.
+    pub ws_broadcast_coalesce_window: Duration,
 }
 
 impl Config {
@@ -27,6 +34,7 @@ impl Config {
             ws_ping_interval: Duration::from_secs(30),
             ws_pong_timeout: Duration::from_secs(10),
             ws_broadcast_capacity: 1024,
+            ws_broadcast_coalesce_window: Duration::from_secs(1),
         }
     }
 }

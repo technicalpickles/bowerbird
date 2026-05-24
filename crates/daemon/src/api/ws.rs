@@ -37,7 +37,9 @@ use std::collections::HashSet;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::OwnedSemaphorePermit;
 
-use protocol::{ClientMessage, EventFrame, EventId, HelloFrame, ServerMessage, StateFrame};
+use protocol::{
+    ClientMessage, DroppedFrame, EventFrame, EventId, HelloFrame, ServerMessage, StateFrame,
+};
 
 use crate::broadcast::{BroadcastEnvelope, Topic};
 use crate::db::queries::SELECT_HELLO_DB_FIELDS;
@@ -201,6 +203,30 @@ async fn connection_task(
     let pong_sleep = tokio::time::sleep(pong_park);
     tokio::pin!(pong_sleep);
 
+    // Story 2.4 — per-connection lag-recovery state.
+    //
+    //   `last_delivered_event_id`: the latest `EventId` this socket
+    //   actually dispatched via `dispatch_envelope` for an Event envelope.
+    //   State envelopes do NOT advance the cursor (they carry no
+    //   `event_id`; see `BroadcastEnvelope::State`).
+    //
+    //   `last_dropped_at`: wall-clock (tokio virtual clock in tests) of
+    //   the most recent `DroppedFrame` emission. `None` until the first
+    //   lag burst.
+    //
+    //   `pending_drop_count`: lag-burst envelopes that were SUPPRESSED
+    //   inside an active coalescing window. Folded into the count of the
+    //   next emission, or never emitted at all if the consumer catches
+    //   up before the window expires (intentional — a fully-recovered
+    //   presenter doesn't need a trailing recap).
+    let mut last_delivered_event_id: Option<EventId> = None;
+    let mut last_dropped_at: Option<tokio::time::Instant> = None;
+    let mut pending_drop_count: u64 = 0;
+    // Second-round review fix: gap cursor captured at first suppression
+    // of a coalescing window so the eventual Dropped emission reports
+    // the true gap start rather than a later cursor-advanced value.
+    let mut pending_dropped_first: Option<EventId> = None;
+
     loop {
         tokio::select! {
             biased;
@@ -218,7 +244,19 @@ async fn connection_task(
             inbound = socket.recv() => {
                 match inbound {
                     Some(Ok(Message::Text(text))) => {
-                        if !handle_text_frame(&mut socket, &mut subscriptions, &mut rx, &state, text.as_str()).await {
+                        if !handle_text_frame(
+                            &mut socket,
+                            &mut subscriptions,
+                            &mut rx,
+                            &state,
+                            text.as_str(),
+                            &mut last_delivered_event_id,
+                            &mut last_dropped_at,
+                            &mut pending_drop_count,
+                            &mut pending_dropped_first,
+                        )
+                        .await
+                        {
                             return;
                         }
                     }
@@ -255,14 +293,50 @@ async fn connection_task(
             recv = rx.recv() => {
                 match recv {
                     Ok(env) => {
-                        if !dispatch_envelope(&mut socket, &subscriptions, &env).await {
-                            return;
+                        // Cursor advances ONLY after a matching Event was
+                        // actually written to the wire — see DispatchOutcome
+                        // doc for why this gate matters for state-only and
+                        // narrow-topic subscribers.
+                        match dispatch_envelope(&mut socket, &subscriptions, &env).await {
+                            DispatchOutcome::Sent => {
+                                if let BroadcastEnvelope::Event(ref ev) = env {
+                                    last_delivered_event_id = Some(ev.event_id);
+                                }
+                            }
+                            DispatchOutcome::Filtered => {}
+                            DispatchOutcome::Closed => return,
                         }
                     }
                     Err(RecvError::Lagged(n)) => {
-                        // Story 2.4 will project this into a `DroppedFrame`.
-                        // Story 2.1 logs and continues; the socket stays open.
-                        tracing::warn!(dropped = n, "ws: broadcast receiver lagged");
+                        // Story 2.4: project lag into a `DroppedFrame` via
+                        // the coalescing helper. Socket stays open per AC #1.
+                        //
+                        // Second-round review fix: when no subscription is
+                        // active, lag is a transport-layer event with no
+                        // wire-contract impact (the client never asked for
+                        // any stream). Silent fast-forward instead of
+                        // emitting a Dropped frame the presenter didn't
+                        // earn through a subscription.
+                        if subscriptions.is_empty() {
+                            tracing::debug!(
+                                dropped = n,
+                                "ws: lag observed pre-subscription; silent fast-forward"
+                            );
+                            continue;
+                        }
+                        if !emit_dropped_or_coalesce(
+                            &mut socket,
+                            &mut last_dropped_at,
+                            &mut pending_drop_count,
+                            &mut pending_dropped_first,
+                            last_delivered_event_id,
+                            n,
+                            state.ws_config.coalesce_window,
+                        )
+                        .await
+                        {
+                            return;
+                        }
                     }
                     Err(RecvError::Closed) => {
                         tracing::debug!("ws: broadcast channel closed; exiting");
@@ -305,12 +379,17 @@ async fn connection_task(
 /// of matching `session_projections` rows BEFORE the connection task's
 /// main loop resumes. See the six-step ordering documented in the
 /// `Subscribe` arm below.
+#[allow(clippy::too_many_arguments)]
 async fn handle_text_frame(
     socket: &mut WebSocket,
     subscriptions: &mut HashSet<Topic>,
     rx: &mut tokio::sync::broadcast::Receiver<BroadcastEnvelope>,
     state: &AppState,
     text: &str,
+    last_delivered_event_id: &mut Option<EventId>,
+    last_dropped_at: &mut Option<tokio::time::Instant>,
+    pending_drop_count: &mut u64,
+    pending_dropped_first: &mut Option<EventId>,
 ) -> bool {
     let msg: ClientMessage = match serde_json::from_str(text) {
         Ok(m) => m,
@@ -350,7 +429,18 @@ async fn handle_text_frame(
             Ok(t) => {
                 // [A] Drain pre-existing in-flight envelopes under the
                 //     OLD subscription set.
-                if !drain_backlog_under_state(socket, subscriptions, rx).await {
+                if !drain_backlog_under_state(
+                    socket,
+                    subscriptions,
+                    rx,
+                    last_delivered_event_id,
+                    last_dropped_at,
+                    pending_drop_count,
+                    pending_dropped_first,
+                    state.ws_config.coalesce_window,
+                )
+                .await
+                {
                     return false;
                 }
 
@@ -434,7 +524,18 @@ async fn handle_text_frame(
         },
         ClientMessage::Unsubscribe { topic } => match Topic::parse(&topic) {
             Ok(t) => {
-                if !drain_backlog_under_state(socket, subscriptions, rx).await {
+                if !drain_backlog_under_state(
+                    socket,
+                    subscriptions,
+                    rx,
+                    last_delivered_event_id,
+                    last_dropped_at,
+                    pending_drop_count,
+                    pending_dropped_first,
+                    state.ws_config.coalesce_window,
+                )
+                .await
+                {
                     return false;
                 }
                 subscriptions.remove(&t);
@@ -455,45 +556,298 @@ async fn handle_text_frame(
 /// queued before the change cannot leak across the topic-set update.
 ///
 /// Returns `false` if a downstream send failed and the connection should
-/// exit. `Lagged` is logged at WARN (consistent with the main `rx` branch).
+/// exit. Lag detected during drain goes through the same coalescing helper
+/// as the main `rx.recv()` arm; the per-connection state is shared (Story
+/// 2.4 AC #3 — both lag surfaces coalesce together).
+#[allow(clippy::too_many_arguments)]
 async fn drain_backlog_under_state(
     socket: &mut WebSocket,
     subscriptions: &HashSet<Topic>,
     rx: &mut tokio::sync::broadcast::Receiver<BroadcastEnvelope>,
+    last_delivered_event_id: &mut Option<EventId>,
+    last_dropped_at: &mut Option<tokio::time::Instant>,
+    pending_drop_count: &mut u64,
+    pending_dropped_first: &mut Option<EventId>,
+    coalesce_window: Duration,
 ) -> bool {
     use tokio::sync::broadcast::error::TryRecvError;
     loop {
         match rx.try_recv() {
             Ok(env) => {
-                if !dispatch_envelope(socket, subscriptions, &env).await {
-                    return false;
+                // Same wire-side cursor discipline as the main rx.recv arm
+                // — see DispatchOutcome doc and the code-review finding
+                // for Story 2.4.
+                match dispatch_envelope(socket, subscriptions, &env).await {
+                    DispatchOutcome::Sent => {
+                        if let BroadcastEnvelope::Event(ref ev) = env {
+                            *last_delivered_event_id = Some(ev.event_id);
+                        }
+                    }
+                    DispatchOutcome::Filtered => {}
+                    DispatchOutcome::Closed => return false,
                 }
             }
             Err(TryRecvError::Empty) => return true,
             Err(TryRecvError::Lagged(n)) => {
-                tracing::warn!(
-                    dropped = n,
-                    "ws: broadcast receiver lagged during subscribe drain"
-                );
+                // Same pre-subscription guard as the main rx.recv arm
+                // (second-round review fix). `drain_backlog_under_state`
+                // runs under the OLD subscription set (before the new
+                // Subscribe is inserted); if that set was empty, the lag
+                // happened entirely outside any wire contract — silent
+                // fast-forward.
+                if subscriptions.is_empty() {
+                    tracing::debug!(
+                        dropped = n,
+                        "ws: drain lag observed pre-subscription; silent fast-forward"
+                    );
+                    continue;
+                }
+                if !emit_dropped_or_coalesce(
+                    socket,
+                    last_dropped_at,
+                    pending_drop_count,
+                    pending_dropped_first,
+                    *last_delivered_event_id,
+                    n,
+                    coalesce_window,
+                )
+                .await
+                {
+                    return false;
+                }
             }
             Err(TryRecvError::Closed) => return true,
         }
     }
 }
 
+/// The decision the coalescing policy made for one lag arrival. Pure
+/// data; no I/O, no `&mut WebSocket`. Lets the policy be unit-tested
+/// deterministically with no `tokio::time::pause` / advance dance and
+/// no TCP scaffolding — addresses Story 2.4 code-review finding #2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoalesceDecision {
+    /// Window expired (or first lag ever); emit a `DroppedFrame` with
+    /// these values. Caller resets `pending_drop_count` and records
+    /// `last_dropped_at = now`.
+    Emit {
+        count: u64,
+        first: EventId,
+        last: EventId,
+    },
+    /// Within the coalesce window; the policy suppressed emission.
+    /// `pending_drop_count` was incremented in-place by `n`.
+    Suppress,
+}
+
+/// Pure coalescing decision. Splits the "should we emit?" policy from
+/// the I/O-bound `emit_dropped_or_coalesce`, so the contract can be
+/// covered by deterministic unit tests that construct fake `Instant`
+/// values via `Instant::now() + Duration`.
+///
+/// Mutates `pending_drop_count` and `pending_dropped_first` in BOTH
+/// branches:
+/// - On `Suppress`: `pending_drop_count` is incremented by `n`; on the
+///   FIRST suppression of a window (when `pending_drop_count` was 0
+///   before this call), `pending_dropped_first` captures the
+///   `last_delivered_event_id + 1` cursor (or `EventId(0)` sentinel)
+///   that will be used when the window eventually emits — see
+///   second-round review finding #2.
+/// - On `Emit`: the caller resets both `pending_drop_count = 0` and
+///   `*pending_dropped_first = None` after a successful wire send.
+///
+/// `#[must_use]` because dropping the result on the Emit branch would
+/// lose the wire-id range.
+#[must_use]
+fn coalesce_decision(
+    now: tokio::time::Instant,
+    last_dropped_at: Option<tokio::time::Instant>,
+    pending_drop_count: &mut u64,
+    pending_dropped_first: &mut Option<EventId>,
+    last_delivered_event_id: Option<EventId>,
+    n: u64,
+    coalesce_window: Duration,
+) -> CoalesceDecision {
+    let within_window = last_dropped_at
+        .map(|t| now.duration_since(t) <= coalesce_window)
+        .unwrap_or(false);
+
+    // Helper: project a cursor to the next dropped-id (cursor+1, or
+    // EventId(0) sentinel when no prior Event was delivered).
+    let cursor_to_first = |cursor: Option<EventId>| -> EventId {
+        match cursor {
+            Some(EventId(id)) => EventId(id.saturating_add(1)),
+            None => EventId(0),
+        }
+    };
+
+    if within_window {
+        // Capture the gap cursor on the FIRST suppression of this
+        // window — the next emission MUST report this as its
+        // `first_dropped_event_id`, even if normal Event delivery
+        // advances `last_delivered_event_id` before the window expires.
+        // Otherwise the eventual Dropped frame describes a range that
+        // starts after the presenter's true gap (the second-round
+        // review's "stale count, fresh cursor" finding).
+        if *pending_drop_count == 0 {
+            *pending_dropped_first = Some(cursor_to_first(last_delivered_event_id));
+        }
+        *pending_drop_count = pending_drop_count.saturating_add(n);
+        return CoalesceDecision::Suppress;
+    }
+
+    let count = pending_drop_count.saturating_add(n);
+    let first = match *pending_dropped_first {
+        // Prior suppressions in this window captured the gap origin;
+        // use that, NOT the (possibly cursor-advanced) current value.
+        Some(captured) => captured,
+        // First lag of a window (no prior suppression): use current
+        // cursor + 1.
+        None => cursor_to_first(last_delivered_event_id),
+    };
+    // Best-estimate upper-bound. The broadcast channel doesn't expose
+    // the post-lag cursor; the presenter recovers via REST with its OWN
+    // last_delivered_event_id (which is the authoritative cursor it
+    // tracked from prior `event` frames). The values here are
+    // informational and satisfy the DroppedFrame::new(count > 0,
+    // first <= last) invariant.
+    let last_offset = count.saturating_sub(1).min(i64::MAX as u64) as i64;
+    let last = EventId(first.0.saturating_add(last_offset));
+    CoalesceDecision::Emit { count, first, last }
+}
+
+/// Project a `RecvError::Lagged(n)` / `TryRecvError::Lagged(n)` into the
+/// wire-level `DroppedFrame` shape, with per-connection coalescing.
+///
+/// Behaviour (three rules):
+///
+/// 1. **First lag, or any lag after `coalesce_window` of silence** → emit
+///    one `DroppedFrame` immediately, reset `pending_drop_count`, record
+///    `last_dropped_at = now`.
+/// 2. **Lag within the window** → silently accumulate into
+///    `pending_drop_count`. No wire emission.
+/// 3. **Catch-up (no lag arriving)** → no action. Accumulated
+///    `pending_drop_count` stays parked; it folds into the next lag burst's
+///    count, or is never emitted at all if the connection catches up fully.
+///    Documented behaviour: a fully-recovered presenter doesn't need a
+///    trailing recap.
+///
+/// The window is a passive `Instant`-comparison check on each call; there
+/// is no active timer, no scheduled wake-up. The next `Lagged` arrival is
+/// what triggers the window-expired check. This is deliberate — adding a
+/// `tokio::time::sleep` arm to the connection's `select!` loop would
+/// complicate the loop without any benefit to the AC.
+///
+/// `first_dropped_event_id` is a best-estimate from
+/// `last_delivered_event_id + 1`; `last_dropped_event_id` is
+/// `first + count - 1` (saturating). The broadcast channel doesn't expose
+/// the post-lag cursor, so these are upper-bound informational values.
+/// The presenter recovers via REST with its OWN `last_delivered_event_id`
+/// (the authoritative cursor it tracked from prior `event` frames).
+///
+/// Returns `false` if the socket send failed; the caller should exit.
+#[tracing::instrument(skip_all, fields(n, pending_drop_count = *pending_drop_count, has_cursor = last_delivered_event_id.is_some()))]
+#[allow(clippy::too_many_arguments)]
+async fn emit_dropped_or_coalesce(
+    socket: &mut WebSocket,
+    last_dropped_at: &mut Option<tokio::time::Instant>,
+    pending_drop_count: &mut u64,
+    pending_dropped_first: &mut Option<EventId>,
+    last_delivered_event_id: Option<EventId>,
+    n: u64,
+    coalesce_window: Duration,
+) -> bool {
+    let now = tokio::time::Instant::now();
+    let decision = coalesce_decision(
+        now,
+        *last_dropped_at,
+        pending_drop_count,
+        pending_dropped_first,
+        last_delivered_event_id,
+        n,
+        coalesce_window,
+    );
+
+    let (count, first, last) = match decision {
+        CoalesceDecision::Suppress => {
+            tracing::debug!(
+                coalesced_into_pending = *pending_drop_count,
+                "ws: dropped frame coalesced"
+            );
+            return true;
+        }
+        CoalesceDecision::Emit { count, first, last } => (count, first, last),
+    };
+
+    let frame = match DroppedFrame::new(count, first, last) {
+        Ok(f) => f,
+        Err(e) => {
+            // Statically unreachable by construction (count >= 1 from n >= 1,
+            // and last >= first by the saturating_add above). Logged at ERROR
+            // because if we reach here the contract assumptions changed.
+            tracing::error!(error = %e, "ws: DroppedFrame::new rejected; skipping emission");
+            return true;
+        }
+    };
+
+    let json = match serde_json::to_string(&ServerMessage::Dropped(frame)) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = ?e, "ws: failed to serialize DroppedFrame; dropping");
+            return true;
+        }
+    };
+    if let Err(e) = socket.send(Message::Text(json.into())).await {
+        tracing::debug!(error = ?e, "ws: send DroppedFrame failed; closing");
+        return false;
+    }
+
+    *last_dropped_at = Some(now);
+    *pending_drop_count = 0;
+    // Reset captured gap cursor for the next window — see Story 2.4
+    // second-round review finding #2.
+    *pending_dropped_first = None;
+    tracing::warn!(dropped = count, "ws: dropped frame emitted");
+    true
+}
+
+/// Outcome of one `dispatch_envelope` call, used by the per-connection
+/// task to decide whether to keep looping AND whether to advance the
+/// `last_delivered_event_id` recovery cursor.
+///
+/// Story 2.4 split this off from a bare `bool` after the first code-review
+/// round caught a cursor-corruption bug: a state-only subscriber received
+/// every Event envelope through `rx.recv()` (broadcast topics are
+/// receiver-side filters, not channel-side), so advancing the cursor on
+/// `rx.recv()` Ok arms — instead of after a successful matching wire-send —
+/// meant the next `DroppedFrame.first_dropped_event_id` was computed from
+/// an Event the presenter never received.
+enum DispatchOutcome {
+    /// Topic-match hit AND wire send succeeded. The caller should advance
+    /// `last_delivered_event_id` if the envelope was an `Event`.
+    Sent,
+    /// No topic-match, or matched but serialization failed (logged at
+    /// ERROR). The caller should NOT advance the cursor — nothing reached
+    /// the wire.
+    Filtered,
+    /// Wire send failed; the caller should exit the connection task.
+    Closed,
+}
+
 /// Dispatch a broadcast envelope to the client iff any topic in the
 /// subscription set matches. Sends at most one wire frame even when
 /// multiple subscription entries match (Topic-match invariant: dedup at
-/// dispatch). Returns `false` if the socket failed to send and the task
-/// should exit.
+/// dispatch). Returns `DispatchOutcome::Closed` if the socket failed to
+/// send and the task should exit; `Sent` if a matching frame reached the
+/// wire; `Filtered` otherwise (no match or serialization failure).
 async fn dispatch_envelope(
     socket: &mut WebSocket,
     subscriptions: &HashSet<Topic>,
     envelope: &BroadcastEnvelope,
-) -> bool {
+) -> DispatchOutcome {
     let any_match = subscriptions.iter().any(|t| t.matches(envelope));
     if !any_match {
-        return true;
+        return DispatchOutcome::Filtered;
     }
     let frame = match envelope {
         BroadcastEnvelope::Event(ev) => ServerMessage::Event(EventFrame { event: ev.clone() }),
@@ -511,14 +865,14 @@ async fn dispatch_envelope(
         Ok(s) => s,
         Err(e) => {
             tracing::error!(error = ?e, "ws: failed to serialize ServerMessage; dropping");
-            return true;
+            return DispatchOutcome::Filtered;
         }
     };
     if let Err(e) = socket.send(Message::Text(json.into())).await {
         tracing::debug!(error = ?e, "ws: send failed; closing");
-        return false;
+        return DispatchOutcome::Closed;
     }
-    true
+    DispatchOutcome::Sent
 }
 
 /// Sanitize a string for inclusion in a WS Close frame reason. Strips `\n`
@@ -584,5 +938,486 @@ mod tests {
         let r = sanitize_for_wire_ws("bad message: ", &detail);
         assert!(r.is_char_boundary(r.len()));
         assert!(r.len() <= WS_CLOSE_REASON_LIMIT);
+    }
+
+    // ----- Story 2.4 coalesce_decision unit tests -----
+    //
+    // The coalescing policy is the timing-sensitive contract Story 2.4
+    // depends on. The async `emit_dropped_or_coalesce` and the e2e
+    // contract tests (`sustained_lag_does_not_storm_dropped_frames`,
+    // `coalesce_window_resets_after_silence`) exercise the wire end-to-
+    // end but are wall-clock sensitive. These unit tests cover the
+    // policy contract deterministically — Instant values are
+    // constructed by arithmetic, no scheduler, no TCP. Addresses
+    // Story 2.4 code-review finding #2.
+
+    #[test]
+    fn coalesce_first_lag_ever_emits() {
+        let now = tokio::time::Instant::now();
+        let mut pending = 0u64;
+        let mut pending_first: Option<EventId> = None;
+        let d = coalesce_decision(
+            now,
+            None,
+            &mut pending,
+            &mut pending_first,
+            None,
+            7,
+            Duration::from_secs(1),
+        );
+        assert_eq!(
+            d,
+            CoalesceDecision::Emit {
+                count: 7,
+                first: EventId(0),
+                last: EventId(6),
+            }
+        );
+        // pending_drop_count is NOT zeroed by the pure decision — the
+        // async caller does that after a successful wire send.
+        assert_eq!(pending, 0);
+        // pending_dropped_first is only set on Suppress (first lag of a
+        // window). On a first-ever lag that goes straight to Emit, it
+        // stays None.
+        assert_eq!(pending_first, None);
+    }
+
+    #[test]
+    fn coalesce_first_lag_uses_cursor_plus_one() {
+        let now = tokio::time::Instant::now();
+        let mut pending = 0u64;
+        let mut pending_first: Option<EventId> = None;
+        let d = coalesce_decision(
+            now,
+            None,
+            &mut pending,
+            &mut pending_first,
+            Some(EventId(100)),
+            3,
+            Duration::from_secs(1),
+        );
+        assert_eq!(
+            d,
+            CoalesceDecision::Emit {
+                count: 3,
+                first: EventId(101),
+                last: EventId(103),
+            }
+        );
+    }
+
+    #[test]
+    fn coalesce_within_window_suppresses_and_accumulates() {
+        let base = tokio::time::Instant::now();
+        let last_dropped_at = Some(base);
+        let mut pending = 5u64;
+        // pending > 0 means we've already captured first for THIS
+        // window — simulate that with a pre-set value.
+        let mut pending_first: Option<EventId> = Some(EventId(11));
+        let d = coalesce_decision(
+            base + Duration::from_millis(50),
+            last_dropped_at,
+            &mut pending,
+            &mut pending_first,
+            Some(EventId(10)),
+            4,
+            Duration::from_millis(100),
+        );
+        assert_eq!(d, CoalesceDecision::Suppress);
+        // pending accumulates by n
+        assert_eq!(pending, 9);
+        // pending_first stays at its captured value (the first
+        // suppression of the window already set it).
+        assert_eq!(pending_first, Some(EventId(11)));
+    }
+
+    #[test]
+    fn coalesce_window_expired_emits_pending_plus_n() {
+        // Reproduces the AC #4 "window resets after silence" contract:
+        // last_dropped_at was 200ms ago; window is 150ms; the next lag
+        // emits a fresh Dropped frame whose count includes any
+        // accumulated pending. With no captured pending_first the
+        // emission uses the current cursor.
+        let base = tokio::time::Instant::now();
+        let last_dropped_at = Some(base);
+        let mut pending = 3u64;
+        let mut pending_first: Option<EventId> = None;
+        let d = coalesce_decision(
+            base + Duration::from_millis(200),
+            last_dropped_at,
+            &mut pending,
+            &mut pending_first,
+            Some(EventId(50)),
+            10,
+            Duration::from_millis(150),
+        );
+        // pending stays untouched here — the caller resets it on
+        // successful wire emission.
+        assert_eq!(pending, 3);
+        assert_eq!(
+            d,
+            CoalesceDecision::Emit {
+                count: 13, // 3 pending + 10 new
+                first: EventId(51),
+                last: EventId(63),
+            }
+        );
+    }
+
+    #[test]
+    fn coalesce_boundary_equal_to_window_suppresses() {
+        // The implementation uses `<=` for the within-window check; this
+        // documents that an exact-boundary call is suppression, not
+        // emission. A regression to strict `<` would flip this test.
+        let base = tokio::time::Instant::now();
+        let mut pending = 0u64;
+        let mut pending_first: Option<EventId> = None;
+        let d = coalesce_decision(
+            base + Duration::from_millis(100),
+            Some(base),
+            &mut pending,
+            &mut pending_first,
+            Some(EventId(1)),
+            1,
+            Duration::from_millis(100),
+        );
+        assert_eq!(d, CoalesceDecision::Suppress);
+        assert_eq!(pending, 1);
+        // First suppression captures pending_first = cursor + 1.
+        assert_eq!(pending_first, Some(EventId(2)));
+    }
+
+    #[test]
+    fn coalesce_pure_repeated_calls_within_window_accumulate() {
+        // Models a tight lag-storm sequence: first lag emits, then
+        // three more lags arrive within the window — all three are
+        // suppressed and folded into `pending`. The single Emit is the
+        // bound the AC #3 "≤ 31 frames over 30s" contract relies on.
+        let base = tokio::time::Instant::now();
+        let mut pending = 0u64;
+        let mut pending_first: Option<EventId> = None;
+
+        // First lag — Emit.
+        let d1 = coalesce_decision(
+            base,
+            None,
+            &mut pending,
+            &mut pending_first,
+            Some(EventId(0)),
+            5,
+            Duration::from_millis(100),
+        );
+        assert!(matches!(d1, CoalesceDecision::Emit { .. }));
+        // Simulate the caller's post-emit bookkeeping.
+        pending = 0;
+        pending_first = None;
+        let last_dropped_at = Some(base);
+
+        // Three more lags within the window — all suppressed.
+        for offset_ms in [10, 30, 60] {
+            let d = coalesce_decision(
+                base + Duration::from_millis(offset_ms),
+                last_dropped_at,
+                &mut pending,
+                &mut pending_first,
+                Some(EventId(0)),
+                2,
+                Duration::from_millis(100),
+            );
+            assert_eq!(d, CoalesceDecision::Suppress);
+        }
+        assert_eq!(pending, 6); // 2 + 2 + 2 accumulated
+        // First suppression of the new window captured the gap origin.
+        assert_eq!(pending_first, Some(EventId(1)));
+
+        // After window expiry, the next lag emits with count = pending + n
+        // and first = the captured pending_first (NOT current cursor).
+        let d_final = coalesce_decision(
+            base + Duration::from_millis(150),
+            last_dropped_at,
+            &mut pending,
+            &mut pending_first,
+            Some(EventId(0)),
+            1,
+            Duration::from_millis(100),
+        );
+        assert_eq!(
+            d_final,
+            CoalesceDecision::Emit {
+                count: 7, // 6 pending + 1 new
+                first: EventId(1),
+                last: EventId(7),
+            }
+        );
+    }
+
+    #[test]
+    fn coalesce_count_one_first_eq_last() {
+        // A single-envelope lag with no prior cursor must produce
+        // first == last == EventId(0). Matches the
+        // dropped_frame_new_allows_count_one_first_eq_last invariant
+        // in `crates/protocol/src/ws.rs`.
+        let now = tokio::time::Instant::now();
+        let mut pending = 0u64;
+        let mut pending_first: Option<EventId> = None;
+        let d = coalesce_decision(
+            now,
+            None,
+            &mut pending,
+            &mut pending_first,
+            None,
+            1,
+            Duration::from_secs(1),
+        );
+        assert_eq!(
+            d,
+            CoalesceDecision::Emit {
+                count: 1,
+                first: EventId(0),
+                last: EventId(0),
+            }
+        );
+    }
+
+    /// Story 2.4 second-round review finding #2 — Pending drops MUST
+    /// carry their own cursor through the coalescing window. When a lag
+    /// is suppressed, then a normal Event delivery advances
+    /// `last_delivered_event_id`, then the window expires and the
+    /// suppressed lag finally emits, the emitted `first_dropped_event_id`
+    /// MUST reflect the cursor at the time of the suppression — NOT the
+    /// post-advance cursor. Otherwise count includes pre-advance gaps but
+    /// the range starts after the presenter's true gap, which is
+    /// internally inconsistent and weakens recovery diagnostics.
+    #[test]
+    fn coalesce_emit_after_cursor_advance_uses_captured_first() {
+        let base = tokio::time::Instant::now();
+        let mut pending = 0u64;
+        let mut pending_first: Option<EventId> = None;
+        let window = Duration::from_millis(100);
+
+        // 1. First lag — Emit immediately. Cursor at EventId(10).
+        let d1 = coalesce_decision(
+            base,
+            None,
+            &mut pending,
+            &mut pending_first,
+            Some(EventId(10)),
+            5,
+            window,
+        );
+        assert_eq!(
+            d1,
+            CoalesceDecision::Emit {
+                count: 5,
+                first: EventId(11),
+                last: EventId(15),
+            }
+        );
+        // Post-Emit caller bookkeeping.
+        pending = 0;
+        pending_first = None;
+        let last_dropped_at = Some(base);
+
+        // 2. Normal Event delivery: cursor advances to EventId(20).
+        //    (No coalesce_decision call — this happens on rx.recv Ok arm.)
+        let cursor_after_delivery_1 = Some(EventId(20));
+
+        // 3. Second lag, within window. Cursor is now EventId(20).
+        //    Should SUPPRESS and capture pending_first = EventId(21).
+        let d2 = coalesce_decision(
+            base + Duration::from_millis(30),
+            last_dropped_at,
+            &mut pending,
+            &mut pending_first,
+            cursor_after_delivery_1,
+            3,
+            window,
+        );
+        assert_eq!(d2, CoalesceDecision::Suppress);
+        assert_eq!(pending, 3);
+        assert_eq!(
+            pending_first,
+            Some(EventId(21)),
+            "first suppression of window must capture cursor + 1"
+        );
+
+        // 4. More normal Event deliveries: cursor advances to EventId(40).
+        //    The captured pending_first MUST stay at EventId(21).
+        let cursor_after_delivery_2 = Some(EventId(40));
+
+        // 5. Third lag, still within window. Should SUPPRESS without
+        //    overwriting pending_first.
+        let d3 = coalesce_decision(
+            base + Duration::from_millis(70),
+            last_dropped_at,
+            &mut pending,
+            &mut pending_first,
+            cursor_after_delivery_2,
+            2,
+            window,
+        );
+        assert_eq!(d3, CoalesceDecision::Suppress);
+        assert_eq!(pending, 5);
+        assert_eq!(
+            pending_first,
+            Some(EventId(21)),
+            "subsequent suppressions in the same window must NOT overwrite \
+             pending_first; the original gap origin is the recovery signal"
+        );
+
+        // 6. Window expires; fourth lag arrives. Cursor is now EventId(40).
+        //    The Emit MUST use the captured first (EventId(21)), NOT the
+        //    advanced cursor (would have been EventId(41)).
+        let d4 = coalesce_decision(
+            base + Duration::from_millis(200),
+            last_dropped_at,
+            &mut pending,
+            &mut pending_first,
+            cursor_after_delivery_2,
+            4,
+            window,
+        );
+        // Pre-fix: this would have been Emit { count: 9, first: EventId(41), ... }
+        // Post-fix: Emit { count: 9, first: EventId(21), ... }
+        assert_eq!(
+            d4,
+            CoalesceDecision::Emit {
+                count: 9, // 5 pending + 4 new
+                first: EventId(21),
+                last: EventId(29),
+            },
+            "emit-after-cursor-advance MUST use the captured pending_first \
+             (EventId(21)), NOT the post-advance current cursor (EventId(41)). \
+             Regression of Story 2.4 second-round code-review finding #2."
+        );
+    }
+
+    /// Story 2.4 second-round review finding #3 — AC #1 says a single
+    /// lag burst produces EXACTLY one `Dropped` frame. At the policy
+    /// level this is structural: `coalesce_decision` is only called from
+    /// the two `Lagged` arms (main `rx.recv()` + drain). One `Lagged(n)`
+    /// arrival → one call → one decision. The test documents the
+    /// post-Emit state so a regression that "double-fires" by emitting
+    /// twice for the same burst would fail loudly.
+    #[test]
+    fn coalesce_single_lag_burst_produces_exactly_one_emit() {
+        let base = tokio::time::Instant::now();
+        let mut pending = 0u64;
+        let mut pending_first: Option<EventId> = None;
+        let window = Duration::from_secs(1);
+
+        // First lag — Emit.
+        let d1 = coalesce_decision(
+            base,
+            None,
+            &mut pending,
+            &mut pending_first,
+            None,
+            1, // n = 1 (1025 envelopes vs capacity 1024 → 1-pos lag)
+            window,
+        );
+        assert!(matches!(
+            d1,
+            CoalesceDecision::Emit {
+                count: 1,
+                first: EventId(0),
+                last: EventId(0),
+            }
+        ));
+        // Caller post-Emit bookkeeping.
+        pending = 0;
+        pending_first = None;
+        let last_dropped_at = Some(base);
+
+        // No further `Lagged` arrives in this scenario — the burst is
+        // over. The receiver consumes the rest of the channel normally;
+        // those are `rx.recv() Ok` arms that DO NOT call
+        // coalesce_decision. Without another Lagged event, no second
+        // emit can occur. (We assert this structurally below: simulate
+        // a second call within the window with n=0 — would be a bug if
+        // it ever happens — and confirm Suppress, NOT Emit.)
+        //
+        // n=0 is a hypothetical bug-state input. The function still
+        // honors the within-window check, so even a "vacuous" lag call
+        // suppresses; the upstream invariant is that Lagged(0) never
+        // arrives from tokio::broadcast.
+        let d2 = coalesce_decision(
+            base + Duration::from_millis(10),
+            last_dropped_at,
+            &mut pending,
+            &mut pending_first,
+            None,
+            0,
+            window,
+        );
+        assert_eq!(d2, CoalesceDecision::Suppress);
+    }
+
+    /// Story 2.4 second-round review finding #6 — The AC #3 contract
+    /// guarantees "≤ 31 Dropped frames over 30s sustained lag with
+    /// `coalesce_window = 1s`." The e2e contract test
+    /// `sustained_lag_does_not_storm_dropped_frames` exercises 1s of
+    /// wall time with a 100ms window. This pure-policy test simulates
+    /// the production default (30s horizon, 1s window) deterministically
+    /// — no scheduler, no TCP — so a regression in long-horizon emission
+    /// rate bookkeeping fails this test even if the integration smoke
+    /// stays green.
+    #[test]
+    fn coalesce_30s_horizon_with_1s_window_bounded_at_31_emits() {
+        let base = tokio::time::Instant::now();
+        let mut pending = 0u64;
+        let mut pending_first: Option<EventId> = None;
+        let mut last_dropped_at: Option<tokio::time::Instant> = None;
+        let window = Duration::from_secs(1);
+
+        // Simulate 30 real seconds of sustained lag by calling
+        // coalesce_decision every 100ms (300 calls). Each call models
+        // one Lagged arrival from the broadcast receiver.
+        let mut emit_count: u64 = 0;
+        let mut cursor: i64 = 0;
+        for i in 0..300 {
+            let now = base + Duration::from_millis(100 * i);
+            let decision = coalesce_decision(
+                now,
+                last_dropped_at,
+                &mut pending,
+                &mut pending_first,
+                Some(EventId(cursor)),
+                10, // n = 10 envelopes per lag event
+                window,
+            );
+            match decision {
+                CoalesceDecision::Emit { .. } => {
+                    emit_count += 1;
+                    // Mirror the caller's post-Emit bookkeeping.
+                    pending = 0;
+                    pending_first = None;
+                    last_dropped_at = Some(now);
+                }
+                CoalesceDecision::Suppress => {
+                    // Nothing — state mutated in-place by the function.
+                }
+            }
+            // Simulate occasional normal Event delivery advancing cursor.
+            // This is the scenario where finding #2 matters: cursor
+            // advances even while suppressed lag accumulates.
+            cursor += 5;
+        }
+
+        // Theoretical ceiling per AC #3: ceil(30s / 1s) = 30 Emit frames,
+        // plus possibly 1 for the very first lag that occurs at t=0
+        // before any window is established. Spec says "≤ 31."
+        assert!(
+            emit_count <= 31,
+            "AC #3: 30s sustained lag with 1s window must emit ≤ 31 \
+             DroppedFrames; got {emit_count}. Coalescing window \
+             bookkeeping regressed."
+        );
+        // Lower bound: at least one emission must happen (sanity check).
+        assert!(
+            emit_count >= 1,
+            "30s of continuous lag must produce at least one Dropped \
+             emission; got {emit_count}"
+        );
     }
 }
