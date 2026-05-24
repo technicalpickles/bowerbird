@@ -5,6 +5,7 @@ pub mod db;
 pub mod error;
 pub mod ingest;
 pub mod projection;
+pub mod server_file;
 pub mod singleton;
 pub mod state;
 pub mod time;

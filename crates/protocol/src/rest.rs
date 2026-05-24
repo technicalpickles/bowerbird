@@ -60,11 +60,9 @@ pub struct SessionDetail {
 /// Body of `GET /status`.
 ///
 /// `last_event_at_ms` and `last_event_id` are `None` when the events table
-/// contains no non-sentinel rows. `connected_ws_clients` is deferred to
-/// Story 3.2 (daemon lifecycle CLI), which introduces the first V1 consumer
-/// (the `bowerbird status` CLI). The semaphore infrastructure that produces
-/// the count ships with Epic 2's WS surface (`AppState::ws_semaphore`); only
-/// the `DaemonStatus` surfacing was deferred.
+/// contains no non-sentinel rows. `connected_ws_clients` is a count of active
+/// WebSocket subscribers — snapshot at request time; can drift between this
+/// read and a follow-up read because WS connections come and go.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonStatus {
     pub daemon_version: String,
@@ -73,4 +71,25 @@ pub struct DaemonStatus {
     pub uptime_ms: i64,
     pub last_event_at_ms: Option<i64>,
     pub last_event_id: Option<EventId>,
+    pub connected_ws_clients: u32,
+}
+
+/// Content of `~/.bowerbird/server.json`.
+///
+/// The daemon publishes its bound HTTP address to this file once
+/// `listener.local_addr()` resolves (the daemon's default bind is
+/// `127.0.0.1:0`, so the kernel picks the port). The CLI reads it to find the
+/// daemon's HTTP surface for `bowerbird start`'s `/healthz` probe and
+/// `bowerbird status`'s `/status` query.
+///
+/// **Asymmetric serde note.** This file is read by an inbound consumer (the
+/// CLI), but its content is daemon-controlled — effectively an outbound
+/// emission from one bowerbird binary to another. The asymmetric
+/// `deny_unknown_fields` rule applies per-direction, so `ServerInfo` does NOT
+/// carry `deny_unknown_fields`: a future daemon adding a field (Story 3.3's
+/// `token` is already on the horizon) must not break older CLIs that round-trip
+/// the file. See `project-context.md` "Wire format conventions" for the rule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerInfo {
+    pub bind_addr: String,
 }

@@ -1,4 +1,8 @@
+pub mod daemon;
 pub mod install;
+pub mod start;
+pub mod status;
+pub mod stop;
 pub mod uninstall;
 
 use std::path::{Path, PathBuf};

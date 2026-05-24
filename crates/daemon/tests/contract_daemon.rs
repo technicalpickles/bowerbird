@@ -59,6 +59,7 @@ fn make_test_state_with_ws(
             ping_interval,
             pong_timeout,
             coalesce_window: Duration::from_secs(1),
+            max_connections: ws_max_conns,
         },
     }
 }
@@ -2197,6 +2198,7 @@ mod story_1_7_rest {
                 ping_interval: Duration::from_secs(30),
                 pong_timeout: Duration::from_secs(10),
                 coalesce_window: Duration::from_secs(1),
+                max_connections: 4,
             },
         };
         let app = api::router(state);
@@ -4695,6 +4697,7 @@ mod story_2_4_dropped {
                 ping_interval: Duration::from_secs(30),
                 pong_timeout: Duration::from_secs(10),
                 coalesce_window,
+                max_connections: 4,
             },
         }
     }
@@ -6341,5 +6344,118 @@ mod story_3_1_singleton {
         kill(Pid::from_raw(second_child.id() as i32), Signal::SIGTERM)
             .expect("SIGTERM second daemon");
         let _ = wait_for_child_exit(second_child, Duration::from_secs(5)).await;
+    }
+}
+
+/// Story 3.2 lifecycle: surface `connected_ws_clients` on `GET /status`,
+/// sourced from the `AppState::ws_semaphore` permit accounting. Closes the
+/// Epic 2 retro AI-1 charter (`deferred-work.md` line 54).
+///
+/// **Definition decision (per Task 8.4):** `connected_ws_clients` ==
+/// `ws_max_connections - semaphore.available_permits()`. This counts WS
+/// connections that have completed the upgrade and not yet released their
+/// permit. It does NOT count connections that are mid-upgrade (before
+/// `try_acquire_owned`) or connections that have dropped but whose
+/// `connection_task` hasn't finished tearing down. The 100ms sleep in the
+/// drop-side of the active-count test absorbs that tear-down lag.
+mod story_3_2_lifecycle {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use axum::body::{to_bytes, Body};
+    use axum::http::{header, Request, StatusCode};
+    use bowerbird_daemon::api;
+    use protocol::DaemonStatus;
+    use tower::ServiceExt;
+
+    use super::story_2_1_ws::{connect_authed, parse_hello, read_text_frame_or_close, spawn_test_daemon};
+    use super::{fresh_pools, make_test_state_with_ws};
+
+    const TEST_BEARER: &str = super::TEST_BEARER;
+
+    /// Hit `GET /status` with bearer auth via `tower::ServiceExt::oneshot`
+    /// against a fresh router built from the (shared, Arc-backed) state. Same
+    /// shape as `story_1_7_rest`'s `auth_get` helper.
+    async fn get_status(state: bowerbird_daemon::state::AppState) -> DaemonStatus {
+        let app = api::router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/status")
+                    .header(header::AUTHORIZATION, format!("Bearer {}", TEST_BEARER))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("oneshot /status");
+        assert_eq!(resp.status(), StatusCode::OK, "/status must return 200");
+        let bytes = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        serde_json::from_slice(&bytes).expect("parse DaemonStatus")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn status_reports_zero_ws_clients_when_no_subscribers() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = make_test_state_with_ws(
+            pools,
+            Arc::new(AtomicBool::new(true)),
+            4,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        );
+        let status = get_status(state).await;
+        assert_eq!(
+            status.connected_ws_clients, 0,
+            "no subscribers connected; expected 0"
+        );
+    }
+
+    /// Open 3 WS connections, prove they are counted, drop them, prove the
+    /// counter returns to zero. The intermediate Hello frame read is what
+    /// proves the upgrade landed past `try_acquire_owned`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn status_reports_active_ws_subscriber_count() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = make_test_state_with_ws(
+            pools,
+            Arc::new(AtomicBool::new(true)),
+            8,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        );
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        // Open three WS clients and read each Hello frame so we know the
+        // upgrade is past the semaphore checkout.
+        let mut clients = Vec::with_capacity(3);
+        for _ in 0..3 {
+            let (mut ws, _resp) = connect_authed(addr, TEST_BEARER).await;
+            let hello_msg = read_text_frame_or_close(&mut ws).await;
+            let _ = parse_hello(&hello_msg);
+            clients.push(ws);
+        }
+
+        let status = get_status(state.clone()).await;
+        assert_eq!(
+            status.connected_ws_clients, 3,
+            "expected 3 active subscribers; got {}",
+            status.connected_ws_clients
+        );
+
+        // Drop all three clients. The per-connection task's `OwnedSemaphorePermit`
+        // is released when the task exits — give the runtime a moment to drive
+        // those drops to completion before re-reading.
+        drop(clients);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let status = get_status(state).await;
+        assert_eq!(
+            status.connected_ws_clients, 0,
+            "expected all subscribers released; got {}",
+            status.connected_ws_clients
+        );
     }
 }

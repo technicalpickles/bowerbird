@@ -1,9 +1,4 @@
-//! `GET /status` — daemon snapshot (version, uptime, last event).
-//!
-//! `connected_ws_clients` is deferred to Story 3.2 alongside the
-//! `bowerbird status` CLI (its first V1 consumer). Epic 2 shipped the
-//! semaphore that produces the count (`AppState::ws_semaphore`); only the
-//! `DaemonStatus` surfacing was deferred.
+//! `GET /status` — daemon snapshot (version, uptime, last event, connected WS clients).
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -66,6 +61,16 @@ pub async fn get(State(state): State<AppState>) -> Response {
         None => (None, None),
     };
 
+    // Snapshot the semaphore once. `available_permits()` is monotonic but reads
+    // are not snapshot-consistent across calls — a new WS upgrade or a closing
+    // connection can shift the count between this read and serialization. The
+    // field documents itself as a snapshot; no re-read inside the response
+    // literal so the value the wire reports matches the value we computed.
+    let cap = state.ws_config.max_connections;
+    let connected_ws_clients =
+        u32::try_from(cap.saturating_sub(state.ws_semaphore.available_permits()))
+            .unwrap_or(u32::MAX);
+
     Json(DaemonStatus {
         daemon_version: env!("CARGO_PKG_VERSION").to_string(),
         protocol_version: PROTOCOL_VERSION.to_string(),
@@ -73,6 +78,7 @@ pub async fn get(State(state): State<AppState>) -> Response {
         uptime_ms: now_ms.saturating_sub(state.started_at_ms),
         last_event_at_ms,
         last_event_id,
+        connected_ws_clients,
     })
     .into_response()
 }

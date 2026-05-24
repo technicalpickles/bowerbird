@@ -30,6 +30,11 @@ pub struct WsConfig {
     /// Coalescing window for `DroppedFrame` emissions on lag. See
     /// `Config::ws_broadcast_coalesce_window`.
     pub coalesce_window: Duration,
+    /// Cap on concurrent WebSocket connections, mirroring
+    /// `Config::ws_max_connections`. Needed in `WsConfig` so the `/status`
+    /// handler can compute `connected_ws_clients = max - available_permits`
+    /// without threading a second `Arc<usize>` through `AppState`.
+    pub max_connections: usize,
 }
 
 pub async fn wait_for_ws_connection_drain(

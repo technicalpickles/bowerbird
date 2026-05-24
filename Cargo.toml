@@ -57,6 +57,7 @@ path = "src/main.rs"
 clap           = { workspace = true }
 anyhow         = { workspace = true }
 libc           = { workspace = true }
+serde_json     = { workspace = true }
 protocol       = { path = "crates/protocol" }
 adapter-claude = { path = "crates/adapter-claude" }
 

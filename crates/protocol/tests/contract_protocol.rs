@@ -235,6 +235,7 @@ fn daemon_status_round_trips_and_accepts_unknown_fields() {
         uptime_ms: 100,
         last_event_at_ms: Some(50),
         last_event_id: Some(EventId(7)),
+        connected_ws_clients: 2,
     };
     let json = serde_json::to_string(&status).unwrap();
     let parsed: protocol::DaemonStatus = serde_json::from_str(&json).unwrap();

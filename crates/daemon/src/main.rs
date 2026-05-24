@@ -11,12 +11,13 @@ use bowerbird_daemon::{
     broadcast::BroadcastHub,
     config::Config,
     db::{init_pools, run_migrations, DbPools},
-    ensure_bowerbird_dir, ingest, init_tracing, install_panic_hook, projection, set_crash_dir,
-    singleton,
+    ensure_bowerbird_dir, ingest, init_tracing, install_panic_hook, projection, server_file,
+    set_crash_dir, singleton,
     state::{wait_for_ws_connection_drain, AppState, WsConfig},
     time::current_unix_millis,
     write_error_report,
 };
+use protocol::ServerInfo;
 use clap::Parser;
 use std::future::IntoFuture;
 use tokio_util::sync::CancellationToken;
@@ -77,7 +78,7 @@ async fn main() {
             config.ingest_sock_path = PathBuf::from(p);
         }
     }
-    if let Err(e) = run(config).await {
+    if let Err(e) = run(config, bowerbird_dir.clone()).await {
         let msg = format!("{e:#}");
         tracing::error!(error = msg, "daemon exited with error");
         // AC #8: write a crash log for unhandled-error exits too, not just
@@ -116,7 +117,7 @@ fn resolve_bowerbird_dir() -> Result<PathBuf, String> {
     Ok(home.join(".bowerbird"))
 }
 
-async fn run(config: Config) -> anyhow::Result<()> {
+async fn run(config: Config, bowerbird_dir: PathBuf) -> anyhow::Result<()> {
     let migrations_complete = Arc::new(AtomicBool::new(false));
     let shutdown_requested = CancellationToken::new();
     let ws_close_requested = CancellationToken::new();
@@ -211,6 +212,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
         ping_interval: config.ws_ping_interval,
         pong_timeout: config.ws_pong_timeout,
         coalesce_window: config.ws_broadcast_coalesce_window,
+        max_connections: config.ws_max_connections,
     };
 
     let state = AppState {
@@ -229,6 +231,23 @@ async fn run(config: Config) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("failed to bind {}", config.bind_addr))?;
     let local_addr = listener.local_addr().context("listener.local_addr")?;
+
+    // Publish the bound address BEFORE the "daemon listening" warn so the log
+    // line is a sound "everything tests/CLIs poll for is ready" marker. The
+    // file is a *hint*, not a liveness proof — the singleton PID + ingest-
+    // socket probe are the authoritative liveness checks. Story 3.3 will fold
+    // the bearer token into the same file; the mode-0600 baseline is set here
+    // so 3.3 inherits it without a TOCTOU window. A write failure here is
+    // logged but does NOT abort startup — the daemon is still functional
+    // via direct HTTP (e.g. for the test harness that already knows the port).
+    let server_info = ServerInfo {
+        bind_addr: local_addr.to_string(),
+    };
+    match server_file::write(&bowerbird_dir, &server_info) {
+        Ok(path) => tracing::info!(path = %path.display(), "wrote server.json"),
+        Err(e) => tracing::warn!(error = %e, "failed to write server.json; CLI cannot read /status"),
+    }
+
     // WARN, not INFO: the bound address is operationally important and must be
     // visible at the default verbosity (`error`). See P20 in story 1.2 review.
     tracing::warn!(addr = %local_addr, "daemon listening");
@@ -289,6 +308,16 @@ async fn run(config: Config) -> anyhow::Result<()> {
     }
     pools.reader.close();
     pools.writer.close();
+
+    // Best-effort cleanup of server.json: a failure means the next daemon
+    // startup will overwrite a stale file. After unclean exit (SIGKILL, OOM,
+    // panic past the panic hook) the file is also left on disk — the CLI
+    // treats it as a hint, not a liveness proof.
+    match server_file::remove(&bowerbird_dir) {
+        Ok(true) => tracing::info!("removed server.json"),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(error = %e, "failed to remove server.json on shutdown"),
+    }
 
     let serve_result = match serve_result {
         Some(result) => result,
