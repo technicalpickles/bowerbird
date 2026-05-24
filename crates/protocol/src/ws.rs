@@ -105,11 +105,64 @@ pub struct StateFrame {
     pub state: SessionState,
 }
 
+/// Dropped frame carrying the lag burst's envelope count and best-estimate
+/// event-id range.
+///
+/// `#[non_exhaustive]` blocks struct-literal construction from outside the
+/// `protocol` crate, so the daemon (and any future producer) must go through
+/// [`DroppedFrame::new`] which enforces `count > 0` and
+/// `first_dropped_event_id <= last_dropped_event_id`. `Deserialize` is
+/// generated inside this crate and is therefore exempt from the attribute —
+/// wire payloads, including ones from a hypothetical buggy peer with
+/// inverted IDs or a zero count, continue to parse without validation
+/// (asymmetric inbound/outbound policy; same pattern as
+/// [`SyncFrame::new`]).
 #[derive(Debug, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct DroppedFrame {
     pub count: u64,
     pub first_dropped_event_id: EventId,
     pub last_dropped_event_id: EventId,
+}
+
+impl DroppedFrame {
+    /// Construct a `DroppedFrame` with field invariants enforced:
+    /// - `count > 0` (vacuous Dropped is a bug; the daemon's coalescing
+    ///   suppresses zero-count emissions before reaching this constructor).
+    /// - `first_dropped_event_id <= last_dropped_event_id`.
+    ///
+    /// Returns `Err(Error::InvalidDroppedFrame { ... })` on violation.
+    ///
+    /// `Deserialize` does NOT call this — wire payloads (including ones
+    /// from a hypothetical buggy peer) still parse without validation per
+    /// the asymmetric inbound/outbound policy. The constructor is the
+    /// daemon-side construction-time gate. Story 2.3's `SyncFrame::new`
+    /// is the sibling pattern.
+    pub fn new(
+        count: u64,
+        first_dropped_event_id: EventId,
+        last_dropped_event_id: EventId,
+    ) -> crate::error::Result<Self> {
+        if count == 0 {
+            return Err(crate::error::Error::InvalidDroppedFrame {
+                count,
+                first: first_dropped_event_id,
+                last: last_dropped_event_id,
+            });
+        }
+        if first_dropped_event_id > last_dropped_event_id {
+            return Err(crate::error::Error::InvalidDroppedFrame {
+                count,
+                first: first_dropped_event_id,
+                last: last_dropped_event_id,
+            });
+        }
+        Ok(Self {
+            count,
+            first_dropped_event_id,
+            last_dropped_event_id,
+        })
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -160,5 +213,70 @@ mod tests {
             serde_json::from_str(wire).expect("wire payload must deserialize unchanged");
         assert_eq!(f.oldest_available_event_id, EventId(20));
         assert_eq!(f.latest_event_id, EventId(10));
+    }
+
+    #[test]
+    fn dropped_frame_new_accepts_valid() {
+        let f = DroppedFrame::new(5, EventId(10), EventId(14)).expect("valid must succeed");
+        assert_eq!(f.count, 5);
+        assert_eq!(f.first_dropped_event_id, EventId(10));
+        assert_eq!(f.last_dropped_event_id, EventId(14));
+    }
+
+    #[test]
+    fn dropped_frame_new_rejects_zero_count() {
+        let err = DroppedFrame::new(0, EventId(10), EventId(14)).expect_err("zero must fail");
+        assert!(matches!(
+            err,
+            Error::InvalidDroppedFrame {
+                count: 0,
+                first: EventId(10),
+                last: EventId(14),
+            }
+        ));
+    }
+
+    #[test]
+    fn dropped_frame_new_rejects_inverted_ids() {
+        let err =
+            DroppedFrame::new(3, EventId(20), EventId(10)).expect_err("inverted ids must fail");
+        assert!(matches!(
+            err,
+            Error::InvalidDroppedFrame {
+                count: 3,
+                first: EventId(20),
+                last: EventId(10),
+            }
+        ));
+    }
+
+    #[test]
+    fn dropped_frame_new_allows_count_one_first_eq_last() {
+        // Singleton drop: count = 1 with first == last is the natural shape
+        // of "one envelope dropped at exactly this position."
+        let f = DroppedFrame::new(1, EventId(42), EventId(42)).expect("singleton must succeed");
+        assert_eq!(f.count, 1);
+        assert_eq!(f.first_dropped_event_id, EventId(42));
+        assert_eq!(f.last_dropped_event_id, EventId(42));
+    }
+
+    #[test]
+    fn dropped_frame_deserialize_tolerates_invalid_from_wire() {
+        // Asymmetric inbound/outbound policy: Deserialize does not call the
+        // constructor. A hypothetical buggy peer's invalid DroppedFrame
+        // (zero count, inverted ids) still parses cleanly. The construction
+        // gate is the only place invariants are enforced.
+        let zero_count =
+            r#"{"count":0,"first_dropped_event_id":1,"last_dropped_event_id":1}"#;
+        let f: DroppedFrame =
+            serde_json::from_str(zero_count).expect("zero-count payload must deserialize");
+        assert_eq!(f.count, 0);
+
+        let inverted =
+            r#"{"count":3,"first_dropped_event_id":20,"last_dropped_event_id":10}"#;
+        let f: DroppedFrame =
+            serde_json::from_str(inverted).expect("inverted payload must deserialize");
+        assert_eq!(f.first_dropped_event_id, EventId(20));
+        assert_eq!(f.last_dropped_event_id, EventId(10));
     }
 }
