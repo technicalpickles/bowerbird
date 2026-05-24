@@ -12,6 +12,7 @@ use bowerbird_daemon::{
     config::Config,
     db::{init_pools, run_migrations, DbPools},
     ensure_bowerbird_dir, ingest, init_tracing, install_panic_hook, projection, set_crash_dir,
+    singleton,
     state::{wait_for_ws_connection_drain, AppState, WsConfig},
     time::current_unix_millis,
     write_error_report,
@@ -41,19 +42,31 @@ async fn main() {
     install_panic_hook(std::env::temp_dir());
     init_tracing(args.verbose);
 
-    let home = match home_dir() {
-        Some(h) if !h.as_os_str().is_empty() && h.is_absolute() => h,
-        _ => {
-            eprintln!("error: HOME is unset, empty, or not absolute");
+    let bowerbird_dir = match resolve_bowerbird_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("error: {e}");
             std::process::exit(1);
         }
     };
-    let bowerbird_dir = home.join(".bowerbird");
     if let Err(e) = ensure_bowerbird_dir(&bowerbird_dir) {
         eprintln!("error: failed to create {}: {}", bowerbird_dir.display(), e);
         std::process::exit(1);
     }
     set_crash_dir(bowerbird_dir.clone());
+
+    // Singleton enforcement BEFORE any DB or socket work — the race this guards
+    // is two daemons running migrations against the same `bower.db`. The lock
+    // is held in `_singleton_lock` for the rest of main; dropping it (on a
+    // clean return) releases the flock and closes the FD. Unclean exits (OOM,
+    // SIGKILL, panic past the panic hook) release via kernel FD reclaim.
+    let _singleton_lock = match singleton::acquire(&bowerbird_dir) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
 
     let mut config = Config::with_bowerbird_dir(&bowerbird_dir);
     // Honor BOWERBIRD_INGEST_SOCK as a path override so tests can run an
@@ -76,6 +89,31 @@ async fn main() {
 
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// Resolve the bowerbird data directory. `BOWERBIRD_DATA_DIR` wins if set and
+/// non-empty — same shape as the `BOWERBIRD_INGEST_SOCK` override below.
+/// Tests use this to run isolated daemon instances against a TempDir without
+/// colliding on `~/.bowerbird/`; Story 3.2's lifecycle CLI will reuse the same
+/// override for its `--data-dir` flag.
+fn resolve_bowerbird_dir() -> Result<PathBuf, String> {
+    if let Some(p) = std::env::var_os("BOWERBIRD_DATA_DIR") {
+        if !p.is_empty() {
+            let path = PathBuf::from(p);
+            if !path.is_absolute() {
+                return Err(format!(
+                    "BOWERBIRD_DATA_DIR must be an absolute path; got {}",
+                    path.display()
+                ));
+            }
+            return Ok(path);
+        }
+    }
+    let home = match home_dir() {
+        Some(h) if !h.as_os_str().is_empty() && h.is_absolute() => h,
+        _ => return Err("HOME is unset, empty, or not absolute".to_string()),
+    };
+    Ok(home.join(".bowerbird"))
 }
 
 async fn run(config: Config) -> anyhow::Result<()> {

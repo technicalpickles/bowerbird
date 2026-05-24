@@ -3,7 +3,11 @@ use std::path::PathBuf;
 use protocol::{AdapterMeta, NormalizeResult, SourceAdapter};
 
 pub(crate) mod error;
+pub mod install;
 pub(crate) mod normalize;
+
+pub use error::InstallError;
+pub use install::{install, uninstall, InstallOutcome, UninstallOutcome};
 
 pub struct ClaudeAdapter {
     tool_reactions_path: PathBuf,

@@ -1,1 +1,1 @@
-pub const SHIM_BINARY_NAME: &str = "bowerbird";
+pub const SHIM_BINARY_NAME: &str = "bowerbird-shim";

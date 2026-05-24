@@ -30,6 +30,7 @@ serde              = { workspace = true }
 serde_json         = { workspace = true }
 secrecy            = { workspace = true }
 subtle             = { workspace = true }
+nix                = { workspace = true }
 
 [dev-dependencies]
 tempfile          = { workspace = true }

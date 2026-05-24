@@ -7,6 +7,8 @@ stepsCompleted:
 inputDocuments:
   - docs/bmad/planning-artifacts/prd.md
   - docs/bmad/project-context.md
+revisions:
+  - 2026-05-24: Folded Epic 2 retrospective action items AI-1..AI-6 into Story 3.1 (singleton enforcement), Story 3.2 (connected_ws_clients wiring), Story 3.4 (CI --test-threads=1, architecture.md WebSocket subsystem section), Story 4.4 (wire-enum serde(other) sweep, hook-to-presenter p99 Criterion bench, NDJ ingest framing narrative). Source: docs/bmad/implementation-artifacts/epic-2-retro-2026-05-24.md
 ---
 
 # bowerbird - Epic Breakdown
@@ -645,6 +647,10 @@ So that I never have to manually edit `~/.claude/settings.json` or worry about l
 **When** I run `bowerbird install`
 **Then** a valid settings.json is created with the hook entry and the operation succeeds
 
+**Given** a `bowerbird` daemon is already running and holding `~/.bowerbird/bower.db`
+**When** I start a second `bowerbird` process targeting the same data directory
+**Then** the second process exits non-zero with a human-readable error to stderr identifying the conflict (PID file or file lock), so no concurrent migration race is possible and `bower.db` is never opened by two daemons simultaneously (folded from `deferred-work.md` 1-2 entry "Singleton enforcement", Epic 2 retro Next Steps #3)
+
 ### Story 3.2: Daemon lifecycle CLI
 
 As a tool builder,
@@ -672,6 +678,14 @@ So that I can restart the daemon after a crash or manually test it without reins
 **Given** `bowerbird install` is run
 **When** the installation completes
 **Then** the daemon starts automatically as part of the install flow (daemon auto-start on install)
+
+**Given** the daemon is running with N active WebSocket subscribers
+**When** I run `bowerbird status` or query `GET /status`
+**Then** the output includes `connected_ws_clients: N` reflecting current WS subscriber count, sourced from the existing `AppState::ws_semaphore` permit accounting (Epic 2 retro action item AI-1)
+
+**Given** Story 3.2 ships
+**When** the code lands
+**Then** `protocol::rest::DaemonStatus` gains a `connected_ws_clients: u32` field, `daemon::api::status::get` populates it, the `"reserved for Epic 2 and intentionally omitted"` comment in `crates/daemon/src/api/status.rs` is removed, and the corresponding entry in `docs/bmad/implementation-artifacts/deferred-work.md` (Story 1.7 section, `/status.connected_ws_clients` line) is struck through with a backlink to this story
 
 ### Story 3.3: Bearer token auth with keychain storage
 
@@ -728,6 +742,14 @@ So that I can start using bowerbird in under a minute regardless of my local too
 **Given** the project documentation
 **When** a new user reads about `bowerbird install`
 **Then** they find a clear description of exactly what the command does to their system (files created, settings modified, daemon started) before they run it
+
+**Given** the CI workflow at `.github/workflows/ci.yml`
+**When** the daemon contract-test job runs
+**Then** it invokes the test binary with `-- --test-threads=1`, because the contract suite shares process-wide state (real subprocesses, signal handlers, file system) and concurrent execution causes hangs (Epic 2 retro action item AI-3, observed in Stories 1.6 and 2.5)
+
+**Given** `architecture.md` is the canonical "what does this system look like" reference
+**When** a tool builder or new contributor reads it
+**Then** it contains a "WebSocket subsystem" section listing the six runtime config knobs with their default values and roles: `ws_max_connections` (256, Semaphore cap), `ws_ping_interval` (30s), `ws_pong_timeout` (10s), `ws_broadcast_capacity` (1024, per-channel ring buffer), `shutdown_drain_timeout` (5s, graceful drain budget), `ws_broadcast_coalesce_window` (1s, Dropped-frame coalescing), so the protocol-changelog is no longer the only consolidated reference for these values (Epic 2 retro action item AI-2)
 
 ---
 
@@ -846,3 +868,15 @@ So that I can build on bowerbird with confidence rather than checking every daem
 **Given** a future daemon version vN+1 is started against a data directory written by daemon vN
 **When** the daemon completes startup
 **Then** no data is lost, existing projection rows are intact, and additive-compat holds for all API responses (cross-version protocol upgrade contract test)
+
+**Given** the wire-surface enums in `crates/protocol/src/` (`ServerMessage`, `ClientMessage`, `EventKind`, `Reaction`, and any `Error` variants serialized on the wire)
+**When** a v1.x daemon emits a variant a v1.0 tool does not know about
+**Then** the tool's `Deserialize` either decodes via `#[serde(other)] Unknown` (or equivalent catch-all) or the protocol crate carries a written justification why that enum cannot accept the catch-all; `ServerMessage::Unknown` (added in Epic 2 Story 2.1) is the existing template (Epic 2 retro action item AI-4)
+
+**Given** the hook-to-presenter p99 ≤100ms budget (NFR2)
+**When** a Criterion benchmark runs in CI
+**Then** it exercises at least four shapes (solo presenter baseline, 3-presenter fanout, burst-shape with events clumped at tool-call boundaries, and steady-state at modest event rate), comparing p99 against a committed per-platform baseline file and failing the build on regression past the threshold described in `project-context.md` (Epic 2 retro action item AI-5; closes the Story 2.2 deferred-work entry)
+
+**Given** the protocol documentation (`docs/protocol.md` and the `docs/protocol-changelog.md` rationale entries)
+**When** a tool builder reads about the ingest socket
+**Then** the NDJ framing on the shim-to-daemon path is documented as a deliberate choice for shim-dependency minimalism (the shim is `std`-only with no async runtime), not as a latency optimization; this narration replaces any retconned perf-driven framing (Epic 1 retro Agreement A3 carryover, Epic 2 retro action item AI-6)

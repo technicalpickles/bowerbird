@@ -5,7 +5,7 @@ use std::str::FromStr;
 use protocol::{EventEnvelope, EventKind, NormalizeResult, Reaction};
 use serde::Deserialize;
 
-use crate::error::Error;
+use crate::error::NormalizeError as Error;
 
 pub(crate) const SOURCE: &str = "claude";
 

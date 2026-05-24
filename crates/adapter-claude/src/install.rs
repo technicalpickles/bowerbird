@@ -1,0 +1,727 @@
+//! Atomic install/uninstall of the bowerbird hook entries in Claude Code's
+//! `~/.claude/settings.json`.
+//!
+//! The contract is the same one in `project-context.md` for every config-file
+//! mutation the project makes: read → parse → merge → write `.tmp` → fsync →
+//! rename. Never open the original for writing. If the process dies after any
+//! step before `rename`, the original is intact.
+
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use serde_json::{Map, Value};
+
+use crate::error::InstallError;
+
+/// Hook kinds the bowerbird shim accepts on its CLI (see
+/// `crates/shim/src/main.rs::parse_hook_kind`). Listed in a stable order so
+/// install output (and the resulting JSON) is deterministic across runs.
+pub(crate) const HOOK_KINDS: &[&str] = &["PreToolUse", "PostToolUse", "Stop", "Notification"];
+
+/// Exponential backoff schedule between rename-race retries. The first
+/// attempt has no preceding sleep; each entry here is the wait between one
+/// attempt and the next. Four entries → one initial attempt + four retries
+/// = five attempts total, matching the story spec ("5 attempts" — the
+/// previously-shipped fifth backoff entry pushed the loop to six attempts
+/// and produced an off-by-one in the reported `attempts` count).
+const RETRY_BACKOFFS: &[Duration] = &[
+    Duration::from_millis(25),
+    Duration::from_millis(50),
+    Duration::from_millis(100),
+    Duration::from_millis(200),
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallOutcome {
+    /// True when `settings.json` did not exist and was created by this call.
+    pub created: bool,
+    /// Hook kinds where a bowerbird entry was added. Empty if every kind
+    /// already had a bowerbird entry (install is idempotent over the
+    /// settings.json dimension).
+    pub hook_kinds_added: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UninstallOutcome {
+    /// True when `settings.json` existed prior to the call.
+    pub existed: bool,
+    /// Hook kinds where a bowerbird entry was removed.
+    pub hook_kinds_removed: Vec<&'static str>,
+}
+
+/// Install the bowerbird hook entries into `settings_path`. Creates the file
+/// if missing (AC #5). Idempotent: re-running on a file that already contains
+/// the entries is a no-op for the JSON.
+///
+/// The hook command written is `<protocol::SHIM_BINARY_NAME> --hook-kind <kind>`
+/// per the shim's CLI surface. The binary name is intentionally PATH-relative
+/// so the user controls resolution (AC #1).
+pub fn install(settings_path: &Path) -> Result<InstallOutcome, InstallError> {
+    let mut state = ReadState::default();
+    for attempt in 0..=RETRY_BACKOFFS.len() {
+        let (existed, mut value) = read_or_init(settings_path)?;
+        // The first attempt records baseline metadata. Subsequent attempts use
+        // the prior snapshot to decide whether to back off (someone else wrote
+        // between us reading and us renaming).
+        if attempt == 0 {
+            state.created = !existed;
+        }
+        let hook_kinds_added = merge_install_into(&mut value);
+        let outcome = InstallOutcome {
+            created: state.created,
+            hook_kinds_added,
+        };
+        match atomic_write(settings_path, &value)? {
+            WriteOutcome::Wrote => return Ok(outcome),
+            WriteOutcome::ConcurrentChange => {
+                if let Some(backoff) = RETRY_BACKOFFS.get(attempt) {
+                    std::thread::sleep(*backoff);
+                    continue;
+                }
+                return Err(InstallError::SettingsAtomicRenameRace {
+                    path: settings_path.to_path_buf(),
+                    attempts: (RETRY_BACKOFFS.len() + 1) as u32,
+                });
+            }
+        }
+    }
+    unreachable!("retry loop must either return or exhaust");
+}
+
+/// Remove the bowerbird hook entries from `settings_path`. Idempotent:
+/// re-running on a file that no longer contains the entries is a no-op.
+/// Returns `existed = false` if the file did not exist (AC #4 only requires
+/// us to leave a valid JSON file behind; not creating one when none existed
+/// is the right thing).
+pub fn uninstall(settings_path: &Path) -> Result<UninstallOutcome, InstallError> {
+    for attempt in 0..=RETRY_BACKOFFS.len() {
+        let (existed, mut value) = match read_existing(settings_path)? {
+            Some(v) => (true, v),
+            None => {
+                return Ok(UninstallOutcome {
+                    existed: false,
+                    hook_kinds_removed: Vec::new(),
+                });
+            }
+        };
+        let hook_kinds_removed = strip_install_from(&mut value);
+        let outcome = UninstallOutcome {
+            existed,
+            hook_kinds_removed,
+        };
+        match atomic_write(settings_path, &value)? {
+            WriteOutcome::Wrote => return Ok(outcome),
+            WriteOutcome::ConcurrentChange => {
+                if let Some(backoff) = RETRY_BACKOFFS.get(attempt) {
+                    std::thread::sleep(*backoff);
+                    continue;
+                }
+                return Err(InstallError::SettingsAtomicRenameRace {
+                    path: settings_path.to_path_buf(),
+                    attempts: (RETRY_BACKOFFS.len() + 1) as u32,
+                });
+            }
+        }
+    }
+    unreachable!("retry loop must either return or exhaust");
+}
+
+#[derive(Default)]
+struct ReadState {
+    created: bool,
+}
+
+enum WriteOutcome {
+    Wrote,
+    ConcurrentChange,
+}
+
+/// Read `path` into a `Value`. Returns `(false, empty object)` on ENOENT —
+/// install's AC #5 contract.
+fn read_or_init(path: &Path) -> Result<(bool, Value), InstallError> {
+    match fs::read(path) {
+        Ok(bytes) => {
+            let value: Value =
+                serde_json::from_slice(&bytes).map_err(|e| InstallError::SettingsParse {
+                    path: path.to_path_buf(),
+                    source: e,
+                })?;
+            if !value.is_object() {
+                return Err(InstallError::SettingsNotObject {
+                    path: path.to_path_buf(),
+                });
+            }
+            Ok((true, value))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok((false, Value::Object(Map::new())))
+        }
+        Err(e) => Err(InstallError::SettingsRead {
+            path: path.to_path_buf(),
+            source: e,
+        }),
+    }
+}
+
+/// Read `path` into a `Value` or return `None` if it does not exist. Distinct
+/// from `read_or_init` so uninstall does not invent an empty object only to
+/// rewrite it back as `{}`.
+fn read_existing(path: &Path) -> Result<Option<Value>, InstallError> {
+    match fs::read(path) {
+        Ok(bytes) => {
+            let value: Value =
+                serde_json::from_slice(&bytes).map_err(|e| InstallError::SettingsParse {
+                    path: path.to_path_buf(),
+                    source: e,
+                })?;
+            if !value.is_object() {
+                return Err(InstallError::SettingsNotObject {
+                    path: path.to_path_buf(),
+                });
+            }
+            Ok(Some(value))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(InstallError::SettingsRead {
+            path: path.to_path_buf(),
+            source: e,
+        }),
+    }
+}
+
+/// Insert the bowerbird hook entry into `value["hooks"][<kind>]` for every
+/// known hook kind. Returns the kinds that received a new entry; kinds that
+/// already had one are skipped (idempotency).
+fn merge_install_into(value: &mut Value) -> Vec<&'static str> {
+    let root = value
+        .as_object_mut()
+        .expect("validated by read_or_init / read_existing");
+    let hooks = root
+        .entry("hooks")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let hooks = match hooks.as_object_mut() {
+        Some(o) => o,
+        None => {
+            // The user has a non-object `hooks` value. Replace it — but only
+            // because there is no reasonable merge target. This is a tiny
+            // surface and a true edge case; an honest replacement is less
+            // surprising than silently ignoring the kind.
+            *hooks = Value::Object(Map::new());
+            hooks.as_object_mut().expect("just set to object")
+        }
+    };
+
+    let mut added = Vec::new();
+    for kind in HOOK_KINDS {
+        let array = hooks
+            .entry(*kind)
+            .or_insert_with(|| Value::Array(Vec::new()));
+        let array = match array.as_array_mut() {
+            Some(a) => a,
+            None => {
+                *array = Value::Array(Vec::new());
+                array.as_array_mut().expect("just set to array")
+            }
+        };
+        if array_contains_bowerbird(array) {
+            continue;
+        }
+        array.push(bowerbird_hook_group(kind));
+        added.push(*kind);
+    }
+    added
+}
+
+/// Remove the bowerbird hook entry from each hook kind. Returns the kinds
+/// where a bowerbird entry was actually present. User-authored entries (any
+/// entry whose `.hooks` array contains a non-bowerbird `command`) are
+/// preserved.
+fn strip_install_from(value: &mut Value) -> Vec<&'static str> {
+    let Some(root) = value.as_object_mut() else {
+        return Vec::new();
+    };
+    let Some(hooks) = root.get_mut("hooks").and_then(|v| v.as_object_mut()) else {
+        return Vec::new();
+    };
+
+    let mut removed = Vec::new();
+    for kind in HOOK_KINDS {
+        let Some(entry) = hooks.get_mut(*kind) else {
+            continue;
+        };
+        let Some(array) = entry.as_array_mut() else {
+            continue;
+        };
+        let before = array.len();
+        array.retain(|group| !group_is_bowerbird_only(group));
+        // Groups that mixed a bowerbird hook with user hooks: strip just
+        // the bowerbird command from each surviving group.
+        for group in array.iter_mut() {
+            if let Some(group_obj) = group.as_object_mut() {
+                if let Some(inner) = group_obj.get_mut("hooks").and_then(|v| v.as_array_mut()) {
+                    let inner_before = inner.len();
+                    inner.retain(|hook| !is_bowerbird_command_hook(hook));
+                    if inner.len() != inner_before {
+                        // Mixed group: removed at least one bowerbird hook
+                        // from a group that also contains user hooks.
+                        if removed.last().is_none_or(|k| *k != *kind) {
+                            removed.push(*kind);
+                        }
+                    }
+                }
+            }
+        }
+        if array.len() != before && removed.last().is_none_or(|k| *k != *kind) {
+            removed.push(*kind);
+        }
+    }
+    removed
+}
+
+fn bowerbird_hook_group(kind: &str) -> Value {
+    // Shape mirrors Claude Code's canonical hook entry: a matcher-less group
+    // (applies to all matchers) with a single command hook. Picked as the
+    // minimal valid form per the architecture's "smallest viable shape"
+    // guideline. The matcher field can be added later without breaking the
+    // uninstall match (which keys off the command string, not the matcher).
+    let mut group = Map::new();
+    let mut hook = Map::new();
+    hook.insert("type".to_string(), Value::String("command".to_string()));
+    hook.insert(
+        "command".to_string(),
+        Value::String(format!(
+            "{} --hook-kind {}",
+            protocol::SHIM_BINARY_NAME,
+            kind
+        )),
+    );
+    group.insert("hooks".to_string(), Value::Array(vec![Value::Object(hook)]));
+    Value::Object(group)
+}
+
+fn array_contains_bowerbird(array: &[Value]) -> bool {
+    array.iter().any(group_contains_bowerbird)
+}
+
+fn group_contains_bowerbird(group: &Value) -> bool {
+    let Some(group_obj) = group.as_object() else {
+        return false;
+    };
+    let Some(hooks) = group_obj.get("hooks").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    hooks.iter().any(is_bowerbird_command_hook)
+}
+
+/// A group is "bowerbird only" when every hook inside it is a bowerbird
+/// command hook. Such a group is safe to drop entirely; mixed groups need
+/// per-hook stripping so user hooks survive.
+fn group_is_bowerbird_only(group: &Value) -> bool {
+    let Some(group_obj) = group.as_object() else {
+        return false;
+    };
+    let Some(hooks) = group_obj.get("hooks").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    if hooks.is_empty() {
+        return false;
+    }
+    hooks.iter().all(is_bowerbird_command_hook)
+}
+
+fn is_bowerbird_command_hook(hook: &Value) -> bool {
+    let Some(obj) = hook.as_object() else {
+        return false;
+    };
+    let Some(cmd) = obj.get("command").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    is_bowerbird_command(cmd)
+}
+
+fn is_bowerbird_command(cmd: &str) -> bool {
+    // Match by binary name token, not substring: a user-authored command
+    // containing the word "bowerbird-shim" inside a longer path (or as an
+    // argument) must not be misclassified. The shim is always invoked as the
+    // first token. Accept either bare name (PATH-relative, our default) or a
+    // trailing path component match for absolute paths a user typed by hand.
+    let first_token = cmd.split_whitespace().next().unwrap_or("");
+    if first_token == protocol::SHIM_BINARY_NAME {
+        return true;
+    }
+    Path::new(first_token).file_name().and_then(|f| f.to_str()) == Some(protocol::SHIM_BINARY_NAME)
+}
+
+/// Serialize `value` and atomically replace `path` with it. Returns
+/// `ConcurrentChange` when an external writer modified `path` between our
+/// pre-write snapshot and the rename — the caller decides whether to retry.
+fn atomic_write(path: &Path, value: &Value) -> Result<WriteOutcome, InstallError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|e| InstallError::SettingsWriteTmp {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+
+    // Snapshot the target's identity before we write the tmp file. After
+    // rename succeeds we cannot distinguish "we won the race" from "we
+    // overwrote a concurrent writer's edit" without this baseline. The
+    // identity tuple (inode, mtime, size) also collapses cleanly to `None`
+    // when the file did not exist at read time — a later non-`None` baseline
+    // trips the comparison just like a same-path inode swap would.
+    let pre_rename = stat_identity(path);
+
+    let tmp_path = tmp_path_for(path);
+    write_pretty_json(&tmp_path, value)?;
+    fsync_file(&tmp_path)?;
+
+    let post_baseline = stat_identity(path);
+    if pre_rename != post_baseline {
+        // Someone else changed the target between read and now. Drop the
+        // tmp file so a stale snapshot does not poison the next attempt.
+        let _ = fs::remove_file(&tmp_path);
+        return Ok(WriteOutcome::ConcurrentChange);
+    }
+
+    fs::rename(&tmp_path, path).map_err(|e| InstallError::SettingsRename {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    // Best-effort fsync the parent directory so the rename is durable. Failure
+    // here does not invalidate the rename itself (POSIX rename is atomic; the
+    // fsync just hardens crash safety), so we swallow errors.
+    if let Ok(dir) = fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+    Ok(WriteOutcome::Wrote)
+}
+
+fn write_pretty_json(path: &Path, value: &Value) -> Result<(), InstallError> {
+    let serialized =
+        serde_json::to_vec_pretty(value).map_err(|e| InstallError::SettingsWriteTmp {
+            path: path.to_path_buf(),
+            source: std::io::Error::other(e),
+        })?;
+
+    let mut file = file_open_for_write(path)?;
+    file.write_all(&serialized)
+        .map_err(|e| InstallError::SettingsWriteTmp {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+    // Append trailing newline — minimal-diff convention for human-edited files.
+    file.write_all(b"\n")
+        .map_err(|e| InstallError::SettingsWriteTmp {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn file_open_for_write(path: &Path) -> Result<fs::File, InstallError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| InstallError::SettingsWriteTmp {
+            path: path.to_path_buf(),
+            source: e,
+        })
+}
+
+#[cfg(not(unix))]
+fn file_open_for_write(path: &Path) -> Result<fs::File, InstallError> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|e| InstallError::SettingsWriteTmp {
+            path: path.to_path_buf(),
+            source: e,
+        })
+}
+
+fn fsync_file(path: &Path) -> Result<(), InstallError> {
+    let file = fs::OpenOptions::new().read(true).open(path).map_err(|e| {
+        InstallError::SettingsWriteTmp {
+            path: path.to_path_buf(),
+            source: e,
+        }
+    })?;
+    file.sync_all().map_err(|e| InstallError::SettingsWriteTmp {
+        path: path.to_path_buf(),
+        source: e,
+    })
+}
+
+fn tmp_path_for(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("settings.json"));
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    // Process-local monotonic counter avoids tmp-path collisions when two
+    // threads in the same process call `tmp_path_for` within the same
+    // nanosecond (`SystemTime::now()` resolution is platform-dependent and
+    // not guaranteed to advance per call). Without this counter, concurrent
+    // installs from the same process can race on the same tmp file: thread A
+    // renames it over the target while thread B is still mid-write, leaving
+    // B's rename to ENOENT.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    name.push(format!(".bowerbird-install.{pid}-{nanos}-{seq}.tmp"));
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(name)
+}
+
+/// File identity for concurrent-write detection. `None` when the file does
+/// not exist. Combines (inode, mtime, size) so a same-second overwrite with
+/// the same size still trips the comparison via inode change.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+struct Identity {
+    #[cfg(unix)]
+    inode: u64,
+    mtime: Option<std::time::SystemTime>,
+    size: u64,
+}
+
+fn stat_identity(path: &Path) -> Option<Identity> {
+    let meta = fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    let inode = {
+        use std::os::unix::fs::MetadataExt;
+        meta.ino()
+    };
+    Some(Identity {
+        #[cfg(unix)]
+        inode,
+        mtime: meta.modified().ok(),
+        size: meta.len(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    fn fresh_settings(dir: &TempDir) -> PathBuf {
+        dir.path().join("settings.json")
+    }
+
+    #[test]
+    fn install_creates_settings_when_missing_writes_valid_json() {
+        let dir = TempDir::new().unwrap();
+        let path = fresh_settings(&dir);
+        assert!(!path.exists());
+
+        let outcome = install(&path).expect("install");
+        assert!(outcome.created);
+        assert_eq!(outcome.hook_kinds_added, HOOK_KINDS);
+        let parsed: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        for kind in HOOK_KINDS {
+            let array = parsed
+                .pointer(&format!("/hooks/{kind}"))
+                .and_then(|v| v.as_array())
+                .unwrap_or_else(|| panic!("expected /hooks/{kind} array"));
+            assert_eq!(array.len(), 1, "kind {kind} should have one group");
+            assert!(group_is_bowerbird_only(&array[0]));
+        }
+    }
+
+    #[test]
+    fn install_is_idempotent_when_already_installed() {
+        let dir = TempDir::new().unwrap();
+        let path = fresh_settings(&dir);
+        install(&path).expect("first install");
+        let before = fs::read_to_string(&path).unwrap();
+
+        let outcome = install(&path).expect("second install");
+        assert!(!outcome.created);
+        assert!(outcome.hook_kinds_added.is_empty());
+        let after = fs::read_to_string(&path).unwrap();
+        assert_eq!(before, after, "re-install should be byte-identical");
+    }
+
+    #[test]
+    fn install_preserves_unrelated_fields_and_user_hooks() {
+        let dir = TempDir::new().unwrap();
+        let path = fresh_settings(&dir);
+        let initial = json!({
+            "theme": "dark",
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "hooks": [
+                            {"type": "command", "command": "/my/own/hook --flag"}
+                        ]
+                    }
+                ]
+            }
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&initial).unwrap()).unwrap();
+
+        let outcome = install(&path).expect("install");
+        assert!(!outcome.created);
+        assert!(outcome.hook_kinds_added.contains(&"PreToolUse"));
+        let parsed: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(parsed.get("theme"), Some(&json!("dark")));
+        let pre = parsed
+            .pointer("/hooks/PreToolUse")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        // User's group plus our group = 2.
+        assert_eq!(pre.len(), 2);
+        let user_present = pre.iter().any(|g| {
+            g.pointer("/hooks/0/command").and_then(|v| v.as_str()) == Some("/my/own/hook --flag")
+        });
+        assert!(user_present, "user hook must survive install");
+    }
+
+    #[test]
+    fn uninstall_returns_existed_false_when_file_missing() {
+        let dir = TempDir::new().unwrap();
+        let path = fresh_settings(&dir);
+        let outcome = uninstall(&path).expect("uninstall");
+        assert!(!outcome.existed);
+        assert!(outcome.hook_kinds_removed.is_empty());
+        assert!(!path.exists(), "uninstall must not create the file");
+    }
+
+    #[test]
+    fn uninstall_removes_only_bowerbird_entries() {
+        let dir = TempDir::new().unwrap();
+        let path = fresh_settings(&dir);
+        let mixed = json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"hooks": [{"type": "command", "command": "/my/own/hook"}]},
+                    {"hooks": [{"type": "command", "command": format!("{} --hook-kind PreToolUse", protocol::SHIM_BINARY_NAME)}]}
+                ]
+            }
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&mixed).unwrap()).unwrap();
+
+        let outcome = uninstall(&path).expect("uninstall");
+        assert!(outcome.existed);
+        assert!(outcome.hook_kinds_removed.contains(&"PreToolUse"));
+        let parsed: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let pre = parsed
+            .pointer("/hooks/PreToolUse")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(pre.len(), 1, "only the user hook must remain");
+        assert_eq!(
+            pre[0].pointer("/hooks/0/command").and_then(|v| v.as_str()),
+            Some("/my/own/hook")
+        );
+    }
+
+    #[test]
+    fn uninstall_strips_bowerbird_from_mixed_group_preserving_user_hooks() {
+        let dir = TempDir::new().unwrap();
+        let path = fresh_settings(&dir);
+        let mixed_group = json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"hooks": [
+                        {"type": "command", "command": "/my/own/hook"},
+                        {"type": "command", "command": format!("{} --hook-kind PreToolUse", protocol::SHIM_BINARY_NAME)}
+                    ]}
+                ]
+            }
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&mixed_group).unwrap()).unwrap();
+
+        uninstall(&path).expect("uninstall");
+        let parsed: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let inner = parsed
+            .pointer("/hooks/PreToolUse/0/hooks")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(inner.len(), 1);
+        assert_eq!(
+            inner[0].get("command").and_then(|v| v.as_str()),
+            Some("/my/own/hook")
+        );
+    }
+
+    #[test]
+    fn install_rejects_non_object_top_level() {
+        let dir = TempDir::new().unwrap();
+        let path = fresh_settings(&dir);
+        fs::write(&path, b"[]").unwrap();
+        let err = install(&path).expect_err("install should refuse non-object");
+        assert!(matches!(err, InstallError::SettingsNotObject { .. }));
+    }
+
+    #[test]
+    fn install_rejects_invalid_json_with_typed_error() {
+        let dir = TempDir::new().unwrap();
+        let path = fresh_settings(&dir);
+        fs::write(&path, b"{not-json").unwrap();
+        let err = install(&path).expect_err("install should refuse malformed JSON");
+        assert!(matches!(err, InstallError::SettingsParse { .. }));
+    }
+
+    #[test]
+    fn install_does_not_strip_user_command_containing_shim_name_substring() {
+        let dir = TempDir::new().unwrap();
+        let path = fresh_settings(&dir);
+        let initial = json!({
+            "hooks": {
+                "PostToolUse": [
+                    {"hooks": [{"type": "command", "command": "echo bowerbird-shim"}]}
+                ]
+            }
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&initial).unwrap()).unwrap();
+        install(&path).expect("install");
+        // Uninstall must not delete the user's `echo bowerbird-shim` hook
+        // because its first token is `echo`, not `bowerbird-shim`.
+        uninstall(&path).expect("uninstall");
+        let parsed: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let post = parsed
+            .pointer("/hooks/PostToolUse")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(post.len(), 1);
+        assert_eq!(
+            post[0].pointer("/hooks/0/command").and_then(|v| v.as_str()),
+            Some("echo bowerbird-shim")
+        );
+    }
+
+    #[test]
+    fn install_matches_absolute_path_with_shim_basename() {
+        // A user may have manually written an absolute path to the shim.
+        // Uninstall must recognize and strip that too.
+        let dir = TempDir::new().unwrap();
+        let path = fresh_settings(&dir);
+        let initial = json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"hooks": [{"type": "command", "command": format!("/usr/local/bin/{} --hook-kind PreToolUse", protocol::SHIM_BINARY_NAME)}]}
+                ]
+            }
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&initial).unwrap()).unwrap();
+        let outcome = uninstall(&path).expect("uninstall");
+        assert!(outcome.hook_kinds_removed.contains(&"PreToolUse"));
+    }
+}

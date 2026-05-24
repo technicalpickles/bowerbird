@@ -195,7 +195,14 @@ dependencies = [
 name = "bowerbird"
 version = "0.1.0"
 dependencies = [
+ "adapter-claude",
+ "anyhow",
+ "assert_cmd",
  "clap",
+ "libc",
+ "protocol",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

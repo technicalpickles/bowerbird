@@ -6159,3 +6159,187 @@ mod story_2_5_shutdown {
         );
     }
 }
+
+/// Story 3.1 AC #6: singleton enforcement on the daemon data directory.
+///
+/// The lock guards `bower.db` from concurrent migration. These tests spawn
+/// real `bowerbird-daemon` subprocesses (the only way to exercise the
+/// `flock(2)` + FD lifetime contract end-to-end) and assert:
+///
+///   - a second daemon pointed at an already-locked data dir exits non-zero
+///     with the holder PID surfaced in stderr;
+///   - a clean SIGTERM exit releases the lock for a fresh acquisition;
+///   - a SIGKILL also releases the lock — the kernel reclaims the FD even
+///     when no userspace code runs.
+///
+/// Run under `--test-threads=1` per Epic 2 retro AI-3 — these tests share
+/// process-level state (signal handlers, file system) and serialize naturally.
+mod story_3_1_singleton {
+    use std::process::{Command as StdCommand, Stdio};
+    use std::time::Duration;
+
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+    use tempfile::TempDir;
+
+    /// Spawn a `bowerbird-daemon` against an explicit shared data dir. Each
+    /// daemon process gets its own ingest socket path so the two daemons in a
+    /// conflict test do not compete on the socket bind (the singleton lock is
+    /// what we are testing, not the socket).
+    fn spawn_daemon_against_data_dir(
+        tmp: &TempDir,
+        data_dir: &std::path::Path,
+        sock_name: &str,
+    ) -> (std::process::Child, std::path::PathBuf, std::path::PathBuf) {
+        std::fs::create_dir_all(data_dir).expect("mkdir data dir");
+        let sock_path = data_dir.join(sock_name);
+        let stderr_path = tmp.path().join(format!("daemon-{sock_name}.stderr.log"));
+        let stderr = std::fs::File::create(&stderr_path).expect("create stderr log");
+        let bin = assert_cmd::cargo::cargo_bin("bowerbird-daemon");
+        let child = StdCommand::new(&bin)
+            .env("HOME", tmp.path())
+            .env("BOWERBIRD_DATA_DIR", data_dir)
+            .env("BOWERBIRD_INGEST_SOCK", &sock_path)
+            .env("RUST_LOG", "warn")
+            .env(
+                "PATH",
+                std::env::var_os("PATH").unwrap_or_else(|| std::ffi::OsString::from("")),
+            )
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr))
+            .spawn()
+            .expect("spawn daemon");
+        (child, sock_path, stderr_path)
+    }
+
+    async fn wait_for_daemon_ready(sock_path: &std::path::Path, stderr_path: &std::path::Path) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let socket_ready = std::fs::metadata(sock_path).is_ok();
+            let log_ready = std::fs::read_to_string(stderr_path)
+                .map(|s| s.contains("daemon listening"))
+                .unwrap_or(false);
+            if socket_ready && log_ready {
+                // The "daemon listening" log line fires just before `axum::serve`
+                // starts polling, but tokio's SIGTERM/SIGINT handlers are
+                // registered inside the graceful-shutdown future on its first
+                // poll. Give the runtime a tick to register them before tests
+                // start signalling — otherwise SIGTERM lands while the kernel
+                // disposition is still "terminate process," and the daemon dies
+                // by signal instead of exiting 0 through the graceful path.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "daemon never became ready; sock={}, stderr={}",
+                sock_path.display(),
+                std::fs::read_to_string(stderr_path).unwrap_or_default()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn wait_for_child_exit(
+        mut child: std::process::Child,
+        timeout: Duration,
+    ) -> std::process::Output {
+        // Run the blocking wait on a dedicated task so the test runtime stays
+        // responsive. `wait_with_output` consumes the child.
+        let join = tokio::task::spawn_blocking(move || {
+            let _ = child.try_wait(); // try_wait drives reaping
+            child.wait_with_output()
+        });
+        tokio::time::timeout(timeout, join)
+            .await
+            .expect("child did not exit within timeout")
+            .expect("join blocking wait")
+            .expect("wait_with_output")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn second_daemon_exits_nonzero_when_first_holds_lock() {
+        let tmp = TempDir::new().expect("tempdir");
+        let data_dir = tmp.path().join(".bowerbird");
+        let (first_child, sock1, stderr1) =
+            spawn_daemon_against_data_dir(&tmp, &data_dir, "ingest1.sock");
+        wait_for_daemon_ready(&sock1, &stderr1).await;
+        let first_pid = first_child.id();
+
+        let (second_child, _sock2, stderr2) =
+            spawn_daemon_against_data_dir(&tmp, &data_dir, "ingest2.sock");
+        let second_pid = second_child.id();
+        let second_output = wait_for_child_exit(second_child, Duration::from_secs(5)).await;
+
+        // Tear down the first daemon BEFORE the assertions so a panic does
+        // not leak a live subprocess into the test runner.
+        kill(Pid::from_raw(first_pid as i32), Signal::SIGTERM).expect("SIGTERM first daemon");
+        let _ = wait_for_child_exit(first_child, Duration::from_secs(5)).await;
+
+        assert!(
+            !second_output.status.success(),
+            "second daemon must exit non-zero when the lock is held; status={:?}",
+            second_output.status
+        );
+        let stderr_text = std::fs::read_to_string(&stderr2).unwrap_or_default();
+        assert!(
+            stderr_text.contains("another bowerbird daemon is already running"),
+            "stderr must explain the conflict; got: {stderr_text}\nsecond_pid={second_pid}"
+        );
+        assert!(
+            stderr_text.contains(&format!("pid={first_pid}")),
+            "stderr must surface the holding PID ({first_pid}); got: {stderr_text}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn singleton_releases_lock_on_clean_exit() {
+        let tmp = TempDir::new().expect("tempdir");
+        let data_dir = tmp.path().join(".bowerbird");
+
+        let (first_child, sock1, stderr1) =
+            spawn_daemon_against_data_dir(&tmp, &data_dir, "ingest1.sock");
+        wait_for_daemon_ready(&sock1, &stderr1).await;
+
+        kill(Pid::from_raw(first_child.id() as i32), Signal::SIGTERM)
+            .expect("SIGTERM first daemon");
+        let first_output = wait_for_child_exit(first_child, Duration::from_secs(10)).await;
+        assert!(
+            first_output.status.success(),
+            "graceful shutdown must exit 0; status={:?}",
+            first_output.status
+        );
+
+        // Lock should be released — second daemon comes up cleanly.
+        let (second_child, sock2, stderr2) =
+            spawn_daemon_against_data_dir(&tmp, &data_dir, "ingest2.sock");
+        wait_for_daemon_ready(&sock2, &stderr2).await;
+        let second_pid = second_child.id();
+        kill(Pid::from_raw(second_pid as i32), Signal::SIGTERM).expect("SIGTERM second daemon");
+        let _ = wait_for_child_exit(second_child, Duration::from_secs(5)).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn singleton_releases_lock_on_sigkill_exit() {
+        let tmp = TempDir::new().expect("tempdir");
+        let data_dir = tmp.path().join(".bowerbird");
+
+        let (first_child, sock1, stderr1) =
+            spawn_daemon_against_data_dir(&tmp, &data_dir, "ingest1.sock");
+        wait_for_daemon_ready(&sock1, &stderr1).await;
+
+        // SIGKILL: the daemon's graceful shutdown does NOT run. The kernel
+        // releases the BSD flock when the FD is reclaimed. This is the test
+        // that proves the self-healing claim in the singleton module's doc.
+        kill(Pid::from_raw(first_child.id() as i32), Signal::SIGKILL)
+            .expect("SIGKILL first daemon");
+        let _ = wait_for_child_exit(first_child, Duration::from_secs(5)).await;
+
+        let (second_child, sock2, stderr2) =
+            spawn_daemon_against_data_dir(&tmp, &data_dir, "ingest2.sock");
+        wait_for_daemon_ready(&sock2, &stderr2).await;
+        kill(Pid::from_raw(second_child.id() as i32), Signal::SIGTERM)
+            .expect("SIGTERM second daemon");
+        let _ = wait_for_child_exit(second_child, Duration::from_secs(5)).await;
+    }
+}
