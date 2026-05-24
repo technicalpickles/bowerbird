@@ -1,0 +1,1 @@
+{"stories":[{"storyId":"2.5","title":"Graceful shutdown notification to connected tools","complexity":{"score":9,"level":"High","reasons":["Real-time communication","Complex database operations","Transaction management","Integration testing required","High AC count (13)"]}}]}

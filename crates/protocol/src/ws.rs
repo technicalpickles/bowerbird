@@ -266,14 +266,12 @@ mod tests {
         // constructor. A hypothetical buggy peer's invalid DroppedFrame
         // (zero count, inverted ids) still parses cleanly. The construction
         // gate is the only place invariants are enforced.
-        let zero_count =
-            r#"{"count":0,"first_dropped_event_id":1,"last_dropped_event_id":1}"#;
+        let zero_count = r#"{"count":0,"first_dropped_event_id":1,"last_dropped_event_id":1}"#;
         let f: DroppedFrame =
             serde_json::from_str(zero_count).expect("zero-count payload must deserialize");
         assert_eq!(f.count, 0);
 
-        let inverted =
-            r#"{"count":3,"first_dropped_event_id":20,"last_dropped_event_id":10}"#;
+        let inverted = r#"{"count":3,"first_dropped_event_id":20,"last_dropped_event_id":10}"#;
         let f: DroppedFrame =
             serde_json::from_str(inverted).expect("inverted payload must deserialize");
         assert_eq!(f.first_dropped_event_id, EventId(20));

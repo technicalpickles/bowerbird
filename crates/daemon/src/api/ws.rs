@@ -38,7 +38,8 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::OwnedSemaphorePermit;
 
 use protocol::{
-    ClientMessage, DroppedFrame, EventFrame, EventId, HelloFrame, ServerMessage, StateFrame,
+    ClientMessage, CloseFrame as ProtocolCloseFrame, DroppedFrame, EventFrame, EventId, HelloFrame,
+    ServerMessage, StateFrame,
 };
 
 use crate::broadcast::{BroadcastEnvelope, Topic};
@@ -66,6 +67,14 @@ pub async fn handle_upgrade(
     Query(query): Query<WsQuery>,
     headers: HeaderMap,
 ) -> Response {
+    if state.shutdown_requested.is_cancelled() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "daemon shutting down" })),
+        )
+            .into_response();
+    }
+
     // Header-vs-query precedence: when an `Authorization` header is present
     // AT ALL — even malformed (`Basic ...`, empty bearer, non-UTF-8) — it
     // wins and the query token is NOT consulted. Otherwise an attacker who
@@ -231,8 +240,19 @@ async fn connection_task(
         tokio::select! {
             biased;
 
-            _ = state.shutdown.cancelled() => {
-                tracing::debug!("ws: shutdown signaled; exiting connection task");
+            _ = state.ws_close_requested.cancelled() => {
+                tracing::debug!("ws: shutdown close requested; draining and closing connection");
+                close_for_daemon_shutdown(
+                    &mut socket,
+                    &subscriptions,
+                    &mut rx,
+                    &mut last_delivered_event_id,
+                    &mut last_dropped_at,
+                    &mut pending_drop_count,
+                    &mut pending_dropped_first,
+                    state.ws_config.coalesce_window,
+                )
+                .await;
                 return;
             }
 
@@ -875,6 +895,57 @@ async fn dispatch_envelope(
     DispatchOutcome::Sent
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn close_for_daemon_shutdown(
+    socket: &mut WebSocket,
+    subscriptions: &HashSet<Topic>,
+    rx: &mut tokio::sync::broadcast::Receiver<BroadcastEnvelope>,
+    last_delivered_event_id: &mut Option<EventId>,
+    last_dropped_at: &mut Option<tokio::time::Instant>,
+    pending_drop_count: &mut u64,
+    pending_dropped_first: &mut Option<EventId>,
+    coalesce_window: Duration,
+) {
+    if !drain_backlog_under_state(
+        socket,
+        subscriptions,
+        rx,
+        last_delivered_event_id,
+        last_dropped_at,
+        pending_drop_count,
+        pending_dropped_first,
+        coalesce_window,
+    )
+    .await
+    {
+        tracing::debug!("ws: shutdown backlog drain ended on send failure");
+        return;
+    }
+
+    let frame = ServerMessage::Close(ProtocolCloseFrame {
+        reason: Some("daemon shutdown".to_string()),
+    });
+    let json = match serde_json::to_string(&frame) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = ?e, "ws: failed to serialize shutdown Close frame");
+            return;
+        }
+    };
+    if let Err(e) = socket.send(Message::Text(json.into())).await {
+        tracing::debug!(error = ?e, "ws: failed to send protocol shutdown Close frame");
+        return;
+    }
+
+    let frame = WsCloseFrame {
+        code: 1000,
+        reason: Utf8Bytes::from("daemon shutdown"),
+    };
+    if let Err(e) = socket.send(Message::Close(Some(frame))).await {
+        tracing::debug!(error = ?e, "ws: failed to send websocket shutdown Close frame");
+    }
+}
+
 /// Sanitize a string for inclusion in a WS Close frame reason. Strips `\n`
 /// and `\r` (which would corrupt frame framing) and truncates on a char
 /// boundary to keep the total reason within the RFC 6455 §5.5.1 123-byte
@@ -1126,7 +1197,8 @@ mod tests {
             );
             assert_eq!(d, CoalesceDecision::Suppress);
         }
-        assert_eq!(pending, 6); // 2 + 2 + 2 accumulated
+        // 2 + 2 + 2 accumulated.
+        assert_eq!(pending, 6);
         // First suppression of the new window captured the gap origin.
         assert_eq!(pending_first, Some(EventId(1)));
 

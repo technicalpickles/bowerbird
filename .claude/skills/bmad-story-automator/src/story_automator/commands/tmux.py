@@ -195,7 +195,7 @@ def _build_cmd(args: list[str]) -> int:
         print(
             f'mkdir -p "{codex_home}"'
             + f' && if [ -f "{auth_src}" ]; then ln -sf "{auth_src}" "{codex_home}/auth.json"; fi'
-            + f' && CODEX_HOME="{codex_home}" codex exec -s workspace-write -c \'approval_policy="never"\''
+            + f' && CODEX_HOME="{codex_home}" codex exec -s danger-full-access -c \'approval_policy="never"\''
             + f' -c \'model_reasoning_effort="high"\''
             + f" --disable plugins --disable sqlite --disable shell_snapshot {quoted_prompt}"
         )

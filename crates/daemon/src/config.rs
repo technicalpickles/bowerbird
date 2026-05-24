@@ -13,6 +13,7 @@ pub struct Config {
     pub ws_ping_interval: Duration,
     pub ws_pong_timeout: Duration,
     pub ws_broadcast_capacity: usize,
+    pub shutdown_drain_timeout: Duration,
     /// Coalescing window for `DroppedFrame` emissions on a lagging WS
     /// connection. The first lag, or any lag after `coalesce_window` of
     /// silence, emits one wire frame; further lag within the window
@@ -34,6 +35,7 @@ impl Config {
             ws_ping_interval: Duration::from_secs(30),
             ws_pong_timeout: Duration::from_secs(10),
             ws_broadcast_capacity: 1024,
+            shutdown_drain_timeout: Duration::from_secs(5),
             ws_broadcast_coalesce_window: Duration::from_secs(1),
         }
     }

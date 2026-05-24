@@ -49,7 +49,8 @@ fn make_test_state_with_ws(
     AppState {
         db: pools,
         migrations_complete,
-        shutdown: CancellationToken::new(),
+        shutdown_requested: CancellationToken::new(),
+        ws_close_requested: CancellationToken::new(),
         bearer: BearerToken::new(TEST_BEARER.to_string()),
         started_at_ms: 0,
         broadcaster: Arc::new(BroadcastHub::new(16)),
@@ -2186,7 +2187,8 @@ mod story_1_7_rest {
         let state = AppState {
             db: pools,
             migrations_complete: mc,
-            shutdown: CancellationToken::new(),
+            shutdown_requested: CancellationToken::new(),
+            ws_close_requested: CancellationToken::new(),
             bearer: BearerToken::new(super::TEST_BEARER.to_string()),
             started_at_ms: 1,
             broadcaster: Arc::new(BroadcastHub::new(16)),
@@ -2271,7 +2273,7 @@ mod story_2_1_ws {
             .await
             .expect("bind");
         let addr = listener.local_addr().expect("local_addr");
-        let shutdown = state.shutdown.clone();
+        let shutdown = state.shutdown_requested.clone();
         let handle = tokio::spawn(async move {
             let _ = axum::serve(listener, router)
                 .with_graceful_shutdown(async move { shutdown.cancelled().await })
@@ -2364,7 +2366,8 @@ mod story_2_1_ws {
         assert_eq!(hello.daemon_version, env!("CARGO_PKG_VERSION"));
         assert_eq!(hello.daemon_started_at, started_at);
 
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2388,7 +2391,8 @@ mod story_2_1_ws {
         let hello = parse_hello(&msg);
         assert_eq!(hello.protocol_version, "1.0");
 
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     fn make_state_envelope(session_id: &str) -> BroadcastEnvelope {
@@ -2495,7 +2499,8 @@ mod story_2_1_ws {
             "after unsubscribe(state.session.*), only Event frame should arrive; got {parsed:?}"
         );
 
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     async fn assert_closes_with_1008(
@@ -2542,7 +2547,8 @@ mod story_2_1_ws {
             .await
             .expect("send");
         assert_closes_with_1008(&mut ws).await;
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2562,7 +2568,8 @@ mod story_2_1_ws {
             .await
             .expect("send");
         assert_closes_with_1008(&mut ws).await;
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2584,7 +2591,8 @@ mod story_2_1_ws {
         .await
         .expect("send");
         assert_closes_with_1008(&mut ws).await;
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2604,7 +2612,8 @@ mod story_2_1_ws {
             .await
             .expect("send binary");
         assert_closes_with_1008(&mut ws).await;
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2630,7 +2639,8 @@ mod story_2_1_ws {
             }
             other => panic!("expected HTTP 401 error, got {other:?}"),
         }
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2655,7 +2665,8 @@ mod story_2_1_ws {
             }
             other => panic!("expected HTTP 401 error, got {other:?}"),
         }
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2693,7 +2704,8 @@ mod story_2_1_ws {
             other => panic!("expected HTTP 401 error, got {other:?}"),
         }
 
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2749,7 +2761,8 @@ mod story_2_1_ws {
             ),
             other => panic!("expected State frame, got {other:?}"),
         }
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2800,7 +2813,8 @@ mod story_2_1_ws {
             other => panic!("expected 401, got {other:?}"),
         }
 
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2850,7 +2864,8 @@ mod story_2_1_ws {
             match tokio_tungstenite::connect_async(req).await {
                 Ok((mut ws, _)) => {
                     let _hello = read_text_frame_or_close(&mut ws).await;
-                    state.shutdown.cancel();
+                    state.shutdown_requested.cancel();
+                    state.ws_close_requested.cancel();
                     return;
                 }
                 Err(tokio_tungstenite::tungstenite::Error::Http(resp))
@@ -2890,7 +2905,8 @@ mod story_2_1_ws {
             matches!(msg, Message::Ping(_)),
             "expected Ping, got {msg:?}"
         );
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2955,7 +2971,8 @@ mod story_2_1_ws {
             succeeded,
             "pong-deadline did not exit task / release permit within budget"
         );
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2972,24 +2989,23 @@ mod story_2_1_ws {
         let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
         let _hello = read_text_frame_or_close(&mut ws).await;
 
-        state.shutdown.cancel();
+        state.ws_close_requested.cancel();
 
-        // Within a generous window the server-side connection task exits
-        // and our client either receives a Close, EOF, or a network error.
-        let close_or_eof = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Close(_))) | None => return,
-                    Some(Err(_)) => return,
-                    Some(Ok(_)) => continue,
-                }
+        let msg = read_text_frame_or_close(&mut ws).await;
+        let text = match msg {
+            Message::Text(t) => t,
+            other => panic!("expected protocol Close text frame, got {other:?}"),
+        };
+        let parsed: ServerMessage = serde_json::from_str(text.as_str()).expect("parse close");
+        match parsed {
+            ServerMessage::Close(frame) => {
+                assert_eq!(frame.reason.as_deref(), Some("daemon shutdown"));
             }
-        })
-        .await;
-        assert!(
-            close_or_eof.is_ok(),
-            "ws did not close within 2s of shutdown"
-        );
+            other => panic!("expected ServerMessage::Close, got {other:?}"),
+        }
+
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3431,7 +3447,8 @@ mod story_2_2_publish {
             "event_ids must be strictly increasing"
         );
 
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     /// AC #2 — `state.session.<id>.current_state` delivers a `State` frame
@@ -3503,7 +3520,8 @@ mod story_2_2_publish {
         let parsed = parse_state_frame(&frame);
         assert_eq!(parsed.session_id, "sess-A");
 
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     /// AC #3 — `events.claude.*` delivers events from `source = "claude"`
@@ -3560,7 +3578,8 @@ mod story_2_2_publish {
             "events.claude.* must not deliver codex-sourced events; got {timed:?}"
         );
 
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     /// AC #4 — `state.session.*` wildcard delivers one `State` frame per
@@ -3606,7 +3625,8 @@ mod story_2_2_publish {
             );
         }
 
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     /// AC #5 — Closing one WS client does not interrupt delivery to the
@@ -3664,7 +3684,8 @@ mod story_2_2_publish {
         // `story_2_1_ws::ws_257th_connection_rejected_503`.
         let _ws_c = connect_until_ready(addr).await;
 
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     /// AC #7 (defense in depth) — `projection::session::write` rejects
@@ -3726,7 +3747,8 @@ mod story_2_2_publish {
             .expect("count");
         assert_eq!(count, 0, "sentinel-rejected writes must not insert rows");
 
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     /// AC #7 — Sentinel writes (`write_recording_started`,
@@ -3787,7 +3809,8 @@ mod story_2_2_publish {
         let event = parse_event_frame(&frame);
         assert_eq!(event.session_id, "sess-alive");
 
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     /// End-to-end: a hook line delivered over the Unix ingest socket
@@ -3850,7 +3873,8 @@ mod story_2_2_publish {
         // Closing the listener drops the sender; await the writer so
         // any tail publishes complete before the test tears down.
         let _ = writer_handle.await;
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     /// AC #1 + AC #2 combined — a single client subscribed to BOTH
@@ -3927,7 +3951,8 @@ mod story_2_2_publish {
             "unexpected trailing frame after Event+State pair: {timed:?}"
         );
 
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 }
 
@@ -4132,7 +4157,8 @@ mod story_2_3_snapshot {
             max_snapshot_last_event_at_ms
         );
 
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     /// AC #2 — A brand-new session's first event reaches a wildcard
@@ -4179,7 +4205,8 @@ mod story_2_3_snapshot {
         let st = parse_state_frame(&f_state);
         assert_eq!(st.session_id, "sess-NEW");
 
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     /// AC #3 — Subscribing to a specific `state.session.<id>` emits a
@@ -4262,7 +4289,8 @@ mod story_2_3_snapshot {
             "expected live update for sess-A, not a leaked snapshot or sess-B leak",
         );
 
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     /// AC #4 — An empty daemon emits zero snapshot frames and
@@ -4307,7 +4335,8 @@ mod story_2_3_snapshot {
         let st = parse_state_frame(&f_state);
         assert_eq!(st.session_id, "sess-NEW");
 
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     /// AC #5 — `state.session.<id>.current_state` emits the same full
@@ -4346,7 +4375,8 @@ mod story_2_3_snapshot {
         assert_eq!(parsed.state.last_event_kind, EventKind::PreToolUse);
         assert!(parsed.state.last_event_at_ms > 0);
 
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     /// AC #6 — Subscribing to an `events.*`-family topic emits zero
@@ -4393,7 +4423,8 @@ mod story_2_3_snapshot {
         let event = parse_event_frame(&frame);
         assert_eq!(event.session_id, "sess-A");
 
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     /// AC #7 — Overlapping subscriptions do not re-snapshot. After
@@ -4483,7 +4514,8 @@ mod story_2_3_snapshot {
             "first frame after second subscribe must be the live update, not a leaked snapshot frame",
         );
 
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     /// AC #1 — Sanity check that snapshot frames carry the
@@ -4525,7 +4557,8 @@ mod story_2_3_snapshot {
             "snapshot wire shape must be ServerMessage::State; got {parsed:?}"
         );
 
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     /// Second-round review finding (Patch) — a transient reader-pool
@@ -4600,7 +4633,8 @@ mod story_2_3_snapshot {
         assert_eq!(st.session_id, "sess-live");
         assert_eq!(st.source, "claude");
 
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 }
 
@@ -4651,7 +4685,8 @@ mod story_2_4_dropped {
         AppState {
             db: pools,
             migrations_complete: Arc::new(AtomicBool::new(true)),
-            shutdown: CancellationToken::new(),
+            shutdown_requested: CancellationToken::new(),
+            ws_close_requested: CancellationToken::new(),
             bearer: BearerToken::new(TEST_BEARER.to_string()),
             started_at_ms: 0,
             broadcaster: Arc::new(BroadcastHub::new(broadcast_capacity)),
@@ -4829,7 +4864,8 @@ mod story_2_4_dropped {
              or State frame; got {next_legit:?}"
         );
 
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     /// AC #1, #4 — After a `Dropped` frame, subsequent publishes are
@@ -4866,8 +4902,7 @@ mod story_2_4_dropped {
 
         // Read until Dropped.
         let outcome = read_until_dropped(&mut ws, 600).await;
-        let (count, _, _, _) =
-            outcome.expect("must observe a Dropped frame within 600 reads");
+        let (count, _, _, _) = outcome.expect("must observe a Dropped frame within 600 reads");
         assert!(count >= 1);
 
         // Now publish 3 fresh events via the PRODUCTION path. Each must
@@ -4948,7 +4983,8 @@ mod story_2_4_dropped {
              and EventKind"
         );
 
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     /// AC #1 — `DroppedFrame.count` is positive (envelopes, not bytes);
@@ -4981,14 +5017,18 @@ mod story_2_4_dropped {
 
         // Invariants from DroppedFrame::new — best-estimate semantics mean
         // we deliberately don't assert exact event-id values.
-        assert!(count > 0, "Dropped count must be > 0 (envelopes); got {count}");
+        assert!(
+            count > 0,
+            "Dropped count must be > 0 (envelopes); got {count}"
+        );
         assert!(
             first <= last,
             "Dropped frame must have first_dropped_event_id <= last_dropped_event_id; \
              got first={first:?}, last={last:?}"
         );
 
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     /// AC #2 — A presenter that receives a `Dropped` frame can recover
@@ -5054,8 +5094,7 @@ mod story_2_4_dropped {
 
         // Hunt for Dropped, ignoring intermediate Event frames.
         let outcome = read_until_dropped(&mut ws, 400).await;
-        let (count, _, _, _) =
-            outcome.expect("must observe a Dropped frame within 400 reads");
+        let (count, _, _, _) = outcome.expect("must observe a Dropped frame within 400 reads");
         assert!(count > 0);
 
         // The presenter's authoritative cursor is `id0` (the last real
@@ -5086,13 +5125,9 @@ mod story_2_4_dropped {
         // Without this, the test would pass even if REST recovery
         // returned a partial set — which would silently corrupt the
         // presenter's gap recovery.
-        let returned_ids: Vec<EventId> =
-            body.events.iter().map(|e| e.event_id).collect();
-        let expected_ids: Vec<EventId> = produced
-            .iter()
-            .copied()
-            .filter(|id| id.0 > id0.0)
-            .collect();
+        let returned_ids: Vec<EventId> = body.events.iter().map(|e| e.event_id).collect();
+        let expected_ids: Vec<EventId> =
+            produced.iter().copied().filter(|id| id.0 > id0.0).collect();
         assert!(
             !expected_ids.is_empty(),
             "test scaffolding: should have produced events past id0={id0:?}"
@@ -5111,7 +5146,8 @@ mod story_2_4_dropped {
             id0.0 + 1
         );
 
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     /// AC #3 — Sustained lag is bounded by the coalesce window. With
@@ -5194,7 +5230,8 @@ mod story_2_4_dropped {
              {dropped_count} (theoretical bound ~10, asserted <=30 for jitter)"
         );
 
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     /// AC #1 + Story 2.3 deferred-work.md:79 — Lag during a Subscribe
@@ -5322,7 +5359,8 @@ mod story_2_4_dropped {
              saw 0 (lag-during-snapshot recovery regressed?). snapshot_seen={snapshot_seen}"
         );
 
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     /// AC #1, #3 — Lag detected by `drain_backlog_under_state` (the
@@ -5377,12 +5415,12 @@ mod story_2_4_dropped {
 
         // Now read; expect to see Dropped somewhere in the stream.
         let outcome = read_until_dropped(&mut ws, 400).await;
-        let (count, _, _, _) = outcome.expect(
-            "Dropped must be emitted when channel lapped before a Subscribe-induced drain",
-        );
+        let (count, _, _, _) = outcome
+            .expect("Dropped must be emitted when channel lapped before a Subscribe-induced drain");
         assert!(count >= 1);
 
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     /// AC #3 lower bound + AC #4 — After sustained lag emits its first
@@ -5439,7 +5477,8 @@ mod story_2_4_dropped {
             .expect("second Dropped must arrive after silence + burst 2");
         assert!(second.0 >= 1);
 
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     /// Story 2.4 second-round code-review finding #1 — A client that
@@ -5524,7 +5563,8 @@ mod story_2_4_dropped {
             "expected the post-subscription real Event to arrive"
         );
 
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     /// Story 2.4 second-round code-review finding #1 — After
@@ -5624,7 +5664,8 @@ mod story_2_4_dropped {
             "expected the post-resubscription real Event to arrive"
         );
 
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     /// AC #1 / Story 2.4 code-review finding #1 — A state-only
@@ -5732,6 +5773,389 @@ mod story_2_4_dropped {
              Story 2.4 code-review finding #1."
         );
 
-        state.shutdown.cancel();
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
+    }
+}
+
+mod story_2_5_shutdown {
+    use std::process::{Command as StdCommand, Stdio};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use bowerbird_daemon::db::{init_pools, run_migrations};
+    use bowerbird_daemon::state::wait_for_ws_connection_drain;
+    use futures_util::SinkExt;
+    use nix::sys::signal::{kill, Signal};
+    use nix::unistd::Pid;
+    use protocol::{EventKind, ServerMessage};
+    use tempfile::TempDir;
+    use tokio_tungstenite::tungstenite::Message;
+
+    use super::story_2_1_ws::{
+        authed_request, connect_authed, parse_hello, read_text_frame_or_close, spawn_test_daemon,
+        ws_url_header,
+    };
+    use super::story_2_2_publish::{
+        parse_event_frame, publish_via_projection, wait_subscribe_live_all, ProbeKind,
+    };
+    use super::{fresh_pools, make_test_state_with_ws, TEST_BEARER};
+
+    fn default_state(pools: bowerbird_daemon::db::DbPools) -> bowerbird_daemon::state::AppState {
+        make_test_state_with_ws(
+            pools,
+            Arc::new(AtomicBool::new(true)),
+            4,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        )
+    }
+
+    fn assert_protocol_shutdown_close(msg: Message) {
+        let text = match msg {
+            Message::Text(t) => t,
+            other => panic!("expected protocol Close text frame, got {other:?}"),
+        };
+        let parsed: ServerMessage = serde_json::from_str(text.as_str()).expect("parse close");
+        match parsed {
+            ServerMessage::Close(frame) => {
+                assert_eq!(frame.reason.as_deref(), Some("daemon shutdown"));
+            }
+            other => panic!("expected ServerMessage::Close, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_token_sends_protocol_close_to_all_connected_tools() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let (mut ws1, _) = connect_authed(addr, TEST_BEARER).await;
+        let (mut ws2, _) = connect_authed(addr, TEST_BEARER).await;
+        let (mut ws3, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws1).await);
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws2).await);
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws3).await);
+
+        for ws in [&mut ws1, &mut ws2, &mut ws3] {
+            ws.send(Message::Text(
+                r#"{"op":"subscribe","topic":"events.*"}"#.into(),
+            ))
+            .await
+            .expect("send subscribe");
+        }
+        wait_subscribe_live_all(
+            &mut [&mut ws1, &mut ws2, &mut ws3],
+            &state,
+            ProbeKind::Event { source: "claude" },
+        )
+        .await;
+
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-shutdown",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+
+        for ws in [&mut ws1, &mut ws2, &mut ws3] {
+            let _event = read_text_frame_or_close(ws).await;
+        }
+
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
+
+        for ws in [&mut ws1, &mut ws2, &mut ws3] {
+            assert_protocol_shutdown_close(read_text_frame_or_close(ws).await);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_close_drains_buffered_event_before_protocol_close() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"events.claude.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+        wait_subscribe_live_all(
+            &mut [&mut ws],
+            &state,
+            ProbeKind::Event { source: "claude" },
+        )
+        .await;
+
+        let event_id = publish_via_projection(
+            &state,
+            "claude",
+            "sess-shutdown-drain",
+            EventKind::PreToolUse,
+            None,
+            r#"{"tool":"bash"}"#,
+        )
+        .await;
+
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
+
+        let event = parse_event_frame(&read_text_frame_or_close(&mut ws).await);
+        assert_eq!(
+            event.event_id, event_id,
+            "queued broadcast event must be drained before the shutdown close frame"
+        );
+        assert_protocol_shutdown_close(read_text_frame_or_close(&mut ws).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_requested_rejects_new_ws_upgrades() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+        state.shutdown_requested.cancel();
+
+        let req = authed_request(&ws_url_header(addr), TEST_BEARER);
+        let err = tokio_tungstenite::connect_async(req)
+            .await
+            .expect_err("shutdown should prevent new websocket sessions");
+        if let tokio_tungstenite::tungstenite::Error::Http(resp) = err {
+            assert_eq!(resp.status().as_u16(), 503);
+        }
+
+        state.ws_close_requested.cancel();
+    }
+
+    fn spawn_daemon_for_signal(
+        tmp: &TempDir,
+    ) -> (std::process::Child, std::path::PathBuf, std::path::PathBuf) {
+        let bowerbird_dir = tmp.path().join(".bowerbird");
+        std::fs::create_dir_all(&bowerbird_dir).expect("mkdir");
+        let sock_path = bowerbird_dir.join("ingest.sock");
+        let stderr_path = tmp.path().join("daemon.stderr.log");
+        let stderr = std::fs::File::create(&stderr_path).expect("create daemon stderr log");
+        let bin = assert_cmd::cargo::cargo_bin("bowerbird-daemon");
+        let child = StdCommand::new(&bin)
+            .env("HOME", tmp.path())
+            .env("BOWERBIRD_INGEST_SOCK", &sock_path)
+            .env("RUST_LOG", "warn")
+            .env(
+                "PATH",
+                std::env::var_os("PATH").unwrap_or_else(|| std::ffi::OsString::from("")),
+            )
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(stderr))
+            .spawn()
+            .expect("spawn daemon");
+        (child, sock_path, stderr_path)
+    }
+
+    async fn wait_for_daemon_ready(sock_path: &std::path::Path, stderr_path: &std::path::Path) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let socket_ready = std::fs::metadata(sock_path).is_ok();
+            let log_ready = std::fs::read_to_string(stderr_path)
+                .map(|s| s.contains("daemon listening"))
+                .unwrap_or(false);
+            if socket_ready && log_ready {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "daemon never became ready; ingest_sock={}, stderr={}",
+                sock_path.display(),
+                std::fs::read_to_string(stderr_path).unwrap_or_default()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn assert_signal_exits_zero(signal: Signal) {
+        let tmp = TempDir::new().expect("tempdir");
+        let (child, sock_path, stderr_path) = spawn_daemon_for_signal(&tmp);
+        wait_for_daemon_ready(&sock_path, &stderr_path).await;
+        kill(Pid::from_raw(child.id() as i32), signal).expect("send signal");
+        let output = tokio::task::spawn_blocking(move || child.wait_with_output())
+            .await
+            .expect("join wait")
+            .expect("wait output");
+        let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        assert!(
+            output.status.success(),
+            "{signal:?} shutdown should exit 0; status={:?}; stderr={}",
+            output.status,
+            stderr
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sigterm_uses_graceful_shutdown_path_and_exits_zero() {
+        assert_signal_exits_zero(Signal::SIGTERM).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sigint_uses_graceful_shutdown_path_and_exits_zero() {
+        assert_signal_exits_zero(Signal::SIGINT).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_drain_timeout_does_not_hang() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = make_test_state_with_ws(
+            pools,
+            Arc::new(AtomicBool::new(true)),
+            1,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        );
+        let held_permit = state
+            .ws_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("hold permit");
+        state.ws_close_requested.cancel();
+
+        let result =
+            wait_for_ws_connection_drain(state.ws_semaphore.clone(), 1, Duration::from_millis(25))
+                .await;
+        assert!(result.is_err(), "held permit should force drain timeout");
+        drop(held_permit);
+
+        wait_for_ws_connection_drain(state.ws_semaphore.clone(), 1, Duration::from_secs(1))
+            .await
+            .expect("permits return after held permit drops");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn graceful_shutdown_mid_transaction_rollback_leaves_no_partial_rows() {
+        let (tmp, pools) = fresh_pools().await;
+        let db_path = tmp.path().join("bower.db");
+        let started = bowerbird_daemon::projection::session::write_recording_started(&pools.writer)
+            .await
+            .expect("recording started");
+        let writer = pools.writer.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let task = tokio::spawn(async move {
+            let conn = writer.get().await.expect("writer get");
+            conn.interact(move |c| -> rusqlite::Result<()> {
+                let tx = c.transaction()?;
+                tx.execute(
+                    "INSERT INTO events (source, session_id, kind, reaction, payload, created_at) \
+                     VALUES ('partial', 'sess-partial', 'PreToolUse', NULL, '{}', 1)",
+                    [],
+                )?;
+                started_tx.send(()).expect("notify transaction started");
+                std::thread::sleep(Duration::from_millis(100));
+                tx.rollback()?;
+                Ok(())
+            })
+            .await
+            .expect("interact")
+            .expect("rollback");
+        });
+
+        started_rx.await.expect("transaction started");
+        let ended_id = tokio::time::timeout(
+            Duration::from_secs(2),
+            bowerbird_daemon::projection::session::write_recording_ended(
+                &pools.writer,
+                started.recording_session_id,
+            ),
+        )
+        .await
+        .expect("shutdown cleanup should wait for transaction and finish")
+        .expect("recording ended");
+        task.await.expect("transaction task");
+        drop(pools);
+
+        let reopened = init_pools(&db_path).await.expect("reopen pools");
+        run_migrations(&reopened.writer)
+            .await
+            .expect("migrate reopen");
+        let conn = reopened.reader.get().await.expect("reader get");
+        let recording_session_id = started.recording_session_id;
+        let (partial_count, ended_count): (i64, i64) = conn
+            .interact(move |c| -> rusqlite::Result<(i64, i64)> {
+                let partial_count = c.query_row(
+                    "SELECT COUNT(*) FROM events WHERE source = 'partial'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let ended_count = c.query_row(
+                    "SELECT COUNT(*) FROM recording_sessions WHERE id = ? AND ended_event_id = ?",
+                    rusqlite::params![recording_session_id, ended_id.0],
+                    |r| r.get(0),
+                )?;
+                Ok((partial_count, ended_count))
+            })
+            .await
+            .expect("interact")
+            .expect("counts");
+        assert_eq!(
+            partial_count, 0,
+            "rolled-back partial event row must not persist"
+        );
+        assert_eq!(
+            ended_count, 1,
+            "shutdown cleanup must complete after the in-flight transaction releases the writer"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn graceful_shutdown_committed_transaction_has_event_and_projection() {
+        let (tmp, pools) = fresh_pools().await;
+        let db_path = tmp.path().join("bower.db");
+        let state = default_state(pools.clone());
+        let _id = publish_via_projection(
+            &state,
+            "claude",
+            "sess-commit",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
+        drop(state);
+        drop(pools);
+
+        let reopened = init_pools(&db_path).await.expect("reopen pools");
+        run_migrations(&reopened.writer)
+            .await
+            .expect("migrate reopen");
+        let conn = reopened.reader.get().await.expect("reader get");
+        let (events, projections): (i64, i64) = conn
+            .interact(|c| -> rusqlite::Result<(i64, i64)> {
+                let events = c.query_row(
+                    "SELECT COUNT(*) FROM events WHERE source = 'claude' AND session_id = 'sess-commit'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let projections = c.query_row(
+                    "SELECT COUNT(*) FROM session_projections WHERE source = 'claude' AND session_id = 'sess-commit'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                Ok((events, projections))
+            })
+            .await
+            .expect("interact")
+            .expect("counts");
+        assert_eq!(events, 1, "committed event row must survive restart");
+        assert_eq!(
+            projections, 1,
+            "matching session projection must commit with event"
+        );
     }
 }

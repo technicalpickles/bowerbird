@@ -1,3 +1,6 @@
 /target/
 /.worktrees/
 /.claude/settings.local.json
+.claude/.story-automator-active
+__pycache__/
+*.pyc

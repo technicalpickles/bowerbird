@@ -62,7 +62,11 @@ def runtime_mode() -> str:
 
 
 def resolve_command_shell() -> str:
-    for candidate in (_tmux_default_shell(), os.environ.get("SHELL", "").strip(), shutil.which("bash") or ""):
+    # Generated command bodies use bash syntax (if/then/fi, [[ ]], etc), so the
+    # executor shell must be bash-compatible. The user's interactive shell (e.g.
+    # fish, zsh) is irrelevant here. Prefer bash; only fall back to user shells
+    # if bash is somehow missing.
+    for candidate in (shutil.which("bash") or "", _tmux_default_shell(), os.environ.get("SHELL", "").strip()):
         resolved = _resolve_shell_path(candidate)
         if resolved:
             return resolved

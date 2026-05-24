@@ -12,11 +12,12 @@ use bowerbird_daemon::{
     config::Config,
     db::{init_pools, run_migrations, DbPools},
     ensure_bowerbird_dir, ingest, init_tracing, install_panic_hook, projection, set_crash_dir,
-    state::{AppState, WsConfig},
+    state::{wait_for_ws_connection_drain, AppState, WsConfig},
     time::current_unix_millis,
     write_error_report,
 };
 use clap::Parser;
+use std::future::IntoFuture;
 use tokio_util::sync::CancellationToken;
 
 use adapter_claude::ClaudeAdapter;
@@ -79,7 +80,8 @@ fn home_dir() -> Option<PathBuf> {
 
 async fn run(config: Config) -> anyhow::Result<()> {
     let migrations_complete = Arc::new(AtomicBool::new(false));
-    let shutdown = CancellationToken::new();
+    let shutdown_requested = CancellationToken::new();
+    let ws_close_requested = CancellationToken::new();
 
     // Load the bearer token before anything else REST-related is constructed.
     // A `Generated` source warrants a WARN line so operators running without
@@ -156,13 +158,13 @@ async fn run(config: Config) -> anyhow::Result<()> {
         ingest_rx,
         pools.writer.clone(),
         broadcaster.clone(),
-        shutdown.clone(),
+        shutdown_requested.clone(),
     ));
     let ingest_listener_task = tokio::spawn(ingest::listener::run_bound(
         ingest_listener,
         config.ingest_sock_path.clone(),
         ingest_tx,
-        shutdown.clone(),
+        shutdown_requested.clone(),
         adapter,
     ));
 
@@ -176,11 +178,12 @@ async fn run(config: Config) -> anyhow::Result<()> {
     let state = AppState {
         db: pools.clone(),
         migrations_complete: migrations_complete.clone(),
-        shutdown: shutdown.clone(),
+        shutdown_requested: shutdown_requested.clone(),
+        ws_close_requested: ws_close_requested.clone(),
         bearer,
         started_at_ms,
         broadcaster,
-        ws_semaphore,
+        ws_semaphore: ws_semaphore.clone(),
         ws_config,
     };
     let router = api::router(state);
@@ -192,15 +195,24 @@ async fn run(config: Config) -> anyhow::Result<()> {
     // visible at the default verbosity (`error`). See P20 in story 1.2 review.
     tracing::warn!(addr = %local_addr, "daemon listening");
 
-    let shutdown_fut = shutdown_signal(shutdown.clone());
-    let serve_result = axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_fut)
-        .await;
+    let serve = axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_signal(shutdown_requested.clone()))
+        .into_future();
+    tokio::pin!(serve);
+    let mut serve_result = None;
+
+    tokio::select! {
+        result = &mut serve => {
+            shutdown_requested.cancel();
+            serve_result = Some(result);
+        }
+        _ = shutdown_requested.cancelled() => {}
+    }
 
     // Ensure ingest shuts down before the final lifecycle marker is written:
     // queued accepted events must either be persisted before RecordingEnded or
     // rejected by a closed queue, not silently aborted by runtime teardown.
-    shutdown.cancel();
+    shutdown_requested.cancel();
     match ingest_listener_task.await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => tracing::error!(error = ?e, "ingest listener exited with error"),
@@ -209,6 +221,15 @@ async fn run(config: Config) -> anyhow::Result<()> {
     if let Err(e) = ingest_writer_task.await {
         tracing::error!(error = ?e, "ingest writer task join failed");
     }
+
+    ws_close_requested.cancel();
+    let ws_drain_timed_out = wait_for_ws_connection_drain(
+        ws_semaphore.clone(),
+        config.ws_max_connections,
+        config.shutdown_drain_timeout,
+    )
+    .await
+    .is_err();
 
     // Drain marker for load balancers / probes — flip ready BEFORE writing the
     // sentinel so a probe between now and process exit observes 503.
@@ -228,7 +249,14 @@ async fn run(config: Config) -> anyhow::Result<()> {
     if let Err(e) = wal_checkpoint_passive(&pools).await {
         tracing::error!(error = ?e, "wal_checkpoint(PASSIVE) failed");
     }
+    pools.reader.close();
+    pools.writer.close();
 
+    let serve_result = match serve_result {
+        Some(result) => result,
+        None if !ws_drain_timed_out => serve.await,
+        None => return Ok(()),
+    };
     serve_result.context("axum::serve")?;
     Ok(())
 }
