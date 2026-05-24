@@ -1,7 +1,9 @@
 //! `GET /status` — daemon snapshot (version, uptime, last event).
 //!
-//! `connected_ws_clients` is reserved for Epic 2 and intentionally omitted
-//! from the V1 surface.
+//! `connected_ws_clients` is deferred to Story 3.2 alongside the
+//! `bowerbird status` CLI (its first V1 consumer). Epic 2 shipped the
+//! semaphore that produces the count (`AppState::ws_semaphore`); only the
+//! `DaemonStatus` surfacing was deferred.
 
 use axum::extract::State;
 use axum::http::StatusCode;

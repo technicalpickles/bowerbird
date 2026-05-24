@@ -19,19 +19,19 @@ createdAt: "2026-05-24T02:47:39Z"
       "complexity": "high",
       "tasks": {
         "create": {
-          "primary": "codex",
+          "primary": "claude",
           "fallback": "claude"
         },
         "dev": {
-          "primary": "codex",
+          "primary": "claude",
           "fallback": "claude"
         },
         "auto": {
-          "primary": "codex",
+          "primary": "claude",
           "fallback": "claude"
         },
         "review": {
-          "primary": "codex",
+          "primary": "claude",
           "fallback": "claude"
         }
       }

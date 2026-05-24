@@ -60,8 +60,11 @@ pub struct SessionDetail {
 /// Body of `GET /status`.
 ///
 /// `last_event_at_ms` and `last_event_id` are `None` when the events table
-/// contains no non-sentinel rows. `connected_ws_clients` is reserved for
-/// Epic 2's WebSocket surface and intentionally absent from V1.
+/// contains no non-sentinel rows. `connected_ws_clients` is deferred to
+/// Story 3.2 (daemon lifecycle CLI), which introduces the first V1 consumer
+/// (the `bowerbird status` CLI). The semaphore infrastructure that produces
+/// the count ships with Epic 2's WS surface (`AppState::ws_semaphore`); only
+/// the `DaemonStatus` surfacing was deferred.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonStatus {
     pub daemon_version: String,
