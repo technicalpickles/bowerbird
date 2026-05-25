@@ -328,6 +328,196 @@ pub fn http_get_status(
     }
 }
 
+/// Outcome of [`http_post_replay`]. Same shape as [`StatusResponse`]; kept
+/// distinct so the caller can match without confusing the two endpoints.
+#[derive(Debug)]
+pub enum ReplayResponse {
+    Ok(Vec<u8>),
+    Status(u16),
+    Unreachable,
+}
+
+/// Hand-rolled `POST /replay` against the bearer-gated endpoint added in
+/// Story 4.1. Mirrors [`http_get_status`]'s shape with three differences:
+/// (a) verb is `POST`, (b) `Content-Type: application/x-ndjson` +
+/// `Content-Length: <body.len()>`, (c) body bytes follow the headers.
+///
+/// Returns the raw response body bytes on 200; status code on non-200;
+/// transport-level errors map to `ReplayResponse::Unreachable`. The caller
+/// parses the 200 body as the daemon's `{replayed_count, parse_errors}`
+/// shape (see `crates/daemon/src/api/replay.rs::ReplayResponse`).
+pub fn http_post_replay(
+    addr: SocketAddr,
+    bearer: &str,
+    body: &[u8],
+    per_attempt: Duration,
+) -> ReplayResponse {
+    let mut stream = match TcpStream::connect_timeout(&addr, per_attempt) {
+        Ok(s) => s,
+        Err(_) => return ReplayResponse::Unreachable,
+    };
+    let _ = stream.set_read_timeout(Some(per_attempt));
+    let _ = stream.set_write_timeout(Some(per_attempt));
+
+    // Headers, then a blank line, then the body bytes. `Content-Length` must
+    // be the byte length (not char count) for axum's body extractor to read
+    // exactly that many bytes.
+    let mut head = String::new();
+    head.push_str("POST /replay HTTP/1.1\r\n");
+    head.push_str(&format!("Host: {addr}\r\n"));
+    head.push_str("Connection: close\r\n");
+    head.push_str(&format!("Authorization: Bearer {bearer}\r\n"));
+    head.push_str("Content-Type: application/x-ndjson\r\n");
+    head.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    head.push_str("Accept: application/json\r\n\r\n");
+
+    if stream.write_all(head.as_bytes()).is_err() {
+        return ReplayResponse::Unreachable;
+    }
+    if stream.write_all(body).is_err() {
+        return ReplayResponse::Unreachable;
+    }
+
+    let mut response = Vec::with_capacity(4096);
+    let _ = stream.read_to_end(&mut response);
+    let status_code = parse_status_code(&response).unwrap_or(0);
+    if status_code == 200 {
+        let body = body_after_headers(&response).to_vec();
+        ReplayResponse::Ok(body)
+    } else if status_code == 0 {
+        ReplayResponse::Unreachable
+    } else {
+        ReplayResponse::Status(status_code)
+    }
+}
+
+/// Outcome of [`http_get_events`]. Mirrors [`StatusResponse`]; we
+/// distinguish 404 explicitly because the export command needs to render a
+/// distinct "session not found" message.
+#[derive(Debug)]
+pub enum EventsResponse {
+    Ok(Vec<u8>),
+    NotFound,
+    Status(u16),
+    Unreachable,
+}
+
+/// Hand-rolled `GET /sessions/{id}/events?since=<cursor>` against the
+/// bearer-gated endpoint. Mirrors [`http_get_status`]'s shape; the response
+/// body is the JSON-serialized `protocol::EventListResponse` that
+/// `bowerbird export` iterates via the `cursor` field.
+pub fn http_get_events(
+    addr: SocketAddr,
+    bearer: &str,
+    session_id: &str,
+    since: i64,
+    per_attempt: Duration,
+) -> EventsResponse {
+    let mut stream = match TcpStream::connect_timeout(&addr, per_attempt) {
+        Ok(s) => s,
+        Err(_) => return EventsResponse::Unreachable,
+    };
+    let _ = stream.set_read_timeout(Some(per_attempt));
+    let _ = stream.set_write_timeout(Some(per_attempt));
+
+    // `session_id` is user-supplied; escape it for URL-path inclusion.
+    // We only encode the unreserved characters strict enough to keep the
+    // path well-formed — letters, digits, `-`, `_`, `.`, `~` pass through;
+    // anything else becomes `%XX`. Avoids pulling `percent-encoding` for
+    // a one-shot path.
+    let encoded_id = encode_path_segment(session_id);
+
+    let mut req = String::new();
+    req.push_str(&format!(
+        "GET /sessions/{encoded_id}/events?since={since} HTTP/1.1\r\n"
+    ));
+    req.push_str(&format!("Host: {addr}\r\n"));
+    req.push_str("Connection: close\r\n");
+    req.push_str(&format!("Authorization: Bearer {bearer}\r\n"));
+    req.push_str("Accept: application/json\r\n\r\n");
+
+    if stream.write_all(req.as_bytes()).is_err() {
+        return EventsResponse::Unreachable;
+    }
+
+    let mut response = Vec::with_capacity(8192);
+    let _ = stream.read_to_end(&mut response);
+    let status_code = parse_status_code(&response).unwrap_or(0);
+    match status_code {
+        200 => EventsResponse::Ok(body_after_headers(&response).to_vec()),
+        404 => EventsResponse::NotFound,
+        0 => EventsResponse::Unreachable,
+        other => EventsResponse::Status(other),
+    }
+}
+
+/// Outcome of [`http_get_session_detail`]. Distinguishes 404 explicitly so
+/// the export command can render the "session not found" message without
+/// inspecting the body. The 200-body bytes are not surfaced — the caller
+/// only needs the existence signal.
+#[derive(Debug)]
+pub enum SessionDetailResponse {
+    Ok,
+    NotFound,
+    Status(u16),
+    Unreachable,
+}
+
+/// `GET /sessions/{id}` pre-check used by `bowerbird export` to disambiguate
+/// "unknown session" from "session exists with 0 events" (the events
+/// endpoint returns 200 + empty list for both today). The 404 path produces
+/// the AC-specified `session <id> not found` stderr.
+pub fn http_get_session_detail(
+    addr: SocketAddr,
+    bearer: &str,
+    session_id: &str,
+    per_attempt: Duration,
+) -> SessionDetailResponse {
+    let mut stream = match TcpStream::connect_timeout(&addr, per_attempt) {
+        Ok(s) => s,
+        Err(_) => return SessionDetailResponse::Unreachable,
+    };
+    let _ = stream.set_read_timeout(Some(per_attempt));
+    let _ = stream.set_write_timeout(Some(per_attempt));
+
+    let encoded_id = encode_path_segment(session_id);
+    let mut req = String::new();
+    req.push_str(&format!("GET /sessions/{encoded_id} HTTP/1.1\r\n"));
+    req.push_str(&format!("Host: {addr}\r\n"));
+    req.push_str("Connection: close\r\n");
+    req.push_str(&format!("Authorization: Bearer {bearer}\r\n"));
+    req.push_str("Accept: application/json\r\n\r\n");
+
+    if stream.write_all(req.as_bytes()).is_err() {
+        return SessionDetailResponse::Unreachable;
+    }
+
+    let mut response = Vec::with_capacity(2048);
+    let _ = stream.read_to_end(&mut response);
+    let status_code = parse_status_code(&response).unwrap_or(0);
+    match status_code {
+        200 => SessionDetailResponse::Ok,
+        404 => SessionDetailResponse::NotFound,
+        0 => SessionDetailResponse::Unreachable,
+        other => SessionDetailResponse::Status(other),
+    }
+}
+
+fn encode_path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+    }
+    out
+}
+
 fn parse_status_code(response: &[u8]) -> Option<u16> {
     let line_end = response.iter().position(|&b| b == b'\n')?;
     let line = &response[..line_end];
@@ -390,5 +580,19 @@ mod tests {
     fn find_subslice_finds_needle() {
         assert_eq!(find_subslice(b"abcdef", b"cd"), Some(2));
         assert_eq!(find_subslice(b"abcdef", b"xyz"), None);
+    }
+
+    #[test]
+    fn encode_path_segment_passes_unreserved() {
+        assert_eq!(encode_path_segment("session-alpha"), "session-alpha");
+        assert_eq!(encode_path_segment("foo_bar.baz"), "foo_bar.baz");
+        assert_eq!(encode_path_segment("abc123~"), "abc123~");
+    }
+
+    #[test]
+    fn encode_path_segment_escapes_slashes_and_spaces() {
+        assert_eq!(encode_path_segment("a/b"), "a%2Fb");
+        assert_eq!(encode_path_segment("a b"), "a%20b");
+        assert_eq!(encode_path_segment("foo?bar"), "foo%3Fbar");
     }
 }

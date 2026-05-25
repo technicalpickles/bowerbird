@@ -1,0 +1,65 @@
+[
+  {
+    "storyId": "3.1",
+    "title": "bowerbird install and uninstall",
+    "complexity": {
+      "score": 7,
+      "level": "Medium",
+      "reasons": [
+        "Database schema changes",
+        "Transaction management",
+        "Rate limiting/throttling",
+        "Integration testing required",
+        "Configuration/feature flags",
+        "Pure refactor (no behavior change)",
+        "High AC count (18)"
+      ]
+    }
+  },
+  {
+    "storyId": "3.2",
+    "title": "Daemon lifecycle CLI",
+    "complexity": {
+      "score": 5,
+      "level": "Medium",
+      "reasons": [
+        "Real-time communication",
+        "Logging/monitoring/observability",
+        "High AC count (21)"
+      ]
+    }
+  },
+  {
+    "storyId": "3.3",
+    "title": "Bearer token auth with keychain storage",
+    "complexity": {
+      "score": 14,
+      "level": "High",
+      "reasons": [
+        "Real-time communication",
+        "Authentication system",
+        "Authorization/permissions",
+        "Encryption/security",
+        "Backend + Frontend combined",
+        "Infrastructure changes",
+        "Accessibility requirements",
+        "High AC count (15)"
+      ]
+    }
+  },
+  {
+    "storyId": "3.4",
+    "title": "Prebuilt binary distribution and release pipeline",
+    "complexity": {
+      "score": 8,
+      "level": "High",
+      "reasons": [
+        "Real-time communication",
+        "Infrastructure changes",
+        "Integration testing required",
+        "Configuration/feature flags",
+        "High AC count (22)"
+      ]
+    }
+  }
+]

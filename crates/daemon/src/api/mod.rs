@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod events;
 pub mod health;
+pub mod replay;
 pub mod sessions;
 pub mod status;
 pub mod token;
@@ -12,7 +13,7 @@ use axum::extract::Request;
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use serde_json::json;
 use tower::ServiceBuilder;
@@ -99,6 +100,7 @@ pub fn router(state: AppState) -> Router {
         .route("/readyz", get(health::readyz));
 
     let authenticated = Router::new()
+        .route("/replay", post(replay::run))
         .route("/sessions", get(sessions::list))
         .route("/sessions/{id}", get(sessions::detail))
         .route("/sessions/{id}/events", get(events::list))

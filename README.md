@@ -24,6 +24,10 @@ bowerbird install
 # 3. Use Claude Code as normal; activity appears in ~/.bowerbird/bower.db
 bowerbird auth token | tr -d '\n' | pbcopy   # copy bearer token for tool config
 bowerbird status                              # render full status block
+
+# Try it without setting up Claude Code — the bundled fixture demonstrates
+# the pub/sub path:
+bowerbird replay
 ```
 
 The Quickstart targets macOS arm64 — substitute the appropriate tarball name

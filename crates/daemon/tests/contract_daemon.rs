@@ -46,6 +46,14 @@ fn make_test_state_with_ws(
     ping_interval: Duration,
     pong_timeout: Duration,
 ) -> AppState {
+    // Story 4.1 added `ingest_tx` to `AppState` so the `POST /replay` endpoint
+    // can push onto the same channel the live-shim ingest path uses. Tests
+    // that don't exercise /replay never push to this sender, so a tiny
+    // capacity (1) with the receiver dropped immediately is safe — the
+    // receiver-half being closed makes the sender error on use, which is
+    // exactly what a non-replay test wants (any accidental /replay call in a
+    // non-replay test would fail fast rather than silently succeed).
+    let (ingest_tx, _ingest_rx) = tokio::sync::mpsc::channel::<protocol::EventEnvelope>(1);
     AppState {
         db: pools,
         migrations_complete,
@@ -61,6 +69,7 @@ fn make_test_state_with_ws(
             coalesce_window: Duration::from_secs(1),
             max_connections: ws_max_conns,
         },
+        ingest_tx,
     }
 }
 
@@ -2194,6 +2203,7 @@ mod story_1_7_rest {
 
         // Use a non-zero started_at_ms so uptime is meaningful.
         let mc = Arc::new(AtomicBool::new(true));
+        let (ingest_tx, _ingest_rx) = tokio::sync::mpsc::channel::<protocol::EventEnvelope>(1);
         let state = AppState {
             db: pools,
             migrations_complete: mc,
@@ -2209,6 +2219,7 @@ mod story_1_7_rest {
                 coalesce_window: Duration::from_secs(1),
                 max_connections: 4,
             },
+            ingest_tx,
         };
         let app = api::router(state);
         let resp = app.oneshot(auth_get("/status")).await.expect("oneshot");
@@ -4693,6 +4704,7 @@ mod story_2_4_dropped {
         broadcast_capacity: usize,
         coalesce_window: Duration,
     ) -> AppState {
+        let (ingest_tx, _ingest_rx) = tokio::sync::mpsc::channel::<protocol::EventEnvelope>(1);
         AppState {
             db: pools,
             migrations_complete: Arc::new(AtomicBool::new(true)),
@@ -4708,6 +4720,7 @@ mod story_2_4_dropped {
                 coalesce_window,
                 max_connections: 4,
             },
+            ingest_tx,
         }
     }
 
@@ -6805,5 +6818,467 @@ mod story_3_3_auth {
             stderr.contains("config.toml"),
             "stderr missing config.toml mention:\n{stderr}"
         );
+    }
+}
+
+// =====================================================================
+// Story 4.1 — `POST /replay` endpoint contract tests
+// =====================================================================
+
+mod story_4_1_replay {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{header, Request, StatusCode};
+    use bowerbird_daemon::broadcast::{BroadcastEnvelope, BroadcastHub};
+    use bowerbird_daemon::ingest::writer;
+    use protocol::{Event, EventId, EventKind};
+    use serde::Deserialize;
+    use tokio::sync::mpsc;
+    use tower::ServiceExt;
+
+    const BEARER_HEADER_VALUE: &str = "Bearer test-bearer-token-1.7";
+
+    #[derive(Debug, Deserialize)]
+    struct ReplayResponseBody {
+        replayed_count: usize,
+        #[serde(default)]
+        parse_errors: Vec<ParseError>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ParseError {
+        line: usize,
+        error: String,
+    }
+
+    /// Build a fully wired test state: AppState carries a real `ingest_tx`,
+    /// the matching `ingest_rx` is drained by a spawned writer task that
+    /// calls `projection::session::write` for each envelope. This mirrors
+    /// the production wiring at `crates/daemon/src/main.rs:195-219` minus
+    /// the listener task — the test POSTs directly to /replay so no Unix
+    /// socket is needed.
+    async fn wired_state(pools: DbPools) -> (AppState, tokio::task::JoinHandle<()>) {
+        let migrations_complete = Arc::new(AtomicBool::new(true));
+        let shutdown = CancellationToken::new();
+        let broadcaster = Arc::new(BroadcastHub::new(32));
+        let (ingest_tx, ingest_rx) = mpsc::channel::<protocol::EventEnvelope>(64);
+
+        let writer_task = tokio::spawn(writer::run(
+            ingest_rx,
+            pools.writer.clone(),
+            broadcaster.clone(),
+            shutdown.clone(),
+        ));
+
+        let state = AppState {
+            db: pools,
+            migrations_complete,
+            shutdown_requested: shutdown,
+            ws_close_requested: CancellationToken::new(),
+            bearer: BearerToken::new(super::TEST_BEARER.to_string()),
+            started_at_ms: 0,
+            broadcaster,
+            ws_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+            ws_config: WsConfig {
+                ping_interval: Duration::from_secs(30),
+                pong_timeout: Duration::from_secs(10),
+                coalesce_window: Duration::from_secs(1),
+                max_connections: 4,
+            },
+            ingest_tx,
+        };
+        (state, writer_task)
+    }
+
+    async fn parse_replay_body(resp: axum::response::Response) -> ReplayResponseBody {
+        let bytes = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        serde_json::from_slice(&bytes).expect("parse ReplayResponse")
+    }
+
+    /// Build a `protocol::Event` JSONL line for use in the request body.
+    fn event_line(source: &str, session_id: &str, kind: EventKind, event_id: i64) -> String {
+        let e = Event {
+            event_id: EventId(event_id),
+            source: source.to_string(),
+            session_id: session_id.to_string(),
+            kind,
+            reaction: None,
+            payload: "{}".to_string(),
+            created_at: 1,
+        };
+        serde_json::to_string(&e).expect("serialize Event")
+    }
+
+    fn auth_post(uri: &str, body: Vec<u8>) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::AUTHORIZATION, BEARER_HEADER_VALUE)
+            .header(header::CONTENT_TYPE, "application/x-ndjson")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    /// Read up to `expected` broadcast frames from `rx` with a 2s overall
+    /// timeout; collects whatever arrives (lagged consumers panic).
+    async fn collect_frames(
+        rx: &mut tokio::sync::broadcast::Receiver<BroadcastEnvelope>,
+        expected: usize,
+    ) -> Vec<BroadcastEnvelope> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut out = Vec::with_capacity(expected);
+        while out.len() < expected && std::time::Instant::now() < deadline {
+            let budget = deadline.saturating_duration_since(std::time::Instant::now());
+            match tokio::time::timeout(budget, rx.recv()).await {
+                Ok(Ok(env)) => out.push(env),
+                Ok(Err(e)) => panic!("broadcast recv error: {e:?}"),
+                Err(_) => break,
+            }
+        }
+        out
+    }
+
+    /// AC #1: events POSTed to /replay arrive on broadcast subscribers as
+    /// `Event` + `State` frame pairs, in JSONL line order, with new
+    /// `event_id` and `created_at` (not the JSONL values).
+    #[tokio::test(flavor = "current_thread")]
+    async fn replay_forwards_events_through_broadcast_path() {
+        let (_tmp, pools) = fresh_pools().await;
+        let (state, _writer) = wired_state(pools).await;
+        let mut rx = state.broadcaster.subscribe();
+        let app = api::router(state.clone());
+
+        let body = [
+            event_line("claude", "sess-r1", EventKind::PreToolUse, 1000),
+            event_line("claude", "sess-r1", EventKind::PostToolUse, 1001),
+            event_line("claude", "sess-r1", EventKind::Stop, 1002),
+        ]
+        .join("\n");
+
+        let resp = app
+            .oneshot(auth_post("/replay", body.into_bytes()))
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let parsed = parse_replay_body(resp).await;
+        assert_eq!(parsed.replayed_count, 3);
+        assert!(parsed.parse_errors.is_empty(), "no parse errors expected");
+
+        // Expect 6 frames: 3 events × (Event, State).
+        let frames = collect_frames(&mut rx, 6).await;
+        assert_eq!(frames.len(), 6, "expected 6 frames; got {frames:?}");
+
+        // Frames arrive in JSONL line order; each event publishes
+        // Event then State.
+        let kinds: Vec<EventKind> = frames
+            .iter()
+            .filter_map(|f| match f {
+                BroadcastEnvelope::Event(e) => Some(e.kind.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                EventKind::PreToolUse,
+                EventKind::PostToolUse,
+                EventKind::Stop
+            ]
+        );
+
+        // event_id is reassigned (the JSONL values were 1000..1002; the
+        // daemon's AUTOINCREMENT starts at 1).
+        let event_ids: Vec<i64> = frames
+            .iter()
+            .filter_map(|f| match f {
+                BroadcastEnvelope::Event(e) => Some(e.event_id.0),
+                _ => None,
+            })
+            .collect();
+        for id in &event_ids {
+            assert!(
+                *id < 100,
+                "event_id {id} suspiciously large; replay should reassign from a fresh DB"
+            );
+        }
+
+        // created_at is reassigned to replay wall-clock (not the JSONL `1`).
+        for f in &frames {
+            if let BroadcastEnvelope::Event(e) = f {
+                assert!(
+                    e.created_at > 1_000_000_000_000,
+                    "created_at {} should be a recent unix-ms, not the JSONL placeholder 1",
+                    e.created_at
+                );
+            }
+        }
+    }
+
+    /// AC #4: events spanning two `(source, session_id)` keys produce
+    /// `State` frames for each session (one per event per session,
+    /// matching Story 2.2 semantics).
+    #[tokio::test(flavor = "current_thread")]
+    async fn replay_emits_state_frames_for_each_session() {
+        let (_tmp, pools) = fresh_pools().await;
+        let (state, _writer) = wired_state(pools).await;
+        let mut rx = state.broadcaster.subscribe();
+        let app = api::router(state.clone());
+
+        let body = [
+            event_line("claude", "sess-a", EventKind::PreToolUse, 1),
+            event_line("claude", "sess-b", EventKind::PreToolUse, 2),
+            event_line("claude", "sess-a", EventKind::PostToolUse, 3),
+            event_line("claude", "sess-b", EventKind::Stop, 4),
+        ]
+        .join("\n");
+
+        let resp = app
+            .oneshot(auth_post("/replay", body.into_bytes()))
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 4 events → 8 frames (Event+State per event). Count distinct
+        // session_ids in the State frames.
+        let frames = collect_frames(&mut rx, 8).await;
+        assert_eq!(frames.len(), 8, "expected 8 frames; got {frames:?}");
+        let mut state_sessions = std::collections::HashSet::new();
+        for f in &frames {
+            if let BroadcastEnvelope::State { session_id, .. } = f {
+                state_sessions.insert(session_id.clone());
+            }
+        }
+        assert!(
+            state_sessions.contains("sess-a") && state_sessions.contains("sess-b"),
+            "State frames must cover both sessions; got {state_sessions:?}"
+        );
+    }
+
+    /// AC #1: per-line parse failures don't fail the whole request — the
+    /// successful lines forward; the errors come back in the response body.
+    #[tokio::test(flavor = "current_thread")]
+    async fn replay_continues_on_per_line_parse_error() {
+        let (_tmp, pools) = fresh_pools().await;
+        let (state, _writer) = wired_state(pools).await;
+        let app = api::router(state);
+
+        let body = format!(
+            "{}\nINVALID JSON LINE\n{}\n",
+            event_line("claude", "sess-x", EventKind::PreToolUse, 1),
+            event_line("claude", "sess-x", EventKind::Stop, 2),
+        );
+
+        let resp = app
+            .oneshot(auth_post("/replay", body.into_bytes()))
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let parsed = parse_replay_body(resp).await;
+        assert_eq!(parsed.replayed_count, 2);
+        assert_eq!(parsed.parse_errors.len(), 1);
+        assert_eq!(parsed.parse_errors[0].line, 2);
+    }
+
+    /// AC #5 + Task 1.4: `RecordingStarted` / `RecordingEnded` sentinels
+    /// are rejected at the parse boundary with a clear error.
+    #[tokio::test(flavor = "current_thread")]
+    async fn replay_rejects_sentinel_kinds() {
+        let (_tmp, pools) = fresh_pools().await;
+        let (state, _writer) = wired_state(pools).await;
+        let app = api::router(state);
+
+        let body = event_line("claude", "sess-s", EventKind::RecordingStarted, 1);
+
+        let resp = app
+            .oneshot(auth_post("/replay", body.into_bytes()))
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let parsed = parse_replay_body(resp).await;
+        assert_eq!(parsed.replayed_count, 0);
+        assert_eq!(parsed.parse_errors.len(), 1);
+        assert!(
+            parsed.parse_errors[0].error.contains("sentinel"),
+            "expected sentinel-rejection message; got {:?}",
+            parsed.parse_errors[0]
+        );
+    }
+
+    /// Bearer-auth: missing header → 401; wrong token → 401; correct
+    /// token + valid body → 200.
+    #[tokio::test(flavor = "current_thread")]
+    async fn replay_requires_bearer() {
+        let (_tmp, pools) = fresh_pools().await;
+        let (state, _writer) = wired_state(pools).await;
+        let app = api::router(state);
+
+        // No Authorization header.
+        let body = event_line("claude", "sess-auth", EventKind::PreToolUse, 1);
+        let req_no_auth = Request::builder()
+            .method("POST")
+            .uri("/replay")
+            .body(Body::from(body.clone().into_bytes()))
+            .unwrap();
+        let resp = app.clone().oneshot(req_no_auth).await.expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Wrong bearer token.
+        let req_wrong = Request::builder()
+            .method("POST")
+            .uri("/replay")
+            .header(header::AUTHORIZATION, "Bearer wrong-token")
+            .body(Body::from(body.clone().into_bytes()))
+            .unwrap();
+        let resp = app.clone().oneshot(req_wrong).await.expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Correct bearer.
+        let resp = app
+            .oneshot(auth_post("/replay", body.into_bytes()))
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// AC #5: the JSONL line's `event_id` and `created_at` are dropped and
+    /// reassigned by the writer. Verifies by querying `events` directly
+    /// after the replay.
+    #[tokio::test(flavor = "current_thread")]
+    async fn replay_dropped_event_id_and_created_at_are_reassigned() {
+        let (_tmp, pools) = fresh_pools().await;
+        let (state, _writer) = wired_state(pools.clone()).await;
+        let app = api::router(state.clone());
+
+        // Provide a JSONL line with absurd event_id and created_at values.
+        let e = Event {
+            event_id: EventId(999_999),
+            source: "claude".to_string(),
+            session_id: "sess-reassign".to_string(),
+            kind: EventKind::PreToolUse,
+            reaction: None,
+            payload: "{}".to_string(),
+            created_at: 1,
+        };
+        let line = serde_json::to_string(&e).unwrap();
+
+        let resp = app
+            .oneshot(auth_post("/replay", line.into_bytes()))
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Wait for the writer task to drain. Poll the DB until the row
+        // shows up; bound at 2s.
+        let session_id_q = "sess-reassign".to_string();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let now_ms_test: i64 = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0),
+        )
+        .unwrap_or(0);
+        let mut maybe_row: Option<(i64, i64)> = None;
+        while std::time::Instant::now() < deadline {
+            let conn = pools.reader.get().await.expect("reader checkout");
+            let q_session = session_id_q.clone();
+            let result = conn
+                .interact(move |c| -> rusqlite::Result<Option<(i64, i64)>> {
+                    c.query_row(
+                        "SELECT event_id, created_at FROM events \
+                             WHERE source = 'claude' AND session_id = ?1 \
+                             ORDER BY event_id LIMIT 1",
+                        rusqlite::params![&q_session],
+                        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+                    )
+                    .map(Some)
+                    .or_else(|e| match e {
+                        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                        other => Err(other),
+                    })
+                })
+                .await
+                .expect("interact")
+                .expect("query");
+            if let Some(t) = result {
+                maybe_row = Some(t);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let (assigned_event_id, assigned_created_at) =
+            maybe_row.expect("replayed event must land in the events table within 2s");
+
+        // event_id was reassigned: the AUTOINCREMENT starts at 1, far below
+        // the 999_999 in the JSONL line.
+        assert!(
+            assigned_event_id < 100,
+            "event_id {assigned_event_id} should be a fresh AUTOINCREMENT value, not 999999"
+        );
+        // created_at was reassigned to wall-clock at write, not the JSONL
+        // placeholder `1`. Within ±5s of test wall-clock.
+        let drift = (assigned_created_at - now_ms_test).abs();
+        assert!(
+            drift < 5_000,
+            "created_at {assigned_created_at} differs from test wall-clock {now_ms_test} by {drift}ms (should be < 5000)"
+        );
+    }
+
+    /// AC #1 + Task 1.4: blank lines and `#`-prefixed comment lines are
+    /// silently skipped — they are NOT counted as `replayed_count` and they
+    /// do NOT show up as `parse_errors`. A body that is all comments and
+    /// blanks therefore returns `replayed_count: 0, parse_errors: []`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn replay_skips_blank_and_comment_lines() {
+        let (_tmp, pools) = fresh_pools().await;
+        let (state, _writer) = wired_state(pools).await;
+        let app = api::router(state);
+
+        // Body shape: comment, blank, real event, comment, blank, real event,
+        // trailing newline (which produces a final empty slice after split).
+        let body = format!(
+            "# replay fixture for skip-test\n\n{}\n# inline comment between events\n\n{}\n",
+            event_line("claude", "sess-skip", EventKind::PreToolUse, 1),
+            event_line("claude", "sess-skip", EventKind::Stop, 2),
+        );
+
+        let resp = app
+            .oneshot(auth_post("/replay", body.into_bytes()))
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let parsed = parse_replay_body(resp).await;
+        assert_eq!(
+            parsed.replayed_count, 2,
+            "only the two real event lines should be replayed"
+        );
+        assert!(
+            parsed.parse_errors.is_empty(),
+            "blank + comment lines must NOT produce parse errors; got {:?}",
+            parsed.parse_errors
+        );
+    }
+
+    /// A body that is all blank lines and comments returns
+    /// `replayed_count: 0, parse_errors: []`. This is the smallest valid
+    /// replay request — the endpoint must not 400 on an empty effective body.
+    #[tokio::test(flavor = "current_thread")]
+    async fn replay_with_only_comments_replays_zero_events() {
+        let (_tmp, pools) = fresh_pools().await;
+        let (state, _writer) = wired_state(pools).await;
+        let app = api::router(state);
+
+        let body = "# header\n# more notes\n\n# trailing comment\n".to_string();
+
+        let resp = app
+            .oneshot(auth_post("/replay", body.into_bytes()))
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let parsed = parse_replay_body(resp).await;
+        assert_eq!(parsed.replayed_count, 0);
+        assert!(parsed.parse_errors.is_empty());
     }
 }

@@ -1,6 +1,8 @@
 pub mod auth;
 pub mod daemon;
+pub mod export;
 pub mod install;
+pub mod replay;
 pub mod start;
 pub mod status;
 pub mod stop;

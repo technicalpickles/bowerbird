@@ -210,6 +210,13 @@ async fn run(config: Config, bowerbird_dir: PathBuf) -> anyhow::Result<()> {
         broadcaster.clone(),
         shutdown_requested.clone(),
     ));
+    // Story 4.1: clone the sender so the `POST /replay` endpoint can push
+    // envelopes onto the same channel the live-shim ingest path uses. The
+    // listener task takes ownership of the original sender; the clone lands
+    // in `AppState` below. Both halves push to the single `ingest_rx` drained
+    // by `ingest::writer::run`, so replayed events flow through the same
+    // writer → projection → broadcast path as live ingest.
+    let ingest_tx_for_state = ingest_tx.clone();
     let ingest_listener_task = tokio::spawn(ingest::listener::run_bound(
         ingest_listener,
         config.ingest_sock_path.clone(),
@@ -236,6 +243,7 @@ async fn run(config: Config, bowerbird_dir: PathBuf) -> anyhow::Result<()> {
         broadcaster,
         ws_semaphore: ws_semaphore.clone(),
         ws_config,
+        ingest_tx: ingest_tx_for_state,
     };
     let router = api::router(state);
     let listener = tokio::net::TcpListener::bind(config.bind_addr)

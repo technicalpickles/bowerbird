@@ -500,8 +500,12 @@ Not applicable.
 - launchd (macOS) and systemd (Linux) integration are deferred post-V1.
 
 **CLI framework: clap 4.x with derive macro**
-- Subcommands (top-level, alphabetical): `auth token`, `install`, `start`, `status`, `stop`, `uninstall`. `replay` and `export` arrive in Story 4.1 (Epic 4). `version` is provided by clap's built-in `--version` flag.
-- CLI binary is intentionally lightweight: no `tokio`, no `axum`, no `reqwest`. HTTP probes to `/healthz` and `/status` are hand-rolled over `std::net::TcpStream`. Daemon spawn uses `libc::setsid` directly. Verified per-story via `cargo tree -p bowerbird --depth 8 | grep -cE '^.* (tokio|axum) v' == 0`.
+- Subcommands (top-level, alphabetical): `auth token`, `export`, `install`, `replay`, `start`, `status`, `stop`, `uninstall`. `version` is provided by clap's built-in `--version` flag.
+- CLI binary is intentionally lightweight: no `tokio`, no `axum`, no `reqwest`. HTTP probes to `/healthz`, `/status`, `/sessions/{id}`, `/sessions/{id}/events`, and `POST /replay` are hand-rolled over `std::net::TcpStream`. Daemon spawn uses `libc::setsid` directly. Verified per-story via `cargo tree -p bowerbird --depth 8 | grep -cE '^.* (tokio|axum) v' == 0`.
+
+**Replay & Export (Story 4.1):**
+- `bowerbird replay [<file>]` reads JSONL of `protocol::Event` records, POSTs them to the daemon's new `POST /replay` endpoint (bearer-auth). The daemon strips `event_id` + `created_at`, constructs `EventEnvelope`s, and pushes them onto the existing `ingest_tx` channel — so replayed events flow through the same `ingest::writer::run` → `projection::session::write` → broadcast path as live ingest. The CLI's no-arg form uses a bundled fixture embedded via `include_bytes!("../../fixtures/replay-demo.jsonl")`. Replay does NOT preserve original inter-event timing; events are forwarded as fast as the channel accepts them. (`crates/daemon/src/api/replay.rs`, `src/commands/replay.rs`, `fixtures/replay-demo.jsonl`)
+- `bowerbird export <session-id>` reads `/sessions/<session-id>/events?since=<cursor>` in a cursor-paginated loop and writes JSONL of `protocol::Event` records to stdout (or `-o <path>`). The output shape is the input shape for `bowerbird replay`, so `bowerbird export <id> | bowerbird replay /dev/stdin` round-trips an entire session through the pub/sub path on the same daemon (or, after `bowerbird export <id> > session.jsonl`, on a different machine after `bowerbird install`). (`src/commands/export.rs`)
 
 **Distribution:**
 - Prebuilt tarballs (per `.github/workflows/release.yml`): macOS arm64 (`aarch64-apple-darwin`, native build on macos-latest), macOS x86_64 (`x86_64-apple-darwin`, cross-compiled from arm64 runner), Linux x86_64 (`x86_64-unknown-linux-gnu`, built on `ubuntu-22.04` for glibc 2.35+ baseline). Each tarball contains `bin/{bowerbird, bowerbird-shim, bowerbird-daemon}` plus `adapters/claude/tool-reactions.toml`, `LICENSE*`, `README.md`, `INSTALL.md`, `CHANGELOG.md`.
@@ -528,7 +532,7 @@ Not applicable.
 5. `crates/daemon` — axum REST endpoints + auth middleware
 6. `crates/daemon` — WebSocket pub/sub, DroppedFrame, HelloFrame
 7. `crates/adapter-claude` — hook normalization, shim installation
-8. CLI binary — clap subcommands (`install`/`uninstall`/`start`/`stop`/`status`/`auth token`), settings.json merge via `adapter-claude::install`, daemon spawn via `setsid`, PID-file + flock singleton, system-keychain token resolver. `replay`/`export` arrive in Epic 4.
+8. CLI binary — clap subcommands (`install`/`uninstall`/`start`/`stop`/`status`/`auth token`), settings.json merge via `adapter-claude::install`, daemon spawn via `setsid`, PID-file + flock singleton, system-keychain token resolver. `replay`/`export` ship in Story 4.1.
 
 **Cross-component dependencies:**
 - `protocol` is a dep of all crates; every change has maximum blast radius — dep budget tightest here
@@ -865,14 +869,14 @@ bowerbird/                              # CLI binary (workspace-root package, no
 │       ├── mod.rs                      # shared helpers (path resolution, daemon-binary discovery, ingest-socket probe)
 │       ├── auth.rs                     # `bowerbird auth token` + CLI-side token resolver (mirrors daemon chain)
 │       ├── daemon.rs                   # shared helpers: start_daemon_detached, stop_daemon_via_pid_file, hand-rolled HTTP probes
+│       ├── export.rs                   # `bowerbird export <session-id>` — fetch /sessions/{id}/events, write JSONL
 │       ├── install.rs                  # `bowerbird install` — settings.json merge + daemon spawn
+│       ├── replay.rs                   # `bowerbird replay [<file>]` — POST /replay with JSONL body (bundled fixture default)
 │       ├── start.rs                    # `bowerbird start`
 │       ├── status.rs                   # `bowerbird status` — resolution chain + /status probe + formatted block
 │       ├── stop.rs                     # `bowerbird stop`
 │       └── uninstall.rs                # `bowerbird uninstall` — settings.json removal + daemon stop
 └── (tests at workspace root in tests/cli_*.rs)
-
-# Epic 4 will add: src/commands/{replay,export}.rs
 ```
 
 Workspace-root tests for the CLI:
@@ -929,7 +933,7 @@ No overlap. No symlinks. Workspace root fixtures are the single authoritative so
 | FR18–FR23: REST + history | `crates/daemon/src/api/sessions.rs`, `events.rs`, `health.rs` |
 | FR24–FR26: Session tracking | `crates/daemon/src/projection/session.rs` (UPSERT) |
 | FR27–FR30: Install + lifecycle | `src/commands/{install,uninstall,start,stop,status,daemon}.rs`, `crates/adapter-claude/src/install.rs`, `crates/daemon/src/{singleton,server_file,config_file}.rs` |
-| FR31–FR35: Developer tools + examples | Epic 4 — `src/commands/{replay,export}.rs`, `examples/*/` (deferred) |
+| FR31–FR35: Developer tools + examples | `src/commands/{replay,export}.rs` (Story 4.1); `examples/*/` (Story 4.2 deferred); `docs/cookbook/` (Story 4.3 deferred) |
 | FR36–FR39: Protocol compat | `crates/protocol/` (wire types + constants) |
 
 ### Data Flow

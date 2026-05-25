@@ -19,6 +19,12 @@ pub struct AppState {
     pub broadcaster: Arc<BroadcastHub>,
     pub ws_semaphore: Arc<tokio::sync::Semaphore>,
     pub ws_config: WsConfig,
+    /// Sender clone for the daemon's single ingest channel. Owned by
+    /// `ingest::listener::run_bound` as the live-shim ingest path; the clone
+    /// here lets the `POST /replay` endpoint (Story 4.1) push envelopes onto
+    /// the same channel so replayed events flow through the existing
+    /// `ingest::writer::run` → `projection::session::write` → broadcast path.
+    pub ingest_tx: tokio::sync::mpsc::Sender<protocol::EventEnvelope>,
 }
 
 /// Small `Copy` snapshot of the WS-specific knobs so per-connection tasks
