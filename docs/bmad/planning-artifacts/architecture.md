@@ -362,7 +362,7 @@ verify all crate version pins compile, and get `cargo check --workspace` green.
 - SQLite schema (events, session_projections, recording_sessions)
 - Auth model split: Unix socket 0600 ingest / UUID4 bearer TCP
 - EventId(i64) AUTOINCREMENT cursor semantics
-- Process supervision: launchd (macOS V1); manual on Linux V1
+- Process supervision: backgrounded process via `setsid` (macOS + Linux V1); launchd / systemd integration deferred post-V1. CLI surfaces lifecycle: `bowerbird install` spawns the daemon detached, `bowerbird stop` sends SIGTERM with SIGKILL escalation after 10s.
 
 **Important Decisions (Shape Architecture):**
 - deadpool-sqlite writer(max=1) + readers(max=4) pool split
@@ -439,7 +439,7 @@ CREATE TABLE recording_sessions (
 - Bind: `127.0.0.1:<port>` only
 - Auth: UUID4 bearer token, `Authorization: Bearer <token>` header
 - `/healthz` and `/readyz` unauthenticated
-- Token storage: `keyring` v3 (system keychain primary → `BOWERBIRD_TOKEN` env-var → `~/.bowerbird/token` file mode 0600)
+- Token storage resolver: `BOWERBIRD_TOKEN` env-var → `keyring` v3 system keychain (macOS Keychain / Linux Secret Service, service=`bowerbird-daemon` user=`bearer-token`; UUID4 generated and stored on first run) → `~/.bowerbird/config.toml` `token` field (mode 0600 expected; warn but still load on wider mode). Env-first ordering is the Story 3.3 reconciliation of NFR12: test infrastructure reuse + escape-hatch ergonomics; documented inline in `crates/daemon/src/api/token.rs` module doc comment.
 
 **Invariants:**
 - Ingest path never reads or logs the bearer token
@@ -494,18 +494,22 @@ Not applicable.
 
 ### Infrastructure & Deployment
 
-**Process supervision:**
-- macOS V1: `bowerbird daemon install` writes a launchd plist to `~/Library/LaunchAgents/` and
-  runs `launchctl load`; `bowerbird daemon uninstall` reverses this
-- Linux V1: manual invocation only; systemd integration is post-V1
+**Process supervision (V1):**
+- `bowerbird install` writes the hook entries into `~/.claude/settings.json` (atomic: read → parse → merge → write `.tmp` → fsync → rename) and spawns the daemon detached via `setsid`. The daemon survives the install process's exit and is owned by the user's session.
+- `bowerbird uninstall` reverses the settings.json merge and sends SIGTERM to the daemon (10s drain budget, then SIGKILL escalation). The data directory at `~/.bowerbird/` is intentionally NOT removed — your event history is your data.
+- launchd (macOS) and systemd (Linux) integration are deferred post-V1.
 
 **CLI framework: clap 4.x with derive macro**
-- Subcommands: `daemon` (start/stop/status/install/uninstall), `replay`, `export`, `version`
+- Subcommands (top-level, alphabetical): `auth token`, `install`, `start`, `status`, `stop`, `uninstall`. `replay` and `export` arrive in Story 4.1 (Epic 4). `version` is provided by clap's built-in `--version` flag.
+- CLI binary is intentionally lightweight: no `tokio`, no `axum`, no `reqwest`. HTTP probes to `/healthz` and `/status` are hand-rolled over `std::net::TcpStream`. Daemon spawn uses `libc::setsid` directly. Verified per-story via `cargo tree -p bowerbird --depth 8 | grep -cE '^.* (tokio|axum) v' == 0`.
 
 **Distribution:**
-- Prebuilt binaries: macOS arm64, macOS x86_64, Linux x86_64 (glibc)
-- `cargo install` as alternative
-- `Cargo.lock` committed
+- Prebuilt tarballs (per `.github/workflows/release.yml`): macOS arm64 (`aarch64-apple-darwin`, native build on macos-latest), macOS x86_64 (`x86_64-apple-darwin`, cross-compiled from arm64 runner), Linux x86_64 (`x86_64-unknown-linux-gnu`, built on `ubuntu-22.04` for glibc 2.35+ baseline). Each tarball contains `bin/{bowerbird, bowerbird-shim, bowerbird-daemon}` plus `adapters/claude/tool-reactions.toml`, `LICENSE*`, `README.md`, `INSTALL.md`, `CHANGELOG.md`.
+- The shim binary in shipped tarballs is built under the `release-shim` profile (panic=abort, lto=fat, codegen-units=1, opt-level=z, strip=true) to preserve the p99 ≤5ms hot-path budget; the CLI and daemon use the default `release` profile.
+- `cargo install --git https://github.com/<owner>/bowerbird --tag vX.Y.Z` as alternative from-source path (NFR10: stable Rust 1.82+; no nightly required).
+- musl Linux is deferred post-V1 (NFR9). Windows is an explicit V1 scope cut.
+- Crates.io publishing deferred post-V1; verify namespace availability before tagging the first crates.io-targeted release.
+- `Cargo.lock` committed; `--locked` enforced on every release build.
 
 **Logging:**
 - `tracing` + `tracing-subscriber`; default level `error`; `RUST_LOG` override
@@ -524,13 +528,13 @@ Not applicable.
 5. `crates/daemon` — axum REST endpoints + auth middleware
 6. `crates/daemon` — WebSocket pub/sub, DroppedFrame, HelloFrame
 7. `crates/adapter-claude` — hook normalization, shim installation
-8. CLI binary — clap subcommands, launchd plist install/uninstall
+8. CLI binary — clap subcommands (`install`/`uninstall`/`start`/`stop`/`status`/`auth token`), settings.json merge via `adapter-claude::install`, daemon spawn via `setsid`, PID-file + flock singleton, system-keychain token resolver. `replay`/`export` arrive in Epic 4.
 
 **Cross-component dependencies:**
 - `protocol` is a dep of all crates; every change has maximum blast radius — dep budget tightest here
 - `shim` depends on `protocol` only; zero daemon deps — enforced by Cargo dep graph
 - `daemon` depends on `protocol`; normalizes via `SourceAdapter` at the ingest boundary
-- launchd integration depends on stable daemon binary path from the distribution step
+- CLI `bowerbird install` depends on the prebuilt-binary distribution from the release step (or `cargo install --git` for from-source installs); the hook entry written into `~/.claude/settings.json` uses `protocol::SHIM_BINARY_NAME` (= `"bowerbird-shim"`) as a PATH-relative name so re-downloads to a different `$PATH` location are picked up automatically without re-running `bowerbird install`.
 
 ---
 
@@ -853,22 +857,29 @@ bowerbird/
                                         # naming: <hook_type>/<scenario>.json
                                         # loaded via include_str!
 
-bowerbird/                              # CLI binary crate
+bowerbird/                              # CLI binary (workspace-root package, not under crates/)
 ├── Cargo.toml
-└── src/
-    ├── main.rs                         # clap entrypoint; anyhow::Context permitted here only
-    ├── client.rs                      # TCP daemon client; bearer token loading from keychain
-    └── commands/
-        ├── mod.rs
-        ├── daemon.rs                   # start / stop / status / install / uninstall
-        ├── replay.rs
-        ├── export.rs
-        └── version.rs
-└── tests/
-    └── integration/
-        ├── replay.rs                   # fixture-driven: bowerbird replay <fixture> → assert output
-        └── export.rs                   # fixture-driven: bowerbird export <fixture> → assert shape
+├── src/
+│   ├── main.rs                         # clap entrypoint; anyhow::Context permitted here only
+│   └── commands/
+│       ├── mod.rs                      # shared helpers (path resolution, daemon-binary discovery, ingest-socket probe)
+│       ├── auth.rs                     # `bowerbird auth token` + CLI-side token resolver (mirrors daemon chain)
+│       ├── daemon.rs                   # shared helpers: start_daemon_detached, stop_daemon_via_pid_file, hand-rolled HTTP probes
+│       ├── install.rs                  # `bowerbird install` — settings.json merge + daemon spawn
+│       ├── start.rs                    # `bowerbird start`
+│       ├── status.rs                   # `bowerbird status` — resolution chain + /status probe + formatted block
+│       ├── stop.rs                     # `bowerbird stop`
+│       └── uninstall.rs                # `bowerbird uninstall` — settings.json removal + daemon stop
+└── (tests at workspace root in tests/cli_*.rs)
+
+# Epic 4 will add: src/commands/{replay,export}.rs
 ```
+
+Workspace-root tests for the CLI:
+- `tests/cli_install.rs` — install / uninstall round-trip via real `bowerbird` subprocess
+- `tests/cli_lifecycle.rs` — start / stop / status round-trip via real `bowerbird` + `bowerbird-daemon` subprocesses
+- `tests/cli_auth.rs` — `bowerbird auth token` via real subprocess + `BOWERBIRD_KEYRING_BACKEND=mock|disable`
+- `tests/release_pipeline_docs.rs` — doc-drift guardrails (architecture.md ↔ source defaults, AC walkthrough markers, license metadata)
 
 ### Fixture Ownership
 
@@ -896,9 +907,10 @@ No overlap. No symlinks. Workspace root fixtures are the single authoritative so
 - All SQL strings in `crates/daemon/src/db/queries.rs`
 
 **API boundary:**
-- `api/auth.rs` — validation (timing-safe compare against stored token)
-- `api/token.rs` — UUID4 issuance on daemon start; `SecretString` wrapping
-- `bowerbird/src/client.rs` — CLI-side TCP client + keychain token loading
+- `crates/daemon/src/api/auth.rs` — validation (`subtle::ConstantTimeEq` timing-safe compare against stored token)
+- `crates/daemon/src/api/token.rs` — four-step token resolver (env → keychain → config.toml → `Err(TokenError)`); UUID4 generated and stored in keychain on first run; `secrecy::SecretString` wrapping
+- `src/commands/auth.rs` — CLI-side token resolver mirroring the daemon chain (CLI does not depend on `crates/daemon` to stay tokio-free)
+- `src/commands/daemon.rs` — hand-rolled HTTP/1.1 GET probes against `/healthz` and `/status` over `std::net::TcpStream` (no `reqwest`, no `ureq`)
 
 **Protocol crate boundary:**
 - `crates/protocol/src/constants.rs` owns `SHIM_BINARY_NAME` — single authoritative string used by `adapter-claude/src/install.rs`. No duplication across crates.
@@ -916,8 +928,8 @@ No overlap. No symlinks. Workspace root fixtures are the single authoritative so
 | FR10–FR17: WS pub/sub | `crates/daemon/src/api/ws.rs`, `crates/daemon/src/broadcast/` |
 | FR18–FR23: REST + history | `crates/daemon/src/api/sessions.rs`, `events.rs`, `health.rs` |
 | FR24–FR26: Session tracking | `crates/daemon/src/projection/session.rs` (UPSERT) |
-| FR27–FR30: Install + lifecycle | `bowerbird/src/commands/daemon.rs`, `crates/adapter-claude/src/install.rs` |
-| FR31–FR35: Developer tools + examples | `bowerbird/src/commands/replay.rs`, `export.rs`, `examples/*/` |
+| FR27–FR30: Install + lifecycle | `src/commands/{install,uninstall,start,stop,status,daemon}.rs`, `crates/adapter-claude/src/install.rs`, `crates/daemon/src/{singleton,server_file,config_file}.rs` |
+| FR31–FR35: Developer tools + examples | Epic 4 — `src/commands/{replay,export}.rs`, `examples/*/` (deferred) |
 | FR36–FR39: Protocol compat | `crates/protocol/` (wire types + constants) |
 
 ### Data Flow
@@ -934,9 +946,17 @@ Claude Code process
 tool REST client
   → api/events.rs → db/queries.rs (reader pool) → EventListResponse
 
-bowerbird CLI
-  → client.rs (TCP + bearer from keychain) → api/sessions.rs / health.rs
+bowerbird CLI (`bowerbird status`)
+  → src/commands/status.rs
+  → src/commands/auth.rs::resolve_token_for_cli (env → keychain → ~/.bowerbird/config.toml)
+  → src/commands/daemon.rs::http_get_status (TcpStream + bearer)
+  → crates/daemon/src/api/status.rs (semaphore permit count → DaemonStatus)
 ```
+
+CLI ↔ daemon discovery uses `~/.bowerbird/{bowerbird.pid, server.json, ingest.sock}`:
+- `bowerbird.pid` (Story 3.1 singleton): authoritative liveness — `kill(pid, 0)` probe.
+- `server.json` (Story 3.2): publishes the daemon's ephemeral bind-addr; written atomically with mode 0600; best-effort removed on clean shutdown. Hint, not liveness proof.
+- `ingest.sock` (Story 1.3): Unix domain socket for hot-path shim writes; CLI uses it as a second-layer liveness probe (`UnixStream::connect` succeeds → daemon is up and accepting).
 
 ---
 

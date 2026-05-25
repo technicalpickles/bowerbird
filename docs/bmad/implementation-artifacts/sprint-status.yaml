@@ -1,5 +1,5 @@
 # generated: 2026-05-16
-# last_updated: 2026-05-25 (story 3.4 → done after code review)
+# last_updated: 2026-05-25 (epic-3-retrospective → done; epic-3 → done)
 # project: bowerbird
 # project_key: NOKEY
 # tracking_system: file-system
@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-05-16
-last_updated: 2026-05-25 (story 3.4 → done after code review)
+last_updated: 2026-05-25 (epic-3-retrospective → done; epic-3 → done)
 project: bowerbird
 project_key: NOKEY
 tracking_system: file-system
@@ -64,12 +64,12 @@ development_status:
   epic-2-retrospective: done
 
   # Epic 3: Easy installation, lifecycle management, and secure access
-  epic-3: in-progress
+  epic-3: done
   3-1-bowerbird-install-and-uninstall: done
   3-2-daemon-lifecycle-cli: done
   3-3-bearer-token-auth-with-keychain-storage: done
   3-4-prebuilt-binary-distribution-and-release-pipeline: done
-  epic-3-retrospective: optional
+  epic-3-retrospective: done
 
   # Epic 4: Developer experience, replay, and protocol stability
   epic-4: backlog
