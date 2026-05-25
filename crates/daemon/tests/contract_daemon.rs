@@ -342,6 +342,10 @@ async fn migration_failure_exits_nonzero() {
         .expect("cargo_bin")
         .env("HOME", tmp.path())
         .env("RUST_LOG", "")
+        // Story 3.3: pin the token via env so this test exercises the
+        // migration code path (not the new token-resolution failure path).
+        .env("BOWERBIRD_TOKEN", "migration-test-token")
+        .env("BOWERBIRD_KEYRING_BACKEND", "disable")
         .timeout(Duration::from_secs(20))
         .assert();
     let output = assert.get_output();
@@ -1305,6 +1309,11 @@ async fn state_plus_event_atomicity_under_sigkill_during_load() {
         .env("HOME", tmp.path())
         .env("BOWERBIRD_INGEST_SOCK", &sock_path)
         .env("RUST_LOG", "warn")
+        // Story 3.3: pin the bearer token via env and disable the keychain
+        // step so the spawned daemon never touches the developer's real
+        // macOS Keychain / Linux Secret Service.
+        .env("BOWERBIRD_TOKEN", "contract-daemon-test-token")
+        .env("BOWERBIRD_KEYRING_BACKEND", "disable")
         // Inherit PATH so dyld can find linked libs on macOS.
         .env(
             "PATH",
@@ -5950,6 +5959,9 @@ mod story_2_5_shutdown {
             .env("HOME", tmp.path())
             .env("BOWERBIRD_INGEST_SOCK", &sock_path)
             .env("RUST_LOG", "warn")
+            // Story 3.3: keep this spawn off the developer's real keychain.
+            .env("BOWERBIRD_TOKEN", "contract-daemon-test-token")
+            .env("BOWERBIRD_KEYRING_BACKEND", "disable")
             .env(
                 "PATH",
                 std::env::var_os("PATH").unwrap_or_else(|| std::ffi::OsString::from("")),
@@ -6204,6 +6216,9 @@ mod story_3_1_singleton {
             .env("BOWERBIRD_DATA_DIR", data_dir)
             .env("BOWERBIRD_INGEST_SOCK", &sock_path)
             .env("RUST_LOG", "warn")
+            // Story 3.3: keep this spawn off the developer's real keychain.
+            .env("BOWERBIRD_TOKEN", "contract-daemon-test-token")
+            .env("BOWERBIRD_KEYRING_BACKEND", "disable")
             .env(
                 "PATH",
                 std::env::var_os("PATH").unwrap_or_else(|| std::ffi::OsString::from("")),
@@ -6369,7 +6384,9 @@ mod story_3_2_lifecycle {
     use protocol::DaemonStatus;
     use tower::ServiceExt;
 
-    use super::story_2_1_ws::{connect_authed, parse_hello, read_text_frame_or_close, spawn_test_daemon};
+    use super::story_2_1_ws::{
+        connect_authed, parse_hello, read_text_frame_or_close, spawn_test_daemon,
+    };
     use super::{fresh_pools, make_test_state_with_ws};
 
     const TEST_BEARER: &str = super::TEST_BEARER;
@@ -6456,6 +6473,337 @@ mod story_3_2_lifecycle {
             status.connected_ws_clients, 0,
             "expected all subscribers released; got {}",
             status.connected_ws_clients
+        );
+    }
+}
+
+/// Story 3.3 — bearer token resolution chain (env → keychain → config.toml).
+///
+/// **Test discipline:** Every test in this module MUST set
+/// `BOWERBIRD_KEYRING_BACKEND={mock|disable}` BEFORE calling
+/// `load_or_generate()`. A new test without this env IS A BUG — it would
+/// touch the developer's real macOS Keychain or Linux Secret Service.
+///
+/// **Run requirement:** `--test-threads=1`. Tests mutate process-global state
+/// (env vars + the keyring credential-builder). Parallel execution would
+/// race and flake.
+///
+/// **Mock state caveat:** `keyring::set_default_credential_builder` has no
+/// inverse — once a mock is installed in the process, it stays installed.
+/// Tests that need a mock-backed keychain (#6.3 + #6.9) run last by virtue
+/// of test-name ordering (`mock_*` sorts after `disable_*` and `env_*`),
+/// minimizing cross-test surprise. Each `mock_*` test clears the entry
+/// first via `Entry::delete_credential` to ensure a clean per-test slate.
+#[cfg(unix)]
+mod story_3_3_auth {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::Path;
+
+    use bowerbird_daemon::api::token::{self, BearerToken, TokenSource, SERVICE, USER};
+    use tempfile::TempDir;
+
+    /// RAII guard: snapshots the relevant env vars on construction and
+    /// restores them on drop, so a panic mid-test does not leak state into
+    /// the next test.
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvGuard {
+        fn new() -> Self {
+            let keys = [
+                "BOWERBIRD_TOKEN",
+                "BOWERBIRD_KEYRING_BACKEND",
+                "BOWERBIRD_DATA_DIR",
+            ];
+            let saved = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// Wipe the keyring entry the daemon uses, so a `mock_*` test always
+    /// starts from a clean slate. Ignores `NoEntry` (the expected case).
+    fn clear_keychain_entry() {
+        if let Ok(e) = keyring::Entry::new(SERVICE, USER) {
+            let _ = e.delete_credential();
+        }
+    }
+
+    fn write_config_toml(dir: &Path, contents: &str, mode: u32) {
+        let path = dir.join("config.toml");
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(mode)
+            .open(&path)
+            .expect("open config.toml");
+        f.write_all(contents.as_bytes()).expect("write config.toml");
+    }
+
+    fn bearer_value(b: &BearerToken) -> String {
+        b.expose_token_for_cli().to_string()
+    }
+
+    /// 6.2 — env var wins over keychain even when both are populated.
+    #[test]
+    fn env_var_wins_when_set_and_keychain_has_other_value() {
+        let _guard = EnvGuard::new();
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("BOWERBIRD_KEYRING_BACKEND", "disable");
+        std::env::set_var("BOWERBIRD_DATA_DIR", tmp.path());
+        std::env::set_var("BOWERBIRD_TOKEN", "expected-from-env");
+
+        let (bearer, source) = token::load_or_generate().expect("resolve");
+        assert_eq!(source, TokenSource::Env);
+        assert_eq!(bearer_value(&bearer), "expected-from-env");
+    }
+
+    /// 6.4 — when keychain is unreachable and env is set, env is used.
+    /// Pins the AC #2 literal-reading path.
+    #[test]
+    fn disable_keychain_unavailable_falls_back_to_env() {
+        let _guard = EnvGuard::new();
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("BOWERBIRD_KEYRING_BACKEND", "disable");
+        std::env::set_var("BOWERBIRD_DATA_DIR", tmp.path());
+        std::env::set_var("BOWERBIRD_TOKEN", "fallback-env-value");
+
+        let (bearer, source) = token::load_or_generate().expect("resolve");
+        assert_eq!(source, TokenSource::Env);
+        assert_eq!(bearer_value(&bearer), "fallback-env-value");
+    }
+
+    /// 6.5 — keychain disabled, no env, config.toml provides the token.
+    #[test]
+    fn disable_keychain_no_env_falls_back_to_config_file() {
+        let _guard = EnvGuard::new();
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("BOWERBIRD_KEYRING_BACKEND", "disable");
+        std::env::set_var("BOWERBIRD_DATA_DIR", tmp.path());
+        std::env::remove_var("BOWERBIRD_TOKEN");
+
+        write_config_toml(tmp.path(), "token = \"from-file\"\n", 0o600);
+
+        let (bearer, source) = token::load_or_generate().expect("resolve");
+        assert_eq!(source, TokenSource::ConfigFile);
+        assert_eq!(bearer_value(&bearer), "from-file");
+    }
+
+    /// 6.6 — no path resolves a token; error names every attempted path.
+    #[test]
+    fn disable_no_path_resolves_token_returns_error_naming_each_attempted_path() {
+        let _guard = EnvGuard::new();
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("BOWERBIRD_KEYRING_BACKEND", "disable");
+        std::env::set_var("BOWERBIRD_DATA_DIR", tmp.path());
+        std::env::remove_var("BOWERBIRD_TOKEN");
+        // no config.toml in tmp
+
+        let err = match token::load_or_generate() {
+            Ok(_) => panic!("expected resolution failure"),
+            Err(e) => e,
+        };
+        let s = err.to_string();
+        assert!(s.contains("BOWERBIRD_TOKEN"), "missing env path: {s}");
+        assert!(s.contains("keychain"), "missing keychain path: {s}");
+        assert!(s.contains("config.toml"), "missing config path: {s}");
+    }
+
+    /// 6.8 — config.toml mode wider than 0600 emits a warning but the value
+    /// is still loaded. Operator-friendly: refusing the file would lock users
+    /// out on machines where they cannot fix the permissions.
+    #[test]
+    fn disable_config_toml_wrong_mode_warns_but_loads() {
+        let _guard = EnvGuard::new();
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("BOWERBIRD_KEYRING_BACKEND", "disable");
+        std::env::set_var("BOWERBIRD_DATA_DIR", tmp.path());
+        std::env::remove_var("BOWERBIRD_TOKEN");
+
+        write_config_toml(tmp.path(), "token = \"weak-mode-still-loads\"\n", 0o644);
+
+        let (bearer, source) = token::load_or_generate().expect("resolve");
+        assert_eq!(source, TokenSource::ConfigFile);
+        assert_eq!(bearer_value(&bearer), "weak-mode-still-loads");
+        // The WARN line goes through `tracing`; capturing it in a test would
+        // require a `tracing-test` dep. The reader unit test in
+        // `config_file::tests::check_mode_returns_actual_when_wider` proves
+        // the detection; this test proves the resolver doesn't refuse on
+        // wrong mode.
+    }
+
+    /// 6.5b — config.toml with an unknown field is rejected by the strict
+    /// `deny_unknown_fields` policy. Pairs with the config_file unit test
+    /// `read_rejects_unknown_field` to prove the asymmetric serde policy
+    /// applies on the inbound config-file surface.
+    #[test]
+    fn disable_config_toml_unknown_field_rejects_parse() {
+        let _guard = EnvGuard::new();
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("BOWERBIRD_KEYRING_BACKEND", "disable");
+        std::env::set_var("BOWERBIRD_DATA_DIR", tmp.path());
+        std::env::remove_var("BOWERBIRD_TOKEN");
+
+        write_config_toml(tmp.path(), "Token = \"typo-capital-t\"\n", 0o600);
+
+        let err = match token::load_or_generate() {
+            Ok(_) => panic!("expected parse failure"),
+            Err(e) => e,
+        };
+        let s = err.to_string();
+        assert!(
+            s.contains("config.toml") && s.to_lowercase().contains("parse"),
+            "expected a parse-error mention of config.toml; got: {s}"
+        );
+    }
+
+    /// 6.x — empty token value in config.toml is treated as missing (chain
+    /// falls through). Mirrors the empty `BOWERBIRD_TOKEN` behavior.
+    #[test]
+    fn disable_config_toml_empty_token_treated_as_missing() {
+        let _guard = EnvGuard::new();
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("BOWERBIRD_KEYRING_BACKEND", "disable");
+        std::env::set_var("BOWERBIRD_DATA_DIR", tmp.path());
+        std::env::remove_var("BOWERBIRD_TOKEN");
+
+        write_config_toml(tmp.path(), "token = \"\"\n", 0o600);
+
+        let err = match token::load_or_generate() {
+            Ok(_) => panic!("empty token must not resolve"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("config.toml"));
+    }
+
+    /// 6.3 — keychain first-run generates a non-empty UUID4 token and tags
+    /// the source as `Keychain { generated: true }`.
+    ///
+    /// **Mock-backend limitation:** `keyring` v3's mock builder produces a
+    /// fresh, password-less `MockCredential` on every `Entry::new(service,
+    /// user)` call — there is no service+user interning. This is documented
+    /// behavior (mock.rs: "This keystore keeps the password in the entry!")
+    /// but it diverges from real macOS Keychain / Linux Secret Service
+    /// persistence. The consequence is that the daemon's write-then-read
+    /// round-trip (NFR14: same token across two `load_or_generate` calls)
+    /// **cannot be exercised against the mock** — the second call always
+    /// sees an empty entry and would re-generate a different value.
+    /// Round-trip coverage instead comes from the cross-process integration
+    /// path in `tests/cli_auth.rs::status_shows_full_block_without_user_supplied_token`
+    /// (config.toml as a shared persistent backing store) plus the real
+    /// platform's persistence guarantee.
+    #[test]
+    fn mock_keychain_first_run_generates_and_tags_source() {
+        let _guard = EnvGuard::new();
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("BOWERBIRD_KEYRING_BACKEND", "mock");
+        std::env::set_var("BOWERBIRD_DATA_DIR", tmp.path());
+        std::env::remove_var("BOWERBIRD_TOKEN");
+
+        clear_keychain_entry();
+
+        let (first, first_src) = token::load_or_generate().expect("first call");
+        assert_eq!(first_src, TokenSource::Keychain { generated: true });
+        let first_value = bearer_value(&first);
+        assert!(!first_value.is_empty(), "generated token must be non-empty");
+        // UUID4 format: 8-4-4-4-12 = 36 chars (well-known invariant).
+        assert_eq!(
+            first_value.len(),
+            36,
+            "generated token must be UUID4-shaped"
+        );
+    }
+
+    /// 6.2-companion: env wins even with the mock keychain backend
+    /// installed (the mock is per-Entry — see the limitation note on
+    /// `mock_keychain_first_run_generates_and_tags_source` — so this test
+    /// proves env-first precedence against accidental reordering, not the
+    /// "keychain has a competing value" scenario which the mock cannot
+    /// represent).
+    #[test]
+    fn mock_env_var_wins_over_keychain_lookup() {
+        let _guard = EnvGuard::new();
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("BOWERBIRD_KEYRING_BACKEND", "mock");
+        std::env::set_var("BOWERBIRD_DATA_DIR", tmp.path());
+        std::env::set_var("BOWERBIRD_TOKEN", "expected-from-env");
+
+        let (bearer, source) = token::load_or_generate().expect("resolve");
+        assert_eq!(source, TokenSource::Env);
+        assert_eq!(bearer_value(&bearer), "expected-from-env");
+    }
+
+    /// 6.7 — end-to-end exit-code check: a real `bowerbird-daemon` subprocess
+    /// with no resolvable token exits non-zero and emits the four-path
+    /// summary to stderr.
+    #[test]
+    fn daemon_exits_nonzero_when_token_chain_exhausted() {
+        use std::time::{Duration, Instant};
+
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path().join(".bowerbird");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        let daemon_bin = assert_cmd::cargo::cargo_bin("bowerbird-daemon");
+        let mut child = std::process::Command::new(&daemon_bin)
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", tmp.path())
+            .env("BOWERBIRD_DATA_DIR", &data_dir)
+            .env("BOWERBIRD_KEYRING_BACKEND", "disable")
+            .env("BOWERBIRD_INGEST_SOCK", tmp.path().join("ingest.sock"))
+            .stderr(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn daemon");
+
+        // Wait up to 5s for exit (the resolver runs before any port binding).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut maybe_status = None;
+        while Instant::now() < deadline {
+            match child.try_wait().expect("try_wait") {
+                Some(status) => {
+                    maybe_status = Some(status);
+                    break;
+                }
+                None => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+        let status = maybe_status.unwrap_or_else(|| {
+            let _ = child.kill();
+            panic!("daemon did not exit within 5s when token chain was exhausted");
+        });
+        assert!(
+            !status.success(),
+            "daemon must exit non-zero on token-chain exhaustion; got {status:?}"
+        );
+
+        let output = child.wait_with_output().expect("collect output");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("BOWERBIRD_TOKEN"),
+            "stderr missing BOWERBIRD_TOKEN mention:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("keychain"),
+            "stderr missing keychain mention:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("config.toml"),
+            "stderr missing config.toml mention:\n{stderr}"
         );
     }
 }

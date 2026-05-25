@@ -22,9 +22,22 @@ fn bowerbird_bin() -> Command {
     cmd.env_remove("BOWERBIRD_DATA_DIR");
     cmd.env_remove("BOWERBIRD_DAEMON_BIN");
     cmd.env_remove("BOWERBIRD_INGEST_SOCK");
-    cmd.env_remove("BOWERBIRD_TOKEN");
+    // Story 3.3: every lifecycle invocation gets a default test token via
+    // env (env wins over keychain in the resolver chain) AND disables the
+    // keychain step (defense in depth: if a test removes BOWERBIRD_TOKEN,
+    // the daemon won't fall through to the developer's real macOS Keychain /
+    // Linux Secret Service). Tests that need a specific token override
+    // BOWERBIRD_TOKEN after calling this helper. The daemon child inherits
+    // both via `spawn_detached`'s env passthrough.
+    cmd.env("BOWERBIRD_TOKEN", LIFECYCLE_TEST_TOKEN);
+    cmd.env("BOWERBIRD_KEYRING_BACKEND", "disable");
     cmd
 }
+
+/// Shared default token used by every lifecycle test that does not override
+/// `BOWERBIRD_TOKEN`. Lifts the pre-Story-3.3 "daemon mints ephemeral, CLI
+/// shows degraded status" pattern to "both sides agree on a known value."
+const LIFECYCLE_TEST_TOKEN: &str = "lifecycle-default-test-token";
 
 fn data_dir(tmp: &TempDir) -> PathBuf {
     tmp.path().join(".bowerbird")
@@ -263,10 +276,7 @@ fn help_lists_all_lifecycle_subcommands() {
     let assertion = cmd.arg("--help").assert().success();
     let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).into_owned();
     for name in ["install", "start", "status", "stop", "uninstall"] {
-        assert!(
-            stdout.contains(name),
-            "help missing `{name}`:\n{stdout}"
-        );
+        assert!(stdout.contains(name), "help missing `{name}`:\n{stdout}");
     }
 }
 

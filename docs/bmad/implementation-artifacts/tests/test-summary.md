@@ -1,53 +1,66 @@
-# Test Automation Summary — Story 3.2
+# Test Automation Summary — Story 3.3
 
-Generated 2026-05-24 via `bmad-qa-generate-e2e-tests`. Prior summary covered Story 3.1; superseded here.
+Generated 2026-05-25 via `bmad-qa-generate-e2e-tests`. Supersedes the Story 3.2 summary and its 3.3 addendum.
 
 ## Gap Analysis
 
-Story 3.2 (daemon lifecycle CLI) landed with substantial test coverage already:
+Story 3.3 (bearer-token auth with keychain storage) landed with substantial test coverage from the dev-story run:
 
-- `tests/cli_lifecycle.rs` (existing, 7 tests) — `status_when_no_pid_file_reports_stopped`, `start_then_status_then_stop_round_trip`, `start_when_already_running_is_idempotent`, `stop_when_not_running_is_a_clean_noop`, `start_recovers_from_stale_pid_file`, `help_lists_all_lifecycle_subcommands`, plus the implicit AC #5 coverage from Story 3.1's `tests/cli_install.rs`.
-- `crates/daemon/tests/contract_daemon.rs::story_3_2_lifecycle` (existing, 2 tests) — `status_reports_zero_ws_clients_when_no_subscribers` and `status_reports_active_ws_subscriber_count` via `tower::ServiceExt::oneshot` against the axum router. Drives `DaemonStatus.connected_ws_clients` through a real `try_acquire_owned` checkout/release cycle on the `ws_semaphore`.
-- `src/commands/status.rs::tests` (in-module) — `format_uptime` boundary tests for the hand-rolled `Duration → "1h 23m 7s"` formatter.
-- `src/commands/daemon.rs::tests` (in-module) — `parse_status_code`, `body_after_headers`, `find_subslice` for the hand-rolled HTTP/1.1 client.
+- `crates/daemon/tests/contract_daemon.rs::story_3_3_auth` (10 tests) — resolver-chain unit/contract coverage for every branch (env wins, keychain disabled→env, keychain disabled→config.toml, all paths exhausted, wrong-mode warns, unknown-field rejected, empty-token === missing, mock-keychain generate, mock+env wins, daemon-subprocess exit-code on chain exhaustion).
+- `tests/cli_auth.rs` (7 tests) — CLI E2E for `bowerbird auth token` covering env / config.toml / failure / piped-stderr / clap help / wide-mode warning / `bowerbird status` full-block.
+- `crates/daemon/src/api/token.rs::tests` (6 unit tests in-module) — `BearerToken::verify` semantics + `TokenError::Display` shape.
+- `crates/daemon/src/config_file.rs::tests` (6 unit tests in-module) — `read()` happy/missing/parse-error/unknown-field, `check_mode()` 0600/wider.
+- `src/commands/auth.rs::tests` (2 unit tests in-module) — `TokenSource::Display` user-facing shape + `TokenError::Display`.
 
-Two gaps remained after that baseline:
+Three gaps remained after that baseline:
 
-**Gap A — `bowerbird status` full-block rendering for AC #3 + AC #6.** The existing round-trip test only asserts `stdout.contains("running")` and the pid. Because the daemon mints an ephemeral random bearer token when `$BOWERBIRD_TOKEN` is unset (`crates/daemon/src/api/token.rs:60`) and the CLI reads the same env var (`src/commands/status.rs:74`), running `bowerbird status` from the test always falls into the `print_running_basic` degraded path. The `print_full_status` formatter — the only place that emits `connected ws  : N` and `uptime`, `version`, `protocol`, `last event` — had zero E2E coverage. The daemon contract test proved the JSON shape; nothing proved the CLI rendered it.
+**Gap A — NFR14 "token never reloaded at runtime without a restart" had no E2E proof.** The dev-story dropped Task 6.9 (`keychain_value_preserved_across_two_load_or_generate_calls`) because the keyring v3 mock builder produces a fresh `MockCredential` per `Entry::new(service, user)` call — it has no service+user interning, so a write-then-read round-trip cannot be exercised against the mock. The Completion Notes claim NFR14 is "exercised by `status_shows_full_block_without_user_supplied_token`," but that test only proves the daemon and CLI resolve to the *same* config.toml value at startup — it does NOT prove the daemon ignores a *later* mutation to config.toml. Without an E2E rotation test, a future change that adds e.g. `tokio::time::interval(...).then(reread_config_toml)` would silently regress NFR14: every existing 3.3 test still passes because none of them touch config.toml after the daemon starts.
 
-**Gap B — `bowerbird status` stale-PID-file path.** The `print_stopped(Some(...))` branch in `status::run` (line 42-45) covers the case where `bowerbird.pid` names a process that has already exited. The start-side stale-PID recovery is covered by `start_recovers_from_stale_pid_file`, but the *status*-side reporting branch had no test.
+**Gap B — Task 7.4 (daemon→CLI direct token round-trip) was never landed.** The story explicitly scoped a test asserting "the daemon's authoritative token and the CLI's emitted token agree." The existing `status_shows_full_block_without_user_supplied_token` test proves the daemon's `/status` handler accepts the CLI's resolved bearer — but it doesn't prove that `bowerbird auth token` (the user-visible CLI surface) prints the same value the daemon caches. A rename of `SERVICE` / `USER` in one binary but not the other would silently break the keychain-path round-trip; renaming the file-format expectations would silently break the config.toml-path round-trip. The CLI's emitted token needs its own equality check against the daemon's authoritative copy.
+
+**Gap C — `bowerbird auth token` failure mode lacked an exact-exit-code assertion.** Task 3.4 of the story spec is explicit ("Exit code MUST be 1 on failure"); the existing `auth_token_returns_nonzero_when_all_paths_exhausted` test used `.failure()`, which accepts any non-zero. A future change that exits 2 (clap's reserved code) instead of 1 — e.g., a refactor that bubbles `anyhow` errors through clap's parse error path — would silently regress the contract.
 
 ## Generated Tests
 
-### E2E Tests (new)
+### CLI E2E Tests (new — `tests/cli_auth.rs`)
 
-- `tests/cli_lifecycle.rs::status_with_shared_token_renders_full_block_including_ws_clients` — AC #3 + AC #6. Sets `BOWERBIRD_TOKEN` on both the spawn and the status invocation so the daemon (which inherits env via `spawn_detached`) and the CLI share a known token. Asserts each labeled row of the full status block — `status        : running`, `pid           :`, `version       :`, `protocol      :`, `uptime        :`, `connected ws  : 0`, `last event    :` — appears in stdout. Asserts the token-unset hint *does not* appear (regression canary for env inheritance / token plumbing). Uses a deferred `cleanup` closure so a failed assertion does not leak a daemon into the test runner.
-- `tests/cli_lifecycle.rs::status_with_stale_pid_file_reports_stopped_stale` — AC #3 (stopped path, stale variant). Spawns and reaps `Command::new("true")` to obtain a known-dead PID (same trick used by `start_recovers_from_stale_pid_file`), writes it to `~/.bowerbird/bowerbird.pid`, runs `bowerbird status`, asserts stdout contains `stopped` + `stale pid` + the dead pid integer. Exercises the `print_stopped(Some(...))` branch in `src/commands/status.rs:42-45`.
+- **`auth_token_matches_daemon_token_via_shared_config_file`** — Task 7.4 (AC #4). Stages a `config.toml` with a known token, spawns the daemon (no env, keychain disabled — forcing the resolver to land on the file), runs `bowerbird auth token` (same env discipline), asserts the CLI's stdout is exactly the token plus `\n`. The mock-keyring backend cannot bridge subprocess boundaries (see the resolver-test limitation comment), so config.toml is the shared persistent backing — the recommended option-1 path from the story's sub-decision section.
+- **`config_toml_rotation_does_not_affect_running_daemon`** — NFR14 (AC #1, AC #5). Stages a `config.toml` with token A, starts the daemon (which caches A in `AppState.bearer`), rewrites `config.toml` to token B, then runs `bowerbird status` twice — once with `BOWERBIRD_TOKEN=A` (env wins in the resolver chain, so this is the in-flight Bearer the CLI sends to `/status`) and once with `BOWERBIRD_TOKEN=B`. The A invocation must render the full `running` block (proves the daemon kept A); the B invocation must produce a 401-degraded message (proves the daemon did NOT reload the rotated file). Fills the dropped Task 6.9 at the E2E layer that the resolver-level mock could not reach.
+
+### CLI E2E Tests (tightened — `tests/cli_auth.rs`)
+
+- **`auth_token_returns_nonzero_when_all_paths_exhausted`** — Task 7.6 contract sharpened from `.failure()` to `.failure().code(1)` to match Task 3.4's exact-exit-1 spec. NFR13 end-to-end stays unchanged otherwise.
 
 ### Supporting changes
 
-None. Both tests fit inside the existing `tests/cli_lifecycle.rs` helper surface (`bowerbird_cmd_in`, `data_dir`, `read_pid_file`, `wait_for_daemon_up`, `wait_for_pid_dead`, `force_stop`). No new crates, no new helpers, no `Cargo.toml` changes.
+Two private helpers added at the bottom of `tests/cli_auth.rs`:
+
+- `spawn_daemon_with_config_toml_backing(&tmp, &daemon_bin)` — `bowerbird start` with `BOWERBIRD_TOKEN` removed and the keychain disabled, then polls the ingest socket up to 5s. Used by both new tests so the spawn pattern stays consistent and the ingest-socket-up wait is not duplicated.
+- `stop_daemon(&tmp, &daemon_bin)` — `bowerbird stop` plus a 5s pid-death poll. Called before any panic in the new tests so a content mismatch or 401-shape mismatch never leaks a daemon into the runner's process tree.
+
+No new crates, no new workspace dependencies, no test framework changes. Both helpers use only the existing `bowerbird_auth_command` env discipline and `assert_cmd::cargo::cargo_bin`.
 
 ## Coverage
 
-| AC | Daemon contract tests | CLI E2E tests |
+| AC / NFR | Resolver-level (daemon contract) | CLI E2E |
 |---|---|---|
-| #1 `start` → `/healthz` 200 within 2s | n/a (Story 1.7 covers `/healthz`) | ✅ existing |
-| #2 `stop` → SIGTERM + graceful shutdown | ✅ Story 2.5 | ✅ existing |
-| #3 `status` shows version + uptime + liveness; "stopped" when not running | n/a | ✅ existing (stopped + running) + **new** (full block + stale-PID variant) |
-| #4 stale-PID → `start` recovers; `/readyz` 200 | ✅ Story 3.1 singleton tests | ✅ existing (start path) |
-| #5 install auto-starts daemon | n/a | ✅ Story 3.1's `tests/cli_install.rs` (out of scope for 3.2) |
-| #6 `connected_ws_clients` on `GET /status` and `bowerbird status` | ✅ existing (JSON shape via `oneshot`) | ✅ **new** (CLI rendering of `connected ws  : 0`) |
-| #7 protocol-surface additions (`DaemonStatus.connected_ws_clients`, doc + deferred-work strike) | ✅ existing (field is used by the contract test); doc/file changes are static review-time | n/a |
+| AC #1 first-run UUID4 keychain + reused next run | ✅ `mock_keychain_first_run_generates_and_tags_source` (generate branch; mock limitation on read-back documented inline) | ✅ existing env/config-file paths + **new** `auth_token_matches_daemon_token_via_shared_config_file` (round-trip via config.toml backing) |
+| AC #2 keychain unavailable → env → config.toml | ✅ `env_var_wins_*`, `disable_keychain_unavailable_falls_back_to_env`, `disable_keychain_no_env_falls_back_to_config_file` | ✅ existing env + config.toml stdout-shape tests |
+| AC #3 no token → exit non-zero + enumerated paths (NFR13) | ✅ `disable_no_path_resolves_token_returns_error_naming_each_attempted_path`, `daemon_exits_nonzero_when_token_chain_exhausted` (subprocess) | ✅ **tightened** `auth_token_returns_nonzero_when_all_paths_exhausted` (now asserts exit code is exactly 1) |
+| AC #4 `bowerbird auth token` pipe-safe stdout | n/a | ✅ existing `auth_token_prints_env_var_when_set`, `auth_token_reads_from_config_toml_when_no_env_and_no_keychain`, `auth_token_stderr_quiet_when_piped`, `auth_appears_in_top_level_help_and_token_appears_in_auth_help`, `auth_token_warns_on_wide_mode_but_still_loads`, **new** `auth_token_matches_daemon_token_via_shared_config_file` |
+| AC #5 rotation requires restart (NFR14) | ⚠️ resolver-level test (Task 6.9) dropped — mock backend cannot model service+user persistence | ✅ **new** `config_toml_rotation_does_not_affect_running_daemon` (E2E proof that daemon caches at startup and ignores mid-run config changes) |
+| AC #6 `bowerbird status` auto-resolves token (no `$BOWERBIRD_TOKEN` required) | n/a | ✅ existing `status_shows_full_block_without_user_supplied_token` |
+| AC #6 placeholders removed, docs updated | n/a (static review) | ✅ verified via `grep -rn "wait for Story 3.3" src/ crates/` → 0 hits |
 
 ## Validation
 
-- [x] `cargo test --workspace -- --test-threads=1` — **288 passed (16 suites, 12.00s)**. Prior baseline was 286 (per `Completion Notes` in `3-2-daemon-lifecycle-cli.md`); the 2 new tests bring the count to 288.
-- [x] `cargo clippy --workspace --all-targets -- -D warnings` — **0 issues**.
+- [x] `cargo test --workspace -- --test-threads=1 --skip state_plus_event_atomicity_under_sigkill_during_load` — **316 passed (17 suites, ~23s)**. Baseline 314 + 2 new tests. 1 filtered out (the known pre-existing teardown deadlock in `state_plus_event_atomicity_under_sigkill_during_load`, skipped per orchestration custom instructions).
+- [x] `cargo clippy --workspace --all-targets` — **0 issues**.
+- [x] Both new tests inherit the file-level isolation discipline (per-test `TempDir`, `BOWERBIRD_DATA_DIR` set via `bowerbird_auth_command`, `BOWERBIRD_KEYRING_BACKEND=disable` default, `BOWERBIRD_TOKEN` removed via the helper, `BOWERBIRD_CLAUDE_SETTINGS` / `BOWERBIRD_DAEMON_BIN` / `BOWERBIRD_INGEST_SOCK` cleared). They cannot touch the developer's real `~/.bowerbird/` or real platform keychain.
 
 ## Notes
 
-- Both new tests inherit the file-level isolation discipline (per-test `TempDir`, `BOWERBIRD_DATA_DIR` + `BOWERBIRD_DAEMON_BIN` + `BOWERBIRD_CLAUDE_SETTINGS` cleared via the `bowerbird_bin` env-remove block). They cannot touch the developer's real `~/.bowerbird/`.
-- The full-block test sets `BOWERBIRD_TOKEN` to a fixed literal (`bb-test-token-3-2`) on both the spawn and the status invocation so the daemon's `load_or_generate` returns the same value the CLI reads — that's the single env-var the daemon and CLI must agree on for the bearer-gated `/status` path to succeed. The test asserts the absence of `$BOWERBIRD_TOKEN` in stdout as a regression canary against the env-inheritance contract.
-- Scope kept tight to Story 3.2 per orchestration custom instructions; no unrelated code refactored, no test framework changes, no new crate dependencies. Both tests use only existing helpers from the file.
-- `--test-threads=1` retained per Epic 2 retro AI-3 + Story 3.1 retro — the new tests spawn real daemon subprocesses and share TCP-port + PID-file state with the rest of `cli_lifecycle.rs`.
+- Scope kept tight to Story 3.3 per orchestration custom instructions; no unrelated code refactored, no new dependencies, no test framework changes. The two new tests use only existing helpers and the established `assert_cmd` + `TempDir` pattern.
+- `--test-threads=1` retained per Epic 2 retro AI-3 + Story 3.1/3.2 + 3.3 lessons — the new tests spawn real daemon subprocesses and share PID-file / ingest-socket state with `cli_lifecycle.rs`.
+- The keychain mock backend's "no service+user interning" limitation (documented inline on `mock_keychain_first_run_generates_and_tags_source`) is what made the rotation test land at the E2E layer instead of the resolver layer. The persistent backing chosen (`config.toml`) mirrors the story's option-1 recommendation from the cross-process keychain mock sub-decision.
+- The rotation test's 401-arm relies on the CLI's `print_running_basic(... "keychain-resolved token rejected by /status (401); ...")` wording from `src/commands/status.rs:101-107` — a future copy-edit on that string would need to keep the substring `running` + `401` to stay green.

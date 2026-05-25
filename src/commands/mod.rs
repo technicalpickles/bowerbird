@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod daemon;
 pub mod install;
 pub mod start;

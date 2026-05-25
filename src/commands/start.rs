@@ -7,9 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use clap::Args;
 
-use super::daemon::{
-    self, wait_for_server_json, HealthzOutcome, StartOutcome,
-};
+use super::daemon::{self, wait_for_server_json, HealthzOutcome, StartOutcome};
 
 /// No flags in v1. `--detach` is implicit (the daemon is always detached;
 /// foreground is a `cargo run -p bowerbird-daemon` workflow for development,
@@ -33,7 +31,9 @@ pub fn run(_args: StartArgs) -> anyhow::Result<()> {
                 .ok()
                 .flatten();
             match pid {
-                Some(p) => println!("daemon already running (pid {p}); use 'bowerbird stop' to stop it"),
+                Some(p) => {
+                    println!("daemon already running (pid {p}); use 'bowerbird stop' to stop it")
+                }
                 None => println!("daemon already running; use 'bowerbird stop' to stop it"),
             }
             return Ok(());

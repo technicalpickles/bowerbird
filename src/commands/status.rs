@@ -9,8 +9,11 @@
 //!    "degraded (process exists but not accepting ingest)".
 //! 4. Read `~/.bowerbird/server.json` — if missing/unparseable, liveness-only
 //!    output (no version/uptime/ws-clients).
-//! 5. `GET /status` with `$BOWERBIRD_TOKEN` — if 401, document the token
-//!    limitation; Story 3.3 will resolve it. On 200, format the full block.
+//! 5. Resolve the bearer token via `commands::auth::resolve_token_for_cli`
+//!    (env → keychain → config.toml, Story 3.3). On `Err` the user sees the
+//!    enumerated tried-paths summary as a degraded fallback. On `Ok`, `GET
+//!    /status` runs; a 401 means the daemon's in-memory token differs from
+//!    what the keychain currently holds (rotation mid-process per NFR14).
 //!
 //! Always exits 0 unless we can't tell what's going on at all (e.g. EACCES on
 //! the data dir, which is reported as an error).
@@ -19,7 +22,9 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use clap::Args;
+use secrecy::ExposeSecret;
 
+use super::auth;
 use super::daemon::{self, StatusResponse};
 
 #[derive(Args)]
@@ -71,16 +76,18 @@ pub fn run(_args: StatusArgs) -> anyhow::Result<()> {
         }
     };
 
-    let token = std::env::var("BOWERBIRD_TOKEN").ok().filter(|s| !s.is_empty());
-    if token.is_none() {
-        print_running_basic(
-            pid,
-            "$BOWERBIRD_TOKEN unset; cannot read /status — set it or wait for Story 3.3",
-        );
-        return Ok(());
-    }
+    let token = match auth::resolve_token_for_cli() {
+        Ok((t, _source)) => t,
+        Err(e) => {
+            print_running_basic(
+                pid,
+                &format!("token resolution failed: {e}; cannot read /status"),
+            );
+            return Ok(());
+        }
+    };
 
-    match daemon::http_get_status(addr, token.as_deref(), STATUS_PER_ATTEMPT) {
+    match daemon::http_get_status(addr, Some(token.expose_secret()), STATUS_PER_ATTEMPT) {
         StatusResponse::Ok(body) => {
             let status: protocol::DaemonStatus = match serde_json::from_slice(&body) {
                 Ok(s) => s,
@@ -94,7 +101,9 @@ pub fn run(_args: StatusArgs) -> anyhow::Result<()> {
         StatusResponse::Status(401) => {
             print_running_basic(
                 pid,
-                "$BOWERBIRD_TOKEN is stale; cannot read /status — set the current token or wait for Story 3.3 keychain integration",
+                "keychain-resolved token rejected by /status (401); the daemon's \
+                 token may have rotated — restart the daemon or re-run \
+                 `bowerbird auth token` after rotation",
             );
         }
         StatusResponse::Status(code) => {
@@ -133,7 +142,9 @@ fn print_full_status(pid: i32, status: &protocol::DaemonStatus) {
     println!("  protocol      : {}", status.protocol_version);
     println!(
         "  uptime        : {}",
-        format_uptime(Duration::from_millis(u64::try_from(status.uptime_ms.max(0)).unwrap_or(0)))
+        format_uptime(Duration::from_millis(
+            u64::try_from(status.uptime_ms.max(0)).unwrap_or(0)
+        ))
     );
     println!("  connected ws  : {}", status.connected_ws_clients);
     match (status.last_event_at_ms, status.last_event_id) {

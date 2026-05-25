@@ -1,6 +1,7 @@
 pub mod api;
 pub mod broadcast;
 pub mod config;
+pub mod config_file;
 pub mod db;
 pub mod error;
 pub mod ingest;

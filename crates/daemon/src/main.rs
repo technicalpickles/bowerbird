@@ -17,8 +17,8 @@ use bowerbird_daemon::{
     time::current_unix_millis,
     write_error_report,
 };
-use protocol::ServerInfo;
 use clap::Parser;
+use protocol::ServerInfo;
 use std::future::IntoFuture;
 use tokio_util::sync::CancellationToken;
 
@@ -123,19 +123,30 @@ async fn run(config: Config, bowerbird_dir: PathBuf) -> anyhow::Result<()> {
     let ws_close_requested = CancellationToken::new();
 
     // Load the bearer token before anything else REST-related is constructed.
-    // A `Generated` source warrants a WARN line so operators running without
-    // `$BOWERBIRD_TOKEN` set realize the ephemeral token has been minted and
-    // is visible only in this log stream (the token value itself is never
-    // logged — `secrecy::SecretString` redacts `Debug`/`Display`).
-    let (bearer, token_source) = token::load_or_generate();
+    // Story 3.3's resolver runs `env → keychain → config.toml`; on full-chain
+    // failure we bail with a stderr message that names every tried path
+    // (NFR13). The match arms below log the source at INFO (or WARN for a
+    // freshly-generated keychain entry, so operators see that a token was
+    // just minted). The token VALUE is never logged — `secrecy::SecretString`
+    // redacts `Debug`/`Display`, and we hand-roll all log lines below to only
+    // mention the source, never the token.
+    let (bearer, token_source) = token::load_or_generate().map_err(|e| anyhow::anyhow!("{e}"))?;
     match token_source {
         TokenSource::Env => {
             tracing::info!("bearer token loaded from $BOWERBIRD_TOKEN");
         }
-        TokenSource::Generated => {
+        TokenSource::Keychain { generated: true } => {
             tracing::warn!(
-                "daemon generated ephemeral bearer token; set $BOWERBIRD_TOKEN to control it (token value not logged)"
+                "generated new bearer token and stored it in the system keychain; \
+                 run `bowerbird auth token` to retrieve it for tool configuration \
+                 (token value not logged)"
             );
+        }
+        TokenSource::Keychain { generated: false } => {
+            tracing::info!("bearer token loaded from system keychain");
+        }
+        TokenSource::ConfigFile => {
+            tracing::info!("bearer token loaded from ~/.bowerbird/config.toml");
         }
     }
 
@@ -235,17 +246,22 @@ async fn run(config: Config, bowerbird_dir: PathBuf) -> anyhow::Result<()> {
     // Publish the bound address BEFORE the "daemon listening" warn so the log
     // line is a sound "everything tests/CLIs poll for is ready" marker. The
     // file is a *hint*, not a liveness proof — the singleton PID + ingest-
-    // socket probe are the authoritative liveness checks. Story 3.3 will fold
-    // the bearer token into the same file; the mode-0600 baseline is set here
-    // so 3.3 inherits it without a TOCTOU window. A write failure here is
-    // logged but does NOT abort startup — the daemon is still functional
-    // via direct HTTP (e.g. for the test harness that already knows the port).
+    // socket probe are the authoritative liveness checks. Story 3.3 landed
+    // the bearer token in the system keychain (with `~/.bowerbird/config.toml`
+    // as the user-supplied file fallback) rather than extending `ServerInfo`,
+    // so the mode-0600 invariant here is now defense in depth rather than a
+    // hard prerequisite for any subsequent secret carried in this file. A write
+    // failure is logged but does NOT abort startup — the daemon is still
+    // functional via direct HTTP (e.g. for the test harness that already knows
+    // the port).
     let server_info = ServerInfo {
         bind_addr: local_addr.to_string(),
     };
     match server_file::write(&bowerbird_dir, &server_info) {
         Ok(path) => tracing::info!(path = %path.display(), "wrote server.json"),
-        Err(e) => tracing::warn!(error = %e, "failed to write server.json; CLI cannot read /status"),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to write server.json; CLI cannot read /status")
+        }
     }
 
     // WARN, not INFO: the bound address is operationally important and must be

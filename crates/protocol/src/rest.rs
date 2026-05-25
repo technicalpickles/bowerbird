@@ -86,9 +86,12 @@ pub struct DaemonStatus {
 /// CLI), but its content is daemon-controlled — effectively an outbound
 /// emission from one bowerbird binary to another. The asymmetric
 /// `deny_unknown_fields` rule applies per-direction, so `ServerInfo` does NOT
-/// carry `deny_unknown_fields`: a future daemon adding a field (Story 3.3's
-/// `token` is already on the horizon) must not break older CLIs that round-trip
-/// the file. See `project-context.md` "Wire format conventions" for the rule.
+/// carry `deny_unknown_fields`: a future daemon adding a field must not break
+/// older CLIs that round-trip the file. (Story 3.3 ultimately landed the
+/// bearer token in the system keychain + `~/.bowerbird/config.toml` fallback
+/// rather than extending `ServerInfo`, so the field-set is unchanged at this
+/// release — but the permissive policy stands for any future additive field.)
+/// See `project-context.md` "Wire format conventions" for the rule.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerInfo {
     pub bind_addr: String,

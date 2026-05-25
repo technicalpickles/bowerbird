@@ -27,12 +27,12 @@ tokio-stream     = "0.1.17"
 clap             = { version = "4.5.37", features = ["derive"] }
 secrecy          = "0.10.3"
 subtle           = "2.6"
-keyring          = "3.6.1"
 tempfile         = "3.20.0"
 assert_cmd       = "2.0.17"
 nix              = { version = "0.30", default-features = false, features = ["signal", "fs"] }
 tower            = "0.5.3"
 toml             = { version = "0.8", default-features = false, features = ["parse"] }
+keyring          = { version = "3.6", default-features = false, features = ["apple-native", "sync-secret-service", "linux-native-sync-persistent", "vendored"] }
 libc             = "0.2.186"
 
 [profile.release-shim]
@@ -57,7 +57,11 @@ path = "src/main.rs"
 clap           = { workspace = true }
 anyhow         = { workspace = true }
 libc           = { workspace = true }
+serde          = { workspace = true }
 serde_json     = { workspace = true }
+secrecy        = { workspace = true }
+keyring        = { workspace = true }
+toml           = { workspace = true }
 protocol       = { path = "crates/protocol" }
 adapter-claude = { path = "crates/adapter-claude" }
 

@@ -61,7 +61,10 @@ fn install_creates_settings_when_missing() {
         .pointer("/hooks/PreToolUse")
         .and_then(|v| v.as_array())
         .expect("hooks/PreToolUse array");
-    assert!(!pre.is_empty(), "hooks/PreToolUse must contain at least one group");
+    assert!(
+        !pre.is_empty(),
+        "hooks/PreToolUse must contain at least one group"
+    );
 }
 
 /// AC #1 + #4: install → uninstall round-trip via the CLI. The user's other
@@ -80,7 +83,11 @@ fn install_then_uninstall_via_cli_preserves_user_content() {
             ]
         }
     });
-    fs::write(&path, serde_json::to_vec_pretty(&initial).expect("seed json")).unwrap();
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&initial).expect("seed json"),
+    )
+    .unwrap();
 
     bowerbird_bin()
         .arg("install")
@@ -246,7 +253,10 @@ fn install_twice_is_idempotent() {
 fn help_lists_install_and_uninstall_subcommands() {
     let assertion = bowerbird_bin().arg("--help").assert().success();
     let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).into_owned();
-    assert!(stdout.contains("install"), "help missing `install`:\n{stdout}");
+    assert!(
+        stdout.contains("install"),
+        "help missing `install`:\n{stdout}"
+    );
     assert!(
         stdout.contains("uninstall"),
         "help missing `uninstall`:\n{stdout}"

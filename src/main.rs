@@ -23,6 +23,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Retrieve the daemon's bearer token from the system keychain (or fallback
+    /// chain).
+    Auth(commands::auth::AuthArgs),
     /// Install the bowerbird hook entries into ~/.claude/settings.json and
     /// start the daemon if it is not already running.
     Install(commands::install::InstallArgs),
@@ -43,6 +46,7 @@ enum Command {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Command::Auth(args) => commands::auth::run(args).context("bowerbird auth"),
         Command::Install(args) => commands::install::run(args).context("bowerbird install"),
         Command::Start(args) => commands::start::run(args).context("bowerbird start"),
         Command::Status(args) => commands::status::run(args).context("bowerbird status"),

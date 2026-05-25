@@ -12,9 +12,13 @@
 //! daemon is alive; `server.json` only tells the CLI where to send HTTP if
 //! something *is* alive.
 //!
-//! **Mode 0600.** Story 3.3 will extend `ServerInfo` with a `token` field. We
-//! pay the cost of setting the mode now so 3.3 inherits a safe baseline rather
-//! than racing with a mode-change step (TOCTOU window for the token).
+//! **Mode 0600.** The file is mode 0600 by default. Story 3.3 ultimately
+//! stored the bearer token in the system keychain (with `~/.bowerbird/config.toml`
+//! as a user-supplied file fallback) rather than extending `ServerInfo` with
+//! a token field, so the mode-0600 invariant here is now defense in depth
+//! rather than a hard prerequisite for any subsequent secret carried in this
+//! file. The asymmetric serde policy (outbound permissive, see
+//! `protocol::ServerInfo`) is unaffected.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};

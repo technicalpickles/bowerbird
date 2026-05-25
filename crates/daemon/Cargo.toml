@@ -8,6 +8,16 @@ rust-version = "1.82"
 name = "bowerbird-daemon"
 path = "src/main.rs"
 
+[features]
+# Story 3.3: `mock-keyring` exposes the in-process `keyring::mock` backend via
+# `BOWERBIRD_KEYRING_BACKEND=mock`. Defaulted ON so `cargo test --workspace`
+# can exercise the resolver hermetically without the developer's real keychain.
+# Release distributions can build with `--no-default-features` to ensure
+# production binaries never honor the `mock` env value (defense in depth: even
+# a malicious env-var injection cannot neutralize keychain protection).
+default = ["mock-keyring"]
+mock-keyring = []
+
 [dependencies]
 protocol           = { path = "../protocol" }
 adapter-claude     = { path = "../adapter-claude" }
@@ -31,6 +41,8 @@ serde_json         = { workspace = true }
 secrecy            = { workspace = true }
 subtle             = { workspace = true }
 nix                = { workspace = true }
+keyring            = { workspace = true }
+toml               = { workspace = true }
 
 [dev-dependencies]
 tempfile          = { workspace = true }
