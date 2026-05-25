@@ -175,5 +175,6 @@ Linux) if you want to fully clean up.
 
 - [`README.md`](README.md) — project overview, Quickstart, architecture and
   protocol pointers.
-- `docs/protocol.md` — protocol reference (in flight under Story 4.3).
+- [`docs/protocol.md`](docs/protocol.md) — REST + WebSocket + ingest-socket wire reference.
+- [`docs/quickstart.md`](docs/quickstart.md) — five-minute walkthrough using the bundled replay fixture (no Claude Code session required).
 - `docs/bmad/planning-artifacts/architecture.md` — system architecture.

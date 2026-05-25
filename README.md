@@ -13,26 +13,21 @@ for the live scope and progress.
 
 ## Quickstart
 
+See [docs/quickstart.md](docs/quickstart.md) for the 5-minute walkthrough — start
+the daemon, replay a bundled fixture, run a reference example, see live JSON state.
+No Claude Code session required.
+
+To install, grab the macOS arm64 prebuilt tarball:
+
 ```sh
-# 1. Install (downloads prebuilt binaries; copies to /usr/local/bin/)
 curl -fsSL https://github.com/technicalpickles/bowerbird/releases/latest/download/bowerbird-aarch64-apple-darwin.tar.gz | tar -xz
 sudo install bowerbird-*-aarch64-apple-darwin/bin/* /usr/local/bin/
-
-# 2. Wire bowerbird into Claude Code's hooks and start the daemon
-bowerbird install
-
-# 3. Use Claude Code as normal; activity appears in ~/.bowerbird/bower.db
-bowerbird auth token | tr -d '\n' | pbcopy   # copy bearer token for tool config
-bowerbird status                              # render full status block
-
-# Try it without setting up Claude Code — the bundled fixture demonstrates
-# the pub/sub path:
-bowerbird replay
 ```
 
-The Quickstart targets macOS arm64 — substitute the appropriate tarball name
-for your platform from the Install section. The `releases/latest/download/...`
-URL always resolves to the most recent non-prerelease tag.
+Substitute the appropriate tarball name for your platform from the [Install](#install)
+section; the `releases/latest/download/...` URL always resolves to the most recent
+non-prerelease tag. Or to try it without setting up Claude Code, the bundled fixture
+demonstrates the pub/sub path — see the linked quickstart.
 
 ## Install
 
@@ -72,8 +67,7 @@ xattr -d com.apple.quarantine /usr/local/bin/bowerbird /usr/local/bin/bowerbird-
 cargo install --git https://github.com/technicalpickles/bowerbird --tag vX.Y.Z
 ```
 
-Windows is an explicit V1 scope cut (see `docs/no-list.md` once Story 4.3
-lands).
+Windows is an explicit V1 scope cut (see [`docs/no-list.md`](docs/no-list.md)).
 
 See [`INSTALL.md`](INSTALL.md) (also bundled in each release tarball) for the
 post-extract walkthrough: verification, `bowerbird install`, uninstall
@@ -171,6 +165,14 @@ node --experimental-strip-types examples/multi-session-router/src/index.ts
 
 See [`examples/README.md`](examples/README.md) for the full walkthrough — `multi-session-router` (live state fan-out), `event-log-viewer` (REST cursor-pagination + gap-detection), and `reconnect-recovery` (Close/Dropped → REST catch-up resilience).
 
+## Documentation
+
+- [docs/quickstart.md](docs/quickstart.md) — five-minute walkthrough, no Claude Code session required
+- [docs/presenter-authoring.md](docs/presenter-authoring.md) — conceptual guide to building tools against the bowerbird substrate
+- [docs/protocol.md](docs/protocol.md) — REST + WebSocket + ingest-socket wire reference
+- [docs/cookbook/](docs/cookbook/) — recipes paired with the reference examples
+- [docs/no-list.md](docs/no-list.md) — explicit V1 scope cuts
+
 ## Architecture
 
 See [`docs/bmad/planning-artifacts/architecture.md`](docs/bmad/planning-artifacts/architecture.md)
@@ -179,10 +181,10 @@ WebSocket subsystem config knobs, and the daemon's startup sequence.
 
 ## Protocol
 
-See [`docs/protocol-changelog.md`](docs/protocol-changelog.md) for the
-immutable change history (additive forward-compat policy for outbound
-messages; `deny_unknown_fields` strict on inbound). The consolidated
-`docs/protocol.md` reference is in flight under Story 4.3.
+See [`docs/protocol.md`](docs/protocol.md) for the consolidated wire-surface
+reference, and [`docs/protocol-changelog.md`](docs/protocol-changelog.md) for the
+change history (additive forward-compat policy for outbound messages;
+`deny_unknown_fields` strict on inbound).
 
 ## Contributing
 

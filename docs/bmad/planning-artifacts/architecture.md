@@ -790,8 +790,14 @@ bowerbird/
 │       └── tests/
 │           └── recover.test.ts         # node --test; covers the Dropped branch
 ├── docs/
-│   ├── architecture/                   # ADRs and decision records
-│   └── api/                            # socket protocol specs, wire format reference
+│   ├── decisions/                      # ADRs (0001, 0002, 0003, ...)
+│   ├── cookbook/                       # recipes paired with examples
+│   ├── quickstart.md                   # 5-minute walkthrough
+│   ├── presenter-authoring.md          # conceptual tool-building guide
+│   ├── protocol.md                     # wire-surface reference (REST + WS + ingest)
+│   ├── no-list.md                      # explicit V1 scope cuts
+│   ├── protocol-changelog.md           # protocol change history (CI-enforced)
+│   └── bmad/                           # planning artifacts + implementation artifacts
 └── crates/
     ├── protocol/                       # stable wire surface; dep of all crates
     │   ├── Cargo.toml
@@ -948,7 +954,7 @@ No overlap. No symlinks. Workspace root fixtures are the single authoritative so
 | FR18–FR23: REST + history | `crates/daemon/src/api/sessions.rs`, `events.rs`, `health.rs` |
 | FR24–FR26: Session tracking | `crates/daemon/src/projection/session.rs` (UPSERT) |
 | FR27–FR30: Install + lifecycle | `src/commands/{install,uninstall,start,stop,status,daemon}.rs`, `crates/adapter-claude/src/install.rs`, `crates/daemon/src/{singleton,server_file,config_file}.rs` |
-| FR31–FR35: Developer tools + examples | `src/commands/{replay,export}.rs` (Story 4.1); `examples/*/` (Story 4.2, TypeScript on Node 22.6+); `docs/cookbook/` (Story 4.3 deferred) |
+| FR31–FR35: Developer tools + examples | `src/commands/{replay,export}.rs` (Story 4.1); `examples/*/` (Story 4.2, TypeScript on Node 22.6+); `docs/{quickstart,presenter-authoring,protocol,no-list}.md` + `docs/cookbook/` (Story 4.3) |
 | FR36–FR39: Protocol compat | `crates/protocol/` (wire types + constants) |
 
 ### Data Flow

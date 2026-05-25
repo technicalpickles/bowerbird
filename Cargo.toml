@@ -70,3 +70,4 @@ adapter-claude = { path = "crates/adapter-claude" }
 assert_cmd = { workspace = true }
 tempfile   = { workspace = true }
 serde_json = { workspace = true }
+pretty_assertions = "1.4"

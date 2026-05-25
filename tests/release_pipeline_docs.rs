@@ -370,6 +370,38 @@ fn every_published_crate_declares_mit_or_apache_license() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Story 4.3 AC #6: README.md links to docs/quickstart.md and docs/protocol.md
+// as Markdown link targets, and the "in flight under Story 4.3" placeholder
+// in §Protocol is replaced with a live link. This is the README↔docs coupling
+// guardrail; it lives here (not in cli_docs_drift.rs) because release_pipeline_docs.rs
+// already covers README-shape doc-drift (license badges, install commands,
+// version literals).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn readme_links_to_quickstart_and_protocol_docs() {
+    let readme = read_workspace_file("README.md");
+    assert!(
+        readme.contains("](docs/quickstart.md)"),
+        "AC #6: README.md must link to docs/quickstart.md as a Markdown link \
+         target (`](docs/quickstart.md)`) — the Quickstart section should \
+         forward to the new doc"
+    );
+    assert!(
+        readme.contains("](docs/protocol.md)"),
+        "AC #6: README.md must link to docs/protocol.md as a Markdown link \
+         target (`](docs/protocol.md)`) — the §Protocol section should \
+         replace the Story 4.3 placeholder with a live link"
+    );
+    assert!(
+        !readme.contains("in flight under Story 4.3"),
+        "AC #6: README.md still carries the placeholder `in flight under \
+         Story 4.3` — Story 4.3 has shipped, the placeholder must be replaced \
+         with the live `docs/protocol.md` link"
+    );
+}
+
 #[test]
 fn workspace_root_ships_dual_license_files() {
     // The two license texts that the release tarball bundles. Their

@@ -1,87 +1,76 @@
-# Test Automation Summary — Story 4.2
+# Test Automation Summary — Story 4.3
 
-Generated 2026-05-25 via `bmad-qa-generate-e2e-tests`. Supersedes the Story 4.1 summary.
+Generated 2026-05-25 via `bmad-qa-generate-e2e-tests`. Supersedes the Story 4.2 summary.
+
+## Context
+
+Story 4.3 ships a documentation suite (`docs/quickstart.md`, `docs/presenter-authoring.md`, `docs/protocol.md`, `docs/no-list.md`, `docs/cookbook/*.md`) plus structural doc-drift guardrails in `tests/cli_docs_drift.rs` (Task 6) and a single README-coupling test added to `tests/release_pipeline_docs.rs` (Task 6.9).
+
+This is a docs-only story for a Rust workspace — no UI, no API surface added, so the workflow's conventional "API tests / E2E tests" boxes don't apply. The analogous QA surface is **content-drift guardrails**: hermetic Rust tests that read the shipped markdown and assert load-bearing markers are present. The existing tests in `tests/cli_docs_drift.rs` cover *structural* drift (file existence, section ordering, cookbook-anchor byte-equality, link resolution). This run adds *content* drift coverage.
 
 ## Baseline coverage already in place
 
-Story 4.2 (three TypeScript reference examples — `multi-session-router`, `event-log-viewer`, `reconnect-recovery`) landed with substantial test coverage from the dev-story pass — 12 dedicated tests before this QA run:
+Before this QA pass:
 
-- **`tests/cli_examples.rs`** (4 tests) — `multi_session_router_routes_state_frames_for_both_fixture_sessions` (AC #1), `event_log_viewer_paginates_session_history_and_renders_tool_calls` (AC #2), `reconnect_recovery_recovers_after_close_frame_and_resumes` (AC #3 Close branch), `examples_fail_clearly_when_daemon_down` (daemon-down error path for all three). Each orchestrates a real `bowerbird-daemon` subprocess plus a Node subprocess running the example's `src/index.ts`, then asserts the canonical stdout/stderr shape.
-- **`tests/cli_examples_drift.rs`** (6 tests) — `each_example_has_required_files`, `each_example_package_json_declares_node_22_6_engine`, `each_example_source_carries_cookbook_anchors`, `architecture_md_describes_examples_as_typescript_not_cargo`, `examples_readme_reconciliation_note_present`, `examples_not_in_root_cargo_toml_members`. Hermetic doc-drift guardrails per Epic 3 retro agreement A7 — no daemon, no Node, fast.
-- **`examples/reconnect-recovery/tests/recover.test.ts`** (2 tests) — `recover fetches missed events and updates the cursor`, `recover returns 0 when no events past the cursor`. Node-built-in `--test` runner covering the AC #3 `Dropped` branch as a compiled assertion against an in-process fake daemon (no real lag burst required).
+- **`tests/cli_docs_drift.rs`** (6 tests) — `required_docs_exist`, `every_cookbook_entry_has_canonical_four_sections`, `cookbook_include_directives_match_example_anchors`, `every_cookbook_anchor_in_examples_has_a_cookbook_entry`, `quickstart_internal_links_resolve`, `architecture_md_docs_tree_matches_shipped_surface`. Pins structural shape: the five required docs exist, cookbook entries follow the four-section recipe, cookbook code blocks are byte-identical to the example anchors they reference (bidirectional), internal markdown links resolve to files on disk, and architecture.md's `docs/` tree matches the shipped surface (not the stale `docs/architecture/` + `docs/api/` placeholders).
+- **`tests/release_pipeline_docs.rs::readme_links_to_quickstart_and_protocol_docs`** (1 test, Task 6.9) — README.md links to `docs/quickstart.md` and `docs/protocol.md` and the "in flight under Story 4.3" placeholder is gone.
 
-All 12 baseline tests pass under `cargo test --workspace -- --test-threads=1` (Rust) and `npm test` (Node).
+Total Story-4.3 doc-drift tests pre-QA: **7**.
 
-## Gap analysis
+## Framework
 
-Four gaps remained after that baseline. Each is a silent-failure mode — a regression here does not break any existing test, but a behavior the AC or story task promises stops being enforced.
+- Rust `#[test]` functions in workspace-root test crates (`tests/*.rs`).
+- Invocation: `cargo test --workspace -- --test-threads=1` (Epic 2 retro AI-3 / Story 3.4 AC #6).
+- Dependencies: `std::fs`, `std::path`, `pretty_assertions` (already transitive via `assert_cmd`). No new deps.
 
-**Gap A — Multi-session-router stderr `new session: ...` lines unasserted.** Story 4.2 Task 7.4 explicitly says: *"assert the example logged `new session: claude/session-alpha` and `new session: claude/session-beta` to stderr."* The baseline smoke test pipes stderr but never reads it. AC #1's stderr-side observable ("treating a previously-unseen `(source, session_id)` as a 'new session appeared' event and logging it on stderr") was therefore unenforced — a refactor that quietly dropped the stderr log would still pass the existing test.
+## Gaps discovered and filled
 
-**Gap B — Event-log-viewer default session id never exercised.** The example defaults to `session-alpha` when `process.argv[2]` is undefined (`src/index.ts:139`). The baseline smoke test always passes `"session-alpha"` explicitly, so the default-arg branch is dead code under test. AC #2's "CLI arg: a session id, default `session-alpha`" was a documented contract with no enforcement.
+Audit of the seven story ACs against existing tests revealed that file-existence + section-ordering tests do not catch silent paraphrasing of AC-mandated marker strings. Added seven content-drift tests to `tests/cli_docs_drift.rs`:
 
-**Gap C — Event-log-viewer behavior for unknown session ids unpinned.** The example's `if (res.status === 404)` handler at `src/index.ts:100-103` anticipates a 404 the daemon does not actually return — the daemon serves `GET /sessions/<unknown-id>/events?since=0` with HTTP 200 and an empty events array. The semantic contract a presenter relies on ("ask for any session id and get a renderable response") was undocumented. A future daemon change that flipped to actual 404s would change observable presenter behavior with no test catching the regression.
-
-**Gap D — Recover()'s gap-detection and multi-session cursor-advancement branches uncovered.** The baseline Node tests covered only the happy path (events past the cursor) and the no-op case (cursor past all events). Two structurally distinct branches in `examples/reconnect-recovery/src/index.ts` had no coverage: (1) the gap-warning branch at lines 167-172 fires when `cursor.lastEventId < oldest_available_event_id - 1`, and (2) the cross-session cursor-advancement loop at lines 146-186 maintains a *global* `cursor.lastEventId` across multiple sessions. Either branch could regress silently against the existing test suite.
-
-## Generated tests
-
-### Rust smoke tests — `tests/cli_examples.rs`
-
-Two new test functions; one existing test gained a stderr-side assertion.
-
-1. **`multi_session_router_routes_state_frames_for_both_fixture_sessions`** — *Modified.* Added a background stderr-drainer thread (same shape as the existing `reconnect_recovery` test) so stderr lines survive the test run. After the child exits, the test asserts the drained stderr contains both `new session: claude/session-alpha` and `new session: claude/session-beta`. Closes Gap A.
-
-2. **`event_log_viewer_defaults_to_session_alpha_when_no_arg`** — *New.* Spawns the event-log-viewer with no CLI args. Asserts exit 0 and stdout containing 6 lines (session-alpha's bundled-fixture event count). The default-arg branch is now exercised. Closes Gap B.
-
-3. **`event_log_viewer_renders_empty_for_unknown_session`** — *New.* Spawns the event-log-viewer with `definitely-not-a-real-session`. Asserts exit 0 with empty stdout — pins the daemon's *current* "200 OK + empty events" contract for unknown session ids. Includes an inline discovery note pointing at the dead-code 404 handler in the example, so a future daemon API tightening surfaces as a test failure rather than a silent presenter behavior change. Closes Gap C.
-
-### Node `--test` tests — `examples/reconnect-recovery/tests/recover.test.ts`
-
-Two new test cases.
-
-4. **`recover handles an unrecoverable gap (cursor predates oldest_available)`** — *New.* Fake daemon serves events with `event_id` starting at 10; cursor starts at 1. Shims `process.stderr.write` to capture writes; asserts the `gap unrecoverable for session rotated-session` warning fires AND the recovered count is 2 AND the cursor advances to 11. Restores `process.stderr.write` on exit. Closes Gap D (gap-detection half).
-
-5. **`recover advances cursor to the max across multiple sessions`** — *New.* Fake daemon serves two sessions with non-overlapping event_id ranges (session-one: 1, 2; session-two: 3, 4). Asserts `recover()` returns 4 (events across both sessions) AND `cursor.lastEventId` ends at the global max (4), not per-session. Closes Gap D (cross-session half).
-
-## Verification
-
-```sh
-cargo test --test cli_examples -- --test-threads=1
-# Result: 6 passed in 5.72s (4 baseline + 2 new)
-
-cargo test --test cli_examples_drift -- --test-threads=1
-# Result: 6 passed (no changes to drift suite)
-
-cd examples/reconnect-recovery && node --experimental-strip-types --test 'tests/**/*.test.ts'
-# Result: 4 passed (2 baseline + 2 new)
-
-cargo fmt --all -- --check
-# Result: clean
-
-cargo clippy --workspace --all-targets -- -D warnings
-# Result: 0 warnings
-```
-
-## Coverage tally
-
-| Surface | Before QA | After QA |
+| Test | AC | What it pins |
 |---|---|---|
-| Rust smoke tests (`tests/cli_examples.rs`) | 4 | 6 |
-| Rust drift tests (`tests/cli_examples_drift.rs`) | 6 | 6 |
-| Node `--test` cases (`recover.test.ts`) | 2 | 4 |
-| **Total dedicated tests** | **12** | **16** |
+| `quickstart_carries_load_bearing_markers` | #1 | Five-step walkthrough commands (`bowerbird start/replay/stop/auth token`, `BOWERBIRD_TOKEN`, `--experimental-strip-types`), Node 22.6+ floor, the troubleshooting grep-target sentence (`should now see` + `{event:"state"` + `scrolling on stdout`), three forward pointers (`docs/presenter-authoring.md`, `docs/protocol.md`, `docs/cookbook/`). |
+| `presenter_authoring_carries_load_bearing_markers` | #2 | Six required sections in order (substrate model → WS connection → Subscribe → ServerMessage handler → dropped-frame recovery → REST snapshot), seven ServerMessage variants (`hello`/`event`/`state`/`sync`/`dropped`/`close`/`Unknown`), six topic-grammar entries, Bearer-auth + `server.json` markers. |
+| `protocol_md_lists_eight_rest_routes` | #3 b | Eight REST routes declared in `crates/daemon/src/api/mod.rs`: `/healthz`, `/readyz`, `/status`, `/sessions`, `/sessions/{id}`, `/sessions/{id}/events`, `/sessions/{id}/stats`, `/replay`. |
+| `protocol_md_documents_wire_surface_variants` | #3 d | Two `ClientMessage` variants + seven `ServerMessage` variants as `### `-level headings, plus per-frame type names (`HelloFrame`, `EventFrame`, `StateFrame`, `SyncFrame`, `DroppedFrame`, `CloseFrame`) sourced from `crates/protocol/src/ws.rs`. |
+| `protocol_md_covers_topic_grammar_wire_format_and_ingest_contract` | #3 a + e + f | Wire-format conventions (`deny_unknown_fields`, `protocol_version`, `Bearer`), six topic-grammar entries, ingest-socket contract markers (`ingest.sock`, `hook_kind`, `0600`). |
+| `no_list_enumerates_thirteen_scope_cuts_with_intentional_framing` | #5 | Opening "intentional / non-targets" framing + all thirteen scope cuts (a–m): No Windows, No distro packaging, No HITL, No tool blocking, No personas, No LAN, No daemon-side activity-rate, No crates.io, No `bowerbird gc`, No musl, No code signing, No structured JSON logging, No rate limiting. |
+| `cookbook_readme_lists_three_required_entries_paired_with_examples` | #4 | Cookbook README table lists the three V1 entries (`state-session-fanout.md`, `rest-cursor-pagination.md`, `dropped-frame-recovery.md`) paired with their example tools (`multi-session-router`, `event-log-viewer`, `reconnect-recovery`). |
 
-## ACs traced
+Pattern: `assert_contains_all(label, body, &[needle, …])` — same shape as `tests/release_pipeline_docs.rs::WALKTHROUGH_MARKERS` (Story 3.4 AC #5). The helper is local to the crate; no shared-module extraction since duplication is small and the helper is idiomatic.
 
-- **AC #1 — multi-session-router** — fully covered. Snapshot fan-out, both sessions surfacing as map entries, stdout JSON shape, stderr new-session lines, Close-frame exit 0.
-- **AC #2 — event-log-viewer** — fully covered. Cursor-pagination loop, tab-separated render shape, default session id, unknown-session graceful render, daemon-down failure, kind/tool/reaction sequence per bundled fixture.
-- **AC #3 — reconnect-recovery** — fully covered. Close-branch via `bowerbird stop` + restart + replay; Dropped-branch via `recover()` unit tests including happy-path, no-op-past-cursor, gap-detection, and multi-session cursor advancement; idle-timeout clean exit.
-- **AC #4 — CI smoke for all three examples** — covered by `tests/cli_examples.rs` running under `cargo test --workspace -- --test-threads=1` with `actions/setup-node@v4` pinning Node 22.6 in CI.
-- **AC #5 — cookbook anchors present** — covered by `tests/cli_examples_drift.rs::each_example_source_carries_cookbook_anchors`.
+## What we did NOT add
+
+- **No "API tests"** — Story 4.3 adds no HTTP routes. Existing route-shape tests live in `tests/cli_*.rs` (untouched).
+- **No E2E browser tests** — bowerbird has no UI surface.
+- **No Node-spawning smoke for the quickstart walkthrough** — `tests/cli_examples.rs` already covers Node-side example invocation; the quickstart's *commands* are pinned at substring granularity in the new content test, which is the right tradeoff for V1.
+- **No new test for AC #7 (architecture.md reconciliation)** — the existing `architecture_md_docs_tree_matches_shipped_surface` already pins it bidirectionally (must contain shipped paths; must NOT contain stale paths).
+
+## Coverage
+
+- **Story 4.3 ACs**: 7/7 ACs have at least one structural OR content guardrail. ACs #1, #2, #3, #4, #5 each got an additional content-marker test in this run; ACs #6 + #7 were already saturated by the structural tests.
+- **Doc-drift test count**: `tests/cli_docs_drift.rs` 6 → **13 tests** (+7). `tests/release_pipeline_docs.rs` unchanged (already has `readme_links_to_quickstart_and_protocol_docs`).
+- **All tests pass**: `cargo test --test cli_docs_drift -- --test-threads=1` → 13 passed. `cargo fmt --check` clean. `cargo clippy --test cli_docs_drift -- -D warnings` clean.
+
+## Checklist validation
+
+Mapped to `.claude/skills/bmad-qa-generate-e2e-tests/checklist.md`:
+
+- [x] API tests generated (if applicable) — N/A; docs-only story.
+- [x] E2E tests generated (if UI exists) — N/A; no UI.
+- [x] Tests use standard test framework APIs — `#[test]`, `std::fs`, `assert_eq!`, `pretty_assertions::assert_eq!`.
+- [x] Tests cover happy path — every test asserts the AC-mandated content is present.
+- [x] Tests cover 1-2 critical error cases — `architecture_md_docs_tree_matches_shipped_surface` and the cookbook bidirectional integrity test both have negative assertions (stale paths must NOT be present; orphan anchors must NOT exist).
+- [x] All generated tests run successfully — 13/13 passing.
+- [x] Tests use proper locators — substring matches against load-bearing tokens, not brittle line numbers.
+- [x] Tests have clear descriptions — each test name describes the AC it pins; failure messages explain what's missing and why it matters.
+- [x] No hardcoded waits or sleeps — hermetic file reads, no async, no I/O beyond `fs::read_to_string`.
+- [x] Tests are independent (no order dependency) — each test reads its own files; no shared state.
 
 ## Next steps
 
-- Run the augmented suite in CI on the next PR push; the Node-side glob (`'tests/**/*.test.ts'` in `package.json`) is Node-version-portable so the CI runner's Node 22.6 pin and contributor environments on Node 23/24 both work.
-- The discovery note in `event_log_viewer_renders_empty_for_unknown_session` should be revisited if the daemon's REST surface ever returns actual HTTP 404s for unknown session ids — the dead-code 404 handler in `event-log-viewer/src/index.ts` would then become live, and the test should flip to asserting the error-exit shape instead of the empty-render shape.
-- The `process.stderr.write` shim in the recover gap-detection test is restored on exit but adds a small surface-area risk: a future test inserted between save and restore could see logs vanish. Keeping the shim block tightly scoped to the single test is the discipline the file already follows; revisit if more tests need stderr capture.
+- The seven new tests run automatically under `cargo test --workspace -- --test-threads=1` on every PR (CI gate from Story 3.4 AC #6).
+- If a future story renames a route, a frame variant, or a scope cut, the corresponding doc-drift test fails with a message naming the missing marker — making the doc-update obligation visible in the same PR that changes the wire surface.
+- If a doc rewrite paraphrases an AC-mandated phrase (e.g. drops "intentional non-targets" from `no-list.md`), the test names the missing substring so the fix is mechanical.
+
+No deferred work surfaced.

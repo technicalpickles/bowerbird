@@ -1,5 +1,5 @@
 # generated: 2026-05-16
-# last_updated: 2026-05-25 (story 4-2 → done)
+# last_updated: 2026-05-25 (story 4-3 → done)
 # project: bowerbird
 # project_key: NOKEY
 # tracking_system: file-system
@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-05-16
-last_updated: 2026-05-25 (story 4-2 → done)
+last_updated: 2026-05-25 (story 4-3 → done)
 project: bowerbird
 project_key: NOKEY
 tracking_system: file-system
@@ -75,6 +75,6 @@ development_status:
   epic-4: in-progress
   4-1-bowerbird-replay-and-export-commands: done
   4-2-three-reference-example-tools: done
-  4-3-documentation-suite: backlog
+  4-3-documentation-suite: done
   4-4-protocol-compatibility-guarantee-and-contract-test-suite: backlog
   epic-4-retrospective: optional
