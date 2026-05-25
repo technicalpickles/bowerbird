@@ -754,7 +754,7 @@ session_id in their own logic if needed.
 
 ```
 bowerbird/
-├── Cargo.toml                          # workspace manifest; members includes examples/*
+├── Cargo.toml                          # workspace manifest; members = ["crates/*"] only; examples/ is a Node project zone, not a Cargo zone (see project-context.md §Example presenters)
 ├── Cargo.lock                          # committed; reproducible builds
 ├── rust-toolchain.toml                 # stable channel pin
 ├── .github/
@@ -766,16 +766,29 @@ bowerbird/
 │   ├── hook_post_tool_use.json
 │   ├── hook_stop.json
 │   └── event_log_sample.db             # SQLite fixture for replay/export demos
-├── examples/                           # Cargo workspace members; compile in CI
+├── examples/                           # TypeScript presenters; Node 22.6+; smoke-tested in CI
+│   ├── .gitignore                      # node_modules/, *.log
+│   ├── README.md                       # overview; reconciliation note vs prior arch draft
 │   ├── multi-session-router/
-│   │   ├── Cargo.toml                  # depends on protocol; listed in root Cargo.toml members
-│   │   └── src/main.rs
+│   │   ├── package.json                # engines.node >= 22.6.0; type: module
+│   │   ├── tsconfig.json               # strict, noEmit (Node strips types at runtime)
+│   │   ├── README.md
+│   │   └── src/
+│   │       └── index.ts                # cookbook-begin:state-session-fanout
 │   ├── event-log-viewer/
-│   │   ├── Cargo.toml
-│   │   └── src/main.rs
+│   │   ├── package.json
+│   │   ├── tsconfig.json
+│   │   ├── README.md
+│   │   └── src/
+│   │       └── index.ts                # cookbook-begin:rest-cursor-pagination
 │   └── reconnect-recovery/
-│       ├── Cargo.toml
-│       └── src/main.rs
+│       ├── package.json
+│       ├── tsconfig.json
+│       ├── README.md
+│       ├── src/
+│       │   └── index.ts                # cookbook-begin:dropped-frame-recovery
+│       └── tests/
+│           └── recover.test.ts         # node --test; covers the Dropped branch
 ├── docs/
 │   ├── architecture/                   # ADRs and decision records
 │   └── api/                            # socket protocol specs, wire format reference
@@ -889,7 +902,7 @@ Workspace-root tests for the CLI:
 
 | Location | Contains | Used by |
 |---|---|---|
-| `fixtures/` (workspace root) | Shared hook payloads + demo SQLite | `examples/*/`, `bowerbird/tests/integration/` |
+| `fixtures/` (workspace root) | Shared hook payloads + demo SQLite | `examples/*/` (runtime read by Node via fs.readFile when needed; primary path is `bowerbird replay` which embeds the fixture compile-time), `bowerbird/tests/integration/` |
 | `crates/adapter-claude/tests/fixtures/` | Adapter-specific raw payloads | `contract_adapter.rs` only; loaded via `include_str!` |
 
 No overlap. No symlinks. Workspace root fixtures are the single authoritative source for anything shared across crates.
@@ -920,8 +933,10 @@ No overlap. No symlinks. Workspace root fixtures are the single authoritative so
 - `crates/protocol/src/constants.rs` owns `SHIM_BINARY_NAME` — single authoritative string used by `adapter-claude/src/install.rs`. No duplication across crates.
 
 **Examples boundary:**
-- `examples/*/Cargo.toml` listed in root `Cargo.toml` `members`
-- Depend on `protocol` directly; compile in CI; break loudly on API changes
+- `examples/*/` are TypeScript projects on Node 22.6+; the workspace root's `[workspace] members = ["crates/*"]` deliberately excludes them — `examples/` is a Node project zone, not a Cargo zone
+- Hand-write the ~30 lines of TypeScript interface declarations they need per example (no shared SDK, per project-context.md §Example presenters)
+- Consume the WS + REST surfaces via Node's built-in `WebSocket` and `fetch`; no runtime npm dependencies
+- Smoke-tested in CI via `tests/cli_examples.rs` (Rust orchestrates daemon + Node subprocess); break loudly on protocol-shape changes via the smoke's stdout-shape assertions
 
 ### Requirements to Structure Mapping
 
@@ -933,7 +948,7 @@ No overlap. No symlinks. Workspace root fixtures are the single authoritative so
 | FR18–FR23: REST + history | `crates/daemon/src/api/sessions.rs`, `events.rs`, `health.rs` |
 | FR24–FR26: Session tracking | `crates/daemon/src/projection/session.rs` (UPSERT) |
 | FR27–FR30: Install + lifecycle | `src/commands/{install,uninstall,start,stop,status,daemon}.rs`, `crates/adapter-claude/src/install.rs`, `crates/daemon/src/{singleton,server_file,config_file}.rs` |
-| FR31–FR35: Developer tools + examples | `src/commands/{replay,export}.rs` (Story 4.1); `examples/*/` (Story 4.2 deferred); `docs/cookbook/` (Story 4.3 deferred) |
+| FR31–FR35: Developer tools + examples | `src/commands/{replay,export}.rs` (Story 4.1); `examples/*/` (Story 4.2, TypeScript on Node 22.6+); `docs/cookbook/` (Story 4.3 deferred) |
 | FR36–FR39: Protocol compat | `crates/protocol/` (wire types + constants) |
 
 ### Data Flow
@@ -1000,7 +1015,7 @@ on a single OS thread. All SQLite access goes through the deadpool-sqlite pool
 | FR18–FR23: REST history | api/sessions.rs + events.rs + health.rs; EventListResponse ✅ |
 | FR24–FR26: Session tracking | projection/session.rs UPSERT; no stuck state on missing PostToolUse ✅ |
 | FR27–FR30: Install/lifecycle | commands/daemon.rs + adapter-claude/install.rs + config.rs ✅ |
-| FR31–FR35: Developer tools | replay.rs + export.rs + examples/ workspace members + fixtures/ ✅ |
+| FR31–FR35: Developer tools | replay.rs + export.rs + examples/ TypeScript projects + fixtures/ ✅ |
 | FR36–FR39: Protocol compat | protocol/ wire types + additive serde + CHANGELOG CI gate ✅ |
 
 **NFR coverage:** Shim p95 <5ms → criterion benchmark gate. Daemon 2s readiness

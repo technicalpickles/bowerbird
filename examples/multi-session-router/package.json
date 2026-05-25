@@ -1,0 +1,14 @@
+{
+  "name": "bowerbird-example-multi-session-router",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.6.0" },
+  "scripts": {
+    "start": "node --experimental-strip-types src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "@types/node": "^22.0.0"
+  }
+}

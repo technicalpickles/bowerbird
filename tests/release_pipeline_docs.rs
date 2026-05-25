@@ -176,6 +176,29 @@ fn install_md_walkthrough_covers_a_through_g_markers() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn ci_workflow_sets_up_node_22_6() {
+    // Story 4.2 AC #4: the CI workflow must install Node 22.6+ before the
+    // cargo test step so `tests/cli_examples.rs` can spawn `node
+    // --experimental-strip-types` against the bundled examples. Without
+    // this, the smoke tests would silently skip on CI (their
+    // `node_22_6_available` gate returns false and the assertions never
+    // run), regressing protection for the three reference examples.
+    let ci = read_workspace_file(".github/workflows/ci.yml");
+    assert!(
+        ci.contains("actions/setup-node@v4"),
+        "AC #4: .github/workflows/ci.yml must use `actions/setup-node@v4` \
+         to install Node before the cargo test step (required by \
+         tests/cli_examples.rs for --experimental-strip-types)"
+    );
+    assert!(
+        ci.contains("node-version: '22.6'"),
+        "AC #4: .github/workflows/ci.yml must pin Node to 22.6 — this is \
+         the minimum version supporting --experimental-strip-types, the \
+         no-build-step entry point for the TypeScript examples"
+    );
+}
+
+#[test]
 fn ci_workflow_runs_workspace_tests_single_threaded() {
     let ci = read_workspace_file(".github/workflows/ci.yml");
     // The exact command — note the `--` separator is what makes

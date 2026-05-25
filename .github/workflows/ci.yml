@@ -14,6 +14,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.6'
+      - name: Verify Node version (>=22.6 required for --experimental-strip-types)
+        shell: bash
+        run: node --version | grep -E '^v22\.[6-9]|^v22\.[1-9][0-9]+|^v2[3-9]|^v[3-9]'
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --workspace -- -D warnings
       - name: Lint - connection factory enforcement

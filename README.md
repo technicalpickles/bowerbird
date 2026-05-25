@@ -3,9 +3,9 @@
 bowerbird is a local-only substrate that captures Claude Code activity over
 Unix-socket hook events, normalizes them via the `adapter-claude` crate,
 persists them in WAL-mode SQLite, and broadcasts them to subscribed tools over
-an authenticated WebSocket. The three reference examples under `examples/`
-(post-V1) will demonstrate the canonical patterns; for V1, the protocol and
-the daemon are the contract.
+an authenticated WebSocket. Three TypeScript reference examples under
+[`examples/`](examples/) demonstrate the canonical patterns (live state
+fan-out, REST cursor-pagination, Close/Dropped recovery).
 
 Status: V1 in development. See
 [`docs/bmad/planning-artifacts/epics.md`](docs/bmad/planning-artifacts/epics.md)
@@ -160,6 +160,16 @@ should not lose it. Explicit data-directory cleanup is `rm -rf
 macOS users see a one-time Keychain prompt; subsequent reads from the same
 binary path do not re-prompt. Retrieve the token with `bowerbird auth
 token` for tool configuration.
+
+## Reference examples
+
+Three TypeScript reference tools demonstrate the canonical patterns (Node 22.6+ required):
+
+```sh
+node --experimental-strip-types examples/multi-session-router/src/index.ts
+```
+
+See [`examples/README.md`](examples/README.md) for the full walkthrough — `multi-session-router` (live state fan-out), `event-log-viewer` (REST cursor-pagination + gap-detection), and `reconnect-recovery` (Close/Dropped → REST catch-up resilience).
 
 ## Architecture
 

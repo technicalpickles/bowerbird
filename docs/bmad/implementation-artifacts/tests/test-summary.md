@@ -1,78 +1,87 @@
-# Test Automation Summary — Story 4.1
+# Test Automation Summary — Story 4.2
 
-Generated 2026-05-25 via `bmad-qa-generate-e2e-tests`. Supersedes the Story 3.4 summary.
+Generated 2026-05-25 via `bmad-qa-generate-e2e-tests`. Supersedes the Story 4.1 summary.
 
 ## Baseline coverage already in place
 
-Story 4.1 (`bowerbird replay` and `bowerbird export` commands) landed with extensive test coverage from the dev-story pass — 20 dedicated tests before this QA run:
+Story 4.2 (three TypeScript reference examples — `multi-session-router`, `event-log-viewer`, `reconnect-recovery`) landed with substantial test coverage from the dev-story pass — 12 dedicated tests before this QA run:
 
-- **`crates/daemon/tests/contract_daemon.rs::story_4_1_replay`** (6 tests) — `replay_forwards_events_through_broadcast_path`, `replay_emits_state_frames_for_each_session`, `replay_continues_on_per_line_parse_error`, `replay_rejects_sentinel_kinds`, `replay_requires_bearer`, `replay_dropped_event_id_and_created_at_are_reassigned`. Each maps to a specific AC and covers the daemon-side wiring of `POST /replay` through the `ingest_tx` → writer task → broadcast hub path.
-- **`tests/cli_replay.rs`** (5 tests) — `replay_with_explicit_file_forwards_events`, `replay_with_no_argument_uses_bundled_fixture`, `replay_continues_after_invalid_lines`, `replay_fails_clearly_when_daemon_down`, `replay_fails_with_401_when_token_wrong`. End-to-end CLI exercise of `bowerbird replay`.
-- **`tests/cli_export.rs`** (4 tests) — `export_writes_jsonl_of_session_events_to_stdout`, `export_writes_to_file_when_output_flag_given`, `export_returns_session_not_found_for_unknown_id`, `export_round_trips_through_replay`. End-to-end CLI exercise of `bowerbird export` including the load-bearing round-trip invariant.
-- **`tests/cli_replay_fixture.rs`** (5 tests) — `bundled_fixture_is_valid_jsonl`, `bundled_fixture_spans_at_least_two_sessions`, `architecture_md_lists_replay_and_export_as_shipped`, `protocol_changelog_documents_post_replay_endpoint`, `cli_help_lists_replay_and_export`. Hermetic doc-drift guardrails per Epic 3 retro agreement A7.
-- **Unit tests in `src/commands/replay.rs`** (2 tests) — `count_fixture_shape_skips_blank_and_comment_lines`, `count_fixture_shape_counts_distinct_sessions`. Cover the CLI-side preamble computation.
+- **`tests/cli_examples.rs`** (4 tests) — `multi_session_router_routes_state_frames_for_both_fixture_sessions` (AC #1), `event_log_viewer_paginates_session_history_and_renders_tool_calls` (AC #2), `reconnect_recovery_recovers_after_close_frame_and_resumes` (AC #3 Close branch), `examples_fail_clearly_when_daemon_down` (daemon-down error path for all three). Each orchestrates a real `bowerbird-daemon` subprocess plus a Node subprocess running the example's `src/index.ts`, then asserts the canonical stdout/stderr shape.
+- **`tests/cli_examples_drift.rs`** (6 tests) — `each_example_has_required_files`, `each_example_package_json_declares_node_22_6_engine`, `each_example_source_carries_cookbook_anchors`, `architecture_md_describes_examples_as_typescript_not_cargo`, `examples_readme_reconciliation_note_present`, `examples_not_in_root_cargo_toml_members`. Hermetic doc-drift guardrails per Epic 3 retro agreement A7 — no daemon, no Node, fast.
+- **`examples/reconnect-recovery/tests/recover.test.ts`** (2 tests) — `recover fetches missed events and updates the cursor`, `recover returns 0 when no events past the cursor`. Node-built-in `--test` runner covering the AC #3 `Dropped` branch as a compiled assertion against an in-process fake daemon (no real lag burst required).
 
-All 20 baseline tests pass under `cargo test --workspace -- --test-threads=1`.
+All 12 baseline tests pass under `cargo test --workspace -- --test-threads=1` (Rust) and `npm test` (Node).
 
-## Gap Analysis
+## Gap analysis
 
-Four gaps remained after that baseline. Each is a silent-failure mode — a regression here does not break any existing test, but a behavior the AC promises stops being enforced.
+Four gaps remained after that baseline. Each is a silent-failure mode — a regression here does not break any existing test, but a behavior the AC or story task promises stops being enforced.
 
-**Gap A — Comment + blank line handling in `POST /replay` was implemented but unpinned.** AC #1 says "every non-blank, non-`#`-prefixed line deserializes as a `protocol::Event`". The daemon code at `crates/daemon/src/api/replay.rs:69-71` honors this by skipping such lines, but no test asserts that a `#`-comment line does not become a `parse_error` entry. A future refactor that, say, switches the body parsing to a stricter line iterator that treats `#` as JSON-invalid would silently break fixture authors who put explanatory headers in their JSONL files. The trailing-newline edge case (universal in JSONL) is implicitly exercised by the existing fixture but not pinned at the contract level.
+**Gap A — Multi-session-router stderr `new session: ...` lines unasserted.** Story 4.2 Task 7.4 explicitly says: *"assert the example logged `new session: claude/session-alpha` and `new session: claude/session-beta` to stderr."* The baseline smoke test pipes stderr but never reads it. AC #1's stderr-side observable ("treating a previously-unseen `(source, session_id)` as a 'new session appeared' event and logging it on stderr") was therefore unenforced — a refactor that quietly dropped the stderr log would still pass the existing test.
 
-**Gap B — Asymmetric transport-failure coverage between replay and export.** `replay_fails_clearly_when_daemon_down` asserts the "daemon stopped" stderr for `bowerbird replay`, but no equivalent existed for `bowerbird export`. The two commands share the same `commands::daemon::read_server_info` + token-resolver chain, but they have separate `Unreachable` arms in their own `run` functions. Symmetric coverage means a future change that swaps one command's error path doesn't silently regress the other.
+**Gap B — Event-log-viewer default session id never exercised.** The example defaults to `session-alpha` when `process.argv[2]` is undefined (`src/index.ts:139`). The baseline smoke test always passes `"session-alpha"` explicitly, so the default-arg branch is dead code under test. AC #2's "CLI arg: a session id, default `session-alpha`" was a documented contract with no enforcement.
 
-**Gap C — Asymmetric 401 coverage between replay and export.** Same shape as Gap B: `replay_fails_with_401_when_token_wrong` exists, but `bowerbird export`'s 401 path (which routes through `http_get_session_detail`, not `http_get_events`, because the pre-check fires first) was untested. A user with a stale `~/.bowerbird/config.toml` or expired `BOWERBIRD_TOKEN` should get the same clear "check your token" message from either command; the only way to keep that promise stable is to test both paths.
+**Gap C — Event-log-viewer behavior for unknown session ids unpinned.** The example's `if (res.status === 404)` handler at `src/index.ts:100-103` anticipates a 404 the daemon does not actually return — the daemon serves `GET /sessions/<unknown-id>/events?since=0` with HTTP 200 and an empty events array. The semantic contract a presenter relies on ("ask for any session id and get a renderable response") was undocumented. A future daemon change that flipped to actual 404s would change observable presenter behavior with no test catching the regression.
 
-**Gap D — Story Task 4.5's truncate-on-overwrite contract for `-o <path>` was undocumented in tests.** The task spec explicitly says "open with `OpenOptions::new().create(true).truncate(true)` (a re-export overwrites)". Implementation uses `File::create`, which truncates by default — but `File::create` and `OpenOptions::new().write(true).open()` (which appends if the file already exists) differ by one method call. A well-intentioned refactor to "use OpenOptions for clarity" without `.truncate(true)` would silently break the documented overwrite semantics.
+**Gap D — Recover()'s gap-detection and multi-session cursor-advancement branches uncovered.** The baseline Node tests covered only the happy path (events past the cursor) and the no-op case (cursor past all events). Two structurally distinct branches in `examples/reconnect-recovery/src/index.ts` had no coverage: (1) the gap-warning branch at lines 167-172 fires when `cursor.lastEventId < oldest_available_event_id - 1`, and (2) the cross-session cursor-advancement loop at lines 146-186 maintains a *global* `cursor.lastEventId` across multiple sessions. Either branch could regress silently against the existing test suite.
 
-## Generated Tests
+## Generated tests
 
-### Daemon contract — `crates/daemon/tests/contract_daemon.rs::story_4_1_replay` (2 new tests)
+### Rust smoke tests — `tests/cli_examples.rs`
 
-- **`replay_skips_blank_and_comment_lines`** — Closes Gap A. Body is a mix of `#`-prefixed comments, blank lines, two real event lines, an inline comment between them, and a trailing newline. Asserts `replayed_count == 2` and `parse_errors.is_empty()`. The trailing-newline assertion is the load-bearing piece: `body.split(|&b| b == b'\n')` produces a final empty slice that the handler must skip rather than treat as an empty-string parse error.
-- **`replay_with_only_comments_replays_zero_events`** — Closes Gap A's smallest case. Body is exclusively `#`-comment and blank lines. Asserts `200 OK` with `replayed_count: 0, parse_errors: []`. Pins the "empty effective body is not an error" contract — a future "should we 400 on empty replay requests?" refactor trips this test.
+Two new test functions; one existing test gained a stderr-side assertion.
 
-### CLI export E2E — `tests/cli_export.rs` (3 new tests)
+1. **`multi_session_router_routes_state_frames_for_both_fixture_sessions`** — *Modified.* Added a background stderr-drainer thread (same shape as the existing `reconnect_recovery` test) so stderr lines survive the test run. After the child exits, the test asserts the drained stderr contains both `new session: claude/session-alpha` and `new session: claude/session-beta`. Closes Gap A.
 
-- **`export_fails_clearly_when_daemon_down`** — Closes Gap B. Mirrors `replay_fails_clearly_when_daemon_down` exactly: no daemon started, `bowerbird export any-session-id`, assert `cannot reach daemon` on stderr and non-zero exit.
-- **`export_fails_with_401_when_token_wrong`** — Closes Gap C. Starts the daemon with the test token, then runs `bowerbird export` under `BOWERBIRD_TOKEN=wrong-token`. Asserts `daemon rejected bearer token` on stderr and non-zero exit. Verifies the export's `http_get_session_detail` pre-check fires the 401 path correctly.
-- **`export_overwrites_existing_output_file`** — Closes Gap D. Pre-seeds the output file with sentinel garbage (`STALE GARBAGE LINE THAT IS NOT JSONL\n`) that would fail JSONL parsing, then runs `bowerbird export session-alpha -o <pre-seeded-file>`. Asserts the garbage is gone and every non-empty line parses as `protocol::Event`. Catches the regression mode "OpenOptions::open without .truncate(true)".
+2. **`event_log_viewer_defaults_to_session_alpha_when_no_arg`** — *New.* Spawns the event-log-viewer with no CLI args. Asserts exit 0 and stdout containing 6 lines (session-alpha's bundled-fixture event count). The default-arg branch is now exercised. Closes Gap B.
 
-## Coverage
+3. **`event_log_viewer_renders_empty_for_unknown_session`** — *New.* Spawns the event-log-viewer with `definitely-not-a-real-session`. Asserts exit 0 with empty stdout — pins the daemon's *current* "200 OK + empty events" contract for unknown session ids. Includes an inline discovery note pointing at the dead-code 404 handler in the example, so a future daemon API tightening surfaces as a test failure rather than a silent presenter behavior change. Closes Gap C.
 
-| AC | Coverage source |
-| --- | --- |
-| AC #1 (replay forwards through broadcast) | `replay_forwards_events_through_broadcast_path` + `replay_continues_on_per_line_parse_error` + new `replay_skips_blank_and_comment_lines` + new `replay_with_only_comments_replays_zero_events` + 3 CLI replay tests |
-| AC #2 (export to JSONL) | `export_writes_jsonl_of_session_events_to_stdout` + `export_writes_to_file_when_output_flag_given` + `export_returns_session_not_found_for_unknown_id` + `export_round_trips_through_replay` + 3 new export-failure-path tests |
-| AC #3 (bundled fixture) | `replay_with_no_argument_uses_bundled_fixture` + `bundled_fixture_is_valid_jsonl` + 2 `count_fixture_shape` unit tests |
-| AC #4 (multi-session fan-out) | `replay_emits_state_frames_for_each_session` + `bundled_fixture_spans_at_least_two_sessions` |
-| AC #5 (no timing preservation) | `replay_dropped_event_id_and_created_at_are_reassigned` |
-| AC #6 (architecture.md updates) | `architecture_md_lists_replay_and_export_as_shipped` |
-| AC #7 (protocol-changelog) | `protocol_changelog_documents_post_replay_endpoint` |
+### Node `--test` tests — `examples/reconnect-recovery/tests/recover.test.ts`
 
-| File | Tests before | Tests after |
-| --- | --- | --- |
-| `crates/daemon/tests/contract_daemon.rs::story_4_1_replay` | 6 | 8 |
-| `tests/cli_replay.rs` | 5 | 5 |
-| `tests/cli_export.rs` | 4 | 7 |
-| `tests/cli_replay_fixture.rs` | 5 | 5 |
-| **Story 4.1 total** | **20** | **25** |
+Two new test cases.
+
+4. **`recover handles an unrecoverable gap (cursor predates oldest_available)`** — *New.* Fake daemon serves events with `event_id` starting at 10; cursor starts at 1. Shims `process.stderr.write` to capture writes; asserts the `gap unrecoverable for session rotated-session` warning fires AND the recovered count is 2 AND the cursor advances to 11. Restores `process.stderr.write` on exit. Closes Gap D (gap-detection half).
+
+5. **`recover advances cursor to the max across multiple sessions`** — *New.* Fake daemon serves two sessions with non-overlapping event_id ranges (session-one: 1, 2; session-two: 3, 4). Asserts `recover()` returns 4 (events across both sessions) AND `cursor.lastEventId` ends at the global max (4), not per-session. Closes Gap D (cross-session half).
 
 ## Verification
 
 ```sh
-cargo fmt --all -- --check                                          # clean
-cargo clippy --workspace --all-targets -- -D warnings               # 0 warnings
-cargo test -p bowerbird-daemon --test contract_daemon \
-  story_4_1_replay -- --test-threads=1                              # 8 passed
-cargo test --test cli_replay --test cli_export --test cli_replay_fixture \
-  -- --test-threads=1                                               # 17 passed (3 suites)
+cargo test --test cli_examples -- --test-threads=1
+# Result: 6 passed in 5.72s (4 baseline + 2 new)
+
+cargo test --test cli_examples_drift -- --test-threads=1
+# Result: 6 passed (no changes to drift suite)
+
+cd examples/reconnect-recovery && node --experimental-strip-types --test 'tests/**/*.test.ts'
+# Result: 4 passed (2 baseline + 2 new)
+
+cargo fmt --all -- --check
+# Result: clean
+
+cargo clippy --workspace --all-targets -- -D warnings
+# Result: 0 warnings
 ```
 
-## Next Steps
+## Coverage tally
 
-- All 25 Story 4.1 tests pass; the 5 new tests close the gaps identified above without introducing new infrastructure.
-- No new dependencies. The daemon contract tests reuse the existing `wired_state` helper and `auth_post` builder; the CLI export tests reuse the existing `bowerbird_cmd_in` + `start_daemon` + `stop_daemon` helpers.
-- Future Story 4.2 (reference examples) will exercise the bundled fixture from another consumer — the existing `bundled_fixture_is_valid_jsonl` doc-drift guardrail catches the cross-consumer drift hazard without needing a separate test in this story.
-- The `replay_channel_full_returns_parse_error` case (the `TrySendError::Full` arm in `crates/daemon/src/api/replay.rs:115`) remains untested — it is hard to trigger deterministically without artificially blocking the writer task. Leaving it deferred; the runtime guard exists, but a regression there is low-probability and self-evident (the "channel full" message appears in parse_errors).
+| Surface | Before QA | After QA |
+|---|---|---|
+| Rust smoke tests (`tests/cli_examples.rs`) | 4 | 6 |
+| Rust drift tests (`tests/cli_examples_drift.rs`) | 6 | 6 |
+| Node `--test` cases (`recover.test.ts`) | 2 | 4 |
+| **Total dedicated tests** | **12** | **16** |
+
+## ACs traced
+
+- **AC #1 — multi-session-router** — fully covered. Snapshot fan-out, both sessions surfacing as map entries, stdout JSON shape, stderr new-session lines, Close-frame exit 0.
+- **AC #2 — event-log-viewer** — fully covered. Cursor-pagination loop, tab-separated render shape, default session id, unknown-session graceful render, daemon-down failure, kind/tool/reaction sequence per bundled fixture.
+- **AC #3 — reconnect-recovery** — fully covered. Close-branch via `bowerbird stop` + restart + replay; Dropped-branch via `recover()` unit tests including happy-path, no-op-past-cursor, gap-detection, and multi-session cursor advancement; idle-timeout clean exit.
+- **AC #4 — CI smoke for all three examples** — covered by `tests/cli_examples.rs` running under `cargo test --workspace -- --test-threads=1` with `actions/setup-node@v4` pinning Node 22.6 in CI.
+- **AC #5 — cookbook anchors present** — covered by `tests/cli_examples_drift.rs::each_example_source_carries_cookbook_anchors`.
+
+## Next steps
+
+- Run the augmented suite in CI on the next PR push; the Node-side glob (`'tests/**/*.test.ts'` in `package.json`) is Node-version-portable so the CI runner's Node 22.6 pin and contributor environments on Node 23/24 both work.
+- The discovery note in `event_log_viewer_renders_empty_for_unknown_session` should be revisited if the daemon's REST surface ever returns actual HTTP 404s for unknown session ids — the dead-code 404 handler in `event-log-viewer/src/index.ts` would then become live, and the test should flip to asserting the error-exit shape instead of the empty-render shape.
+- The `process.stderr.write` shim in the recover gap-detection test is restored on exit but adds a small surface-area risk: a future test inserted between save and restore could see logs vanish. Keeping the shim block tightly scoped to the single test is the discipline the file already follows; revisit if more tests need stderr capture.
