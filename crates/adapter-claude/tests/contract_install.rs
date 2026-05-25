@@ -232,6 +232,51 @@ fn install_creates_parent_directory_when_missing() {
         serde_json::from_slice(&fs::read(&nested).unwrap()).expect("created file is valid JSON");
 }
 
+/// Story 3.4 AC #4: the command written into settings.json is PATH-relative —
+/// no path component, no absolute path, no `current_exe()` interpolation. A
+/// user who downloads a tarball today, extracts it, and copies the binaries to
+/// `/usr/local/bin/` can re-download tomorrow into `~/.local/bin/` (or any
+/// other `$PATH` location) WITHOUT re-running `bowerbird install` — Claude
+/// Code's hook engine resolves the bare name `bowerbird-shim` via `$PATH` at
+/// each invocation. This test pins the invariant against future drift.
+///
+/// Pinned by two assertions per hook kind:
+///   1. The command string contains zero `/` characters (PATH-relative form).
+///   2. The first whitespace-separated token equals `protocol::SHIM_BINARY_NAME`.
+#[test]
+fn installed_command_uses_path_relative_binary_name_no_slash_in_first_token() {
+    let dir = TempDir::new().unwrap();
+    let path = fresh_settings(&dir);
+
+    install(&path).expect("install");
+    let parsed: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+
+    for kind in ["PreToolUse", "PostToolUse", "Stop", "Notification"] {
+        let cmd = parsed
+            .pointer(&format!("/hooks/{kind}/0/hooks/0/command"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| panic!("missing command for {kind}"));
+
+        assert!(
+            !cmd.contains('/'),
+            "AC #4 regression: command for {kind} must be PATH-relative \
+             (no `/` characters), found {cmd:?}"
+        );
+
+        let first_token = cmd
+            .split_whitespace()
+            .next()
+            .unwrap_or_else(|| panic!("empty command for {kind}"));
+        assert_eq!(
+            first_token,
+            protocol::SHIM_BINARY_NAME,
+            "AC #4 regression: first token of {kind} command must equal \
+             SHIM_BINARY_NAME ({:?}), found {first_token:?}",
+            protocol::SHIM_BINARY_NAME
+        );
+    }
+}
+
 /// AC #4: uninstall is idempotent when called on a file that does not contain
 /// the bowerbird entries — including a file that was never installed to.
 #[test]

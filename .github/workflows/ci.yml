@@ -22,7 +22,17 @@ jobs:
       - name: Lint - inline SQL ban
         shell: bash
         run: ./scripts/lint-inline-sql.sh
-      - run: cargo test --workspace
+      # `-- --test-threads=1` serializes the daemon contract-test suite under
+      # crates/daemon/tests/contract_daemon.rs and workspace-level tests/cli_*.rs.
+      # Those suites share process-wide state — real subprocesses spawned via
+      # assert_cmd, OS signal handlers, BOWERBIRD_DATA_DIR file fixtures, and
+      # (since Story 3.3) BOWERBIRD_KEYRING_BACKEND keychain backends. Parallel
+      # execution causes hangs (observed in Stories 1.6, 2.5, 3.1, 3.2, 3.3).
+      # See docs/bmad/planning-artifacts/architecture.md "Contract-test
+      # serialization (operational note)" for the full rationale (Epic 2 retro
+      # AI-3 / Discovery #3). Cost: ~60-90s additional wall-clock; that is the
+      # price for eliminating an entire class of flake source.
+      - run: cargo test --workspace -- --test-threads=1
 
   shim-bench-gate:
     name: Shim hot-path bench (p99 ≤ 5ms, +15% regression fails)

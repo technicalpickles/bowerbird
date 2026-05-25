@@ -1,0 +1,261 @@
+name: Release
+
+# Two-stage release pipeline:
+#
+#   1. `build` matrix — three target triples (macOS arm64, macOS x86_64 via
+#      cross-compile, Linux x86_64 glibc 2.35+). Each entry runs TWO cargo
+#      invocations per matrix row: one for the workspace minus the shim under
+#      the default `release` profile, and one for `bowerbird-shim` alone under
+#      the `release-shim` profile (panic=abort, lto=fat, codegen-units=1,
+#      opt-level=z, strip=true) so the shipped shim preserves the p99 ≤5ms
+#      hot-path budget the CI bench gates against. The two cargo runs are
+#      necessary because cargo lacks per-target-per-binary profile selection
+#      in a single invocation.
+#
+#   2. `release` job — downloads all matrix artifacts, creates (or updates)
+#      the GitHub Release for the triggering tag, attaches the three tarballs,
+#      and renders the release-notes template that names the artifacts and
+#      restates the musl-deferral statement verbatim (AC #2).
+#
+# Trigger: tag push matching `v*.*.*` OR manual `workflow_dispatch` against an
+# existing tag (useful for iterating on the workflow itself without re-pushing
+# refs).
+#
+# Third-party action audit (V1; SHA-pinning is V2 supply-chain hardening):
+#   - actions/checkout@v4              first-party
+#   - dtolnay/rust-toolchain@stable    curated, widely used in Rust GH Actions
+#   - actions/upload-artifact@v4       first-party
+#   - actions/download-artifact@v4     first-party
+#   - softprops/action-gh-release@v2   battle-tested release-attachment action;
+#                                      resolves release-id race a hand-rolled
+#                                      `gh release create || gh release upload`
+#                                      would re-introduce.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g., v0.1.0)'
+        required: true
+
+permissions:
+  contents: write  # required for softprops/action-gh-release to create releases
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS arm64 (Apple Silicon) — native build on the default
+          # `macos-latest` runner (currently ARM).
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            cross: false
+          # macOS x86_64 (Intel) — cross-compiled from the ARM runner via
+          # `rustup target add x86_64-apple-darwin`. GitHub phased out
+          # Intel-based macOS runners; cross-compilation is the supported
+          # path. The resulting binary runs on Intel Macs (or under Rosetta 2
+          # on ARM Macs).
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            cross: false
+          # Linux x86_64 glibc. Pinned to `ubuntu-22.04` (glibc 2.35) NOT
+          # `ubuntu-latest` (which floats to 24.04 = glibc 2.39 and would
+          # exclude Debian 12 and older LTS distros). musl Linux is deferred
+          # post-V1 (NFR9) — see the release-notes template below.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            cross: false
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        # dtolnay/rust-toolchain auto-reads rust-toolchain.toml when no
+        # explicit `toolchain:` input is given. `targets` adds the cross
+        # target on top of the host target.
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          # On tag-push triggers, github.ref_name = "v0.1.0".
+          # On workflow_dispatch triggers, the user supplies the tag input.
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build workspace under release profile (excl. shim)
+        # The CLI binary and daemon ship under the default `release` profile.
+        # `--locked` enforces the committed Cargo.lock as the dependency
+        # graph (NFR10 reproducibility contract).
+        run: |
+          cargo build --release --workspace --locked \
+            --target ${{ matrix.target }} \
+            --exclude bowerbird-shim
+
+      - name: Build shim under release-shim profile
+        # The shim ships under `release-shim` (panic=abort, lto=fat,
+        # codegen-units=1, opt-level=z, strip=true) so the shipped binary
+        # honors the p99 ≤5ms hot-path budget. Output lands in
+        # `target/<triple>/release-shim/bowerbird-shim`.
+        run: |
+          cargo build --profile release-shim --locked \
+            --target ${{ matrix.target }} \
+            -p bowerbird-shim
+
+      - name: Stage tarball contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.tag }}"
+          STAGING="staging/bowerbird-${TAG}-${{ matrix.target }}"
+          mkdir -p "${STAGING}/bin"
+          mkdir -p "${STAGING}/adapters/claude"
+
+          cp "target/${{ matrix.target }}/release/bowerbird"          "${STAGING}/bin/"
+          cp "target/${{ matrix.target }}/release/bowerbird-daemon"   "${STAGING}/bin/"
+          cp "target/${{ matrix.target }}/release-shim/bowerbird-shim" "${STAGING}/bin/"
+          cp adapters/claude/tool-reactions.toml                      "${STAGING}/adapters/claude/"
+
+          cp LICENSE        "${STAGING}/"
+          cp LICENSE-MIT    "${STAGING}/"
+          cp LICENSE-APACHE "${STAGING}/"
+          cp README.md      "${STAGING}/"
+          cp INSTALL.md     "${STAGING}/"
+          cp docs/protocol-changelog.md "${STAGING}/CHANGELOG.md"
+
+          ls -lR "${STAGING}"
+
+      - name: Create tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.tag }}"
+          NAME="bowerbird-${TAG}-${{ matrix.target }}"
+          tar -czvf "${NAME}.tar.gz" -C staging "${NAME}"
+          # Compute SHA-256 for the release notes (helpful for users
+          # validating their download integrity).
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
+          else
+            sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
+          fi
+          ls -l "${NAME}.tar.gz" "${NAME}.tar.gz.sha256"
+
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bowerbird-${{ steps.tag.outputs.tag }}-${{ matrix.target }}
+          path: |
+            bowerbird-${{ steps.tag.outputs.tag }}-${{ matrix.target }}.tar.gz
+            bowerbird-${{ steps.tag.outputs.tag }}-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List artifacts
+        shell: bash
+        run: |
+          find artifacts -type f -name '*.tar.gz*' | sort
+
+      - name: Build release notes body
+        id: notes
+        shell: bash
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          # The musl-deferral paragraph (AC #2) is verbatim here; the README
+          # contains the same paragraph in its Install section so a user
+          # landing on either entry point sees the deferral.
+          cat > release-notes.md <<EOF
+          ## Prebuilt binaries
+
+          | Target | Tarball |
+          |---|---|
+          | macOS arm64 (Apple Silicon) | \`bowerbird-${TAG}-aarch64-apple-darwin.tar.gz\` |
+          | macOS x86_64 (Intel) | \`bowerbird-${TAG}-x86_64-apple-darwin.tar.gz\` |
+          | Linux x86_64 (glibc 2.35+) | \`bowerbird-${TAG}-x86_64-unknown-linux-gnu.tar.gz\` |
+
+          > **musl Linux is deferred post-V1** (NFR9). On musl-based distributions
+          > (Alpine, Void, etc.) install from source instead:
+          >
+          > \`\`\`sh
+          > cargo install --git https://github.com/${{ github.repository }} --tag ${TAG}
+          > \`\`\`
+          >
+          > Windows is an explicit V1 scope cut (see \`docs/no-list.md\`).
+
+          Each tarball contains the three binaries (\`bowerbird\`,
+          \`bowerbird-shim\` under the \`release-shim\` profile,
+          \`bowerbird-daemon\`), the bundled \`adapters/claude/tool-reactions.toml\`,
+          MIT+Apache-2.0 license files, the project README, and \`INSTALL.md\`
+          with the post-extract walkthrough.
+
+          ## Install (prebuilt)
+
+          See \`INSTALL.md\` inside the tarball or the
+          [project README](https://github.com/${{ github.repository }}#install).
+
+          ## Verify the download
+
+          SHA-256 checksums are attached as \`*.sha256\` files alongside each
+          tarball.
+
+          ## macOS Gatekeeper
+
+          The prebuilt binaries are not signed (Apple Developer ID
+          certificates are deferred post-V1). On first run, macOS will block
+          the binaries with a Gatekeeper warning. Clear the quarantine flag
+          per the README's Install section.
+          EOF
+          echo "path=release-notes.md" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: bowerbird ${{ steps.tag.outputs.tag }}
+          body_path: release-notes.md
+          # Treat `v0.1.0-rc1` (or any tag containing `-`) as prerelease.
+          prerelease: ${{ contains(steps.tag.outputs.tag, '-') }}
+          # Auto-generate the "What's Changed" section from PR history.
+          generate_release_notes: true
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.tar.gz.sha256
+          fail_on_unmatched_files: true

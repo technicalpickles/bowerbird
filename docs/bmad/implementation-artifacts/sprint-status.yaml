@@ -1,5 +1,5 @@
 # generated: 2026-05-16
-# last_updated: 2026-05-25 (story 3.3 done after auto-fix review)
+# last_updated: 2026-05-25 (story 3.4 → done after code review)
 # project: bowerbird
 # project_key: NOKEY
 # tracking_system: file-system
@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-05-16
-last_updated: 2026-05-25
+last_updated: 2026-05-25 (story 3.4 → done after code review)
 project: bowerbird
 project_key: NOKEY
 tracking_system: file-system
@@ -68,7 +68,7 @@ development_status:
   3-1-bowerbird-install-and-uninstall: done
   3-2-daemon-lifecycle-cli: done
   3-3-bearer-token-auth-with-keychain-storage: done
-  3-4-prebuilt-binary-distribution-and-release-pipeline: backlog
+  3-4-prebuilt-binary-distribution-and-release-pipeline: done
   epic-3-retrospective: optional
 
   # Epic 4: Developer experience, replay, and protocol stability

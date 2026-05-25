@@ -458,11 +458,24 @@ CREATE TABLE recording_sessions (
 - `GET /healthz` — liveness (unauthenticated)
 - `GET /readyz` — readiness; 503 until migrations complete (unauthenticated)
 
-**WebSocket:**
-- Upgrade at `GET /ws`; bearer auth on upgrade
-- Topic filtering: session_id or wildcard subscriptions
-- Fan-out: tokio broadcast channel per topic; slow consumer receives `DroppedFrame`; channel never blocks
-- Max 256 concurrent WS connections; 257th receives defined rejection
+### WebSocket subsystem
+
+**Wire surface:** Upgrade at `GET /ws`; bearer auth on upgrade (header or `?token=` query fallback per protocol-changelog v1.0 → v1.1). Topic filtering: `events.*`, `events.<source>.*`, `events.<source>.<session_id>`, `state.session.*`, `state.session.<id>`, `state.session.<id>.current_state`. Fan-out via `tokio::sync::broadcast`; slow consumers receive a coalesced `DroppedFrame` rather than blocking the publisher.
+
+**Runtime config knobs** (defaults in `crates/daemon/src/config.rs::Config::with_bowerbird_dir`; all overridable via the daemon's `Config` builder):
+
+| Field | Default | Role |
+|---|---|---|
+| `ws_max_connections` | `256` | Semaphore cap on concurrent WS connections; the 257th upgrade returns HTTP 503. |
+| `ws_ping_interval` | `30s` | Per-client liveness probe cadence (axum WS Ping frame). |
+| `ws_pong_timeout` | `10s` | If no Pong arrives within this deadline of a Ping, the connection is closed; dead-connection cleanup is deadline-granularity, not next-tick-granularity. |
+| `ws_broadcast_capacity` | `1024` | Per-channel ring buffer size; a subscriber more than this many envelopes behind the publisher triggers a `DroppedFrame`. |
+| `shutdown_drain_timeout` | `5s` | After SIGTERM/SIGINT, the daemon waits up to this long for WS tasks to drain protocol `close` frames before forcing the WebSocket control close. |
+| `ws_broadcast_coalesce_window` | `1s` | Sliding window for coalescing `DroppedFrame` emissions on a sustained-lagging connection; 30s of continuous lag emits ≤31 frames, not 1024+. |
+
+Defaults are committed at `crates/daemon/src/config.rs::Config::with_bowerbird_dir`; the table above MUST be updated in the same commit as any field-default change. There is no machine-checked binding between source and doc — the discipline lives in commit hygiene and code review.
+
+**Contract-test serialization (operational note).** The daemon contract-test suite under `crates/daemon/tests/contract_daemon.rs` and the workspace-level CLI E2E suites under `tests/cli_*.rs` share process-wide state — real subprocesses spawned via `assert_cmd`, OS signal handlers, file system fixtures under `BOWERBIRD_DATA_DIR`, and (since Story 3.3) keychain backends via `BOWERBIRD_KEYRING_BACKEND`. Concurrent execution of these tests causes hangs (observed in Stories 1.6, 2.5, 3.1, 3.2, 3.3). CI invokes `cargo test --workspace -- --test-threads=1` in `.github/workflows/ci.yml` to serialize the suite. Contributors running `cargo test` locally should mirror this flag; the workspace does not yet enforce it via a `.cargo/config.toml` `[alias]` because doing so would also serialize `cargo build` invocations (a measurable wall-clock cost on a multi-core dev box).
 
 **Protocol serde:**
 - Inbound: `deny_unknown_fields` — strict
