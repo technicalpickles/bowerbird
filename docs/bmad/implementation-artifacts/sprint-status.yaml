@@ -72,7 +72,7 @@ development_status:
   epic-3-retrospective: done
 
   # Epic 4: Developer experience, replay, and protocol stability
-  epic-4: in-progress
+  epic-4: done
   4-1-bowerbird-replay-and-export-commands: done
   4-2-three-reference-example-tools: done
   4-3-documentation-suite: done

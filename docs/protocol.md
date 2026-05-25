@@ -279,7 +279,7 @@ The `event.reaction` field is `null` when the adapter cannot classify the tool �
 
 Emitted after every projection write AND as a snapshot on subscribe to any `state.*` topic (Story 2.3). Snapshot frames apply the read-time stale-`Working` → `Idle` fallback (Story 1.6's `current_state_for_read`) just like the REST `/sessions/*` responses. Snapshot frames precede live frames on the same connection; subsequent live frames continue without gap. Source: [`crates/protocol/src/ws.rs:102`](../crates/protocol/src/ws.rs) `StateFrame`, [`crates/protocol/src/state.rs:13`](../crates/protocol/src/state.rs) `SessionState`.
 
-`SessionCurrentState` is one of `Idle`, `Working`, `WaitingInput`.
+`SessionCurrentState` is one of `Idle`, `Working`, `WaitingInput`, `Unknown`. The `Unknown` variant is the additive-compat catch-all added in Story 4.4 (via `#[serde(other)]`): a future v1.x daemon may introduce new state values (e.g. `Compacting`, `AwaitingApproval`) which v1.0 presenters MUST decode as `Unknown` rather than erroring on the tag. The daemon never *produces* `Unknown` — it's decode-only, same shape as `ServerMessage::Unknown` (Story 2.1). Source: [`crates/protocol/src/state.rs`](../crates/protocol/src/state.rs).
 
 ### `dropped`
 
@@ -337,7 +337,7 @@ Rules:
 
 ## EventKind enum
 
-The six values from [`crates/protocol/src/event.rs:9`](../crates/protocol/src/event.rs):
+The seven values from [`crates/protocol/src/event.rs:9`](../crates/protocol/src/event.rs):
 
 | Value | User-facing? | Meaning |
 |---|---|---|
@@ -347,8 +347,9 @@ The six values from [`crates/protocol/src/event.rs:9`](../crates/protocol/src/ev
 | `Notification` | yes | A non-tool side-channel event (e.g. permission prompt) |
 | `RecordingStarted` | **no — internal sentinel** | Daemon started a recording session |
 | `RecordingEnded` | **no — internal sentinel** | Daemon ended a recording session |
+| `Unknown` | **decode-only catch-all** | Forward-compat hatch added in Story 4.4 via `#[serde(other)]`; v1.0 presenters decode future v1.x event kinds as `Unknown` instead of erroring on the tag |
 
-Sentinel events are stored with `source = "__daemon__"` and filtered out of every wire emission (REST, WebSocket, replay).
+Sentinel events are stored with `source = "__daemon__"` and filtered out of every wire emission (REST, WebSocket, replay). The daemon never *produces* `Unknown` — adapter `normalize` rejects unknown hook strings at the boundary, `event_kind_as_str` debug-asserts against persisting Unknown to SQLite, and `POST /replay` rejects Unknown at the JSONL parse boundary with a clear "this build is older than the source daemon" message. `Unknown` is strictly a wire-decode safety net for v1.x → v1.0 forward-compat.
 
 ## Reaction enum
 
