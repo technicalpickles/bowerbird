@@ -1,0 +1,10 @@
+{
+  "op": "state",
+  "source": "claude",
+  "session_id": "sess-state-working",
+  "state": {
+    "current_state": "Working",
+    "last_event_kind": "PreToolUse",
+    "last_event_at_ms": 1748352011000
+  }
+}

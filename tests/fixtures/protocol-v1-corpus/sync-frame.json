@@ -1,0 +1,5 @@
+{
+  "op": "sync",
+  "oldest_available_event_id": 1,
+  "latest_event_id": 200
+}

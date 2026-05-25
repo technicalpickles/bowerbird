@@ -1,0 +1,12 @@
+{
+  "op": "event",
+  "event": {
+    "event_id": 45,
+    "source": "claude",
+    "session_id": "sess-corpus-2",
+    "kind": "PreToolUse",
+    "reaction": "FutureReactionShippedInV1_42",
+    "payload": "{\"tool_name\":\"AnotherTool\"}",
+    "created_at": 1748352003000
+  }
+}

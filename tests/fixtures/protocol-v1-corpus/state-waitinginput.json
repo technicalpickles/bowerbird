@@ -1,0 +1,10 @@
+{
+  "op": "state",
+  "source": "claude",
+  "session_id": "sess-state-waiting",
+  "state": {
+    "current_state": "WaitingInput",
+    "last_event_kind": "Notification",
+    "last_event_at_ms": 1748352012000
+  }
+}

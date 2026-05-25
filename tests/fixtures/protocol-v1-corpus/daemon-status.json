@@ -1,0 +1,9 @@
+{
+  "daemon_version": "0.1.0",
+  "protocol_version": "1.0",
+  "started_at_ms": 1748352000000,
+  "uptime_ms": 360000,
+  "last_event_at_ms": 1748352101000,
+  "last_event_id": 102,
+  "connected_ws_clients": 3
+}

@@ -1,0 +1,18 @@
+[
+  {
+    "source": "claude",
+    "session_id": "sess-list-1",
+    "current_state": "Working",
+    "last_event_kind": "PreToolUse",
+    "last_event_at_ms": 1748352200000,
+    "updated_at": 1748352200000
+  },
+  {
+    "source": "claude",
+    "session_id": "sess-list-2",
+    "current_state": "Idle",
+    "last_event_kind": "PostToolUse",
+    "last_event_at_ms": 1748352199000,
+    "updated_at": 1748352199500
+  }
+]

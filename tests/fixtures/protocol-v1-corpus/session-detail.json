@@ -1,0 +1,10 @@
+{
+  "source": "claude",
+  "session_id": "sess-detail",
+  "state": {
+    "current_state": "WaitingInput",
+    "last_event_kind": "Notification",
+    "last_event_at_ms": 1748352300000
+  },
+  "updated_at": 1748352300500
+}

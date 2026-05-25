@@ -1,0 +1,10 @@
+{
+  "op": "state",
+  "source": "claude",
+  "session_id": "sess-state-unknown",
+  "state": {
+    "current_state": "Compacting",
+    "last_event_kind": "PreToolUse",
+    "last_event_at_ms": 1748352012000
+  }
+}

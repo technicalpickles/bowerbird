@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "solo_p99_nanos": 0,
+  "fanout3_p99_nanos": 0,
+  "burst_p99_nanos": 0,
+  "steady_p99_nanos": 0,
+  "samples": 50,
+  "absolute_budget_nanos": 100000000,
+  "regression_max_ratio": 1.30,
+  "_seeding_note": "p99 values are 0 (uninitialized) — the regression gate is auto-skipped per-shape until real values land. The absolute gate still enforces NFR2 (100ms). Seed by downloading the daemon-bench-macos-latest artifact from the first green CI run and committing it here."
+}

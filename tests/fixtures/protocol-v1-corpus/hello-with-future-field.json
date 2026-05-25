@@ -1,0 +1,9 @@
+{
+  "op": "hello",
+  "protocol_version": "1.0",
+  "daemon_version": "9.9.9",
+  "oldest_available_event_id": 0,
+  "daemon_started_at": 0,
+  "history_begins_cleanly": false,
+  "future_field_added_in_v1_42": "v1.0 presenters must ignore me"
+}

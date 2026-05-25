@@ -74,3 +74,45 @@ jobs:
           name: shim-bench-${{ matrix.os }}
           path: target/shim-bench-summary.json
           if-no-files-found: warn
+
+  daemon-bench-gate:
+    name: Daemon hook→presenter bench (p99 ≤ 100ms, +30% regression fails)
+    # Story 4.4 / AC #7. End-to-end p99 hook→presenter (Unix ingest → broadcast
+    # hub → WS frame) gated against per-platform baselines + the NFR2 absolute
+    # 100ms ceiling. Four shapes: solo, fanout3, burst, steady-state.
+    # Structurally identical to shim-bench-gate; same artifact-upload pattern
+    # for baseline seeding. The 30% regression ratio is looser than the shim's
+    # 15% per Axiom 3 (daemon-internal perf is soft) but tight enough to be a
+    # real signal.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            baseline: macos.json
+          - os: ubuntu-latest
+            baseline: linux.json
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build daemon under release profile
+        run: cargo build --release -p bowerbird-daemon
+
+      - name: Run hook→presenter bench (subprocess daemon, 4 shapes)
+        run: cargo bench -p bowerbird-daemon --bench hook_to_presenter
+
+      - name: Gate current p99 across all four shapes
+        shell: bash
+        run: |
+          python3 scripts/check-daemon-bench-p99.py \
+            target/daemon-bench-summary.json \
+            crates/daemon/benches/baselines/${{ matrix.baseline }}
+
+      - name: Upload bench summary (for baseline seeding)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daemon-bench-${{ matrix.os }}
+          path: target/daemon-bench-summary.json
+          if-no-files-found: warn

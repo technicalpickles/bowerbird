@@ -1,0 +1,12 @@
+{
+  "op": "event",
+  "event": {
+    "event_id": 43,
+    "source": "claude",
+    "session_id": "sess-corpus-1",
+    "kind": "PostToolUse",
+    "reaction": null,
+    "payload": "{\"tool_name\":\"Bash\",\"tool_output\":\"hi\\n\"}",
+    "created_at": 1748352001500
+  }
+}

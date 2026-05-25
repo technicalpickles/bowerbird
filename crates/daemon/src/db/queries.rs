@@ -115,7 +115,20 @@ pub const PROBE_DB_READY: &str = "SELECT 1 FROM events WHERE 1=0";
 ///
 /// Delegates to the protocol's serde representation so storage stays in lockstep
 /// with the wire format. Trims the surrounding JSON quotes.
+///
+/// **`EventKind::Unknown` must never reach this function.** Unknown is the
+/// decode-only catch-all the additive-compat policy requires (Story 4.4 /
+/// Epic 2 retro AI-4); it appears at wire-deserialize boundaries (Event JSON
+/// in `/replay`, broadcast envelope decode in third-party bindings) but the
+/// daemon never CONSTRUCTS it, and `/replay` rejects it at the parse boundary.
+/// A `debug_assert!` fires in debug builds if this invariant breaks; release
+/// builds tolerate it by serializing through as the literal string `"Unknown"`
+/// (lossy, but no panic on the hot ingest path).
 pub fn event_kind_as_str(k: &EventKind) -> String {
+    debug_assert!(
+        !matches!(k, EventKind::Unknown),
+        "EventKind::Unknown is decode-only; the daemon must never persist it (see Story 4.4)"
+    );
     let mut s = serde_json::to_string(k).expect("EventKind serialize is infallible");
     if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
         s.truncate(s.len() - 1);
@@ -126,8 +139,23 @@ pub fn event_kind_as_str(k: &EventKind) -> String {
 
 /// Inverse of [`event_kind_as_str`]: parses an `events.kind` TEXT column value
 /// back into an [`EventKind`]. Returns a parse-error message string on
-/// unknown values; callers map to their preferred error type.
+/// malformed input.
+///
+/// **Permissive on unknown variants** since Story 4.4 — the wire-decode
+/// catch-all `#[serde(other)] Unknown` (Epic 2 retro AI-4) means any string
+/// that isn't a recognized variant deserializes to `EventKind::Unknown`
+/// rather than erroring. Storage staying in lockstep with the wire is
+/// intentional: a DB row written by a future v1.x daemon with a kind this
+/// build doesn't know about reads back as `Unknown`, the same way the wire
+/// would deserialize it.
+///
+/// Empty strings are still rejected explicitly — they aren't future
+/// variants, they're corrupt storage rows. Surface the corruption rather
+/// than silently mapping to `Unknown`.
 pub fn event_kind_from_db_str(s: &str) -> Result<EventKind, String> {
+    if s.is_empty() {
+        return Err("empty EventKind string: corrupt storage row".to_string());
+    }
     // Round-trip through serde so storage stays in lockstep with the wire
     // format. JSON quote the input first since serde expects `"PreToolUse"`,
     // not `PreToolUse`.
@@ -177,8 +205,39 @@ mod tests {
     }
 
     #[test]
-    fn event_kind_from_db_str_rejects_unknown() {
-        assert!(event_kind_from_db_str("Bogus").is_err());
+    fn event_kind_from_db_str_rejects_garbage_but_accepts_unknown_literal() {
+        // Empty/whitespace strings still error — they're malformed storage rows.
         assert!(event_kind_from_db_str("").is_err());
+
+        // Story 4.4 / Epic 2 retro AI-4: the wire-decode catch-all
+        // `EventKind::Unknown` would deserialize from the literal string
+        // `"Unknown"`. The DB round-trip therefore accepts it — but
+        // `event_kind_as_str` debug-asserts against constructing it on the
+        // write side, so this code path is unreachable in normal daemon
+        // operation. The test pins the read-side tolerance for completeness.
+        let parsed = event_kind_from_db_str("Unknown").expect("Unknown literal round-trips");
+        assert_eq!(parsed, EventKind::Unknown);
+
+        // A garbage string that isn't a known variant decodes to
+        // `EventKind::Unknown` because the wire derive carries
+        // `#[serde(other)]`. Storage staying in lockstep with the wire is
+        // intentional — operators reading a DB row with a future-only kind
+        // see the same lossy `Unknown` token the wire would deserialize to.
+        let parsed = event_kind_from_db_str("FutureVariant").unwrap();
+        assert_eq!(parsed, EventKind::Unknown);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "EventKind::Unknown is decode-only")]
+    fn event_kind_as_str_panics_on_unknown_in_debug_builds() {
+        // Story 4.4: the daemon must never persist `EventKind::Unknown`.
+        // Adapters reject unknown hook strings at the normalize boundary and
+        // /replay rejects Unknown at the parse boundary, so this path is
+        // unreachable in practice — but the debug-assert is the canary that
+        // catches a future regression where a code path slips Unknown
+        // through. Release builds tolerate it (no panic) so the hot ingest
+        // path is unaffected.
+        let _ = event_kind_as_str(&EventKind::Unknown);
     }
 }

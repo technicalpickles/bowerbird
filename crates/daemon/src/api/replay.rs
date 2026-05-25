@@ -95,6 +95,20 @@ pub async fn run(State(state): State<AppState>, body: Bytes) -> Response {
             continue;
         }
 
+        // Reject the decode-only `Unknown` catch-all (Story 4.4 / Epic 2 retro
+        // AI-4). A replay line with a v1.x-only `kind` value (e.g., a future
+        // `"SubAgentSpawn"`) parses to `EventKind::Unknown` via `#[serde(other)]`
+        // — replaying it would persist the lossy `"Unknown"` token to SQLite
+        // and lose the original kind string. Surface as a parse error so the
+        // operator updates their bowerbird before replaying foreign data.
+        if matches!(event.kind, protocol::EventKind::Unknown) {
+            parse_errors.push(ParseError {
+                line: line_no,
+                error: "unknown event kind: this build is older than the source daemon".to_string(),
+            });
+            continue;
+        }
+
         let envelope = EventEnvelope {
             source: event.source,
             session_id: event.session_id,

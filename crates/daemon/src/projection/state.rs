@@ -40,7 +40,14 @@ pub(crate) fn transition(
         // `__daemon__/__daemon__` row via their own helpers and never reach
         // this function. If they ever do, preserve prior state rather than
         // corrupting the projection.
-        EventKind::RecordingStarted | EventKind::RecordingEnded => {
+        //
+        // `EventKind::Unknown` is the decode-only wire catch-all from Story
+        // 4.4 (Epic 2 retro AI-4). The daemon never CONSTRUCTS Unknown — the
+        // adapter normalize layer rejects unknown hook strings at the
+        // boundary — but defense-in-depth keeps the projection layer correct
+        // if a future code path ever does. Same handling as the sentinels:
+        // preserve prior state, do not corrupt the projection.
+        EventKind::RecordingStarted | EventKind::RecordingEnded | EventKind::Unknown => {
             return prev.cloned().unwrap_or(SessionState {
                 current_state: SessionCurrentState::Idle,
                 last_event_kind: event_kind,

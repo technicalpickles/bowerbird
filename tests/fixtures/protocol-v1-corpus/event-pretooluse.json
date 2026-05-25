@@ -1,0 +1,12 @@
+{
+  "op": "event",
+  "event": {
+    "event_id": 42,
+    "source": "claude",
+    "session_id": "sess-corpus-1",
+    "kind": "PreToolUse",
+    "reaction": "Continue",
+    "payload": "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"echo hi\"}}",
+    "created_at": 1748352001000
+  }
+}

@@ -26,6 +26,43 @@ fn event_kind_serializes_pascal_case() {
         serde_json::to_string(&EventKind::RecordingEnded).unwrap(),
         "\"RecordingEnded\""
     );
+    // Story 4.4 / Epic 2 retro AI-4: the decode-only `Unknown` variant
+    // serializes back to the literal string `"Unknown"`. The daemon never
+    // constructs `Unknown` (it's a wire-decode catch-all), but Serialize must
+    // round-trip cleanly so a presenter that does see `Unknown` can re-emit
+    // it without losing information.
+    assert_eq!(
+        serde_json::to_string(&EventKind::Unknown).unwrap(),
+        "\"Unknown\""
+    );
+}
+
+#[test]
+fn event_kind_unknown_variant_round_trips_as_unknown() {
+    // Story 4.4 / Epic 2 retro AI-4 (closes part of #6 in the AC sweep):
+    // a future v1.x daemon may emit a new EventKind variant (e.g.
+    // `"SubAgentSpawn"`) in `Event.kind`. v1.0 presenters reading the wire
+    // must decode it gracefully via `#[serde(other)] Unknown` rather than
+    // failing the whole `Event` parse.
+    let future_kind = r#""SubAgentSpawn""#;
+    let parsed: EventKind = serde_json::from_str(future_kind).unwrap();
+    assert!(
+        matches!(parsed, EventKind::Unknown),
+        "unknown EventKind string must decode to Unknown, got {parsed:?}"
+    );
+
+    // Known variants still decode normally.
+    let known = r#""PreToolUse""#;
+    let parsed: EventKind = serde_json::from_str(known).unwrap();
+    assert!(
+        matches!(parsed, EventKind::PreToolUse),
+        "known EventKind string must decode to its variant, got {parsed:?}"
+    );
+
+    // The literal `"Unknown"` itself round-trips.
+    let literal_unknown = r#""Unknown""#;
+    let parsed: EventKind = serde_json::from_str(literal_unknown).unwrap();
+    assert!(matches!(parsed, EventKind::Unknown));
 }
 
 #[test]
@@ -76,6 +113,47 @@ fn reaction_named_variants_round_trip() {
 }
 
 #[test]
+fn reaction_unknown_variant_round_trips_via_unknown() {
+    // Story 4.4 / Epic 2 retro AI-4 — the LOAD-BEARING behavioral fix. Prior
+    // to 2026-05-25, `Reaction::deserialize` returned `Err(...)` on any
+    // unknown reaction string, which would have broken the additive-compat
+    // claim the moment a future v1.x daemon shipped a new reaction (e.g.
+    // `"Block"`). v1.0 presenters would have failed the whole `Event` parse
+    // instead of gracefully decoding the reaction as `Unknown`.
+    //
+    // After the fix, the catch-all maps any unknown string to
+    // `Reaction::Unknown`. This test pins the behavior so a future refactor
+    // that "tightens" the deserialize back to erroring fails CI loudly.
+    let future_reaction = r#""Block""#;
+    let parsed: Reaction = serde_json::from_str(future_reaction).unwrap();
+    assert_eq!(
+        parsed,
+        Reaction::Unknown,
+        "future reaction string must decode to Unknown for additive-compat"
+    );
+
+    // A handful of other future-shipped shapes also round-trip:
+    for future in &[
+        r#""Allow""#,
+        r#""Deny""#,
+        r#""Defer""#,
+        r#""SomethingNewIn2027""#,
+    ] {
+        let parsed: Reaction = serde_json::from_str(future).unwrap();
+        assert_eq!(parsed, Reaction::Unknown);
+    }
+
+    // Malformed `Vendor(...)` shapes still ERROR — they're not additive-
+    // compat misses, they're broken payloads. Pinning this so a future
+    // refactor doesn't silently swallow Vendor parse errors as Unknown.
+    let bad_vendor = r#""Vendor(not-a-number)""#;
+    assert!(
+        serde_json::from_str::<Reaction>(bad_vendor).is_err(),
+        "malformed Vendor(...) must still error, not fall through to Unknown"
+    );
+}
+
+#[test]
 fn outbound_type_accepts_unknown_fields() {
     let extra_field = r#"{"protocol_version":"1.0","daemon_version":"0.1.0","oldest_available_event_id":0,"daemon_started_at":0,"history_begins_cleanly":true,"unknown_future_field":"ok"}"#;
     assert!(serde_json::from_str::<HelloFrame>(extra_field).is_ok());
@@ -101,6 +179,37 @@ fn session_current_state_serializes_pascal_case() {
         serde_json::to_string(&SessionCurrentState::WaitingInput).unwrap(),
         "\"WaitingInput\""
     );
+    // Story 4.4 / Epic 2 retro AI-4: the decode-only `Unknown` variant
+    // serializes back to the literal string `"Unknown"` so a presenter that
+    // sees a future v1.x state can re-emit it without information loss.
+    assert_eq!(
+        serde_json::to_string(&SessionCurrentState::Unknown).unwrap(),
+        "\"Unknown\""
+    );
+}
+
+#[test]
+fn session_current_state_unknown_variant_round_trips_as_unknown() {
+    // Story 4.4 / Epic 2 retro AI-4: a future v1.x daemon may add a state
+    // (e.g. `"Compacting"`, `"AwaitingApproval"`). v1.0 presenters must
+    // decode it as `SessionCurrentState::Unknown` via `#[serde(other)]`
+    // rather than failing the whole `StateFrame` parse.
+    let future_state = r#""Compacting""#;
+    let parsed: SessionCurrentState = serde_json::from_str(future_state).unwrap();
+    assert!(
+        matches!(parsed, SessionCurrentState::Unknown),
+        "unknown state must decode to Unknown, got {parsed:?}"
+    );
+
+    // Known variants still decode normally.
+    let known = r#""Working""#;
+    let parsed: SessionCurrentState = serde_json::from_str(known).unwrap();
+    assert!(matches!(parsed, SessionCurrentState::Working));
+
+    // The literal `"Unknown"` itself round-trips.
+    let literal_unknown = r#""Unknown""#;
+    let parsed: SessionCurrentState = serde_json::from_str(literal_unknown).unwrap();
+    assert!(matches!(parsed, SessionCurrentState::Unknown));
 }
 
 #[test]

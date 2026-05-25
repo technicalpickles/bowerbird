@@ -1,6 +1,27 @@
-// Error surface between source adapters and the daemon. Adapters convert
-// their internal errors into this enum via `From`; the daemon matches on it
-// to choose the wire response.
+//! Error surface between source adapters and the daemon.
+//!
+//! Adapters convert their internal errors into [`Error`] via `From`; the
+//! daemon matches on it to choose the wire response.
+//!
+//! **`Error` is never directly wire-serialized.** This enum exists only as
+//! an in-process error type — its `#[derive(thiserror::Error)]` impl produces
+//! a `Display` string that the daemon then formats into one of the wire
+//! shapes the protocol actually defines:
+//!
+//! - HTTP error responses: `{"error": "<message>"}` JSON body (the wrapper
+//!   struct, not `Error` itself; see `daemon::api::error::ApiError`).
+//! - Ingest socket replies: `400 <reason>\n` plain text per ADR-0002 (the
+//!   shim parses the leading status code; the reason string is operator-facing).
+//! - WebSocket close frames: WS code 1008 + sanitized reason ≤123 bytes per
+//!   Story 2.1.
+//!
+//! Because `Error` never appears as a JSON-encoded enum on the wire, the
+//! asymmetric `deny_unknown_fields` / `#[serde(other)]` sweep that covers the
+//! other protocol enums (Story 4.4, Epic 2 retro AI-4) does NOT add a catch-
+//! all variant here — there is no wire surface to keep additive. Adding
+//! variants is an in-process API change governed by SemVer on this crate, not
+//! a v1.x protocol break.
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("serde error: {0}")]

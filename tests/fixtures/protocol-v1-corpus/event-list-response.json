@@ -1,0 +1,33 @@
+{
+  "events": [
+    {
+      "event_id": 100,
+      "source": "claude",
+      "session_id": "sess-history",
+      "kind": "PreToolUse",
+      "reaction": "Continue",
+      "payload": "{\"tool_name\":\"Read\"}",
+      "created_at": 1748352100000
+    },
+    {
+      "event_id": 101,
+      "source": "claude",
+      "session_id": "sess-history",
+      "kind": "PostToolUse",
+      "reaction": null,
+      "payload": "{\"tool_name\":\"Read\",\"result\":\"ok\"}",
+      "created_at": 1748352100100
+    },
+    {
+      "event_id": 102,
+      "source": "claude",
+      "session_id": "sess-history",
+      "kind": "Stop",
+      "reaction": null,
+      "payload": "{}",
+      "created_at": 1748352101000
+    }
+  ],
+  "cursor": 102,
+  "oldest_available_event_id": 1
+}

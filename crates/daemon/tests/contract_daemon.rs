@@ -1296,6 +1296,19 @@ async fn state_machine_full_sequence_determinism() {
 /// Supersedes the `drop(pool)` surrogate in `wal_durability_after_simulated_crash`
 /// (which exits cleanly through rusqlite's destructor). SIGKILL skips
 /// destructors entirely and exercises a different failure mode.
+///
+/// **Story 4.4 AC #3a (Epic 3 retro AI-2 fold-in, taskwarrior `a2ea3bfb`).**
+/// This test was previously flagged for `sqlite3_close → sqlite3_mutex_enter
+/// → pthread_mutex_wait` deadlocks in TempDir teardown — symptom: the test
+/// body asserts complete, then the async drop ordering of `pools` vs
+/// `TempDir` deadlocks inside SQLite's connection-close mutex. The fix
+/// shipped in 4.4 is Option A from the AC: explicit `drop(reader)` →
+/// `drop(pools)` → `drop(tmp)` ordering at end-of-function with
+/// `tokio::task::yield_now().await` between each so any pending rusqlite
+/// finalizers run before the next stage runs. The test runs unflagged
+/// under `cargo test --workspace -- --test-threads=1` (no `--skip`
+/// invocations survive in `.github/workflows/ci.yml` or any helper script).
+/// See Epic 3 retrospective Discovery #2 for the original symptom.
 #[tokio::test(flavor = "current_thread")]
 async fn state_plus_event_atomicity_under_sigkill_during_load() {
     use std::io::{Read as _, Write as _};
@@ -1556,6 +1569,19 @@ async fn state_plus_event_atomicity_under_sigkill_during_load() {
         "last_event_kind must reflect a load event, got {:?}",
         parsed.last_event_kind
     );
+
+    // Story 4.4 AC #3a / Epic 3 retro AI-2: explicit drop ordering so the
+    // SQLite connection-close mutexes finish before `TempDir`'s destructor
+    // tries to remove `bower.db`. Without this, the previous-observed
+    // `sqlite3_close → sqlite3_mutex_enter → pthread_mutex_wait` deadlock
+    // could re-emerge under a future CI runner's scheduler ordering.
+    // `yield_now().await` gives the runtime a tick to flush any pending
+    // rusqlite finalizers.
+    drop(reader);
+    tokio::task::yield_now().await;
+    drop(pools);
+    tokio::task::yield_now().await;
+    drop(tmp);
 }
 
 /// AC #5 — Deleting the projection rows and calling `rebuild_missing_projections`

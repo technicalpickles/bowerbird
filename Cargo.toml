@@ -71,3 +71,9 @@ assert_cmd = { workspace = true }
 tempfile   = { workspace = true }
 serde_json = { workspace = true }
 pretty_assertions = "1.4"
+# Story 4.4 / AC #5 — `tests/cross_version_upgrade.rs` needs to send SIGTERM
+# to spawned daemon subprocesses (nix) and inspect the SQLite file across the
+# vN → vN+1 boundary (rusqlite). Both already vendored at the workspace
+# level; this entry just exposes them to workspace-root tests.
+nix      = { workspace = true }
+rusqlite = { workspace = true }

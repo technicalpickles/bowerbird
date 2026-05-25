@@ -1,0 +1,6 @@
+{
+  "op": "dropped",
+  "count": 5,
+  "first_dropped_event_id": 10,
+  "last_dropped_event_id": 14
+}

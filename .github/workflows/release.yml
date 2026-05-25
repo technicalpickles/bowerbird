@@ -164,6 +164,83 @@ jobs:
             bowerbird-${{ steps.tag.outputs.tag }}-${{ matrix.target }}.tar.gz.sha256
           if-no-files-found: error
 
+  cross-version-test:
+    # Story 4.4 / AC #5. Verifies that the current-tree daemon binary can take
+    # over a data directory written by the prior tagged release without losing
+    # state or breaking additive-compat on the REST surface.
+    #
+    # Runs on the release-pipeline lane ONLY (not per-PR). The test installs
+    # the prior tag via `cargo install --git . --tag <prior>` which is slow
+    # (~30s) and we don't want to pay that cost on every PR. The per-PR lane
+    # runs the protocol-changelog gate + v1.0 compat corpus + contract
+    # inventory; those are fast and catch most regressions.
+    #
+    # Until v0.1.0 actually ships and there IS a prior tag, the test SKIPs
+    # cleanly (the `BOWERBIRD_PRIOR_VERSION_BINARY` env var still set, but the
+    # `cargo install` step finds no such tag → empty install dir → test SKIPs
+    # with a clear message). The job result stays green either way; the gate
+    # becomes load-bearing once v0.1.x has shipped.
+    name: Cross-version protocol upgrade (vN → vN+1)
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            triple: aarch64-apple-darwin
+          - runner: ubuntu-22.04
+            triple: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Resolve prior tag (one minor below the current release)
+        id: prior
+        shell: bash
+        run: |
+          # On the release-pipeline lane, the current tag is the one the
+          # release was triggered for. We pick the most-recent v* tag that is
+          # NOT the current one (i.e., the prior release). If none exist yet
+          # (v0.1.0 = first release), emit an empty string and the install
+          # step will skip.
+          set -euo pipefail
+          if [ -n "${{ inputs.tag }}" ]; then
+            CURRENT_TAG="${{ inputs.tag }}"
+          else
+            CURRENT_TAG="${{ github.ref_name }}"
+          fi
+          # `git tag --sort=-v:refname` returns tags in semver-descending
+          # order. Skip the current one and take the next.
+          PRIOR_TAG=$(git tag --sort=-v:refname --list 'v*.*.*' | grep -v "^${CURRENT_TAG}$" | head -n1 || true)
+          echo "current=${CURRENT_TAG}" >> "$GITHUB_OUTPUT"
+          echo "prior=${PRIOR_TAG}" >> "$GITHUB_OUTPUT"
+          echo "Current tag: ${CURRENT_TAG}"
+          echo "Prior tag:   ${PRIOR_TAG:-<none — this is v0.1.0 or earlier>}"
+
+      - name: Install prior-tag daemon binary
+        if: steps.prior.outputs.prior != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install --git . --tag "${{ steps.prior.outputs.prior }}" \
+            --root target/cross-version-installs/${{ steps.prior.outputs.prior }} \
+            --bin bowerbird-daemon --locked
+
+      - name: Run cross-version upgrade test
+        if: steps.prior.outputs.prior != ''
+        shell: bash
+        env:
+          BOWERBIRD_RUN_CROSS_VERSION_TEST: '1'
+          BOWERBIRD_PRIOR_VERSION_BINARY: target/cross-version-installs/${{ steps.prior.outputs.prior }}/bin/bowerbird-daemon
+        run: |
+          cargo test --test cross_version_upgrade --locked -- --test-threads=1 --nocapture
+
+      - name: SKIP message (no prior tag)
+        if: steps.prior.outputs.prior == ''
+        run: |
+          echo "::notice::No prior v* tag found — cross-version test SKIPs. This is expected for v0.1.0 (first release); it becomes load-bearing on v0.1.1 and beyond."
+
   release:
     name: Create GitHub Release
     needs: build

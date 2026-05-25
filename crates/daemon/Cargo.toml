@@ -53,6 +53,15 @@ tokio             = { workspace = true }
 tower             = { workspace = true, features = ["util"] }
 tokio-tungstenite = { workspace = true }
 futures-util      = "0.3"
+# Story 4.4 / AC #7 — `benches/hook_to_presenter.rs` reads `~/.bowerbird/server.json`.
+serde             = { workspace = true }
+
+# Story 4.4 / AC #7 — Hook→presenter p99 bench. `harness = false` per the same
+# reasoning as the shim hot-path bench: Criterion's `SamplingMode::Flat`
+# batches samples in our latency range and averages spikes into invisibility.
+[[bench]]
+name    = "hook_to_presenter"
+harness = false
 
 [lints]
 workspace = true

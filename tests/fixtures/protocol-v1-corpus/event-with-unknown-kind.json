@@ -1,0 +1,12 @@
+{
+  "op": "event",
+  "event": {
+    "event_id": 47,
+    "source": "claude",
+    "session_id": "sess-corpus-unknown-kind",
+    "kind": "SubAgentSpawn",
+    "reaction": "Continue",
+    "payload": "{\"sub_agent_id\":\"agent-1\"}",
+    "created_at": 1748352005000
+  }
+}

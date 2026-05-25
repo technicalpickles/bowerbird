@@ -1,0 +1,8 @@
+{
+  "op": "hello",
+  "protocol_version": "1.0",
+  "daemon_version": "0.1.0",
+  "oldest_available_event_id": 1,
+  "daemon_started_at": 1748352000000,
+  "history_begins_cleanly": true
+}

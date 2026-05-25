@@ -1,0 +1,10 @@
+{
+  "op": "state",
+  "source": "claude",
+  "session_id": "sess-state-idle",
+  "state": {
+    "current_state": "Idle",
+    "last_event_kind": "PostToolUse",
+    "last_event_at_ms": 1748352010000
+  }
+}

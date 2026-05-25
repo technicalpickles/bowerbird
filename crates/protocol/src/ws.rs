@@ -13,6 +13,12 @@ use crate::state::SessionState;
 /// false the moment a new variant ships. The daemon never constructs
 /// `Unknown` (it only ever produces concrete variants on the wire), so
 /// the catch-all is decode-only in practice.
+///
+/// Story 4.4 (Epic 2 retro AI-4) confirmed this enum already had the catch-
+/// all from Story 2.1 — no code change. The sweep added the same pattern to
+/// `EventKind` (`event.rs`), `SessionCurrentState` (`state.rs`), and fixed
+/// `Reaction::deserialize` (`reaction.rs`) to map unknown strings to
+/// `Reaction::Unknown` instead of erroring.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ServerMessage {
@@ -26,7 +32,22 @@ pub enum ServerMessage {
     Unknown,
 }
 
-/// Inbound (tool → daemon). STRICT: deny_unknown_fields.
+/// Inbound (tool → daemon). STRICT: `deny_unknown_fields` plus no `Unknown`
+/// catch-all variant.
+///
+/// The asymmetric serde policy (project-context.md §Wire format conventions,
+/// architecture.md:606-608) says **outbound** types stay permissive so a
+/// newer daemon can ship additive variants without breaking older presenters
+/// — that is what `ServerMessage::Unknown` (above) implements. `ClientMessage`
+/// is the inbound direction and gets the opposite treatment: a presenter
+/// sending an `op` the daemon doesn't recognize is a protocol violation, NOT
+/// a forward-compat surface. The daemon rejects it via WS close code 1008
+/// (Policy Violation) with a `bad message: unknown op` reason per Story 2.1.
+///
+/// Story 4.4 (Epic 2 retro AI-4) audited every wire-surface enum for this
+/// rule; `ClientMessage` is the documented exception. If a future story
+/// genuinely needs additive inbound ops, the daemon's `bad message: ...`
+/// rejection path is the right place to widen — not this enum.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClientMessage {
