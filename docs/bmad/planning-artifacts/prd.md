@@ -145,6 +145,8 @@ V1 ships when pickles can build and iterate on multiple tools simultaneously aga
 
 **MVP philosophy carve-out:** the contribution model (auto-close by default, weekly triage) is explicitly designed for a solo maintainer. V1 does not need community adoption to succeed — it needs one user (the maintainer) to find it genuinely useful.
 
+**Phase 2 — Release Readiness (Epic 5):** V1 ships in two beats. Phase 1 (Epics 1–4, complete) produced the capture + streaming + install + replay substrate. Phase 2 validates and hardens it: the maintainer installs bowerbird on their main machine, builds a first-party presenter in a sibling repository, uses it daily, and harvests the friction. Bugs found in that loop become hotfix stories folded into the Epic 5 cadence; the planned Epic 5 stories then convert the CI gates from aspirational to load-bearing, exercise the release pipeline end-to-end, polish the install UX, and rewrite the README and quickstart for the first-time reader who has not been in the room while bowerbird was built. The v0.1.0 tag is the closing event of Phase 2.
+
 ### MVP Feature Set
 
 **All four user journeys supported at v1:**

@@ -492,7 +492,9 @@ Defaults are committed at `crates/daemon/src/config.rs::Config::with_bowerbird_d
 
 ### Frontend Architecture
 
-Not applicable.
+Not applicable in this repository. bowerbird has no UI; presenters are external consumers of the WebSocket and REST surfaces.
+
+**Companion projects (out of scope for `crates/`).** A first-party presenter shipped alongside V1 lives in a sibling repository, not in this crate workspace. Per Axiom 1 (the substrate observes; it does not interpret), interpretation belongs in a presenter, and a presenter is structurally a *consumer* of bowerbird — not a component of it. Sibling-repo conventions (naming, license, install path) are documented in the presenter repo itself, not here. See Epic 5 Story 5.1 for the V1 first-party presenter.
 
 ### Infrastructure & Deployment
 
