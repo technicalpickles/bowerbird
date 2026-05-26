@@ -1,5 +1,5 @@
 # generated: 2026-05-16
-# last_updated: 2026-05-26 (Epic 5 added — V1 Release Readiness; epic-4-retrospective → done)
+# last_updated: 2026-05-26 (Story 5.5 cookbook-consolidation inserted; old 5.5→5.6, old 5.6→5.7 per sprint-change-proposal-2026-05-26-cookbook-consolidation.md)
 # project: bowerbird
 # project_key: NOKEY
 # tracking_system: file-system
@@ -35,7 +35,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-05-16
-last_updated: 2026-05-26 (Epic 5 added — V1 Release Readiness; epic-4-retrospective → done)
+last_updated: 2026-05-26 (Story 5.5 cookbook-consolidation inserted; old 5.5→5.6, old 5.6→5.7 per sprint-change-proposal-2026-05-26-cookbook-consolidation.md)
 project: bowerbird
 project_key: NOKEY
 tracking_system: file-system
@@ -80,7 +80,7 @@ development_status:
   epic-4-retrospective: done
 
   # Dogfooding validation phase (no formal stories; bugs become 5.X-hotfix stories ad-hoc)
-  # Begins after Story 5.1 (presenter) ships; runs in parallel with Stories 5.2–5.6.
+  # Begins after Story 5.1 (presenter) ships; runs in parallel with Stories 5.2–5.7.
   dogfooding-validation-phase: backlog  # transitions to 'in-progress' when 5.1 ships; 'done' on v0.1.0 tag
 
   # Epic 5: V1 Release Readiness (dogfooding → presenter → hardening)
@@ -89,6 +89,7 @@ development_status:
   5-2-bench-gates-load-bearing: backlog
   5-3-release-pipeline-end-to-end-verification: backlog
   5-4-install-ux-polish-and-middleware-closure: backlog
-  5-5-first-time-reader-docs-pass: backlog
-  5-6-crates-io-namespace-and-v0-1-0-tag: backlog
+  5-5-cookbook-consolidation: backlog
+  5-6-first-time-reader-docs-pass: backlog
+  5-7-crates-io-namespace-and-v0-1-0-tag: backlog
   epic-5-retrospective: optional

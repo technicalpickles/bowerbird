@@ -10,6 +10,7 @@ inputDocuments:
 revisions:
   - 2026-05-24: Folded Epic 2 retrospective action items AI-1..AI-6 into Story 3.1 (singleton enforcement), Story 3.2 (connected_ws_clients wiring), Story 3.4 (CI --test-threads=1, architecture.md WebSocket subsystem section), Story 4.4 (wire-enum serde(other) sweep, hook-to-presenter p99 Criterion bench, NDJ ingest framing narrative). Source: docs/bmad/implementation-artifacts/epic-2-retro-2026-05-24.md
   - 2026-05-26: Added Epic 5 (V1 Release Readiness) with 6 stories — first-party presenter (sibling repo), bench gates load-bearing, release pipeline E2E, install UX + middleware closure, first-time-reader docs pass, crates.io + v0.1.0 tag. Source: docs/bmad/planning-artifacts/sprint-change-proposal-2026-05-26.md (folds Epic 3 retro AI-3/AI-4, Epic 4 retro AI-1..AI-5, plus 5 deferred-work entries).
+  - 2026-05-26: Inserted new Story 5.5 (Cookbook consolidation) into Epic 5; old 5.5 (first-time-reader docs pass) → 5.6; old 5.6 (crates.io + v0.1.0 tag) → 5.7. Closes Story 4.2/4.3 cookbook-coupling AC and deferred-work.md:104. Source: docs/bmad/planning-artifacts/sprint-change-proposal-2026-05-26-cookbook-consolidation.md.
 ---
 
 # bowerbird - Epic Breakdown
@@ -890,7 +891,7 @@ So that I can build on bowerbird with confidence rather than checking every daem
 
 ## Epic 5: V1 Release Readiness
 
-The maintainer installs bowerbird on their main machine, builds a first-party presenter in a sibling repository, runs it daily against live Claude Code sessions, and harvests the friction. The planned stories below convert the CI gates from aspirational to load-bearing, exercise the release pipeline end-to-end against a real tag, polish the install UX, and rewrite the README + quickstart for a first-time reader. Closing event: v0.1.0 tagged on GitHub Releases.
+The maintainer installs bowerbird on their main machine, builds a first-party presenter in a sibling repository, runs it daily against live Claude Code sessions, and harvests the friction. The planned stories below convert the CI gates from aspirational to load-bearing, exercise the release pipeline end-to-end against a real tag, polish the install UX, consolidate the cookbook into single-directory entries that colocate prose with runnable code (pocketflow pattern), and rewrite the README + quickstart for a first-time reader. Closing event: v0.1.0 tagged on GitHub Releases.
 
 **FRs covered:** primarily hardening of FRs already covered by Epics 1–4. No new FRs introduced.
 **NFRs covered:** strengthens NFR1, NFR2 (bench gates load-bearing); NFR19 (protocol stability, cross-version upgrade test load-bearing).
@@ -1007,7 +1008,49 @@ Folds in five deferred-work entries; no new design surface.
 **When** the daemon processes it
 **Then** the response is `404 Not Found` rather than `200 {events: [], cursor: None, ...}` (Story 4.1 deferred-work entry "/sessions/{id}/events 404 for unknown sessions"); a `type: behavioral` entry lands in `docs/protocol-changelog.md` documenting the alignment; `bowerbird export` drops its pre-check round trip
 
-### Story 5.5: First-time-reader docs pass
+### Story 5.5: Cookbook consolidation into self-contained directory entries
+
+As the bowerbird maintainer,
+I want each cookbook entry to be one self-contained directory under `docs/cookbook/<name>/` containing prose (`README.md`) and runnable code (`src/`, `package.json`, `tsconfig.json`) colocated,
+So that the cookbook is the canonical home of the working examples — no duplication, no drift-check, no separate `examples/` surface to navigate.
+
+Closes Story 4.2 AC at `epics.md:817-819`, Story 4.3 AC at `epics.md:843`, and `project-context.md` §Cookbook discipline directive (L526) "do not hand-copy snippets — they rot." Closes `deferred-work.md:104` ("Cookbook inlining mechanism"). See `sprint-change-proposal-2026-05-26-cookbook-consolidation.md` for the full rationale.
+
+**Acceptance Criteria:**
+
+**Given** the existing `examples/multi-session-router/`, `examples/event-log-viewer/`, and `examples/reconnect-recovery/` directories
+**When** Story 5.5 lands
+**Then** they have been `git mv`'d to `docs/cookbook/state-session-fanout/`, `docs/cookbook/rest-cursor-pagination/`, and `docs/cookbook/dropped-frame-recovery/` respectively; the `examples/` directory no longer exists at the repo root; `cargo build --workspace`, `cargo test --workspace`, and the TypeScript smoke tests all pass against the new paths
+
+**Given** the three standalone cookbook prose files (`docs/cookbook/state-session-fanout.md`, `docs/cookbook/rest-cursor-pagination.md`, `docs/cookbook/dropped-frame-recovery.md`)
+**When** Story 5.5 lands
+**Then** they have been deleted; their Problem / Approach / Variants content has been folded into the per-entry `docs/cookbook/<name>/README.md` files alongside the existing per-example README content
+
+**Given** each new `docs/cookbook/<name>/README.md`
+**When** a reader opens it
+**Then** the README contains no embedded TypeScript code blocks — only prose sections (*What this is*, *Run it*, *How it works*, *How to apply it*, *Files* with relative links to `src/index.ts` and any sidecar code files); code is read by opening `src/index.ts` directly, matching the pocketflow cookbook pattern
+
+**Given** the `// cookbook-begin:<name>` / `// cookbook-end:<name>` comment markers in each `src/index.ts`
+**When** Story 5.5 lands
+**Then** the markers have been deleted; the smoke test `tests/cli_examples.rs::each_example_source_carries_cookbook_anchors` (or its current equivalent) has been deleted; the drift-check test `tests/cli_docs_drift.rs::cookbook_include_directives_match_example_anchors` has been deleted
+
+**Given** the smoke-test crate `tests/cli_examples.rs` and CI workflow at `.github/workflows/ci.yml`
+**When** Story 5.5 lands
+**Then** all `examples/*/src/index.ts` path references have been retargeted to `docs/cookbook/*/src/index.ts`; shell loops over `examples/*/` similarly retarget
+
+**Given** the planning and project-context artifacts
+**When** Story 5.5 lands
+**Then** `prd.md:327, 445, 448-450`, `architecture.md:760-829, 915, 946`, and `project-context.md:242-258, 524-545` have been updated to reflect the single-directory shape; `deferred-work.md:104` is struck through with a backlink to this story's merge commit; path-retarget edits applied to `deferred-work.md:101, 102, 105, 106, 107`
+
+**Given** the project's update protocol (`project-context.md` L77: "Every merged ADR includes Affects context.md sections: field")
+**When** Story 5.5 lands
+**Then** ADR 0005 has been authored at `docs/decisions/0005-cookbook-consolidation.md` documenting the decision, considered alternatives (mdBook `{{#include}}`, hand-rolled preprocessor, pocketflow pattern), the chosen path, and `Affects context.md sections: Repository layout, Cookbook discipline`
+
+**Given** reader-facing docs
+**When** Story 5.5 lands
+**Then** `README.md` (entries at L7-8 and L162-166), `docs/quickstart.md:19`, and `docs/presenter-authoring.md` (grep pass) have all `examples/` path references retargeted to `docs/cookbook/<name>/`
+
+### Story 5.6: First-time-reader docs pass
 
 As a developer who has never seen bowerbird before,
 I want the README and quickstart to answer "what is this, why would I care, how do I try it in five minutes" before I bounce,
@@ -1025,17 +1068,17 @@ So that the V1 audience (other developers reachable via the Claude Code communit
 
 **Given** the docs path Quickstart → presenter-authoring → protocol → cookbook (PRD §Documentation Requirements line 436)
 **When** the first-time reader graduates from Quickstart and reaches `docs/presenter-authoring.md`
-**Then** the first paragraph names the audience switch ("you've seen it work; now you're going to build something") rather than starting directly in technical detail
+**Then** the first paragraph names the audience switch ("you've seen it work; now you're going to build something") rather than starting directly in technical detail; cross-references to the cookbook target the per-entry directory shape introduced by Story 5.5 (e.g. `docs/cookbook/state-session-fanout/`), not pre-5.5 standalone .md files
 
 **Given** the README in its current state mentions install before motivation
-**When** Story 5.5 lands
-**Then** motivation precedes install; the "Status: V1 in development" framing is removed in favor of "Status: v0.1.0 — first stable release" once Story 5.6 tags it
+**When** Story 5.6 lands
+**Then** motivation precedes install; the "Status: V1 in development" framing is removed in favor of "Status: v0.1.0 — first stable release" once Story 5.7 tags it
 
-**Given** the Story 5.5 PR
+**Given** the Story 5.6 PR
 **When** review runs
 **Then** the review explicitly invokes the `bmad-editorial-review-prose` and `bmad-editorial-review-structure` skills against `README.md` and `docs/quickstart.md`, and the priority-1 findings are addressed in the same PR
 
-### Story 5.6: Crates.io namespace decision and v0.1.0 tag
+### Story 5.7: Crates.io namespace decision and v0.1.0 tag
 
 As the project owner,
 I want a deliberate decision on crates.io publishing,
@@ -1046,17 +1089,17 @@ Closes Epic 3 retro AI-3 / Epic 4 retro AI-5.
 **Acceptance Criteria:**
 
 **Given** `cargo search bowerbird`
-**When** Story 5.6 is started
+**When** Story 5.7 is started
 **Then** the namespace availability is documented (available / squatted / taken-by-related-project); if available, the four workspace crates are published with `description`, `repository`, `keywords`, `categories`, and `[package.metadata.docs.rs]` blocks added to each `Cargo.toml`; if not available, an ADR documents the renaming decision or the decision to publish under a different namespace
 
-**Given** all Epic 5 stories 5.1 through 5.5 are complete and any hotfix stories are merged
+**Given** all Epic 5 stories 5.1 through 5.6 are complete and any hotfix stories are merged
 **When** the maintainer tags `v0.1.0`
 **Then** the release workflow runs end-to-end producing artifacts; the GitHub Release is published (not draft); release notes name the V1 scope, the dogfooding signal that motivated the tag, and the contract-test summary
 
 **Given** the v0.1.0 tag exists
 **When** the maintainer reads `docs/bmad/implementation-artifacts/deferred-work.md`
-**Then** every entry referenced in this Epic 5 (Story 5.2 AI-1/AI-2/AI-3, Story 5.4's five entries, Story 5.6's AI-3/AI-5) is struck through with a backlink to its closing story's merge commit
+**Then** every entry referenced in this Epic 5 (Story 5.2 AI-1/AI-2/AI-3, Story 5.4's five entries, Story 5.5's deferred-work-104 closure, Story 5.7's AI-3/AI-5) is struck through with a backlink to its closing story's merge commit
 
 **Given** the v0.1.0 release notes
-**When** a first-time reader (Story 5.5's audience) finds them
+**When** a first-time reader (Story 5.6's audience) finds them
 **Then** they include the install one-liner, a link to Quickstart, and an honest statement of "what works today and what doesn't" (the deferred-work entries that remain — code-signing, second-adapter, etc.)
