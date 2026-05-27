@@ -8,6 +8,7 @@
 # last_updated: 2026-05-27 (Story 5.2 session-state-projection-correctness created via bmad-create-story; 5.1 acknowledged as in-flight)
 # last_updated: 2026-05-27 (Story 5.2 → in-progress; dev-story session started)
 # last_updated: 2026-05-27 (Story 5.2 → review; dev-story session complete — 14 tasks done, workspace tests + fmt + clippy green)
+# last_updated: 2026-05-27 (Story 5.2 → in-progress; code review found unresolved patch findings)
 # project: bowerbird
 # project_key: NOKEY
 # tracking_system: file-system
@@ -43,7 +44,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-05-16
-last_updated: 2026-05-27 (Story 5.2 → review; dev-story session complete — 14 tasks done, workspace tests + fmt + clippy green)
+last_updated: 2026-05-27 (Story 5.2 → in-progress; code review found unresolved patch findings)
 project: bowerbird
 project_key: NOKEY
 tracking_system: file-system
@@ -96,7 +97,7 @@ development_status:
   # then install UX, then CI/release hardening, then reader-facing polish, then the tag.
   epic-5: in-progress
   5-1-first-party-presenter-tool: in-progress
-  5-2-session-state-projection-correctness: review
+  5-2-session-state-projection-correctness: in-progress
   5-3-session-process-liveness-pid-capture: backlog
   5-4-install-ux-polish-and-middleware-closure: backlog
   5-5-bench-gates-load-bearing: backlog

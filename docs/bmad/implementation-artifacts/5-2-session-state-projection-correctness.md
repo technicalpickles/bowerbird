@@ -1,6 +1,6 @@
 # Story 5.2: Session state projection correctness
 
-Status: review
+Status: in-progress
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -140,6 +140,93 @@ The substrate changes (event.rs, state.rs, session.rs, install.rs, normalize.rs)
   - [x] When the story file moves to `in-progress`: `5-2-session-state-projection-correctness: in-progress`. Add a `last_updated` line.
   - [x] When the story moves to `review` (post `dev-story`): `5-2-session-state-projection-correctness: review`. Add a `last_updated` line.
   - [x] When the story moves to `done` (post `code-review`): `5-2-session-state-projection-correctness: done`. Add a `last_updated` line.
+
+### Review Findings
+
+- [ ] [Review][Patch] UserPromptSubmit hook is installed but rejected by the shim [crates/shim/src/main.rs:88]
+
+  What breaks: `bowerbird install` now writes a Claude Code hook command `bowerbird-shim --hook-kind UserPromptSubmit`, but the shim exits before sending that payload to the daemon. That means AC #3 is not true in a real installed Claude session: the `UserPromptSubmit` hook does not fire through bowerbird, the daemon never ingests the event, and the session stays `Idle` until the first later hook that the shim accepts.
+
+  Evidence: `crates/adapter-claude/src/install.rs::HOOK_KINDS` includes `"UserPromptSubmit"`, and `docs/protocol.md` declares `UserPromptSubmit` as a valid ingest `hook_kind`. `crates/shim/src/main.rs::parse_hook_kind` still matches only `"PreToolUse" | "PostToolUse" | "Stop" | "Notification"`. Reproduced locally with:
+
+  ```sh
+  printf '{"session_id":"s1"}' | BOWERBIRD_SHIM_LOG=/private/tmp/bowerbird-shim-userprompt.log target/debug/bowerbird-shim --hook-kind UserPromptSubmit
+  ```
+
+  Actual result: exit code `1`, log line `invalid hook-kind: UserPromptSubmit`.
+
+  Fix direction: add `"UserPromptSubmit"` to `parse_hook_kind`. Add a shim contract test that runs the shim with `--hook-kind UserPromptSubmit`, captures the mock ingest payload, and asserts the injected `"hook_kind":"UserPromptSubmit"` survives. Add or extend a daemon ingest round-trip test so a `UserPromptSubmit` payload reaches the ingest channel as `EventKind::UserPromptSubmit`.
+
+- [ ] [Review][Patch] State publish gating ignores the read-time stale-Working fallback [crates/daemon/src/projection/session.rs:127]
+
+  What breaks: a state-only subscriber can observe a session as `Idle` via snapshot or REST because `current_state_for_read` turns a stale stored `Working` row into read-facing `Idle`. When new activity resumes for that session, `projection::session::write` compares stored `prev_state.current_state` (`Working`) to the new stored state (`Working`) and suppresses the live `State` frame. The state-only subscriber remains stuck on `Idle` even though the agent resumed work.
+
+  Concrete path:
+
+  1. A row is stored as `current_state=Working`, `last_event_at_ms` older than `STALE_WORKING_MS`.
+  2. A presenter subscribes to `state.session.*`.
+  3. Snapshot generation applies `current_state_for_read` and sends `Idle`.
+  4. A new `UserPromptSubmit`, `PreToolUse`, or `PostToolUse` event arrives.
+  5. `transition()` stores `Working`.
+  6. `write()` compares stored `Working` to new `Working`, decides `state_changed == false`, and emits only the `Event` envelope.
+
+  Fix direction: base the publish-gating comparison on the previous read-facing state, not only the previous stored state. For example, compute `prev_read_current_state = prev_state.as_ref().map(|s| current_state_for_read(s, now_ms))` inside the transaction before calling `transition()`, return that value from the closure, and compare it to `new_state.current_state` at the publish site. This preserves normal transition-only behavior while emitting `Idle -> Working` when the stale fallback was what subscribers could previously see.
+
+  Regression coverage: add a contract test that seeds or writes a stale stored `Working` projection, subscribes to `state.session.*` and confirms the snapshot says `Idle`, then writes `UserPromptSubmit` or `PreToolUse` and asserts a live `State` frame arrives with `current_state=Working`. Also assert the `Event` frame still publishes.
+
+- [ ] [Review][Patch] Legacy reinstall hint text differs from the story-specified message [src/commands/install.rs:43]
+
+  What breaks: the behavior is probably understandable to a human, but the implementation does not match the story's operator-facing text. Task 5 specifies the exact note: `note: detected pre-Story-5.2 hooks; re-running install to subscribe UserPromptSubmit`. The CLI currently prints `note: detected pre-Story-5.2 hooks; re-running install subscribed UserPromptSubmit`.
+
+  Fix direction: change the string in `src/commands/install.rs` to match Task 5 exactly unless there is a deliberate product-copy reason to change the story. Add coverage that builds a pre-5.2 four-hook settings file, runs the CLI install path, and asserts stdout contains the exact hint. The lower-level `InstallOutcome.legacy_upgrade_detected` flag should also have unit coverage for three cases: legacy four hooks only -> true, fresh install -> false, already-upgraded five hooks -> false.
+
+- [ ] [Review][Patch] Forward-compat regression test does not exercise the full event shape required by Task 7 [crates/daemon/tests/contract_daemon.rs:1470]
+
+  What is missing: AC #5 says a v1.0 presenter receives an event with `kind: "UserPromptSubmit"` and decodes that kind as `Unknown` without crashing. Task 7 asks for a full JSON event object. The implemented test deserializes only the bare JSON string `"UserPromptSubmit"` into a legacy enum, so it does not prove a legacy presenter can parse the actual event payload shape.
+
+  Fix direction: replace or extend `pre_story_5_2_presenter_decodes_user_prompt_submit_as_unknown` with a local legacy event struct, for example:
+
+  ```rust
+  #[derive(Deserialize)]
+  struct LegacyEvent {
+      event_id: i64,
+      source: String,
+      session_id: String,
+      kind: LegacyEventKind,
+      reaction: Option<serde_json::Value>,
+      payload: String,
+      created_at: i64,
+  }
+  ```
+
+  Deserialize a JSON object shaped like the story text: `{"event_id":1,"source":"claude","session_id":"x","kind":"UserPromptSubmit","reaction":null,"payload":"{}","created_at":0}`. Assert `event.kind == LegacyEventKind::Unknown` and the rest of the fields parse. If the wire frame path is easy to express, a `ServerMessage::Event`-like mock wrapper would be even closer to the presenter path.
+
+- [ ] [Review][Patch] UserPromptSubmit normalization lacks a direct adapter contract test [crates/adapter-claude/src/normalize.rs:68]
+
+  What is missing: `adapter-claude` now maps the string `"UserPromptSubmit"` to `EventKind::UserPromptSubmit`, but no adapter contract test exercises that new match arm. Existing daemon-level tests construct `EventEnvelope` values directly, so they do not prove the adapter accepts the real hook string and preserves the native payload.
+
+  Fix direction: add a test in `crates/adapter-claude/tests/contract_adapter.rs` with a representative JSON payload such as `{"session_id":"sess-ups","prompt":"hello"}`. Call `adapter.normalize("UserPromptSubmit", payload.as_bytes())`. Assert:
+
+  - `envelope.source == "claude"`
+  - `envelope.session_id == "sess-ups"`
+  - `envelope.kind == EventKind::UserPromptSubmit`
+  - `envelope.reaction == None`
+  - `envelope.payload` still contains the original fields verbatim
+
+  This test is intentionally adapter-scoped; it should fail if a future edit removes the match arm or accidentally treats `UserPromptSubmit` like `PreToolUse` and requires `tool_name`.
+
+- [ ] [Review][Patch] Story File List omits files changed by this review scope [docs/bmad/implementation-artifacts/5-2-session-state-projection-correctness.md]
+
+  What is wrong: the branch diff includes planning/documentation files that the story File List does not list. That makes the Dev Agent Record incomplete and weakens later review/audit work.
+
+  Add these files to the File List with short descriptions:
+
+  - `docs/bmad/planning-artifacts/epics.md` — Epic 5 resequencing and Story 5.2/5.3 insertion updates.
+  - `docs/bmad/planning-artifacts/sprint-change-proposal-2026-05-27.md` — disambiguation note for the old Story 5.7 numbering.
+  - `docs/bmad/planning-artifacts/sprint-change-proposal-2026-05-27-epic-5-resequencing.md` — added resequencing proposal.
+  - `docs/bmad/planning-artifacts/sprint-change-proposal-2026-05-27-pid-liveness.md` — added PID liveness proposal that became the resequenced Story 5.3.
+
+  Also re-check the story's "Files explicitly NOT updated" section. It should not imply `epics.md` or the sprint-change proposal docs were untouched when they are part of the branch diff.
 
 ## Dev Notes
 
