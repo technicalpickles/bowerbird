@@ -31,7 +31,11 @@ Source: `docs/bmad/planning-artifacts/epics.md` §"Story 5.1: First-party presen
 
 3. **Given** the presenter is in a sibling repository, not in `crates/` or `examples/` **When** a reader of the bowerbird repository looks at `docs/bmad/planning-artifacts/architecture.md` §Frontend Architecture (currently lines 494–498) **Then** they find a backlink to `https://github.com/<owner>/bowerbird-deck` (real URL — replace `<owner>` with the GitHub org/user the repo lives under), with the existing one-sentence justification preserved ("Per Axiom 1 (the substrate observes; it does not interpret), interpretation belongs in a presenter, and a presenter is structurally a *consumer* of bowerbird — not a component of it"). The placeholder text "See Epic 5 Story 5.1 for the V1 first-party presenter." is replaced with the real link.
 
-4. **Given** the presenter consumes the WebSocket and REST API **When** any aspect of consumption is awkward (auth flow, snapshot-on-connect, dropped-frame handling, reconnect behavior, topic-filter grammar, type-system seams on Node's WebSocket constructor — i.e. the patterns Story 4.2 retro-flagged) **Then** the awkwardness is captured either as a `5.X-hotfix-<topic>` story in `docs/bmad/implementation-artifacts/sprint-status.yaml` (with a backlink to the line of `bowerbird-deck` code that hit it) OR as a deferred-work entry in `docs/bmad/implementation-artifacts/deferred-work.md` (with the same backlink). The presenter MUST NOT silently work around a substrate awkwardness — friction is the signal we are after.
+4. **Given** the presenter consumes the WebSocket and REST API **When** any aspect of consumption is awkward (auth flow, snapshot-on-connect, dropped-frame handling, reconnect behavior, topic-filter grammar, type-system seams on Node's WebSocket constructor — i.e. the patterns Story 4.2 retro-flagged) **Then** the awkwardness is captured via the **severity-driven split**:
+   - **Hotfix story** (`5.X-hotfix-<topic>` file in `docs/bmad/implementation-artifacts/` + key added to the Epic 5 block in `sprint-status.yaml`) when the friction *blocks the dogfooding window* — i.e. it makes `bowerbird-deck` unusable for the maintainer's daily work until resolved. Hotfix stories get a full CS/DS/CR cycle and land between the next two planned Epic 5 stories.
+   - **Deferred-work entry** (`docs/bmad/implementation-artifacts/deferred-work.md`, canonical format) for everything else — annoying but workable friction that doesn't block daily use.
+   - In both cases, cross-link from the `bowerbird-deck` line of code that hit the friction (a `// see bowerbird/docs/.../5.X-hotfix-<topic>.md` or `// see bowerbird/docs/.../deferred-work.md#<anchor>` comment).
+   - The presenter MUST NOT silently work around a substrate awkwardness — friction is the signal we are after.
 
 5. **Given** the `bowerbird-deck` codebase **When** the maintainer reaches a "this is the V1 presenter" milestone (subjective: the presenter is useful enough that the maintainer prefers it to the terminal for daily work) **Then** a `README.md` in the sibling repo names:
    - The required `bowerbird` version (initially "main; pinned to v0.1.0 once Story 5.8 tags it").
@@ -74,12 +78,12 @@ Source: `docs/bmad/planning-artifacts/epics.md` §"Story 5.1: First-party presen
   - [ ] **Live step:** install bowerbird on the maintainer's main machine via `bowerbird install`; start a real Claude Code session; confirm the presenter's TUI tracks it through `idle → working → waiting-on-input → idle`. Record any latency surprises or wire-shape surprises as Task 6 friction items.
   - [ ] **Dogfooding step:** use the presenter as the maintainer's actual signal source for 5 working days. Log calendar dates in the Dev Agent Record › Completion Notes section. AC #2 explicitly requires this.
 
-- [ ] **Task 6: Capture friction as `5.X-hotfix-<topic>` stories or deferred-work entries** (AC: #4)
-  - [ ] For each substrate awkwardness encountered during Task 5 (especially during the 5-day dogfooding window), file either:
-    - A `5.X-hotfix-<topic>` story file under `docs/bmad/implementation-artifacts/` (using the same shape as planned Epic 5 stories), AND add the key to `sprint-status.yaml` in the Epic 5 block.
-    - OR a new entry in `docs/bmad/implementation-artifacts/deferred-work.md` with the canonical format (problem + reproduction + proposed-fix + backlink).
+- [ ] **Task 6: Capture friction via the severity-driven split** (AC: #4)
+  - [ ] For each substrate awkwardness encountered during Task 5 (especially during the 5-day dogfooding window), apply the severity split:
+    - **Blocks dogfooding** (the friction makes `bowerbird-deck` unusable for the maintainer's daily work until resolved) → file a `5.X-hotfix-<topic>` story file under `docs/bmad/implementation-artifacts/` AND add the key to the Epic 5 block in `sprint-status.yaml`. Hotfix stories get a full CS/DS/CR cycle.
+    - **Annoying but workable** (everything else — the maintainer can keep using the presenter while the issue waits) → add a new entry to `docs/bmad/implementation-artifacts/deferred-work.md` with the canonical format (problem + reproduction + proposed-fix + backlink).
   - [ ] DO NOT silently work around a substrate awkwardness in `bowerbird-deck` code. The friction signal IS the deliverable.
-  - [ ] Cross-link from the `bowerbird-deck` line of code that hit the friction (a `// see bowerbird/docs/.../5.X-hotfix-<topic>.md` comment is sufficient).
+  - [ ] Cross-link from the `bowerbird-deck` line of code that hit the friction (a `// see bowerbird/docs/.../5.X-hotfix-<topic>.md` or `// see bowerbird/docs/.../deferred-work.md#<anchor>` comment is sufficient).
 
 - [ ] **Task 7: Write `bowerbird-deck/README.md`** (AC: #5)
   - [ ] Name the required bowerbird version (initially `main` pinned to a specific commit SHA; switch to `v0.1.0` after Story 5.8 tags it).
@@ -92,7 +96,7 @@ Source: `docs/bmad/planning-artifacts/epics.md` §"Story 5.1: First-party presen
   - [ ] Edit `docs/bmad/planning-artifacts/architecture.md` at the `### Frontend Architecture` section (currently lines 494–498).
   - [ ] Replace the placeholder text "See Epic 5 Story 5.1 for the V1 first-party presenter." with: "See [bowerbird-deck](https://github.com/\<owner\>/bowerbird-deck) — the V1 first-party presenter (Story 5.1)."
   - [ ] Preserve the existing one-sentence Axiom 1 justification verbatim ("Per Axiom 1 (the substrate observes; it does not interpret), interpretation belongs in a presenter, and a presenter is structurally a *consumer* of bowerbird — not a component of it.").
-  - [ ] This edit lands in the *bowerbird* repo as a separate commit (same PR if the dev agent's workflow supports it; otherwise a paired follow-up). It is the only `bowerbird/` repo change Story 5.1 makes besides this story file itself.
+  - [ ] **Timing:** this edit lands in the *same* bowerbird PR that closes Story 5.1 — i.e. after the 5-day dogfooding window finishes (Task 5) and the dogfooding-log lands in the Completion Notes. The presenter must be real enough to back-link to before bowerbird's architecture.md acknowledges it by URL. This is the only `bowerbird/` repo change Story 5.1 makes besides this story file itself.
 
 - [ ] **Task 9: Transition sprint-status markers** (AC: #6)
   - [ ] When the story file moves to `review`, update `docs/bmad/implementation-artifacts/sprint-status.yaml`:
