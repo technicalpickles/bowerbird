@@ -1,6 +1,6 @@
 # Story 5.1: First-party presenter tool (sibling repository)
 
-Status: ready-for-dev
+Status: in-progress
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -48,30 +48,30 @@ Source: `docs/bmad/planning-artifacts/epics.md` §"Story 5.1: First-party presen
 ## Tasks / Subtasks
 
 - [ ] **Task 1: Decide GitHub remote and create `bowerbird-deck` sibling repo** (AC: #1, #3)
-  - [ ] Confirm the GitHub org/user that will own `bowerbird-deck` (default: `github.com/technicalpickles/bowerbird-deck`).
-  - [ ] Create the repo via `gh repo create <owner>/bowerbird-deck --public --description "First-party presenter for bowerbird — terminal TUI for live Claude Code session state"`.
-  - [ ] Clone it as a *sibling* directory next to `bowerbird/` (NOT inside `bowerbird/`). Path: `<pt root>/repos/bowerbird-deck/` if pt-tracked; otherwise wherever the maintainer keeps sibling repos.
-  - [ ] Initial commit: `LICENSE` (matching bowerbird's), a stub `README.md` (filled in by Task 7), `.gitignore` from `examples/multi-session-router/.gitignore` as a starting point.
+  - [x] Confirm the GitHub org/user that will own `bowerbird-deck` (default: `github.com/technicalpickles/bowerbird-deck`). — Confirmed `technicalpickles` (matches the gh-auth account).
+  - [ ] Create the repo via `gh repo create <owner>/bowerbird-deck --public --description "First-party presenter for bowerbird — terminal TUI for live Claude Code session state"`. — **Deferred to maintainer** (per dev-session choice "local-only today; I'll create the GitHub repo myself later"). Local origin remote is already set to `git@github.com:technicalpickles/bowerbird-deck.git`; once the GH repo exists, `git push -u origin main` from `~/pickleton/repos/bowerbird-deck/worktrees/main/` lands the initial commit.
+  - [x] Clone it as a *sibling* directory next to `bowerbird/` (NOT inside `bowerbird/`). Path: `<pt root>/repos/bowerbird-deck/` if pt-tracked; otherwise wherever the maintainer keeps sibling repos. — Created at `~/pickleton/repos/bowerbird-deck/` using the pt-tracked layout (`bare.git/` + `worktrees/main/`).
+  - [x] Initial commit: `LICENSE` (matching bowerbird's), a stub `README.md` (filled in by Task 7), `.gitignore` from `examples/multi-session-router/.gitignore` as a starting point. — Initial commit `f9a2e9e`: `LICENSE` (dual MIT/Apache mirror of bowerbird's), `LICENSE-MIT`, `LICENSE-APACHE`, `.gitignore`, plus the full Task 2/3/4/7 bootstrap (`package.json`, `tsconfig.json`, `src/index.ts`, `README.md`).
 
-- [ ] **Task 2: Bootstrap the Node project shape** (AC: #1)
-  - [ ] Copy the `package.json` shape from `bowerbird/examples/multi-session-router/package.json` — same `engines.node >= 22.6.0`, same `type: module`, same `--experimental-strip-types` flag in `scripts.start`.
-  - [ ] Copy the TypeScript interface declarations for the protocol surface (`ServerMessage`, `Event`, `SessionCurrentState`, `Reaction`, etc.) from `bowerbird/examples/multi-session-router/src/index.ts`. These were authored by hand against `crates/protocol/src/*.rs` in Story 4.2; same pattern applies here (no `@bowerbird/presenter` SDK yet — see `project-context.md` §Example presenters open question).
-  - [ ] Carry forward the Story 4.2 lessons from `bowerbird/docs/bmad/implementation-artifacts/epic-4-retro-2026-05-25.md` §"What was hard":
-    - The `@ts-expect-error` shape on `new WebSocket(url, { headers: { Authorization: \`Bearer ${token}\` } })` (DOM lib doesn't know about Node's headers options bag).
-    - Module-scope reference to the active WS so SIGINT/SIGTERM handlers can call `ws.close()` instead of hanging in a quiet `await new Promise`.
+- [x] **Task 2: Bootstrap the Node project shape** (AC: #1)
+  - [x] Copy the `package.json` shape from `bowerbird/examples/multi-session-router/package.json` — same `engines.node >= 22.6.0`, same `type: module`, same `--experimental-strip-types` flag in `scripts.start`.
+  - [x] Copy the TypeScript interface declarations for the protocol surface (`ServerMessage`, `Event`, `SessionCurrentState`, `Reaction`, etc.) from `bowerbird/examples/multi-session-router/src/index.ts`. These were authored by hand against `crates/protocol/src/*.rs` in Story 4.2; same pattern applies here (no `@bowerbird/presenter` SDK yet — see `project-context.md` §Example presenters open question). — Hand-authored against `crates/protocol/src/{state,event,reaction,ws,rest}.rs`; covers `SessionCurrentState`, `StateFrame`, `EventBody`, `EventFrame`, `DroppedFrame`, `HelloFrame`, `CloseFrame`, `SessionListItem`, `ServerInfo`. Permissive `ServerMessage` union with `{op: string; [k]: unknown}` catch-all mirrors the substrate's `ServerMessage::Unknown`.
+  - [x] Carry forward the Story 4.2 lessons from `bowerbird/docs/bmad/implementation-artifacts/epic-4-retro-2026-05-25.md` §"What was hard":
+    - [x] The `@ts-expect-error` shape on `new WebSocket(url, { headers: { Authorization: \`Bearer ${token}\` } })` (DOM lib doesn't know about Node's headers options bag).
+    - [x] Module-scope reference to the active WS so SIGINT/SIGTERM handlers can call `ws.close()` instead of hanging in a quiet `await new Promise`.
 
-- [ ] **Task 3: Implement the minimum viable presenter** (AC: #1)
-  - [ ] **State subscription:** subscribe to `state.session.*` on connect; render one row per session keyed by `session_id`. Rows show `session_id` (truncated to 12 chars), `current_state` (color-coded if a TUI library is in play), and last `Reaction` (rendered by enum name).
-  - [ ] **Event subscription (secondary):** subscribe to `events.*` or scope tighter (`events.claude.*`) for the "recent tool-use activity" requirement in AC #1. Keep a small in-memory ring (16 events) per session; surface the most recent tool name + reaction in the same row, or in a per-session detail pane if the TUI library supports one.
-  - [ ] **TUI library choice:** the minimal path is `process.stdout.write` with ANSI escapes (no deps; same shape as `examples/event-log-viewer/`). If the maintainer wants splits/panes, `blessed`, `ink`, or `terminal-kit` are reasonable; document the choice in a one-line comment at the top of `src/index.ts`.
-  - [ ] **Snapshot-on-connect:** the WS server emits a `Snapshot` frame after subscribe (Story 2.3); render its sessions before any live event arrives, so the TUI is populated from instant 0.
-  - [ ] **Dropped-frame handling:** on a `DroppedFrame` envelope from the WS subsystem (Story 2.4 / Epic 2 retro AI-4 path), refetch the full state via `GET /sessions` and reconcile. The `reconnect-recovery` example at `bowerbird/examples/reconnect-recovery/src/index.ts` is the canonical recipe.
-  - [ ] **Reconnect loop:** on WS close (any reason: daemon restart, network blip, timeout), exponential backoff up to 30s ceiling, refetch `GET /sessions`, reopen WS, resubscribe. Surface the disconnected state in the TUI (e.g. dim the rows + a status line at the bottom).
+- [x] **Task 3: Implement the minimum viable presenter** (AC: #1)
+  - [x] **State subscription:** subscribe to `state.session.*` on connect; render one row per session keyed by `session_id`. Rows show `session_id` (truncated to 12 chars), `current_state` (color-coded if a TUI library is in play), and last `Reaction` (rendered by enum name). — Color codes: green=Idle, yellow=Working, cyan=WaitingInput, gray=Unknown. Map keyed by `(source, session_id)` (natural key per substrate-not-actor invariant), NOT just `session_id`.
+  - [x] **Event subscription (secondary):** subscribe to `events.*` or scope tighter (`events.claude.*`) for the "recent tool-use activity" requirement in AC #1. Keep a small in-memory ring (16 events) per session; surface the most recent tool name + reaction in the same row, or in a per-session detail pane if the TUI library supports one. — Simpler than a ring: per-session row carries `last_reaction` + `last_tool` fields, updated on each `PreToolUse` event. Rendered in the "tool (reaction)" column. **Friction worth watching during dogfooding window:** state snapshot gives historical state but events subscription has no history → `last_tool` / `last_reaction` columns stay null for pre-existing sessions until a fresh `PreToolUse` fires. Could be a deferred-work item ("fetch recent events per session on connect") if it lands as real friction.
+  - [x] **TUI library choice:** the minimal path is `process.stdout.write` with ANSI escapes (no deps; same shape as `examples/event-log-viewer/`). If the maintainer wants splits/panes, `blessed`, `ink`, or `terminal-kit` are reasonable; document the choice in a one-line comment at the top of `src/index.ts`. — Chose **zero-deps ANSI escapes**. Header comment at `src/index.ts:13` names the choice. If splits/detail panes become a real need during dogfooding, `blessed` or `ink` can land in a later iteration without changing the connection / state-table shape.
+  - [x] **Snapshot-on-connect:** the WS server emits a `Snapshot` frame after subscribe (Story 2.3); render its sessions before any live event arrives, so the TUI is populated from instant 0. — Confirmed live against the running daemon: 31 sessions arrived as a burst of `state` frames immediately after `subscribe`. No special handling needed — the snapshot is just the first batch of state frames in the stream.
+  - [x] **Dropped-frame handling:** on a `DroppedFrame` envelope from the WS subsystem (Story 2.4 / Epic 2 retro AI-4 path), refetch the full state via `GET /sessions` and reconcile. The `reconnect-recovery` example at `bowerbird/examples/reconnect-recovery/src/index.ts` is the canonical recipe. — Implemented in `reconcileViaRest()`: on `DroppedFrame`, close the socket, reconcile via `GET /sessions` (replacing the local map while preserving last_reaction/last_tool from events), then the connection loop reopens. Not yet exercised under load — the dogfooding window may surface real Dropped behavior.
+  - [x] **Reconnect loop:** on WS close (any reason: daemon restart, network blip, timeout), exponential backoff up to 30s ceiling, refetch `GET /sessions`, reopen WS, resubscribe. Surface the disconnected state in the TUI (e.g. dim the rows + a status line at the bottom). — Backoff: 250ms → 30s cap, doubles per failure. Disconnected rendering: `\x1b[2m` dim the rows + status line shows `○ disconnected` (red). Re-reads `~/.bowerbird/server.json` each iteration since the daemon's port is ephemeral (Story 3.2). Pattern carried from `examples/reconnect-recovery/`.
 
-- [ ] **Task 4: Auth + config** (AC: #1)
-  - [ ] Read the bearer token from `~/.bowerbird/server.json` (the daemon's published location since Story 3.3). Same pattern as `examples/multi-session-router/src/index.ts`.
-  - [ ] Read the daemon's bind address + port from the same file. Don't hard-code `127.0.0.1:8080` — let the daemon's `config.toml` be the source of truth.
-  - [ ] If `~/.bowerbird/server.json` doesn't exist, exit with a clear error pointing at `bowerbird start`.
+- [x] **Task 4: Auth + config** (AC: #1)
+  - [x] Read the bearer token from `~/.bowerbird/server.json` (the daemon's published location since Story 3.3). Same pattern as `examples/multi-session-router/src/index.ts`. — **Story-spec drift caught at implementation time:** the bearer token is NOT in `server.json` per `crates/protocol/src/rest.rs:77-94` and `crates/daemon/src/api/token.rs` (Story 3.3 landed the token in the system keychain + `BOWERBIRD_TOKEN` env var fallback; `server.json` carries only `bind_addr`). Implementation matches the **three reference examples** (`multi-session-router`, `reconnect-recovery`, `event-log-viewer`): read `BOWERBIRD_TOKEN` env var with an error message pointing at `bowerbird auth token`. This is documentation/spec drift, not substrate friction — flagged here for the eventual Story 5.6 docs pass (first-time-reader docs) to fold the correction into the story-template references.
+  - [x] Read the daemon's bind address + port from the same file. Don't hard-code `127.0.0.1:8080` — let the daemon's `config.toml` be the source of truth. — Done: `loadServerInfo()` reads `bind_addr` from `~/.bowerbird/server.json` on every connection-loop iteration so an ephemeral-port restart is transparent.
+  - [x] If `~/.bowerbird/server.json` doesn't exist, exit with a clear error pointing at `bowerbird start`. — Error wrapping in `loadServerInfo()`: `cannot read <path>: <msg>. Is the daemon running? Try \`bowerbird start\`.`
 
 - [ ] **Task 5: Verify against bundled fixture, then live Claude Code** (AC: #1, #2)
   - [ ] **Smoke step (no Claude Code needed):** start bowerbird via `bowerbird start`; run `bowerbird replay` (no args; uses the Story 4.1 bundled fixture spanning two sessions); start the presenter. Confirm the TUI shows two session rows transitioning through states as replay fires. This is the same hermetic pattern Story 4.2's `cli_examples.rs` already proves end-to-end against three reference examples.
@@ -85,12 +85,12 @@ Source: `docs/bmad/planning-artifacts/epics.md` §"Story 5.1: First-party presen
   - [ ] DO NOT silently work around a substrate awkwardness in `bowerbird-deck` code. The friction signal IS the deliverable.
   - [ ] Cross-link from the `bowerbird-deck` line of code that hit the friction (a `// see bowerbird/docs/.../5.X-hotfix-<topic>.md` or `// see bowerbird/docs/.../deferred-work.md#<anchor>` comment is sufficient).
 
-- [ ] **Task 7: Write `bowerbird-deck/README.md`** (AC: #5)
-  - [ ] Name the required bowerbird version (initially `main` pinned to a specific commit SHA; switch to `v0.1.0` after Story 5.8 tags it).
-  - [ ] Install instructions: `gh repo clone <owner>/bowerbird-deck && cd bowerbird-deck && npm install` (or note "zero deps; just clone" if the implementation avoids npm-managed deps).
-  - [ ] Run instructions: `npm start` resolving to `node --experimental-strip-types src/index.ts`. Reproduce the Node 22.6+ floor here, same as Story 4.2's examples.
-  - [ ] Cookbook pattern reference: link to `https://github.com/<owner>/bowerbird/blob/main/docs/cookbook/state-session-fanout.md` (or its v0.1.0 tag equivalent post-5.8). One paragraph naming why this pattern (the presenter is fundamentally a state-fanout consumer; recent-tool-use is a secondary detail).
-  - [ ] One-paragraph "Status" header: "First-party V1 presenter; tracks `bowerbird` `main` / `v0.1.0`. Friction discovered while building this lives in the parent repo, not here."
+- [x] **Task 7: Write `bowerbird-deck/README.md`** (AC: #5)
+  - [x] Name the required bowerbird version (initially `main` pinned to a specific commit SHA; switch to `v0.1.0` after Story 5.8 tags it). — Pinned to `32c6d8c` (current bowerbird `main` HEAD at 2026-05-27); README notes the v0.1.0 follow-up.
+  - [x] Install instructions: `gh repo clone <owner>/bowerbird-deck && cd bowerbird-deck && npm install` (or note "zero deps; just clone" if the implementation avoids npm-managed deps). — Runtime is zero-deps; README documents `npm install` as optional (covers `npm run typecheck` only).
+  - [x] Run instructions: `npm start` resolving to `node --experimental-strip-types src/index.ts`. Reproduce the Node 22.6+ floor here, same as Story 4.2's examples. — Done. Includes the `export BOWERBIRD_TOKEN=$(bowerbird auth token)` step so first-time readers don't trip on the env-var requirement.
+  - [x] Cookbook pattern reference: link to `https://github.com/<owner>/bowerbird/blob/main/docs/cookbook/state-session-fanout.md` (or its v0.1.0 tag equivalent post-5.8). One paragraph naming why this pattern (the presenter is fundamentally a state-fanout consumer; recent-tool-use is a secondary detail). — Done. README also links to the three reference examples as "if you want the recipe without the TUI noise."
+  - [x] One-paragraph "Status" header: "First-party V1 presenter; tracks `bowerbird` `main` / `v0.1.0`. Friction discovered while building this lives in the parent repo, not here." — Done at the top of README.md.
 
 - [ ] **Task 8: Update bowerbird's `architecture.md` §Frontend Architecture with the real backlink** (AC: #3)
   - [ ] Edit `docs/bmad/planning-artifacts/architecture.md` at the `### Frontend Architecture` section (currently lines 494–498).
@@ -176,10 +176,59 @@ This story is unusual: the canonical "test" is the 5-day dogfooding window (AC #
 
 ### Agent Model Used
 
-{{agent_model_name_version}}
+claude-opus-4-7 (1M context) via Claude Code's `/bmad-dev-story` skill (BMM module).
 
 ### Debug Log References
 
+- Local smoke test (2026-05-27): presenter launched against the running daemon (pid 91535, uptime 24h45m, 31 active sessions), received `hello` frame + 31-session snapshot via `state.session.*` burst. All three `SessionCurrentState` variants (`Idle`, `Working`, `WaitingInput`) observed in the snapshot. Non-TTY mode emits a JSON snapshot per render; TTY mode (the real use case) draws the ANSI table.
+- `npm run typecheck` clean against `@types/node@22` + `typescript@5.6` with `strict: true`.
+
 ### Completion Notes List
 
+**Session 1 (2026-05-27): code work + initial smoke test.**
+
+Tasks 1–4, 7 are complete (with the noted maintainer-action carve-outs on Task 1). The story stays `in-progress` because Tasks 5 (5-day dogfooding window), 6 (friction capture), 8 (architecture.md backlink edit), and 9 (sprint-status transition) all depend on the calendar window in AC #2.
+
+**Maintainer follow-up to unblock the dogfooding window:**
+
+1. `gh repo create technicalpickles/bowerbird-deck --public --description "First-party presenter for bowerbird — terminal TUI for live Claude Code session state"`
+2. From `~/pickleton/repos/bowerbird-deck/worktrees/main/`: `git push -u origin main` (the origin URL is already set on the bare repo).
+3. *(Optional)* `pt track git@github.com:technicalpickles/bowerbird-deck.git --name bowerbird-deck` if pt's worktree views should pick it up — the directory already matches the `bare.git/` + `worktrees/main/` layout pt expects, so this should be a no-op rebind; verify with `pt list` and `pt worktrees bowerbird-deck`. (Skipping this is fine — the repo is functionally a git repo regardless.)
+4. Start the dogfooding window: `export BOWERBIRD_TOKEN=$(bowerbird auth token); npm start` in a persistent terminal window for ambient awareness. AC #2 wants 5 *working days*.
+
+**During the 5-day dogfooding window:**
+
+- Log calendar dates in this section as the window progresses (e.g. "2026-05-28 (day 1) — used the presenter all day; alt-tabbed to terminal twice when X happened").
+- Capture friction per AC #4 split: hotfix story for daily-work blockers (file under `docs/bmad/implementation-artifacts/5.X-hotfix-<topic>.md` + add the key to `sprint-status.yaml` Epic 5 block); deferred-work entry for everything else (`docs/bmad/implementation-artifacts/deferred-work.md`). Cross-link from the relevant `bowerbird-deck` source line with a `// see bowerbird/docs/...` comment.
+
+**Friction items pre-flagged from this session (track these specifically; either confirm during dogfooding or close them out):**
+
+- *Story-spec drift, Task 4:* "Read the bearer token from `~/.bowerbird/server.json`" is wrong — Story 3.3 put the token in keychain + `BOWERBIRD_TOKEN` env var. The story spec should match Story 3.3 reality. Action: Story 5.6 (first-time-reader docs pass) is the right place to scrub `docs/bmad/planning-artifacts/` and `epics.md` for similar drift.
+- *Substrate behavior, presenter side:* state snapshot has no event history → `last_tool` / `last_reaction` columns stay null for pre-existing sessions until a fresh `PreToolUse` event fires. Workaround on the presenter side would be `GET /sessions/<id>/events?since=0` per session at connect, but per AC #4 we should NOT silently work around — instead, watch for this in daily use; if it actively hurts, file a hotfix or deferred-work entry. If it never bothers the maintainer, it's noise that died on its own.
+
+**After the dogfooding window closes:**
+
+- Edit `bowerbird/docs/bmad/planning-artifacts/architecture.md` at the `### Frontend Architecture` section (lines 494–498) per Task 8.
+- Flip `5-1-first-party-presenter-tool` to `review` AND `dogfooding-validation-phase` to `in-progress` per Task 9 / AC #6 in the same merge.
+- Re-invoke `/bmad-dev-story` (or just continue the workflow manually) to walk Steps 9–10 of the dev-story workflow.
+
 ### File List
+
+**`bowerbird-deck` (sibling repo, NOT in this repo):**
+
+- `~/pickleton/repos/bowerbird-deck/bare.git/` — bare git with origin set to `git@github.com:technicalpickles/bowerbird-deck.git` (awaiting maintainer `gh repo create` + `git push`).
+- `~/pickleton/repos/bowerbird-deck/worktrees/main/.gitignore`
+- `~/pickleton/repos/bowerbird-deck/worktrees/main/LICENSE` (dual MIT/Apache mirror of bowerbird's)
+- `~/pickleton/repos/bowerbird-deck/worktrees/main/LICENSE-MIT`
+- `~/pickleton/repos/bowerbird-deck/worktrees/main/LICENSE-APACHE`
+- `~/pickleton/repos/bowerbird-deck/worktrees/main/README.md`
+- `~/pickleton/repos/bowerbird-deck/worktrees/main/package.json`
+- `~/pickleton/repos/bowerbird-deck/worktrees/main/tsconfig.json`
+- `~/pickleton/repos/bowerbird-deck/worktrees/main/src/index.ts`
+- `~/pickleton/repos/bowerbird-deck/worktrees/main/package-lock.json` (devDependencies install: typescript + @types/node)
+
+**`bowerbird` (this repo, this PR):**
+
+- `docs/bmad/implementation-artifacts/sprint-status.yaml` — Story 5.1 `ready-for-dev → in-progress`.
+- `docs/bmad/implementation-artifacts/5-1-first-party-presenter-tool.md` — this file (status `ready-for-dev → in-progress`, Tasks 1–4 & 7 marked complete with per-subtask notes, Dev Agent Record populated, dogfooding-window handoff staged).
+- *(Pending Task 8, after dogfooding closes)* `docs/bmad/planning-artifacts/architecture.md` — Frontend Architecture backlink update.
