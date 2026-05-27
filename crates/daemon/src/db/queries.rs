@@ -191,6 +191,7 @@ mod tests {
     #[test]
     fn event_kind_db_string_round_trip_all_variants() {
         for kind in [
+            EventKind::UserPromptSubmit,
             EventKind::PreToolUse,
             EventKind::PostToolUse,
             EventKind::Stop,

@@ -32,7 +32,13 @@ fn install_writes_shim_command_with_hook_kind_for_each_known_kind() {
     install(&path).expect("install");
     let parsed: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
 
-    for kind in ["PreToolUse", "PostToolUse", "Stop", "Notification"] {
+    for kind in [
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PostToolUse",
+        "Stop",
+        "Notification",
+    ] {
         let cmd = parsed
             .pointer(&format!("/hooks/{kind}/0/hooks/0/command"))
             .and_then(|v| v.as_str())
@@ -129,7 +135,13 @@ fn concurrent_install_yields_consistent_final_state() {
         parsed.is_object(),
         "settings.json must remain a JSON object"
     );
-    for kind in ["PreToolUse", "PostToolUse", "Stop", "Notification"] {
+    for kind in [
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PostToolUse",
+        "Stop",
+        "Notification",
+    ] {
         let groups = parsed
             .pointer(&format!("/hooks/{kind}"))
             .and_then(|v| v.as_array())
@@ -251,7 +263,13 @@ fn installed_command_uses_path_relative_binary_name_no_slash_in_first_token() {
     install(&path).expect("install");
     let parsed: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
 
-    for kind in ["PreToolUse", "PostToolUse", "Stop", "Notification"] {
+    for kind in [
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PostToolUse",
+        "Stop",
+        "Notification",
+    ] {
         let cmd = parsed
             .pointer(&format!("/hooks/{kind}/0/hooks/0/command"))
             .and_then(|v| v.as_str())

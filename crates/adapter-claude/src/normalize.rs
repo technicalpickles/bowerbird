@@ -66,6 +66,7 @@ pub(crate) fn normalize(
     // daemon emits `400 unknown hook_kind: <value>` and not the generic
     // `400 normalize error: missing required field: session_id`.
     let kind = match hook_kind {
+        "UserPromptSubmit" => EventKind::UserPromptSubmit,
         "PreToolUse" => EventKind::PreToolUse,
         "PostToolUse" => EventKind::PostToolUse,
         "Stop" => EventKind::Stop,

@@ -18,7 +18,21 @@ use crate::error::InstallError;
 /// Hook kinds the bowerbird shim accepts on its CLI (see
 /// `crates/shim/src/main.rs::parse_hook_kind`). Listed in a stable order so
 /// install output (and the resulting JSON) is deterministic across runs.
-pub(crate) const HOOK_KINDS: &[&str] = &["PreToolUse", "PostToolUse", "Stop", "Notification"];
+/// Chronological-lifecycle order: a user submits, the agent runs tools,
+/// the agent stops, the agent waits for input.
+pub(crate) const HOOK_KINDS: &[&str] = &[
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "Stop",
+    "Notification",
+];
+
+/// The four hook kinds installed by pre-Story-5.2 builds. Used by
+/// [`install`] to detect a legacy installation and surface a one-line
+/// upgrade hint (story 5.2 AC #4). Order is irrelevant — we only check
+/// set-membership against the bowerbird entries already in settings.json.
+const LEGACY_HOOK_KINDS: &[&str] = &["PreToolUse", "PostToolUse", "Stop", "Notification"];
 
 /// Exponential backoff schedule between rename-race retries. The first
 /// attempt has no preceding sleep; each entry here is the wait between one
@@ -41,6 +55,13 @@ pub struct InstallOutcome {
     /// already had a bowerbird entry (install is idempotent over the
     /// settings.json dimension).
     pub hook_kinds_added: Vec<&'static str>,
+    /// True when, pre-merge, settings.json already had bowerbird entries for
+    /// all four legacy hook kinds (PreToolUse, PostToolUse, Stop,
+    /// Notification) but was missing the Story 5.2 addition
+    /// (UserPromptSubmit). The CLI surfaces this as a one-line hint so an
+    /// operator re-running install after a version bump sees that the new
+    /// hook was subscribed (story 5.2 AC #4).
+    pub legacy_upgrade_detected: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,10 +89,14 @@ pub fn install(settings_path: &Path) -> Result<InstallOutcome, InstallError> {
         if attempt == 0 {
             state.created = !existed;
         }
+        let pre_merge_legacy = settings_has_only_legacy_bowerbird_hooks(&value);
         let hook_kinds_added = merge_install_into(&mut value);
+        let legacy_upgrade_detected =
+            pre_merge_legacy && hook_kinds_added.contains(&"UserPromptSubmit");
         let outcome = InstallOutcome {
             created: state.created,
             hook_kinds_added,
+            legacy_upgrade_detected,
         };
         match atomic_write(settings_path, &value)? {
             WriteOutcome::Wrote => return Ok(outcome),
@@ -303,6 +328,35 @@ fn bowerbird_hook_group(kind: &str) -> Value {
 
 fn array_contains_bowerbird(array: &[Value]) -> bool {
     array.iter().any(group_contains_bowerbird)
+}
+
+/// True when the pre-merge settings.json has a bowerbird entry under
+/// every pre-Story-5.2 hook kind but no bowerbird entry under any newer
+/// kind (currently just `UserPromptSubmit`). Drives the install hint that
+/// tells operators their re-run upgraded a legacy install (story 5.2 AC #4).
+fn settings_has_only_legacy_bowerbird_hooks(value: &Value) -> bool {
+    let Some(hooks) = value.get("hooks").and_then(|v| v.as_object()) else {
+        return false;
+    };
+    let legacy_present = LEGACY_HOOK_KINDS.iter().all(|kind| {
+        hooks
+            .get(*kind)
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| array_contains_bowerbird(a))
+    });
+    if !legacy_present {
+        return false;
+    }
+    let post_legacy_present = HOOK_KINDS
+        .iter()
+        .filter(|k| !LEGACY_HOOK_KINDS.contains(k))
+        .any(|kind| {
+            hooks
+                .get(*kind)
+                .and_then(|v| v.as_array())
+                .is_some_and(|a| array_contains_bowerbird(a))
+        });
+    !post_legacy_present
 }
 
 fn group_contains_bowerbird(group: &Value) -> bool {

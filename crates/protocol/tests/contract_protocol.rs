@@ -5,6 +5,11 @@ use protocol::{
 
 #[test]
 fn event_kind_serializes_pascal_case() {
+    // Story 5.2 variant — slotted before PreToolUse in lifecycle order.
+    assert_eq!(
+        serde_json::to_string(&EventKind::UserPromptSubmit).unwrap(),
+        "\"UserPromptSubmit\""
+    );
     assert_eq!(
         serde_json::to_string(&EventKind::PreToolUse).unwrap(),
         "\"PreToolUse\""
@@ -35,6 +40,17 @@ fn event_kind_serializes_pascal_case() {
         serde_json::to_string(&EventKind::Unknown).unwrap(),
         "\"Unknown\""
     );
+}
+
+#[test]
+fn user_prompt_submit_round_trips() {
+    // Story 5.2 — the new variant must round-trip cleanly through serde so
+    // every consumer (REST snapshot, WS frame, DB column) sees the same
+    // wire string.
+    let json = serde_json::to_string(&EventKind::UserPromptSubmit).unwrap();
+    assert_eq!(json, "\"UserPromptSubmit\"");
+    let parsed: EventKind = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed, EventKind::UserPromptSubmit);
 }
 
 #[test]

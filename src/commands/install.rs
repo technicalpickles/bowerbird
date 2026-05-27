@@ -40,6 +40,12 @@ pub fn run(args: InstallArgs) -> anyhow::Result<()> {
         );
     }
 
+    if outcome.legacy_upgrade_detected {
+        println!(
+            "note: detected pre-Story-5.2 hooks; re-running install subscribed UserPromptSubmit"
+        );
+    }
+
     if args.no_start {
         return Ok(());
     }

@@ -21,6 +21,7 @@ pub struct EventId(pub i64);
 /// reached `event_kind_as_str`, but that path is unreachable in practice.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventKind {
+    UserPromptSubmit,
     PreToolUse,
     PostToolUse,
     Stop,

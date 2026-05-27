@@ -1,4 +1,4 @@
-use protocol::{Event, EventEnvelope, EventId, SessionState};
+use protocol::{Event, EventEnvelope, EventId, SessionCurrentState, SessionState};
 use rusqlite::OptionalExtension;
 
 use crate::broadcast::{BroadcastEnvelope, BroadcastHub};
@@ -27,13 +27,16 @@ pub struct RecordingStarted {
 
 /// Sole owner of the SQLite write transaction AND the sole publisher of
 /// user-facing `BroadcastEnvelope::Event` / `BroadcastEnvelope::State`
-/// frames (per story 2.2).
+/// frames (per story 2.2; refined by story 5.2).
 ///
 /// Inserts one row into `events` and upserts the matching row in
 /// `session_projections` inside a single transaction containing exactly those
 /// two writes — nothing else. After `tx.commit()` succeeds, publishes one
-/// `BroadcastEnvelope::Event` followed by one `BroadcastEnvelope::State` so
-/// any WS subscribers see the event before the resulting projection update.
+/// `BroadcastEnvelope::Event` followed by ZERO-OR-ONE `BroadcastEnvelope::State`
+/// so any WS subscribers see the event before the resulting projection update
+/// IFF the projection update actually changed `current_state` (story 5.2). A
+/// first event for a previously-unknown session counts as a transition
+/// (`None != Some(new_state.current_state)`) and DOES publish State.
 /// Publishing is gated on commit success: if `interact` or `tx.commit` returns
 /// `Err`, no envelope is published (story 2.2 AC #6).
 ///
@@ -89,69 +92,77 @@ pub async fn write(
     let payload_for_closure = payload.clone();
 
     let interact_res = conn
-        .interact(move |c| -> rusqlite::Result<(i64, SessionState)> {
-            let tx = c.transaction()?;
+        .interact(
+            move |c| -> rusqlite::Result<(i64, SessionState, Option<SessionCurrentState>)> {
+                let tx = c.transaction()?;
 
-            // Read the prior state inside the transaction so a concurrent
-            // writer cannot interleave between SELECT and UPSERT. Reads do
-            // not break the "exactly two writes" invariant from
-            // architecture.md:634-641 — the invariant is about *writes*.
-            let prev_state: Option<SessionState> = tx
-                .query_row(
-                    SELECT_SESSION_PROJECTION_STATE,
-                    rusqlite::params![&source_for_closure, &session_id_for_closure],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?
-                .and_then(|raw| match serde_json::from_str::<SessionState>(&raw) {
-                    Ok(v) => Some(v),
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            raw = %raw,
-                            "session_projections.state failed to deserialize; \
-                             treating as fresh — next event will overwrite",
-                        );
-                        None
-                    }
-                });
+                // Read the prior state inside the transaction so a concurrent
+                // writer cannot interleave between SELECT and UPSERT. Reads do
+                // not break the "exactly two writes" invariant from
+                // architecture.md:634-641 — the invariant is about *writes*.
+                let prev_state: Option<SessionState> = tx
+                    .query_row(
+                        SELECT_SESSION_PROJECTION_STATE,
+                        rusqlite::params![&source_for_closure, &session_id_for_closure],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .and_then(|raw| match serde_json::from_str::<SessionState>(&raw) {
+                        Ok(v) => Some(v),
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                raw = %raw,
+                                "session_projections.state failed to deserialize; \
+                                 treating as fresh — next event will overwrite",
+                            );
+                            None
+                        }
+                    });
 
-            let new_state = transition(prev_state.as_ref(), kind_for_transition, now_ms);
-            let state_json = serde_json::to_string(&new_state).map_err(|e| {
-                rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("SessionState serialize failed: {e}"),
-                )))
-            })?;
+                // Capture prev's current_state BEFORE the closure consumes
+                // `prev_state` into `transition` — the post-commit publish path
+                // needs both prev and new current_state to decide whether to emit
+                // a `BroadcastEnvelope::State` (story 5.2).
+                let prev_current_state = prev_state.as_ref().map(|s| s.current_state);
 
-            tx.execute(
-                UPSERT_SESSION_PROJECTION,
-                rusqlite::params![
-                    source_for_closure,
-                    session_id_for_closure,
-                    state_json,
-                    now_ms
-                ],
-            )?;
-            tx.execute(
-                INSERT_EVENT,
-                rusqlite::params![
-                    source_for_closure,
-                    session_id_for_closure,
-                    kind_str,
-                    reaction_str,
-                    payload_for_closure,
-                    now_ms
-                ],
-            )?;
-            let id = tx.last_insert_rowid();
-            tx.commit()?;
-            Ok((id, new_state))
-        })
+                let new_state = transition(prev_state.as_ref(), kind_for_transition, now_ms);
+                let state_json = serde_json::to_string(&new_state).map_err(|e| {
+                    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("SessionState serialize failed: {e}"),
+                    )))
+                })?;
+
+                tx.execute(
+                    UPSERT_SESSION_PROJECTION,
+                    rusqlite::params![
+                        source_for_closure,
+                        session_id_for_closure,
+                        state_json,
+                        now_ms
+                    ],
+                )?;
+                tx.execute(
+                    INSERT_EVENT,
+                    rusqlite::params![
+                        source_for_closure,
+                        session_id_for_closure,
+                        kind_str,
+                        reaction_str,
+                        payload_for_closure,
+                        now_ms
+                    ],
+                )?;
+                let id = tx.last_insert_rowid();
+                tx.commit()?;
+                Ok((id, new_state, prev_current_state))
+            },
+        )
         .await
         .map_err(|e| Error::Pool(format!("interact failed: {e}")))?;
 
-    let (event_id_raw, new_state) = interact_res?;
+    let (event_id_raw, new_state, prev_current_state) = interact_res?;
     let event_id = EventId(event_id_raw);
 
     // Post-commit publish. Event BEFORE State so a presenter consuming both
@@ -170,14 +181,23 @@ pub async fn write(
         created_at: now_ms,
     };
     broadcaster.publish(BroadcastEnvelope::Event(event));
-    broadcaster.publish(BroadcastEnvelope::State {
-        source,
-        session_id,
-        state: new_state,
-    });
+
+    // Story 5.2: only publish State when `current_state` actually changed.
+    // First-event semantics fall out naturally — `prev_current_state` is
+    // `None` for a new session, `None != Some(new_state.current_state)`
+    // returns true, and the State envelope publishes.
+    let state_changed = prev_current_state != Some(new_state.current_state);
+    if state_changed {
+        broadcaster.publish(BroadcastEnvelope::State {
+            source,
+            session_id,
+            state: new_state,
+        });
+    }
     tracing::debug!(
         event_id = event_id.0,
-        "ws: published event + state envelopes"
+        state_published = state_changed,
+        "ws: published event envelope; state envelope gated on transition"
     );
 
     Ok(event_id)

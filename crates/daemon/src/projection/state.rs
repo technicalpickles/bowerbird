@@ -16,6 +16,13 @@ use protocol::{EventKind, SessionCurrentState, SessionState};
 /// If `now_ms - last_event_at_ms > STALE_WORKING_MS` and the stored state is
 /// `Working`, `current_state_for_read` returns `Idle`. The stored row is left
 /// untouched — see Dev Notes "Hook unreliability mitigation".
+///
+/// As of Story 5.2 the canonical Working→Idle transition is `Stop`
+/// (`PostToolUse` now preserves prior state — see `transition` below), so this
+/// fallback's primary role is backstopping a dropped `Stop`. The original
+/// role (backstopping a dropped `PostToolUse` in the pre-5.2 era) is still
+/// covered by the same logic — the threshold doesn't care which specific event
+/// was dropped, only that the session looks Working long past anything plausible.
 pub(crate) const STALE_WORKING_MS: i64 = 300_000;
 
 /// Compute the new `SessionState` to store after observing `event_kind`.
@@ -32,8 +39,17 @@ pub(crate) fn transition(
     now_ms: i64,
 ) -> SessionState {
     let next_current = match event_kind {
+        EventKind::UserPromptSubmit => SessionCurrentState::Working,
         EventKind::PreToolUse => SessionCurrentState::Working,
-        EventKind::PostToolUse => SessionCurrentState::Idle,
+        // Story 5.2: PostToolUse no longer flips to Idle. The agent is alive
+        // between tool calls (composing the next call, thinking) — the only
+        // event that ends a turn is `Stop`. Preserve the prior `current_state`
+        // and update `last_event_kind`/`last_event_at_ms`. The degenerate
+        // PostToolUse-without-prior-state case defaults to Working (the agent
+        // was clearly active a moment ago).
+        EventKind::PostToolUse => prev
+            .map(|s| s.current_state)
+            .unwrap_or(SessionCurrentState::Working),
         EventKind::Stop => SessionCurrentState::Idle,
         EventKind::Notification => SessionCurrentState::WaitingInput,
         // Defensive guard — not an expected code path. Sentinels write to the
@@ -96,12 +112,42 @@ mod tests {
     }
 
     #[test]
-    fn transition_pretooluse_then_posttooluse_yields_idle() {
+    fn transition_posttooluse_preserves_working() {
+        // Story 5.2: PostToolUse no longer flips to Idle. The session stays
+        // Working between tool calls; only `Stop` ends a turn. `last_event_kind`
+        // and `last_event_at_ms` still update so REST readers see freshness.
         let after_pre = transition(None, EventKind::PreToolUse, 1_000);
         let after_post = transition(Some(&after_pre), EventKind::PostToolUse, 2_000);
-        assert_eq!(after_post.current_state, SessionCurrentState::Idle);
+        assert_eq!(after_post.current_state, SessionCurrentState::Working);
         assert_eq!(after_post.last_event_kind, EventKind::PostToolUse);
         assert_eq!(after_post.last_event_at_ms, 2_000);
+    }
+
+    #[test]
+    fn transition_posttooluse_without_prev_defaults_to_working() {
+        // Degenerate path: a PostToolUse without a prior projection row.
+        // Shouldn't happen in practice but Working is the right fallback —
+        // the agent was clearly active a moment ago.
+        let after_post = transition(None, EventKind::PostToolUse, 1_000);
+        assert_eq!(after_post.current_state, SessionCurrentState::Working);
+        assert_eq!(after_post.last_event_kind, EventKind::PostToolUse);
+        assert_eq!(after_post.last_event_at_ms, 1_000);
+    }
+
+    #[test]
+    fn transition_user_prompt_submit_yields_working() {
+        let next = transition(None, EventKind::UserPromptSubmit, 1_000);
+        assert_eq!(next.current_state, SessionCurrentState::Working);
+        assert_eq!(next.last_event_kind, EventKind::UserPromptSubmit);
+        assert_eq!(next.last_event_at_ms, 1_000);
+    }
+
+    #[test]
+    fn transition_user_prompt_submit_then_pretooluse_stays_working() {
+        let after_ups = transition(None, EventKind::UserPromptSubmit, 1_000);
+        let after_pre = transition(Some(&after_ups), EventKind::PreToolUse, 2_000);
+        assert_eq!(after_pre.current_state, SessionCurrentState::Working);
+        assert_eq!(after_pre.last_event_kind, EventKind::PreToolUse);
     }
 
     #[test]

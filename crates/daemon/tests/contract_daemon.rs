@@ -1125,11 +1125,13 @@ async fn source_session_id_collision_safety() {
         .expect("updated_at row")
     };
 
-    // Mutate only the claude session.
+    // Mutate only the claude session. Use Stop here so claude ends up Idle and
+    // diverges from codex's Working state — Story 5.2 made PostToolUse preserve
+    // prev, so a single PostToolUse no longer flips Working → Idle.
     projection::session::write(
         &pools.writer,
         &BroadcastHub::new(16),
-        envelope_for("claude", "sess-shared", EventKind::PostToolUse),
+        envelope_for("claude", "sess-shared", EventKind::Stop),
     )
     .await
     .expect("write claude#2");
@@ -1238,6 +1240,11 @@ async fn hook_unreliability_tolerance_pretooluse_without_posttooluse() {
 
 /// AC #4 — Drive a session through a mixed event sequence and assert the
 /// stored `current_state` matches the documented transition table at each step.
+///
+/// Updated by Story 5.2: the table now encodes PostToolUse-preserves-prev
+/// (no longer flips to Idle), Stop as the canonical "agent done" event, and
+/// UserPromptSubmit as a Working trigger. The shape models a realistic full
+/// turn: prompt → tool work → notify → more tool work → stop.
 #[tokio::test(flavor = "current_thread")]
 async fn state_machine_full_sequence_determinism() {
     let (_tmp, pools) = fresh_pools().await;
@@ -1245,10 +1252,16 @@ async fn state_machine_full_sequence_determinism() {
 
     let cases: &[(EventKind, SessionCurrentState)] = &[
         (EventKind::PreToolUse, SessionCurrentState::Working),
-        (EventKind::PostToolUse, SessionCurrentState::Idle),
+        // Story 5.2: PostToolUse preserves prev (Working), no longer flips Idle.
+        (EventKind::PostToolUse, SessionCurrentState::Working),
+        // Stop is the canonical "agent done" transition.
+        (EventKind::Stop, SessionCurrentState::Idle),
+        // UserPromptSubmit drives Idle → Working (Story 5.2 new variant).
+        (EventKind::UserPromptSubmit, SessionCurrentState::Working),
         (EventKind::PreToolUse, SessionCurrentState::Working),
         (EventKind::Notification, SessionCurrentState::WaitingInput),
         (EventKind::PreToolUse, SessionCurrentState::Working),
+        (EventKind::PostToolUse, SessionCurrentState::Working),
         (EventKind::Stop, SessionCurrentState::Idle),
     ];
 
@@ -1272,6 +1285,195 @@ async fn state_machine_full_sequence_determinism() {
             "last_event_kind must always reflect the latest event"
         );
     }
+}
+
+/// Story 5.2 AC #1, #2 — `BroadcastEnvelope::State` is published only when a
+/// projection write actually changes `current_state`. Back-to-back
+/// `PreToolUse`/`PostToolUse` pairs (which both keep the session Working
+/// under Story 5.2's new transition table) must publish exactly one
+/// state envelope across the entire run — the initial `None → Working`.
+#[tokio::test(flavor = "current_thread")]
+async fn state_broadcast_only_on_transition() {
+    let (_tmp, pools) = fresh_pools().await;
+    let hub = BroadcastHub::new(64);
+    let mut rx = hub.subscribe();
+    let session_id = "sess-only-on-transition";
+
+    // 1 PreToolUse → Idle→Working transition (1 Event + 1 State).
+    projection::session::write(
+        &pools.writer,
+        &hub,
+        envelope_for("claude", session_id, EventKind::PreToolUse),
+    )
+    .await
+    .expect("write PreToolUse");
+
+    // N=3 back-to-back PostToolUse/PreToolUse pairs. Each event stays in
+    // Working — zero additional State envelopes.
+    const N: usize = 3;
+    for _ in 0..N {
+        projection::session::write(
+            &pools.writer,
+            &hub,
+            envelope_for("claude", session_id, EventKind::PostToolUse),
+        )
+        .await
+        .expect("write PostToolUse");
+        projection::session::write(
+            &pools.writer,
+            &hub,
+            envelope_for("claude", session_id, EventKind::PreToolUse),
+        )
+        .await
+        .expect("write PreToolUse");
+    }
+
+    // 1 Stop → Working→Idle transition (1 Event + 1 State).
+    projection::session::write(
+        &pools.writer,
+        &hub,
+        envelope_for("claude", session_id, EventKind::Stop),
+    )
+    .await
+    .expect("write Stop");
+
+    // Drain the receiver. Use `try_recv` in a deadline loop — the hub is
+    // synchronous so all envelopes should already be in the channel.
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    let mut events = 0usize;
+    let mut states = 0usize;
+    while std::time::Instant::now() < deadline {
+        match rx.try_recv() {
+            Ok(bowerbird_daemon::broadcast::BroadcastEnvelope::Event(_)) => events += 1,
+            Ok(bowerbird_daemon::broadcast::BroadcastEnvelope::State { .. }) => states += 1,
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                // No more frames pending — done.
+                break;
+            }
+            Err(e) => panic!("unexpected recv error: {e:?}"),
+        }
+    }
+    // Events: 1 (initial PreToolUse) + 2*N (back-to-back pairs) + 1 (final Stop) = 2 + 2N.
+    let expected_events = 2 + 2 * N;
+    assert_eq!(events, expected_events, "event count mismatch");
+    // State envelopes: exactly two — initial Idle→Working + final Working→Idle.
+    assert_eq!(
+        states, 2,
+        "expected exactly two State envelopes (Idle→Working, Working→Idle)"
+    );
+}
+
+/// Story 5.2 AC #3 — `UserPromptSubmit` drives the session into `Working`
+/// from `Idle`, and the subsequent `PreToolUse` is a no-op for state-frame
+/// purposes (already Working). `last_event_kind` always reflects the most
+/// recent event regardless of state-frame gating.
+#[tokio::test(flavor = "current_thread")]
+async fn user_prompt_submit_drives_working_transition() {
+    let (_tmp, pools) = fresh_pools().await;
+    let hub = BroadcastHub::new(64);
+    let mut rx = hub.subscribe();
+    let session_id = "sess-ups";
+
+    // Stop first to put session at Idle.
+    projection::session::write(
+        &pools.writer,
+        &hub,
+        envelope_for("claude", session_id, EventKind::Stop),
+    )
+    .await
+    .expect("write Stop");
+
+    // UserPromptSubmit → Idle → Working: should emit one State envelope.
+    projection::session::write(
+        &pools.writer,
+        &hub,
+        envelope_for("claude", session_id, EventKind::UserPromptSubmit),
+    )
+    .await
+    .expect("write UserPromptSubmit");
+
+    // PreToolUse: already Working → no additional State envelope.
+    projection::session::write(
+        &pools.writer,
+        &hub,
+        envelope_for("claude", session_id, EventKind::PreToolUse),
+    )
+    .await
+    .expect("write PreToolUse");
+
+    // Tally.
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    let mut events = 0usize;
+    let mut states_after_first_stop = 0usize;
+    // The Stop write itself counts as `None → Idle`, which is a transition
+    // (None != Some(Idle)) — so the very first envelope sequence is
+    // Event(Stop) + State(Idle). We track State envelopes AFTER the
+    // initial Stop transition to assert specifically that
+    // UserPromptSubmit drives one transition and PreToolUse drives zero.
+    let mut state_seq: Vec<EventKind> = Vec::new();
+    while std::time::Instant::now() < deadline {
+        match rx.try_recv() {
+            Ok(bowerbird_daemon::broadcast::BroadcastEnvelope::Event(_)) => events += 1,
+            Ok(bowerbird_daemon::broadcast::BroadcastEnvelope::State { state, .. }) => {
+                state_seq.push(state.last_event_kind);
+                if state_seq.len() > 1 {
+                    states_after_first_stop += 1;
+                }
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+            Err(e) => panic!("unexpected recv error: {e:?}"),
+        }
+    }
+    assert_eq!(events, 3, "3 events: Stop + UserPromptSubmit + PreToolUse");
+    assert_eq!(
+        state_seq,
+        vec![EventKind::Stop, EventKind::UserPromptSubmit],
+        "exactly two State frames — initial Stop (None→Idle) and UserPromptSubmit (Idle→Working)"
+    );
+    assert_eq!(
+        states_after_first_stop, 1,
+        "UserPromptSubmit emits one State frame; trailing PreToolUse emits none"
+    );
+
+    // Stored row reflects the most recent event regardless of state-frame
+    // gating: last_event_kind must be PreToolUse, not UserPromptSubmit.
+    let stored = read_session_state(&pools.reader, "claude", session_id).await;
+    let parsed: SessionState = serde_json::from_str(&stored).expect("parse");
+    assert_eq!(parsed.last_event_kind, EventKind::PreToolUse);
+    assert_eq!(parsed.current_state, SessionCurrentState::Working);
+}
+
+/// Story 5.2 AC #5 — A presenter compiled against the pre-Story-5.2
+/// protocol enum (lacking `UserPromptSubmit`) must decode that variant as
+/// `EventKind::Unknown` via Story 4.4's `#[serde(other)]` catch-all. The
+/// test constructs a local mock enum that omits UserPromptSubmit and
+/// asserts the catch-all fires.
+#[test]
+fn pre_story_5_2_presenter_decodes_user_prompt_submit_as_unknown() {
+    use serde::Deserialize;
+
+    // Mock copy of pre-Story-5.2 EventKind: 6 named variants + Unknown.
+    // The `#[serde(other)]` Unknown is the Story 4.4 catch-all contract
+    // that lets older presenters survive new variants.
+    #[derive(Debug, PartialEq, Eq, Deserialize)]
+    enum LegacyEventKind {
+        PreToolUse,
+        PostToolUse,
+        Stop,
+        Notification,
+        RecordingStarted,
+        RecordingEnded,
+        #[serde(other)]
+        Unknown,
+    }
+
+    let raw = r#""UserPromptSubmit""#;
+    let decoded: LegacyEventKind = serde_json::from_str(raw).expect("must deserialize");
+    assert_eq!(
+        decoded,
+        LegacyEventKind::Unknown,
+        "pre-5.2 enum must decode UserPromptSubmit as Unknown"
+    );
 }
 
 /// AC #2 — Atomicity contract: an `INSERT INTO events` and its matching
@@ -1768,7 +1970,9 @@ mod story_1_7_rest {
         )
         .await
         .expect("write sess-a");
-        // sess-b: PostToolUse → stored Idle.
+        // sess-b: PostToolUse + Stop → stored Idle.
+        // Story 5.2: PostToolUse alone now preserves prev (defaults to Working
+        // when there is no prev). The Stop is what drives Idle.
         projection::session::write(
             &pools.writer,
             &BroadcastHub::new(16),
@@ -1781,7 +1985,20 @@ mod story_1_7_rest {
             },
         )
         .await
-        .expect("write sess-b");
+        .expect("write sess-b PostToolUse");
+        projection::session::write(
+            &pools.writer,
+            &BroadcastHub::new(16),
+            EventEnvelope {
+                source: "claude".to_string(),
+                session_id: "sess-b".to_string(),
+                kind: EventKind::Stop,
+                reaction: None,
+                payload: "{}".to_string(),
+            },
+        )
+        .await
+        .expect("write sess-b Stop");
 
         let app = api::router(ready_state(pools));
         let resp = app.oneshot(auth_get("/sessions")).await.expect("oneshot");
@@ -1802,9 +2019,9 @@ mod story_1_7_rest {
         assert_eq!(
             by_id["sess-b"].current_state,
             SessionCurrentState::Idle,
-            "PostToolUse surfaces as Idle"
+            "Stop surfaces as Idle"
         );
-        assert_eq!(by_id["sess-b"].last_event_kind, EventKind::PostToolUse);
+        assert_eq!(by_id["sess-b"].last_event_kind, EventKind::Stop);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3555,15 +3772,11 @@ mod story_2_2_publish {
         );
 
         // Positive #2: publish for sess-A again — expect State frame.
-        let _ = publish_via_projection(
-            &state,
-            "claude",
-            "sess-A",
-            EventKind::PostToolUse,
-            None,
-            "{}",
-        )
-        .await;
+        // Story 5.2: State frames fire only on `current_state` transitions.
+        // sess-A is currently Working (from the earlier PreToolUse); use Stop
+        // to flip it to Idle and trigger a State publish.
+        let _ =
+            publish_via_projection(&state, "claude", "sess-A", EventKind::Stop, None, "{}").await;
         let frame = read_text_frame_or_close(&mut ws).await;
         let parsed = parse_state_frame(&frame);
         assert_eq!(parsed.session_id, "sess-A");
@@ -3656,14 +3869,21 @@ mod story_2_2_publish {
         )
         .await;
 
-        let order = ["sess-A", "sess-B", "sess-A", "sess-C"];
-        for sid in &order {
-            let _ =
-                publish_via_projection(&state, "claude", sid, EventKind::PreToolUse, None, "{}")
-                    .await;
+        // Story 5.2: State frames fire only on `current_state` transitions.
+        // For the repeated `sess-A` to publish twice, the second occurrence
+        // must drive a different state — use Stop (Working → Idle) for the
+        // second `sess-A` so all four publishes yield State frames.
+        let order: [(&str, EventKind); 4] = [
+            ("sess-A", EventKind::PreToolUse),
+            ("sess-B", EventKind::PreToolUse),
+            ("sess-A", EventKind::Stop),
+            ("sess-C", EventKind::PreToolUse),
+        ];
+        for (sid, kind) in &order {
+            let _ = publish_via_projection(&state, "claude", sid, kind.clone(), None, "{}").await;
         }
 
-        for expected in &order {
+        for (expected, _) in &order {
             let frame = read_text_frame_or_close(&mut ws).await;
             let parsed = parse_state_frame(&frame);
             assert_eq!(
@@ -4088,15 +4308,10 @@ mod story_2_3_snapshot {
         )
         .await;
         tokio::time::sleep(Duration::from_millis(2)).await;
-        let _ = publish_via_projection(
-            &state,
-            "claude",
-            "sess-B",
-            EventKind::PostToolUse,
-            None,
-            "{}",
-        )
-        .await;
+        // sess-B uses Stop so it lands in Idle — Story 5.2 made PostToolUse
+        // preserve prev, so a lone PostToolUse no longer yields Idle.
+        let _ =
+            publish_via_projection(&state, "claude", "sess-B", EventKind::Stop, None, "{}").await;
         tokio::time::sleep(Duration::from_millis(2)).await;
         let _ = publish_via_projection(
             &state,
@@ -4144,12 +4359,12 @@ mod story_2_3_snapshot {
             SessionCurrentState::Working,
             "sess-A PreToolUse → Working"
         );
-        // sess-B: PostToolUse → Idle
-        assert_eq!(frame_b.state.last_event_kind, EventKind::PostToolUse);
+        // sess-B: Stop → Idle (Story 5.2 — Stop is the canonical Idle trigger).
+        assert_eq!(frame_b.state.last_event_kind, EventKind::Stop);
         assert_eq!(
             frame_b.state.current_state,
             SessionCurrentState::Idle,
-            "sess-B PostToolUse → Idle"
+            "sess-B Stop → Idle"
         );
         // sess-C: PreToolUse → Working
         assert_eq!(frame_c.state.last_event_kind, EventKind::PreToolUse);
@@ -4182,21 +4397,19 @@ mod story_2_3_snapshot {
         // `dispatch_envelope` and never reaches the wire — only the
         // resulting State frame does. Its `last_event_at_ms` must be
         // strictly later than the snapshot's newest timestamp.
+        //
+        // Story 5.2: State frames fire only on `current_state` transitions.
+        // sess-A is currently `Working` (from its earlier PreToolUse); we
+        // need an event that flips it. `Stop` is the canonical Working → Idle
+        // trigger.
         tokio::time::sleep(Duration::from_millis(2)).await;
-        let _ = publish_via_projection(
-            &state,
-            "claude",
-            "sess-A",
-            EventKind::PostToolUse,
-            None,
-            "{}",
-        )
-        .await;
+        let _ =
+            publish_via_projection(&state, "claude", "sess-A", EventKind::Stop, None, "{}").await;
         let f_state = read_text_frame_or_close(&mut ws).await;
         let live = parse_state_frame(&f_state);
         assert_eq!(live.session_id, "sess-A");
         assert_eq!(live.source, "claude");
-        assert_eq!(live.state.last_event_kind, EventKind::PostToolUse);
+        assert_eq!(live.state.last_event_kind, EventKind::Stop);
         assert_eq!(live.state.current_state, SessionCurrentState::Idle);
         assert!(
             live.state.last_event_at_ms > max_snapshot_last_event_at_ms,
@@ -4307,24 +4520,14 @@ mod story_2_3_snapshot {
         // next State frame and asserting it is sess-A — and that the
         // first frame seen is not sess-B — is deterministic across CI
         // load, scheduler jitter, and TCP backpressure.
-        let _ = publish_via_projection(
-            &state,
-            "claude",
-            "sess-B",
-            EventKind::PostToolUse,
-            None,
-            "{}",
-        )
-        .await;
-        let _ = publish_via_projection(
-            &state,
-            "claude",
-            "sess-A",
-            EventKind::PostToolUse,
-            None,
-            "{}",
-        )
-        .await;
+        //
+        // Story 5.2: State frames fire only on `current_state` transitions.
+        // Both sessions are currently Working (from initial PreToolUse);
+        // Stop drives them to Idle so each publish yields a State frame.
+        let _ =
+            publish_via_projection(&state, "claude", "sess-B", EventKind::Stop, None, "{}").await;
+        let _ =
+            publish_via_projection(&state, "claude", "sess-A", EventKind::Stop, None, "{}").await;
         let frame = read_text_frame_or_close(&mut ws).await;
         let parsed = parse_state_frame(&frame);
         assert_eq!(
@@ -4333,7 +4536,7 @@ mod story_2_3_snapshot {
         );
         assert_eq!(
             parsed.state.last_event_kind,
-            EventKind::PostToolUse,
+            EventKind::Stop,
             "expected live update for sess-A, not a leaked snapshot or sess-B leak",
         );
 
@@ -4540,25 +4743,22 @@ mod story_2_3_snapshot {
         // frame during readiness, any duplicate-snapshot regression
         // would already have been caught BEFORE this publish. The
         // assertion below then has its own ordering barrier: the live
-        // frame's `last_event_kind` (PostToolUse) differs from the
-        // snapshot's (PreToolUse), so a leaked snapshot would surface
-        // here as a `last_event_kind` mismatch rather than relying on
-        // a fixed timeout window.
-        let _ = publish_via_projection(
-            &state,
-            "claude",
-            "sess-A",
-            EventKind::PostToolUse,
-            None,
-            "{}",
-        )
-        .await;
+        // frame's `last_event_kind` (Stop) differs from the snapshot's
+        // (PreToolUse), so a leaked snapshot would surface here as a
+        // `last_event_kind` mismatch rather than relying on a fixed
+        // timeout window.
+        //
+        // Story 5.2: Stop drives Working → Idle which triggers the State
+        // publish; PostToolUse would now preserve Working and emit no
+        // State frame.
+        let _ =
+            publish_via_projection(&state, "claude", "sess-A", EventKind::Stop, None, "{}").await;
         let f_state = read_text_frame_or_close(&mut ws).await;
         let live = parse_state_frame(&f_state);
         assert_eq!(live.session_id, "sess-A");
         assert_eq!(
             live.state.last_event_kind,
-            EventKind::PostToolUse,
+            EventKind::Stop,
             "first frame after second subscribe must be the live update, not a leaked snapshot frame",
         );
 
@@ -5766,11 +5966,17 @@ mod story_2_4_dropped {
         .await;
 
         // Publish 5 real events via the production projection path. Each
-        // produces one Event + one State on the hub. The state-only
-        // subscription matches only the State envelopes; the Event
-        // envelopes pass through rx.recv but `dispatch_envelope` filters
-        // them. Drain the 5 State frames as they arrive so the per-
+        // produces one Event + (post-Story-5.2) ZERO-OR-ONE State on the
+        // hub. The state-only subscription matches only the State envelopes;
+        // the Event envelopes pass through rx.recv but `dispatch_envelope`
+        // filters them. Drain the 5 State frames as they arrive so the per-
         // connection task isn't stuck on socket.send.
+        //
+        // Story 5.2: alternate PreToolUse / Stop so each event actually
+        // transitions `current_state` (Idle ↔ Working) and therefore
+        // publishes a State envelope. PreToolUse/PostToolUse alternation
+        // would now only emit one State frame (the very first Idle→Working
+        // transition); the rest would preserve Working.
         for i in 0..5 {
             let _ = publish_via_projection(
                 &state,
@@ -5779,7 +5985,7 @@ mod story_2_4_dropped {
                 if i % 2 == 0 {
                     EventKind::PreToolUse
                 } else {
-                    EventKind::PostToolUse
+                    EventKind::Stop
                 },
                 None,
                 "{}",
@@ -6967,8 +7173,10 @@ mod story_4_1_replay {
     }
 
     /// AC #1: events POSTed to /replay arrive on broadcast subscribers as
-    /// `Event` + `State` frame pairs, in JSONL line order, with new
-    /// `event_id` and `created_at` (not the JSONL values).
+    /// `Event` frames in JSONL line order — each followed by an optional
+    /// `State` frame IFF the projection's `current_state` changed
+    /// (story 5.2). `event_id` and `created_at` are reassigned to fresh
+    /// values (not the JSONL values).
     #[tokio::test(flavor = "current_thread")]
     async fn replay_forwards_events_through_broadcast_path() {
         let (_tmp, pools) = fresh_pools().await;
@@ -6992,9 +7200,13 @@ mod story_4_1_replay {
         assert_eq!(parsed.replayed_count, 3);
         assert!(parsed.parse_errors.is_empty(), "no parse errors expected");
 
-        // Expect 6 frames: 3 events × (Event, State).
-        let frames = collect_frames(&mut rx, 6).await;
-        assert_eq!(frames.len(), 6, "expected 6 frames; got {frames:?}");
+        // Story 5.2: State frames fire only on `current_state` transitions.
+        //   - PreToolUse: None → Working   → Event + State
+        //   - PostToolUse: Working → Working (preserved) → Event only
+        //   - Stop: Working → Idle         → Event + State
+        // 3 Event + 2 State = 5 frames.
+        let frames = collect_frames(&mut rx, 5).await;
+        assert_eq!(frames.len(), 5, "expected 5 frames; got {frames:?}");
 
         // Frames arrive in JSONL line order; each event publishes
         // Event then State.
@@ -7043,8 +7255,9 @@ mod story_4_1_replay {
     }
 
     /// AC #4: events spanning two `(source, session_id)` keys produce
-    /// `State` frames for each session (one per event per session,
-    /// matching Story 2.2 semantics).
+    /// `State` frames for each session, matching Story 2.2 publish
+    /// semantics as refined by Story 5.2 — State frames are gated on
+    /// `current_state` transitions, not emitted on every write.
     #[tokio::test(flavor = "current_thread")]
     async fn replay_emits_state_frames_for_each_session() {
         let (_tmp, pools) = fresh_pools().await;
@@ -7066,10 +7279,13 @@ mod story_4_1_replay {
             .expect("oneshot");
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // 4 events → 8 frames (Event+State per event). Count distinct
-        // session_ids in the State frames.
-        let frames = collect_frames(&mut rx, 8).await;
-        assert_eq!(frames.len(), 8, "expected 8 frames; got {frames:?}");
+        // Story 5.2: 4 events → 4 Event frames + 3 State frames = 7 total.
+        //   - sess-a PreToolUse:  None → Working    → Event + State
+        //   - sess-b PreToolUse:  None → Working    → Event + State
+        //   - sess-a PostToolUse: Working → Working → Event only
+        //   - sess-b Stop:        Working → Idle    → Event + State
+        let frames = collect_frames(&mut rx, 7).await;
+        assert_eq!(frames.len(), 7, "expected 7 frames; got {frames:?}");
         let mut state_sessions = std::collections::HashSet::new();
         for f in &frames {
             if let BroadcastEnvelope::State { session_id, .. } = f {
