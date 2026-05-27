@@ -3,16 +3,5 @@
     "enabled": false
   },
   "hooks": {
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "env PROJECT_ROOT=/Users/technicalpickles/github.com/technicalpickles/bowerbird /Users/technicalpickles/github.com/technicalpickles/bowerbird/.claude/skills/bmad-story-automator/scripts/story-automator stop-hook",
-            "timeout": 10
-          }
-        ]
-      }
-    ]
   }
 }
