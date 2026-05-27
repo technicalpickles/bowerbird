@@ -14,6 +14,7 @@ use bowerbird_daemon::db::{init_pools, run_migrations, DbPools};
 use bowerbird_daemon::projection;
 use bowerbird_daemon::state::{AppState, WsConfig};
 use protocol::{EventEnvelope, EventKind, SessionCurrentState, SessionState};
+use rusqlite::OptionalExtension;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
@@ -1037,6 +1038,114 @@ async fn shim_binary_round_trip_to_daemon_ingest() {
     shutdown.cancel();
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn shim_user_prompt_submit_round_trip_persists_working() {
+    // Story 5.2 AC #3/#8 — prove the real installed path, not just the
+    // projection helper: shim CLI accepts UserPromptSubmit, injects hook_kind,
+    // daemon ingest normalizes it without tool_name, writer persists it, and
+    // the projection moves to Working.
+    let (_tmp, pools) = fresh_pools().await;
+    let sock_tmp = TempDir::new().expect("socket tempdir");
+    let log_tmp = TempDir::new().expect("log tmpdir");
+    let sock_path = sock_tmp.path().join("ingest.sock");
+    let log_path = log_tmp.path().join("shim.log");
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<EventEnvelope>(16);
+    let shutdown = CancellationToken::new();
+    let adapter = Arc::new(ClaudeAdapter::new(
+        sock_tmp.path().join("nonexistent-tool-reactions.toml"),
+    ));
+
+    let listener_path = sock_path.clone();
+    let listener_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        let _ =
+            bowerbird_daemon::ingest::listener::run(listener_path, tx, listener_shutdown, adapter)
+                .await;
+    });
+
+    let writer_pool = pools.writer.clone();
+    let writer_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        bowerbird_daemon::ingest::writer::run(
+            rx,
+            writer_pool,
+            Arc::new(BroadcastHub::new(16)),
+            writer_shutdown,
+        )
+        .await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let sock_str = sock_path.to_string_lossy().into_owned();
+    let log_str = log_path.to_string_lossy().into_owned();
+    let stdin = br#"{"session_id":"sess-ups-e2e","prompt":"hello"}"#;
+    let shim_result = tokio::task::spawn_blocking(move || {
+        Command::cargo_bin("bowerbird-shim")
+            .expect("cargo_bin shim")
+            .arg("--hook-kind")
+            .arg("UserPromptSubmit")
+            .env("BOWERBIRD_INGEST_SOCK", &sock_str)
+            .env("BOWERBIRD_SHIM_LOG", &log_str)
+            .write_stdin(stdin.to_vec())
+            .output()
+            .expect("shim spawn")
+    })
+    .await
+    .expect("join shim task");
+
+    assert_eq!(
+        shim_result.status.code(),
+        Some(0),
+        "shim should exit 0 against real daemon; stderr: {:?}, stdout: {:?}",
+        String::from_utf8_lossy(&shim_result.stderr),
+        String::from_utf8_lossy(&shim_result.stdout),
+    );
+
+    let expected_kind = event_kind_as_str(&EventKind::UserPromptSubmit);
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let (event_count, state_json) = loop {
+        let conn = pools.reader.get().await.expect("reader");
+        let expected_kind = expected_kind.clone();
+        let row = conn
+            .interact(move |c| -> rusqlite::Result<(i64, Option<String>)> {
+                let event_count = c.query_row(
+                    "SELECT COUNT(*) FROM events WHERE source = ? AND session_id = ? AND kind = ?",
+                    rusqlite::params!["claude", "sess-ups-e2e", expected_kind],
+                    |r| r.get(0),
+                )?;
+                let state_json = c
+                    .query_row(
+                        "SELECT state FROM session_projections WHERE source = ? AND session_id = ?",
+                        rusqlite::params!["claude", "sess-ups-e2e"],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                Ok((event_count, state_json))
+            })
+            .await
+            .expect("interact")
+            .expect("query");
+        if row.0 == 1 && row.1.is_some() {
+            break row;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for UserPromptSubmit event/projection row; last row={row:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+
+    assert_eq!(event_count, 1);
+    let parsed: SessionState =
+        serde_json::from_str(&state_json.expect("state row")).expect("parse state");
+    assert_eq!(parsed.current_state, SessionCurrentState::Working);
+    assert_eq!(parsed.last_event_kind, EventKind::UserPromptSubmit);
+
+    shutdown.cancel();
+}
+
 // -----------------------------------------------------------------------------
 // Story 1.6 — session projection + hook unreliability tolerance
 // -----------------------------------------------------------------------------
@@ -1517,6 +1626,73 @@ async fn state_broadcast_publishes_when_stale_working_recovers() {
     assert_eq!(
         states, 1,
         "stale Working → fresh Working must publish a State envelope because the read-facing prev was Idle"
+    );
+}
+
+/// Story 5.2 review #7 — a delayed `Stop` after stale stored `Working` must
+/// still publish the live Idle correction. The state publish gate compares raw
+/// stored state too, not only read-facing state, so `Working → Idle` is not
+/// suppressed as read-facing `Idle → Idle`.
+#[tokio::test(flavor = "current_thread")]
+async fn state_broadcast_publishes_when_stale_working_stops() {
+    let (_tmp, pools) = fresh_pools().await;
+    let hub = BroadcastHub::new(64);
+    let session_id = "sess-stale-stop";
+
+    projection::session::write(
+        &pools.writer,
+        &hub,
+        envelope_for("claude", session_id, EventKind::PreToolUse),
+    )
+    .await
+    .expect("seed write");
+
+    {
+        let writer = pools.writer.get().await.expect("writer get");
+        writer
+            .interact(|c| -> rusqlite::Result<usize> {
+                c.execute(
+                    "UPDATE session_projections SET state = ? WHERE source = ? AND session_id = ?",
+                    rusqlite::params![
+                        r#"{"current_state":"Working","last_event_kind":"PreToolUse","last_event_at_ms":0}"#,
+                        "claude",
+                        "sess-stale-stop",
+                    ],
+                )
+            })
+            .await
+            .expect("interact")
+            .expect("update");
+    }
+
+    let mut rx = hub.subscribe();
+    projection::session::write(
+        &pools.writer,
+        &hub,
+        envelope_for("claude", session_id, EventKind::Stop),
+    )
+    .await
+    .expect("delayed Stop write");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    let mut events = 0usize;
+    let mut states = Vec::new();
+    while std::time::Instant::now() < deadline {
+        match rx.try_recv() {
+            Ok(bowerbird_daemon::broadcast::BroadcastEnvelope::Event(_)) => events += 1,
+            Ok(bowerbird_daemon::broadcast::BroadcastEnvelope::State { state, .. }) => {
+                states.push(state.current_state);
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+            Err(e) => panic!("unexpected recv error: {e:?}"),
+        }
+    }
+
+    assert_eq!(events, 1, "delayed Stop publishes one Event envelope");
+    assert_eq!(
+        states,
+        vec![SessionCurrentState::Idle],
+        "delayed Stop after stale stored Working must publish one Idle State envelope"
     );
 }
 
@@ -7325,8 +7501,8 @@ mod story_4_1_replay {
         let frames = collect_frames(&mut rx, 5).await;
         assert_eq!(frames.len(), 5, "expected 5 frames; got {frames:?}");
 
-        // Frames arrive in JSONL line order; each event publishes
-        // Event then State.
+        // Event frames arrive in JSONL line order. Transition-causing events
+        // are followed by State frames; non-transitions publish Event only.
         let kinds: Vec<EventKind> = frames
             .iter()
             .filter_map(|f| match f {

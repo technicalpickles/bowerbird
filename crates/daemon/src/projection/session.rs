@@ -93,7 +93,12 @@ pub async fn write(
 
     let interact_res = conn
         .interact(
-            move |c| -> rusqlite::Result<(i64, SessionState, Option<SessionCurrentState>)> {
+            move |c| -> rusqlite::Result<(
+                i64,
+                SessionState,
+                Option<SessionCurrentState>,
+                Option<SessionCurrentState>,
+            )> {
                 let tx = c.transaction()?;
 
                 // Read the prior state inside the transaction so a concurrent
@@ -132,7 +137,8 @@ pub async fn write(
                 // restores live `Working`. Comparing raw stored states would
                 // miss that transition because the stored row sat at
                 // `Working` the whole time.
-                let prev_current_state = prev_state
+                let prev_raw_current_state = prev_state.as_ref().map(|s| s.current_state);
+                let prev_read_current_state = prev_state
                     .as_ref()
                     .map(|s| current_state_for_read(s, now_ms));
 
@@ -166,13 +172,18 @@ pub async fn write(
                 )?;
                 let id = tx.last_insert_rowid();
                 tx.commit()?;
-                Ok((id, new_state, prev_current_state))
+                Ok((
+                    id,
+                    new_state,
+                    prev_raw_current_state,
+                    prev_read_current_state,
+                ))
             },
         )
         .await
         .map_err(|e| Error::Pool(format!("interact failed: {e}")))?;
 
-    let (event_id_raw, new_state, prev_current_state) = interact_res?;
+    let (event_id_raw, new_state, prev_raw_current_state, prev_read_current_state) = interact_res?;
     let event_id = EventId(event_id_raw);
 
     // Post-commit publish. Event BEFORE State so a presenter consuming both
@@ -193,10 +204,16 @@ pub async fn write(
     broadcaster.publish(BroadcastEnvelope::Event(event));
 
     // Story 5.2: only publish State when `current_state` actually changed.
-    // First-event semantics fall out naturally — `prev_current_state` is
+    // First-event semantics fall out naturally — `prev_raw_current_state` is
     // `None` for a new session, `None != Some(new_state.current_state)`
     // returns true, and the State envelope publishes.
-    let state_changed = prev_current_state != Some(new_state.current_state);
+    //
+    // Compare both the stored state and the read-facing state:
+    // - raw catches a delayed `Stop` after stale stored `Working` (Working→Idle)
+    // - read-facing catches renewed activity after stale stored `Working`
+    //   (Idle-as-read→Working)
+    let state_changed = prev_raw_current_state != Some(new_state.current_state)
+        || prev_read_current_state != Some(new_state.current_state);
     if state_changed {
         broadcaster.publish(BroadcastEnvelope::State {
             source,

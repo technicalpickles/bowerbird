@@ -266,13 +266,34 @@ mod tests {
     }
 
     #[test]
-    fn transition_recording_started_returns_prev_unchanged() {
+    fn transition_defensive_variants_return_prev_unchanged() {
         let prev = SessionState {
             current_state: SessionCurrentState::Working,
             last_event_kind: EventKind::PreToolUse,
             last_event_at_ms: 1_000,
         };
-        let next = transition(Some(&prev), EventKind::RecordingStarted, 2_000);
-        assert_eq!(next, prev);
+
+        for kind in [
+            EventKind::RecordingStarted,
+            EventKind::RecordingEnded,
+            EventKind::Unknown,
+        ] {
+            let next = transition(Some(&prev), kind, 2_000);
+            assert_eq!(next, prev);
+        }
+    }
+
+    #[test]
+    fn transition_defensive_variants_without_prev_default_to_idle() {
+        for kind in [
+            EventKind::RecordingStarted,
+            EventKind::RecordingEnded,
+            EventKind::Unknown,
+        ] {
+            let next = transition(None, kind.clone(), 2_000);
+            assert_eq!(next.current_state, SessionCurrentState::Idle);
+            assert_eq!(next.last_event_kind, kind);
+            assert_eq!(next.last_event_at_ms, 2_000);
+        }
     }
 }

@@ -1,6 +1,6 @@
 # Story 5.2: Session state projection correctness
 
-Status: review
+Status: done
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -228,6 +228,30 @@ The substrate changes (event.rs, state.rs, session.rs, install.rs, normalize.rs)
 
   Also re-check the story's "Files explicitly NOT updated" section. It should not imply `epics.md` or the sprint-change proposal docs were untouched when they are part of the branch diff.
 
+- [x] [Review][Patch] Stale Working → delayed Stop suppresses the live Idle state broadcast [crates/daemon/src/projection/session.rs:135]
+
+  What breaks: after a session has broadcast `Working`, goes stale past `STALE_WORKING_MS`, and then eventually receives `Stop`, comparing only the read-facing previous state sees `Idle → Idle` and suppresses the `State` frame. A long-lived WS subscriber that saw the original live `Working` frame never receives the live `Idle` correction.
+
+  Fix direction: keep both raw stored and read-facing previous `current_state` values from the transaction and publish `State` when either differs from the new state. Added regression coverage in `state_broadcast_publishes_when_stale_working_stops`.
+
+- [x] [Review][Patch] Replay contract comment still documented per-event Event+State pairing [crates/daemon/tests/contract_daemon.rs:7328]
+
+  What breaks: the test expectation was updated to five frames, but the adjacent comment still said every event publishes `Event then State`, contradicting Story 5.2's transition-gated state behavior.
+
+  Fix direction: rewrite the comment to state that every replayed event publishes an `Event`, and only transition-causing events publish a following `State`.
+
+- [x] [Review][Patch] UserPromptSubmit daemon ingest path lacked end-to-end coverage [crates/daemon/tests/contract_daemon.rs:1001]
+
+  What was missing: daemon tests covered projection writes directly, and adapter/shim tests covered their pieces separately, but no daemon contract test proved the real shim → ingest listener → adapter normalize → writer → projection path for `UserPromptSubmit` without `tool_name`.
+
+  Fix direction: add `shim_user_prompt_submit_round_trip_persists_working`, invoking the real `bowerbird-shim --hook-kind UserPromptSubmit` against a real ingest listener/writer and asserting the event row plus stored `Working` projection.
+
+- [x] [Review][Patch] Defensive transition arm did not cover every EventKind variant named by AC #6 [crates/daemon/src/projection/state.rs:66]
+
+  What was missing: `transition()` groups `RecordingStarted`, `RecordingEnded`, and `Unknown` in one preserve-prev arm, but unit coverage only checked `RecordingStarted`.
+
+  Fix direction: replace the single-variant test with parameterized coverage for all three defensive variants preserving `prev`, plus explicit `prev=None` default-to-Idle behavior.
+
 ## Dev Notes
 
 ### Why this story exists (the user-visible flap)
@@ -415,7 +439,7 @@ claude-opus-4-7 (1M context)
 - **AC #5 (forward-compat for legacy presenters):** New regression test `pre_story_5_2_presenter_decodes_user_prompt_submit_as_unknown` in `contract_daemon.rs` constructs a mock pre-5.2 enum and asserts the Story 4.4 `#[serde(other)]` catch-all maps `"UserPromptSubmit"` to `Unknown`.
 - **AC #6 (full transition table):** `state_machine_full_sequence_determinism` rewritten to encode the new table (PostToolUse preserves prev, UserPromptSubmit → Working, Stop is canonical Idle trigger). `STALE_WORKING_MS` unchanged; doc comment updated to clarify it now backstops dropped `Stop` (the new Working→Idle transition trigger).
 - **AC #7 (protocol surface):** `crates/protocol/src/event.rs` gains `UserPromptSubmit` before `PreToolUse` (lifecycle order); `Unknown` stays last with `#[serde(other)]`.
-- **AC #8 (contract-test surface):** `contract_protocol.rs` adds round-trip and PascalCase assertions for `UserPromptSubmit`. `contract_daemon.rs` rewrites `state_machine_full_sequence_determinism` and adds three new tests. `contract_install.rs` extends three loops to all five hook kinds. The `event_kind_db_string_round_trip_all_variants` lib test in `db/queries.rs` adds `UserPromptSubmit` to the iteration.
+- **AC #8 (contract-test surface):** `contract_protocol.rs` adds round-trip and PascalCase assertions for `UserPromptSubmit`. `contract_daemon.rs` rewrites `state_machine_full_sequence_determinism` and adds six focused contract tests, including the real shim-to-daemon `UserPromptSubmit` path and both stale-Working recovery directions. `contract_install.rs` extends three loops to all five hook kinds. The `event_kind_db_string_round_trip_all_variants` lib test in `db/queries.rs` adds `UserPromptSubmit` to the iteration.
 - **AC #9 (cross-reference renumber):** `docs/protocol.md:334` updated from "Story 1.8, extended in Story 5.7" → "Story 1.8, extended in Story 5.2". No production-doc references to Story 5.7 remain; all surviving hits are inside historical sprint-change-proposal docs (with disambiguation notes already at the top).
 - **AC #10 (changelog gate):** Refined the pre-staged "type: behavioral" Story 5.2 entry with two implementation-time clarifications (first-event semantics + `state_broadcast_only_on_transition` test reference). Gate test passes against `origin/main`.
 - **Audit sweep:** Eight tests outside the explicit AC-targeted ones depended on the pre-5.2 `PostToolUse → Idle` rule or on state-envelope-per-event behavior. Each was updated to either send `Stop` (the new Idle trigger) or to assert the new transition-gated envelope count. Documented in code-side comments tagged "Story 5.2".
@@ -424,8 +448,8 @@ claude-opus-4-7 (1M context)
 
 **Source files (7):**
 - `crates/protocol/src/event.rs` — added `UserPromptSubmit` variant before `PreToolUse`.
-- `crates/daemon/src/projection/state.rs` — `PostToolUse` arm preserves prev; new `UserPromptSubmit` arm returns `Working`; `STALE_WORKING_MS` doc comment updated; four new unit tests.
-- `crates/daemon/src/projection/session.rs` — closure return type extended to `(i64, SessionState, Option<SessionCurrentState>)`; `BroadcastEnvelope::State` publish gated on the READ-FACING prev `current_state` (via `current_state_for_read`) so stale-Working recovery still emits a transition; doc comment updated to reflect zero-or-one State envelope semantics. (Read-facing gating added in review-fix pass per review finding #2.)
+- `crates/daemon/src/projection/state.rs` — `PostToolUse` arm preserves prev; new `UserPromptSubmit` arm returns `Working`; `STALE_WORKING_MS` doc comment updated; unit coverage expanded for `UserPromptSubmit`, `PostToolUse`, and all defensive preserve-prev variants.
+- `crates/daemon/src/projection/session.rs` — closure return type extended to return both raw and read-facing previous `current_state`; `BroadcastEnvelope::State` publish gated on raw OR read-facing transitions so stale-Working recovery emits both renewed `Working` and delayed `Stop` corrections; doc comment updated to reflect zero-or-one State envelope semantics.
 - `crates/daemon/src/db/queries.rs` — `event_kind_db_string_round_trip_all_variants` now includes `UserPromptSubmit`.
 - `crates/shim/src/main.rs` — `parse_hook_kind` accepts the new `UserPromptSubmit` value (review finding #1; without this, the installed hook command fails at the shim CLI boundary).
 - `crates/adapter-claude/src/install.rs` — `HOOK_KINDS` adds `UserPromptSubmit` (lifecycle order); new `LEGACY_HOOK_KINDS` constant; `InstallOutcome.legacy_upgrade_detected` field; `settings_has_only_legacy_bowerbird_hooks` detection helper; three new unit tests covering the legacy-upgrade flag (review finding #3).
@@ -434,7 +458,7 @@ claude-opus-4-7 (1M context)
 
 **Test files (5):**
 - `crates/protocol/tests/contract_protocol.rs` — `UserPromptSubmit` added to `event_kind_serializes_pascal_case`; new `user_prompt_submit_round_trips` test.
-- `crates/daemon/tests/contract_daemon.rs` — rewrote `state_machine_full_sequence_determinism`; audited and updated eight other tests (sess-b list test, snapshot multi-session, state-current-topic-filter, state-wildcard-preserves-session, specific-id-subscription, overlapping-subscriptions, state-only-subscriber-cursor, two replay tests); added four new contract tests (`state_broadcast_only_on_transition`, `user_prompt_submit_drives_working_transition`, `state_broadcast_publishes_when_stale_working_recovers` [review finding #2], `pre_story_5_2_presenter_decodes_user_prompt_submit_as_unknown` — expanded to full event JSON shape per review finding #4).
+- `crates/daemon/tests/contract_daemon.rs` — rewrote `state_machine_full_sequence_determinism`; audited and updated eight other tests (sess-b list test, snapshot multi-session, state-current-topic-filter, state-wildcard-preserves-session, specific-id-subscription, overlapping-subscriptions, state-only-subscriber-cursor, two replay tests); added six focused contract tests (`state_broadcast_only_on_transition`, `user_prompt_submit_drives_working_transition`, `state_broadcast_publishes_when_stale_working_recovers`, `state_broadcast_publishes_when_stale_working_stops`, `shim_user_prompt_submit_round_trip_persists_working`, and `pre_story_5_2_presenter_decodes_user_prompt_submit_as_unknown` — expanded to full event JSON shape per review finding #4).
 - `crates/shim/tests/contract_shim.rs` — added `shim_accepts_user_prompt_submit_hook_kind` (review finding #1).
 - `crates/adapter-claude/tests/contract_adapter.rs` — added `normalize_user_prompt_submit_round_trip` (review finding #5).
 - `crates/adapter-claude/tests/contract_install.rs` — three loops now iterate all five hook kinds.
@@ -466,3 +490,4 @@ claude-opus-4-7 (1M context)
 - 2026-05-27: Renumbered `docs/protocol.md:334` cross-reference Story 5.7 → 5.2; refined pre-staged protocol-changelog entry to satisfy gate.
 - 2026-05-27: All workspace tests, `cargo fmt --check`, and `cargo clippy --all-targets --workspace -- -D warnings` green.
 - 2026-05-27 (review-fix pass): Addressed all six review findings. Shim now accepts `UserPromptSubmit` at the CLI parse boundary (#1 — was a genuine runtime AC #3 break). State publish gating now compares the read-facing prev state via `current_state_for_read` so stale-Working → fresh-Working still emits a State envelope (#2 — added regression test `state_broadcast_publishes_when_stale_working_recovers` which fails on the pre-fix code). Install hint copy matched to Task 5 spec verbatim, plus three unit tests covering the `legacy_upgrade_detected` flag (#3). Forward-compat test expanded to deserialize a full Event-shaped JSON object through a mock legacy presenter (#4). New `normalize_user_prompt_submit_round_trip` adapter contract test (#5). File List broadened to acknowledge planning-artifact docs carried from the resequencing commit on this branch (#6). All tests + fmt + clippy still green.
+- 2026-05-27 (final code-review pass): Addressed four additional findings from bmad-code-review. State publish gating now compares both raw and read-facing previous state so stale `Working → Stop` emits the live `Idle` correction; added `state_broadcast_publishes_when_stale_working_stops`. Added end-to-end daemon ingest coverage for real `bowerbird-shim --hook-kind UserPromptSubmit` through persistence/projection. Expanded defensive transition tests for `RecordingStarted`, `RecordingEnded`, and `Unknown`. Fixed stale replay test commentary. Full workspace tests, fmt, and clippy green.
