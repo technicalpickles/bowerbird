@@ -9,7 +9,7 @@ use crate::db::queries::{
     UPDATE_RECORDING_SESSION_ENDED, UPSERT_SESSION_PROJECTION,
 };
 use crate::error::{Error, Result};
-use crate::projection::state::transition;
+use crate::projection::state::{current_state_for_read, transition};
 
 /// Sentinel `source`/`session_id` for daemon-emitted lifecycle events.
 const DAEMON_SENTINEL_SOURCE: &str = "__daemon__";
@@ -120,11 +120,21 @@ pub async fn write(
                         }
                     });
 
-                // Capture prev's current_state BEFORE the closure consumes
-                // `prev_state` into `transition` — the post-commit publish path
-                // needs both prev and new current_state to decide whether to emit
-                // a `BroadcastEnvelope::State` (story 5.2).
-                let prev_current_state = prev_state.as_ref().map(|s| s.current_state);
+                // Capture prev's READ-FACING current_state BEFORE the closure
+                // consumes `prev_state` into `transition` — the post-commit
+                // publish path needs both prev and new current_state to decide
+                // whether to emit a `BroadcastEnvelope::State` (story 5.2).
+                //
+                // The read-facing value (via `current_state_for_read`) folds in
+                // the `STALE_WORKING_MS` fallback so a stale stored `Working`
+                // that subscribers were seeing as `Idle` (via snapshot, REST,
+                // or any read path) triggers a State envelope when a new event
+                // restores live `Working`. Comparing raw stored states would
+                // miss that transition because the stored row sat at
+                // `Working` the whole time.
+                let prev_current_state = prev_state
+                    .as_ref()
+                    .map(|s| current_state_for_read(s, now_ms));
 
                 let new_state = transition(prev_state.as_ref(), kind_for_transition, now_ms);
                 let state_json = serde_json::to_string(&new_state).map_err(|e| {

@@ -1,6 +1,6 @@
 # Story 5.2: Session state projection correctness
 
-Status: in-progress
+Status: review
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -143,7 +143,7 @@ The substrate changes (event.rs, state.rs, session.rs, install.rs, normalize.rs)
 
 ### Review Findings
 
-- [ ] [Review][Patch] UserPromptSubmit hook is installed but rejected by the shim [crates/shim/src/main.rs:88]
+- [x] [Review][Patch] UserPromptSubmit hook is installed but rejected by the shim [crates/shim/src/main.rs:88]
 
   What breaks: `bowerbird install` now writes a Claude Code hook command `bowerbird-shim --hook-kind UserPromptSubmit`, but the shim exits before sending that payload to the daemon. That means AC #3 is not true in a real installed Claude session: the `UserPromptSubmit` hook does not fire through bowerbird, the daemon never ingests the event, and the session stays `Idle` until the first later hook that the shim accepts.
 
@@ -157,7 +157,7 @@ The substrate changes (event.rs, state.rs, session.rs, install.rs, normalize.rs)
 
   Fix direction: add `"UserPromptSubmit"` to `parse_hook_kind`. Add a shim contract test that runs the shim with `--hook-kind UserPromptSubmit`, captures the mock ingest payload, and asserts the injected `"hook_kind":"UserPromptSubmit"` survives. Add or extend a daemon ingest round-trip test so a `UserPromptSubmit` payload reaches the ingest channel as `EventKind::UserPromptSubmit`.
 
-- [ ] [Review][Patch] State publish gating ignores the read-time stale-Working fallback [crates/daemon/src/projection/session.rs:127]
+- [x] [Review][Patch] State publish gating ignores the read-time stale-Working fallback [crates/daemon/src/projection/session.rs:127]
 
   What breaks: a state-only subscriber can observe a session as `Idle` via snapshot or REST because `current_state_for_read` turns a stale stored `Working` row into read-facing `Idle`. When new activity resumes for that session, `projection::session::write` compares stored `prev_state.current_state` (`Working`) to the new stored state (`Working`) and suppresses the live `State` frame. The state-only subscriber remains stuck on `Idle` even though the agent resumed work.
 
@@ -174,13 +174,13 @@ The substrate changes (event.rs, state.rs, session.rs, install.rs, normalize.rs)
 
   Regression coverage: add a contract test that seeds or writes a stale stored `Working` projection, subscribes to `state.session.*` and confirms the snapshot says `Idle`, then writes `UserPromptSubmit` or `PreToolUse` and asserts a live `State` frame arrives with `current_state=Working`. Also assert the `Event` frame still publishes.
 
-- [ ] [Review][Patch] Legacy reinstall hint text differs from the story-specified message [src/commands/install.rs:43]
+- [x] [Review][Patch] Legacy reinstall hint text differs from the story-specified message [src/commands/install.rs:43]
 
   What breaks: the behavior is probably understandable to a human, but the implementation does not match the story's operator-facing text. Task 5 specifies the exact note: `note: detected pre-Story-5.2 hooks; re-running install to subscribe UserPromptSubmit`. The CLI currently prints `note: detected pre-Story-5.2 hooks; re-running install subscribed UserPromptSubmit`.
 
   Fix direction: change the string in `src/commands/install.rs` to match Task 5 exactly unless there is a deliberate product-copy reason to change the story. Add coverage that builds a pre-5.2 four-hook settings file, runs the CLI install path, and asserts stdout contains the exact hint. The lower-level `InstallOutcome.legacy_upgrade_detected` flag should also have unit coverage for three cases: legacy four hooks only -> true, fresh install -> false, already-upgraded five hooks -> false.
 
-- [ ] [Review][Patch] Forward-compat regression test does not exercise the full event shape required by Task 7 [crates/daemon/tests/contract_daemon.rs:1470]
+- [x] [Review][Patch] Forward-compat regression test does not exercise the full event shape required by Task 7 [crates/daemon/tests/contract_daemon.rs:1470]
 
   What is missing: AC #5 says a v1.0 presenter receives an event with `kind: "UserPromptSubmit"` and decodes that kind as `Unknown` without crashing. Task 7 asks for a full JSON event object. The implemented test deserializes only the bare JSON string `"UserPromptSubmit"` into a legacy enum, so it does not prove a legacy presenter can parse the actual event payload shape.
 
@@ -201,7 +201,7 @@ The substrate changes (event.rs, state.rs, session.rs, install.rs, normalize.rs)
 
   Deserialize a JSON object shaped like the story text: `{"event_id":1,"source":"claude","session_id":"x","kind":"UserPromptSubmit","reaction":null,"payload":"{}","created_at":0}`. Assert `event.kind == LegacyEventKind::Unknown` and the rest of the fields parse. If the wire frame path is easy to express, a `ServerMessage::Event`-like mock wrapper would be even closer to the presenter path.
 
-- [ ] [Review][Patch] UserPromptSubmit normalization lacks a direct adapter contract test [crates/adapter-claude/src/normalize.rs:68]
+- [x] [Review][Patch] UserPromptSubmit normalization lacks a direct adapter contract test [crates/adapter-claude/src/normalize.rs:68]
 
   What is missing: `adapter-claude` now maps the string `"UserPromptSubmit"` to `EventKind::UserPromptSubmit`, but no adapter contract test exercises that new match arm. Existing daemon-level tests construct `EventEnvelope` values directly, so they do not prove the adapter accepts the real hook string and preserves the native payload.
 
@@ -215,7 +215,7 @@ The substrate changes (event.rs, state.rs, session.rs, install.rs, normalize.rs)
 
   This test is intentionally adapter-scoped; it should fail if a future edit removes the match arm or accidentally treats `UserPromptSubmit` like `PreToolUse` and requires `tool_name`.
 
-- [ ] [Review][Patch] Story File List omits files changed by this review scope [docs/bmad/implementation-artifacts/5-2-session-state-projection-correctness.md]
+- [x] [Review][Patch] Story File List omits files changed by this review scope [docs/bmad/implementation-artifacts/5-2-session-state-projection-correctness.md]
 
   What is wrong: the branch diff includes planning/documentation files that the story File List does not list. That makes the Dev Agent Record incomplete and weakens later review/audit work.
 
@@ -422,26 +422,39 @@ claude-opus-4-7 (1M context)
 
 ### File List
 
-**Source files (5):**
+**Source files (7):**
 - `crates/protocol/src/event.rs` — added `UserPromptSubmit` variant before `PreToolUse`.
 - `crates/daemon/src/projection/state.rs` — `PostToolUse` arm preserves prev; new `UserPromptSubmit` arm returns `Working`; `STALE_WORKING_MS` doc comment updated; four new unit tests.
-- `crates/daemon/src/projection/session.rs` — closure return type extended to `(i64, SessionState, Option<SessionCurrentState>)`; `BroadcastEnvelope::State` publish gated on transition; doc comment updated to reflect zero-or-one State envelope semantics.
+- `crates/daemon/src/projection/session.rs` — closure return type extended to `(i64, SessionState, Option<SessionCurrentState>)`; `BroadcastEnvelope::State` publish gated on the READ-FACING prev `current_state` (via `current_state_for_read`) so stale-Working recovery still emits a transition; doc comment updated to reflect zero-or-one State envelope semantics. (Read-facing gating added in review-fix pass per review finding #2.)
 - `crates/daemon/src/db/queries.rs` — `event_kind_db_string_round_trip_all_variants` now includes `UserPromptSubmit`.
-- `crates/adapter-claude/src/install.rs` — `HOOK_KINDS` adds `UserPromptSubmit` (lifecycle order); new `LEGACY_HOOK_KINDS` constant; `InstallOutcome.legacy_upgrade_detected` field; `settings_has_only_legacy_bowerbird_hooks` detection helper.
+- `crates/shim/src/main.rs` — `parse_hook_kind` accepts the new `UserPromptSubmit` value (review finding #1; without this, the installed hook command fails at the shim CLI boundary).
+- `crates/adapter-claude/src/install.rs` — `HOOK_KINDS` adds `UserPromptSubmit` (lifecycle order); new `LEGACY_HOOK_KINDS` constant; `InstallOutcome.legacy_upgrade_detected` field; `settings_has_only_legacy_bowerbird_hooks` detection helper; three new unit tests covering the legacy-upgrade flag (review finding #3).
 - `crates/adapter-claude/src/normalize.rs` — `match hook_kind` block gains `UserPromptSubmit` arm before `PreToolUse`.
-- `src/commands/install.rs` — surfaces the legacy-upgrade hint when present.
+- `src/commands/install.rs` — surfaces the legacy-upgrade hint when present (exact Task 5 copy: "re-running install to subscribe UserPromptSubmit", review finding #3).
 
-**Test files (4):**
+**Test files (5):**
 - `crates/protocol/tests/contract_protocol.rs` — `UserPromptSubmit` added to `event_kind_serializes_pascal_case`; new `user_prompt_submit_round_trips` test.
-- `crates/daemon/tests/contract_daemon.rs` — rewrote `state_machine_full_sequence_determinism`; audited and updated eight other tests (sess-b list test, snapshot multi-session, state-current-topic-filter, state-wildcard-preserves-session, specific-id-subscription, overlapping-subscriptions, state-only-subscriber-cursor, two replay tests); added three new contract tests (`state_broadcast_only_on_transition`, `user_prompt_submit_drives_working_transition`, `pre_story_5_2_presenter_decodes_user_prompt_submit_as_unknown`).
+- `crates/daemon/tests/contract_daemon.rs` — rewrote `state_machine_full_sequence_determinism`; audited and updated eight other tests (sess-b list test, snapshot multi-session, state-current-topic-filter, state-wildcard-preserves-session, specific-id-subscription, overlapping-subscriptions, state-only-subscriber-cursor, two replay tests); added four new contract tests (`state_broadcast_only_on_transition`, `user_prompt_submit_drives_working_transition`, `state_broadcast_publishes_when_stale_working_recovers` [review finding #2], `pre_story_5_2_presenter_decodes_user_prompt_submit_as_unknown` — expanded to full event JSON shape per review finding #4).
+- `crates/shim/tests/contract_shim.rs` — added `shim_accepts_user_prompt_submit_hook_kind` (review finding #1).
+- `crates/adapter-claude/tests/contract_adapter.rs` — added `normalize_user_prompt_submit_round_trip` (review finding #5).
 - `crates/adapter-claude/tests/contract_install.rs` — three loops now iterate all five hook kinds.
 
-**Documentation (2):**
+**Documentation (2 directly edited this session):**
 - `docs/protocol.md` — line 334 renumbered Story 5.7 → 5.2.
 - `docs/protocol-changelog.md` — refined the pre-staged Story 5.2 behavioral entry with implementation-time clarifications (first-event semantics + new contract-test reference) to satisfy the changelog gate against origin/main.
 
+**Planning artifacts on the branch (carried over from `a616a35` Epic 5 resequencing commit — not edited this dev session but part of the PR diff against origin/main):**
+- `docs/bmad/planning-artifacts/epics.md` — Epic 5 resequencing and Story 5.2/5.3 insertions.
+- `docs/bmad/planning-artifacts/sprint-change-proposal-2026-05-27.md` — disambiguation note for the old Story 5.7 numbering.
+- `docs/bmad/planning-artifacts/sprint-change-proposal-2026-05-27-epic-5-resequencing.md` — the resequencing proposal itself.
+- `docs/bmad/planning-artifacts/sprint-change-proposal-2026-05-27-pid-liveness.md` — PID liveness proposal that became Story 5.3.
+
 **Bookkeeping (1):**
-- `docs/bmad/implementation-artifacts/sprint-status.yaml` — story status transitions ready-for-dev → in-progress → review with timestamped notes.
+- `docs/bmad/implementation-artifacts/sprint-status.yaml` — story status transitions ready-for-dev → in-progress → review → in-progress (review-receipt) → review with timestamped notes.
+
+**Files explicitly NOT updated by THIS dev session** (pre-staged in `78c26b3` and verified intact):
+- `docs/bmad/planning-artifacts/architecture.md:50–51, :1027` — pre-staged.
+- `docs/bmad/planning-artifacts/prd.md:206` — pre-staged.
 
 ### Change Log
 
@@ -452,3 +465,4 @@ claude-opus-4-7 (1M context)
 - 2026-05-27: Updated daemon contract tests for new transition table and broadcast gating; added three new contract tests; audited and updated eight collateral tests.
 - 2026-05-27: Renumbered `docs/protocol.md:334` cross-reference Story 5.7 → 5.2; refined pre-staged protocol-changelog entry to satisfy gate.
 - 2026-05-27: All workspace tests, `cargo fmt --check`, and `cargo clippy --all-targets --workspace -- -D warnings` green.
+- 2026-05-27 (review-fix pass): Addressed all six review findings. Shim now accepts `UserPromptSubmit` at the CLI parse boundary (#1 — was a genuine runtime AC #3 break). State publish gating now compares the read-facing prev state via `current_state_for_read` so stale-Working → fresh-Working still emits a State envelope (#2 — added regression test `state_broadcast_publishes_when_stale_working_recovers` which fails on the pre-fix code). Install hint copy matched to Task 5 spec verbatim, plus three unit tests covering the `legacy_upgrade_detected` flag (#3). Forward-compat test expanded to deserialize a full Event-shaped JSON object through a mock legacy presenter (#4). New `normalize_user_prompt_submit_round_trip` adapter contract test (#5). File List broadened to acknowledge planning-artifact docs carried from the resequencing commit on this branch (#6). All tests + fmt + clippy still green.

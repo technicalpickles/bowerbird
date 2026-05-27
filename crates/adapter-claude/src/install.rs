@@ -761,6 +761,70 @@ mod tests {
         );
     }
 
+    // Story 5.2 review #3 — three cases for `legacy_upgrade_detected`:
+    // legacy-four-only → true, fresh install → false, already-upgraded → false.
+    fn legacy_four_hook_settings() -> Value {
+        let mut hooks = Map::new();
+        for kind in ["PreToolUse", "PostToolUse", "Stop", "Notification"] {
+            hooks.insert(
+                kind.to_string(),
+                Value::Array(vec![bowerbird_hook_group(kind)]),
+            );
+        }
+        let mut root = Map::new();
+        root.insert("hooks".to_string(), Value::Object(hooks));
+        Value::Object(root)
+    }
+
+    #[test]
+    fn legacy_upgrade_detected_true_when_only_legacy_four_present() {
+        let dir = TempDir::new().unwrap();
+        let path = fresh_settings(&dir);
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&legacy_four_hook_settings()).unwrap(),
+        )
+        .unwrap();
+
+        let outcome = install(&path).expect("install");
+        assert!(
+            outcome.legacy_upgrade_detected,
+            "pre-5.2 four-hook install must surface the legacy-upgrade hint"
+        );
+        assert!(
+            outcome.hook_kinds_added.contains(&"UserPromptSubmit"),
+            "the fifth hook must be added in the same call"
+        );
+    }
+
+    #[test]
+    fn legacy_upgrade_detected_false_on_fresh_install() {
+        let dir = TempDir::new().unwrap();
+        let path = fresh_settings(&dir);
+        let outcome = install(&path).expect("install");
+        assert!(outcome.created);
+        assert!(
+            !outcome.legacy_upgrade_detected,
+            "fresh install is not a legacy upgrade"
+        );
+    }
+
+    #[test]
+    fn legacy_upgrade_detected_false_on_already_upgraded_five_hooks() {
+        let dir = TempDir::new().unwrap();
+        let path = fresh_settings(&dir);
+        install(&path).expect("first install");
+        let outcome = install(&path).expect("second install");
+        assert!(
+            outcome.hook_kinds_added.is_empty(),
+            "re-running on full five-hook install is a no-op"
+        );
+        assert!(
+            !outcome.legacy_upgrade_detected,
+            "an install that already had all five hooks is not a legacy upgrade"
+        );
+    }
+
     #[test]
     fn install_matches_absolute_path_with_shim_basename() {
         // A user may have manually written an absolute path to the shim.

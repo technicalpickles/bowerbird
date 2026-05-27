@@ -40,6 +40,34 @@ fn normalize_pretooluse_bash_known_reaction() {
 }
 
 #[test]
+fn normalize_user_prompt_submit_round_trip() {
+    // Story 5.2: the adapter must map the new "UserPromptSubmit" hook
+    // string to EventKind::UserPromptSubmit. UserPromptSubmit payloads
+    // carry no `tool_name` (only PreToolUse does); the envelope's
+    // `reaction` must therefore be None — the load-bearing match arm in
+    // normalize.rs falls through to `_ => None` for non-PreToolUse kinds.
+    let dir = TempDir::new().unwrap();
+    let toml_path = write_toml(&dir, minimal_toml_with_bash());
+    let adapter = ClaudeAdapter::new(toml_path);
+
+    let payload = br#"{"session_id":"sess-ups","prompt":"hello"}"#;
+    let result = adapter.normalize("UserPromptSubmit", payload).unwrap();
+    let env = result.envelope;
+
+    assert_eq!(env.source, "claude");
+    assert_eq!(env.session_id, "sess-ups");
+    assert_eq!(env.kind, EventKind::UserPromptSubmit);
+    assert_eq!(
+        env.reaction, None,
+        "UserPromptSubmit carries no tool_name and therefore no reaction"
+    );
+    // Native payload rides verbatim — substrate-not-actor invariant
+    // (project-context.md §Substrate-not-actor invariants).
+    assert!(env.payload.contains("sess-ups"));
+    assert!(env.payload.contains("hello"));
+}
+
+#[test]
 fn normalize_unknown_tool_returns_unknown_reaction() {
     let dir = TempDir::new().unwrap();
     let toml_path = write_toml(&dir, minimal_toml_with_bash());

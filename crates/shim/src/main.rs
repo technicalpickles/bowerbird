@@ -86,7 +86,7 @@ fn parse_hook_kind() -> Result<String> {
 
     let kind = hook_kind.ok_or_else(|| Error::BadArgs("--hook-kind not provided".into()))?;
     match kind.as_str() {
-        "PreToolUse" | "PostToolUse" | "Stop" | "Notification" => Ok(kind),
+        "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "Stop" | "Notification" => Ok(kind),
         other => Err(Error::BadArgs(format!("invalid hook-kind: {other}"))),
     }
 }

@@ -425,6 +425,41 @@ fn shim_injects_hook_kind() {
 }
 
 #[test]
+fn shim_accepts_user_prompt_submit_hook_kind() {
+    // Story 5.2: `bowerbird install` writes a hook entry for
+    // `bowerbird-shim --hook-kind UserPromptSubmit`. The shim's
+    // `parse_hook_kind` must accept the new kind end-to-end, otherwise
+    // the installed hook fails at the CLI parse boundary and the daemon
+    // never sees the event.
+    let tmp = TempDir::new().expect("tempdir");
+    let log_tmp = TempDir::new().expect("log tmpdir");
+    let log = log_tmp.path().join("shim.log");
+    let mock = start_mock_ingest(&tmp, b"200\n");
+
+    let stdin = br#"{"session_id":"sess-ups","prompt":"hello"}"#;
+    let out = run_shim_with_env(&mock.sock_path, &log, "UserPromptSubmit", stdin, None);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "shim must exit 0; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let captured = wait_for_capture(&mock);
+    let value = parse_captured_payload(&captured);
+    let obj = value.as_object().expect("payload is a JSON object");
+    assert_eq!(
+        obj.get("hook_kind").and_then(|v| v.as_str()),
+        Some("UserPromptSubmit"),
+        "shim must inject hook_kind=UserPromptSubmit"
+    );
+    assert_eq!(
+        obj.get("session_id").and_then(|v| v.as_str()),
+        Some("sess-ups")
+    );
+}
+
+#[test]
 fn shim_preserves_existing_hook_event_name_field() {
     let tmp = TempDir::new().expect("tempdir");
     let log_tmp = TempDir::new().expect("log tmpdir");

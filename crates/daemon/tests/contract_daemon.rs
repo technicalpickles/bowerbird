@@ -1443,11 +1443,91 @@ async fn user_prompt_submit_drives_working_transition() {
     assert_eq!(parsed.current_state, SessionCurrentState::Working);
 }
 
+/// Story 5.2 review #2 — a stale-Working stored row that subscribers see
+/// as `Idle` (via `current_state_for_read` in the snapshot/REST paths) must
+/// re-emit a `State` envelope when a new event restores live `Working`.
+/// Without read-facing gating, comparing raw stored `Working` to new stored
+/// `Working` would suppress the publish and leave the subscriber stuck on
+/// `Idle`.
+#[tokio::test(flavor = "current_thread")]
+async fn state_broadcast_publishes_when_stale_working_recovers() {
+    let (_tmp, pools) = fresh_pools().await;
+    let hub = BroadcastHub::new(64);
+    let session_id = "sess-stale-recover";
+
+    // Seed: write a fresh PreToolUse so the projection row exists at Working.
+    projection::session::write(
+        &pools.writer,
+        &hub,
+        envelope_for("claude", session_id, EventKind::PreToolUse),
+    )
+    .await
+    .expect("seed write");
+
+    // Age the row past STALE_WORKING_MS so the read-facing view becomes Idle.
+    // Real sleeps are forbidden (deterministic-test discipline) — direct
+    // UPDATE is the right pattern (see sessions_list_applies_stale_working_fallback).
+    // Scope the writer guard so the connection returns to the pool (max_size = 1)
+    // before the recovery write tries to check one out.
+    {
+        let writer = pools.writer.get().await.expect("writer get");
+        writer
+            .interact(|c| -> rusqlite::Result<usize> {
+                c.execute(
+                    "UPDATE session_projections SET state = ? WHERE source = ? AND session_id = ?",
+                    rusqlite::params![
+                        r#"{"current_state":"Working","last_event_kind":"PreToolUse","last_event_at_ms":0}"#,
+                        "claude",
+                        "sess-stale-recover",
+                    ],
+                )
+            })
+            .await
+            .expect("interact")
+            .expect("update");
+    }
+
+    // Subscribe AFTER the seed write so we only see envelopes from the
+    // post-stale recovery write.
+    let mut rx = hub.subscribe();
+
+    // Recovery: a new PreToolUse stores Working again. Stored prev was
+    // Working, stored new is Working — the read-facing prev is Idle (stale),
+    // and the publish gate should fire because Idle != Working.
+    projection::session::write(
+        &pools.writer,
+        &hub,
+        envelope_for("claude", session_id, EventKind::PreToolUse),
+    )
+    .await
+    .expect("recovery write");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    let mut events = 0usize;
+    let mut states = 0usize;
+    while std::time::Instant::now() < deadline {
+        match rx.try_recv() {
+            Ok(bowerbird_daemon::broadcast::BroadcastEnvelope::Event(_)) => events += 1,
+            Ok(bowerbird_daemon::broadcast::BroadcastEnvelope::State { .. }) => states += 1,
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+            Err(e) => panic!("unexpected recv error: {e:?}"),
+        }
+    }
+    assert_eq!(events, 1, "recovery write publishes one Event envelope");
+    assert_eq!(
+        states, 1,
+        "stale Working → fresh Working must publish a State envelope because the read-facing prev was Idle"
+    );
+}
+
 /// Story 5.2 AC #5 — A presenter compiled against the pre-Story-5.2
-/// protocol enum (lacking `UserPromptSubmit`) must decode that variant as
-/// `EventKind::Unknown` via Story 4.4's `#[serde(other)]` catch-all. The
-/// test constructs a local mock enum that omits UserPromptSubmit and
-/// asserts the catch-all fires.
+/// protocol enum (lacking `UserPromptSubmit`) must decode an event whose
+/// `kind: "UserPromptSubmit"` as `EventKind::Unknown` via Story 4.4's
+/// `#[serde(other)]` catch-all — and the surrounding event payload must
+/// still parse so the legacy presenter does not drop the whole frame.
+///
+/// Task 7 of Story 5.2 explicitly asks for full-event-shape coverage,
+/// not just the bare kind string in isolation.
 #[test]
 fn pre_story_5_2_presenter_decodes_user_prompt_submit_as_unknown() {
     use serde::Deserialize;
@@ -1467,13 +1547,50 @@ fn pre_story_5_2_presenter_decodes_user_prompt_submit_as_unknown() {
         Unknown,
     }
 
-    let raw = r#""UserPromptSubmit""#;
-    let decoded: LegacyEventKind = serde_json::from_str(raw).expect("must deserialize");
+    // Mock copy of the pre-Story-5.2 Event struct as a v1.0 presenter would
+    // have authored it: the same wire field names as `protocol::Event`, but
+    // typed against the legacy enum. `reaction` stays `serde_json::Value`
+    // so any future Reaction additions are tolerated alongside the kind
+    // catch-all.
+    #[derive(Debug, Deserialize)]
+    struct LegacyEvent {
+        event_id: i64,
+        source: String,
+        session_id: String,
+        kind: LegacyEventKind,
+        reaction: Option<serde_json::Value>,
+        payload: String,
+        created_at: i64,
+    }
+
+    // Bare-kind sanity check — the catch-all itself.
+    let bare = r#""UserPromptSubmit""#;
+    let kind: LegacyEventKind = serde_json::from_str(bare).expect("bare kind must deserialize");
+    assert_eq!(kind, LegacyEventKind::Unknown);
+
+    // Full-event shape — the actual contract a v1.0 presenter sees on the wire.
+    let raw = r#"{
+        "event_id": 1,
+        "source": "claude",
+        "session_id": "x",
+        "kind": "UserPromptSubmit",
+        "reaction": null,
+        "payload": "{}",
+        "created_at": 0
+    }"#;
+    let event: LegacyEvent =
+        serde_json::from_str(raw).expect("legacy presenter must decode full event payload");
+    assert_eq!(event.event_id, 1);
+    assert_eq!(event.source, "claude");
+    assert_eq!(event.session_id, "x");
     assert_eq!(
-        decoded,
+        event.kind,
         LegacyEventKind::Unknown,
-        "pre-5.2 enum must decode UserPromptSubmit as Unknown"
+        "pre-5.2 presenter must surface UserPromptSubmit as Unknown without dropping the frame"
     );
+    assert!(event.reaction.is_none());
+    assert_eq!(event.payload, "{}");
+    assert_eq!(event.created_at, 0);
 }
 
 /// AC #2 — Atomicity contract: an `INSERT INTO events` and its matching
