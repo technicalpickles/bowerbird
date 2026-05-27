@@ -5,6 +5,7 @@
 # last_updated: 2026-05-27 (Story 5.1 → in-progress; dev-story session started)
 # last_updated: 2026-05-27 (Story 5.8 session-process-liveness-pid-capture inserted; old 5.8→5.9 per sprint-change-proposal-2026-05-27-pid-liveness.md)
 # last_updated: 2026-05-27 (Epic 5 resequenced for dogfooding-first ordering: old 5.7→5.2 projection-correctness, old 5.8→5.3 pid-capture, old 5.2→5.5 bench-gates, old 5.3→5.6 release-e2e, old 5.5→5.7 cookbook, old 5.6→5.8 first-time-reader-docs; 5.1, 5.4, 5.9 unchanged per sprint-change-proposal-2026-05-27-epic-5-resequencing.md)
+# last_updated: 2026-05-27 (Story 5.2 session-state-projection-correctness created via bmad-create-story; 5.1 acknowledged as in-flight)
 # project: bowerbird
 # project_key: NOKEY
 # tracking_system: file-system
@@ -40,7 +41,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-05-16
-last_updated: 2026-05-27 (Epic 5 resequenced for dogfooding-first ordering per sprint-change-proposal-2026-05-27-epic-5-resequencing.md)
+last_updated: 2026-05-27 (Story 5.2 session-state-projection-correctness ready-for-dev via bmad-create-story)
 project: bowerbird
 project_key: NOKEY
 tracking_system: file-system
@@ -93,7 +94,7 @@ development_status:
   # then install UX, then CI/release hardening, then reader-facing polish, then the tag.
   epic-5: in-progress
   5-1-first-party-presenter-tool: in-progress
-  5-2-session-state-projection-correctness: backlog
+  5-2-session-state-projection-correctness: ready-for-dev
   5-3-session-process-liveness-pid-capture: backlog
   5-4-install-ux-polish-and-middleware-closure: backlog
   5-5-bench-gates-load-bearing: backlog
