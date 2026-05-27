@@ -11,6 +11,7 @@ revisions:
   - 2026-05-24: Folded Epic 2 retrospective action items AI-1..AI-6 into Story 3.1 (singleton enforcement), Story 3.2 (connected_ws_clients wiring), Story 3.4 (CI --test-threads=1, architecture.md WebSocket subsystem section), Story 4.4 (wire-enum serde(other) sweep, hook-to-presenter p99 Criterion bench, NDJ ingest framing narrative). Source: docs/bmad/implementation-artifacts/epic-2-retro-2026-05-24.md
   - 2026-05-26: Added Epic 5 (V1 Release Readiness) with 6 stories — first-party presenter (sibling repo), bench gates load-bearing, release pipeline E2E, install UX + middleware closure, first-time-reader docs pass, crates.io + v0.1.0 tag. Source: docs/bmad/planning-artifacts/sprint-change-proposal-2026-05-26.md (folds Epic 3 retro AI-3/AI-4, Epic 4 retro AI-1..AI-5, plus 5 deferred-work entries).
   - 2026-05-26: Inserted new Story 5.5 (Cookbook consolidation) into Epic 5; old 5.5 (first-time-reader docs pass) → 5.6; old 5.6 (crates.io + v0.1.0 tag) → 5.7. Closes Story 4.2/4.3 cookbook-coupling AC and deferred-work.md:104. Source: docs/bmad/planning-artifacts/sprint-change-proposal-2026-05-26-cookbook-consolidation.md.
+  - 2026-05-27: Inserted new Story 5.7 (Session state projection correctness) into Epic 5; old 5.7 (crates.io + v0.1.0 tag) → 5.8. Tightens state-broadcast to transitions-only, removes the PostToolUse→Idle flip, adds UserPromptSubmit hook subscription. Surfaced during dogfooding via pickletown /sessions livestream page. Source: docs/bmad/planning-artifacts/sprint-change-proposal-2026-05-27.md.
 ---
 
 # bowerbird - Epic Breakdown
@@ -1072,13 +1073,59 @@ So that the V1 audience (other developers reachable via the Claude Code communit
 
 **Given** the README in its current state mentions install before motivation
 **When** Story 5.6 lands
-**Then** motivation precedes install; the "Status: V1 in development" framing is removed in favor of "Status: v0.1.0 — first stable release" once Story 5.7 tags it
+**Then** motivation precedes install; the "Status: V1 in development" framing is removed in favor of "Status: v0.1.0 — first stable release" once Story 5.8 tags it
 
 **Given** the Story 5.6 PR
 **When** review runs
 **Then** the review explicitly invokes the `bmad-editorial-review-prose` and `bmad-editorial-review-structure` skills against `README.md` and `docs/quickstart.md`, and the priority-1 findings are addressed in the same PR
 
-### Story 5.7: Crates.io namespace decision and v0.1.0 tag
+### Story 5.7: Session state projection correctness
+
+As a presenter author,
+I want session-state broadcasts to fire only on actual `current_state` transitions, and Working signals to cover the agent's full active period (user prompt submission through tool completion — not just PreToolUse moments),
+So that ribbon UIs render only on meaningful state changes — no flap between back-to-back tool calls, no false Idle gap during the agent's between-tool thinking, no false Idle gap while the agent composes its first tool call after a user prompt.
+
+Closes the dogfooding finding in `sprint-change-proposal-2026-05-27.md`.
+
+**Acceptance Criteria:**
+
+**Given** a session in `Working` and an incoming `PostToolUse` event
+**When** the projection writes the new state
+**Then** `last_event_kind` and `last_event_at_ms` are updated AND `current_state` remains `Working` (not `Idle`); subscribers to `state.session.*` and `state.session.<id>` receive NO `state` envelope for this event; subscribers to `events.*` still receive the `event` envelope
+
+**Given** N back-to-back `PreToolUse`/`PostToolUse` pairs for one session
+**When** the events are ingested
+**Then** subscribers to `state.session.*` receive exactly one `state` envelope (the first `PreToolUse`'s `Idle`→`Working`); subscribers to `events.*` receive 2N event envelopes; `last_event_at_ms` still updates on every `PostToolUse`
+
+**Given** Claude Code running with bowerbird installed
+**When** the user submits a prompt
+**Then** the `UserPromptSubmit` hook fires; the daemon ingests it; the `EventEnvelope` has `kind=UserPromptSubmit`; `current_state` transitions to `Working` (or remains `Working`); `last_event_at_ms` updates
+
+**Given** a fresh `bowerbird install` against a Claude Code settings file with no prior hooks
+**When** installation completes
+**Then** `~/.claude/settings.json` registers five hooks (`PreToolUse`, `PostToolUse`, `Stop`, `Notification`, `UserPromptSubmit`); `bowerbird uninstall` removes all five; an existing install that pre-dates Story 5.7 surfaces "re-run `bowerbird install` to subscribe UserPromptSubmit" when old-style hooks are detected
+
+**Given** a v1.0 presenter compiled against the pre-Story-5.7 protocol enum
+**When** it receives an event with `kind: "UserPromptSubmit"` from a Story-5.7+ daemon
+**Then** serde decodes it as `EventKind::Unknown` (Story 4.4 catch-all); no crash, no panic, no protocol-violation close frame
+
+**Given** `crates/daemon/src/projection/state.rs` after Story 5.7
+**When** `transition()` is called with each `EventKind` variant
+**Then** `PostToolUse` preserves `prev.current_state`; `UserPromptSubmit` returns `Working`; `PreToolUse` returns `Working`; `Stop` returns `Idle`; `Notification` returns `WaitingInput`; `RecordingStarted`/`RecordingEnded`/`Unknown` preserve prev (unchanged); the 5-minute `STALE_WORKING_MS` fallback is unchanged and now backstops both missing-`Stop` and missing-`PostToolUse`
+
+**Given** the protocol surface
+**When** Story 5.7 lands
+**Then** `crates/protocol/src/event.rs` `EventKind` gains `UserPromptSubmit`; `crates/adapter-claude/src/normalize.rs` maps the string; `HOOK_KINDS` in `crates/adapter-claude/src/install.rs` adds it
+
+**Given** the doc and contract-test surface
+**When** Story 5.7 lands
+**Then** `docs/protocol.md:280` rewrites the broadcast emission rule to transitions-only; `docs/protocol.md:334` and `:338` add `UserPromptSubmit`; `docs/protocol-changelog.md` gains two entries (behavioral: tighten state broadcast to transitions-only; schema: `UserPromptSubmit` `EventKind`); `crates/protocol/tests/contract_protocol.rs` and `crates/daemon/tests/contract_daemon.rs` are updated for both rules
+
+**Given** the planning artifacts
+**When** Story 5.7 lands
+**Then** `prd.md:206` tightens "goes green when Claude finishes" to "goes green when Claude finishes the turn"; `architecture.md:50` and `:1026` amend "no stuck state on missing PostToolUse" to "no stuck state on missing PostToolUse or Stop"
+
+### Story 5.8: Crates.io namespace decision and v0.1.0 tag
 
 As the project owner,
 I want a deliberate decision on crates.io publishing,
@@ -1089,16 +1136,16 @@ Closes Epic 3 retro AI-3 / Epic 4 retro AI-5.
 **Acceptance Criteria:**
 
 **Given** `cargo search bowerbird`
-**When** Story 5.7 is started
+**When** Story 5.8 is started
 **Then** the namespace availability is documented (available / squatted / taken-by-related-project); if available, the four workspace crates are published with `description`, `repository`, `keywords`, `categories`, and `[package.metadata.docs.rs]` blocks added to each `Cargo.toml`; if not available, an ADR documents the renaming decision or the decision to publish under a different namespace
 
-**Given** all Epic 5 stories 5.1 through 5.6 are complete and any hotfix stories are merged
+**Given** all Epic 5 stories 5.1 through 5.7 are complete and any hotfix stories are merged
 **When** the maintainer tags `v0.1.0`
 **Then** the release workflow runs end-to-end producing artifacts; the GitHub Release is published (not draft); release notes name the V1 scope, the dogfooding signal that motivated the tag, and the contract-test summary
 
 **Given** the v0.1.0 tag exists
 **When** the maintainer reads `docs/bmad/implementation-artifacts/deferred-work.md`
-**Then** every entry referenced in this Epic 5 (Story 5.2 AI-1/AI-2/AI-3, Story 5.4's five entries, Story 5.5's deferred-work-104 closure, Story 5.7's AI-3/AI-5) is struck through with a backlink to its closing story's merge commit
+**Then** every entry referenced in this Epic 5 (Story 5.2 AI-1/AI-2/AI-3, Story 5.4's five entries, Story 5.5's deferred-work-104 closure, Story 5.8's AI-3/AI-5) is struck through with a backlink to its closing story's merge commit
 
 **Given** the v0.1.0 release notes
 **When** a first-time reader (Story 5.6's audience) finds them

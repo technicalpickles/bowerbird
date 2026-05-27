@@ -47,7 +47,8 @@ _This document builds collaboratively through step-by-step discovery. Sections a
   `/healthz` + `/readyz`.
 - **Session Tracking (FR24–FR26):** `(source, session_id)` composite key;
   per-session projection; hook-unreliability tolerance (no stuck state on
-  missing `PostToolUse`).
+  missing `PostToolUse` or `Stop`; 5-minute read-time stale-`Working`
+  fallback backstops both).
 - **Installation & Configuration (FR27–FR30):** Prebuilt binaries +
   `cargo install`; daemon lifecycle commands; status/version CLI.
 - **Developer Tools & Experience (FR31–FR35):** `bowerbird replay` and
@@ -1023,7 +1024,7 @@ on a single OS thread. All SQLite access goes through the deadpool-sqlite pool
 | FR6–FR9: Event persistence | db/ + projection/session.rs atomic transaction ✅ |
 | FR10–FR17: WS streaming | broadcast/ + api/ws.rs; DroppedFrame; SyncFrame; HelloFrame ✅ |
 | FR18–FR23: REST history | api/sessions.rs + events.rs + health.rs; EventListResponse ✅ |
-| FR24–FR26: Session tracking | projection/session.rs UPSERT; no stuck state on missing PostToolUse ✅ |
+| FR24–FR26: Session tracking | projection/session.rs UPSERT; no stuck state on missing PostToolUse or Stop (5-min stale-Working fallback) ✅ |
 | FR27–FR30: Install/lifecycle | commands/daemon.rs + adapter-claude/install.rs + config.rs ✅ |
 | FR31–FR35: Developer tools | replay.rs + export.rs + examples/ TypeScript projects + fixtures/ ✅ |
 | FR36–FR39: Protocol compat | protocol/ wire types + additive serde + CHANGELOG CI gate ✅ |

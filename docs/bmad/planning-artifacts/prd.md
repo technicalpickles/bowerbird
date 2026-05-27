@@ -203,7 +203,7 @@ Marcus has been using Claude Code for a few weeks. He's productive with it, but 
 
 He finds bowerbird in the README of a Claude Code community thread. He runs `bowerbird install`. It modifies his `~/.claude/settings.json` to add the hook shim, tells him the daemon is running, and shows a health check URL. Ten seconds.
 
-He opens the bowerbird docs, reads the WebSocket event format, and spends an afternoon writing ~80 lines of TypeScript. His tool subscribes to the `state.session.*` topic and maps `current_state` values to a menu bar icon: green for idle, yellow for working, red for waiting on input. He runs it. The dot appears. He triggers a Claude Code tool call. The dot goes yellow. It goes green when Claude finishes.
+He opens the bowerbird docs, reads the WebSocket event format, and spends an afternoon writing ~80 lines of TypeScript. His tool subscribes to the `state.session.*` topic and maps `current_state` values to a menu bar icon: green for idle, yellow for working, red for waiting on input. He runs it. The dot appears. He triggers a Claude Code tool call. The dot goes yellow. It goes green when Claude finishes the turn.
 
 He didn't configure a hook. He didn't restart Claude. He didn't touch anything except his 80-line TypeScript file and the one install command.
 
