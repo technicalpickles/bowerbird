@@ -1,5 +1,7 @@
 # Sprint Change Proposal — Session state projection correctness
 
+> **Note (2026-05-27 resequencing):** This proposal references "Story 5.7" throughout. The Epic 5 resequencing of 2026-05-27 (see `sprint-change-proposal-2026-05-27-epic-5-resequencing.md`) renumbered the projection-correctness story to **Story 5.2**. The proposal text below is preserved verbatim from approval-time; read "Story 5.7" as "Story 5.2" when referring to current Epic 5.
+
 Date: 2026-05-27
 Author: pickles (via bmad-correct-course)
 Status: Approved 2026-05-27

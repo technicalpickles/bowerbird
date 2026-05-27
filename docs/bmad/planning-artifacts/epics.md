@@ -12,6 +12,8 @@ revisions:
   - 2026-05-26: Added Epic 5 (V1 Release Readiness) with 6 stories — first-party presenter (sibling repo), bench gates load-bearing, release pipeline E2E, install UX + middleware closure, first-time-reader docs pass, crates.io + v0.1.0 tag. Source: docs/bmad/planning-artifacts/sprint-change-proposal-2026-05-26.md (folds Epic 3 retro AI-3/AI-4, Epic 4 retro AI-1..AI-5, plus 5 deferred-work entries).
   - 2026-05-26: Inserted new Story 5.5 (Cookbook consolidation) into Epic 5; old 5.5 (first-time-reader docs pass) → 5.6; old 5.6 (crates.io + v0.1.0 tag) → 5.7. Closes Story 4.2/4.3 cookbook-coupling AC and deferred-work.md:104. Source: docs/bmad/planning-artifacts/sprint-change-proposal-2026-05-26-cookbook-consolidation.md.
   - 2026-05-27: Inserted new Story 5.7 (Session state projection correctness) into Epic 5; old 5.7 (crates.io + v0.1.0 tag) → 5.8. Tightens state-broadcast to transitions-only, removes the PostToolUse→Idle flip, adds UserPromptSubmit hook subscription. Surfaced during dogfooding via pickletown /sessions livestream page. Source: docs/bmad/planning-artifacts/sprint-change-proposal-2026-05-27.md.
+  - 2026-05-27: Inserted new Story 5.8 (Session-process liveness via PID capture) into Epic 5; old 5.8 (crates.io + v0.1.0 tag) → 5.9. Adds `SessionState.last_pid` (mechanical fact), shim captures `getppid()`, presenters compute liveness via `kill(pid, 0)` per Axiom 1/4. Surfaced during Story 5.1 bowerbird-deck dogfooding (30+ stale session rows visible, no signal to mark dead-process tombstones). Source: docs/bmad/planning-artifacts/sprint-change-proposal-2026-05-27-pid-liveness.md.
+  - 2026-05-27: Resequenced Epic 5 for dogfooding-first ordering. The two dogfood-surfaced correctness stories move forward (old 5.7 projection correctness → new 5.2; old 5.8 PID liveness → new 5.3) so they sit adjacent to Story 5.1's presenter and make daily dogfooding actually useful before the CI/release/docs polish work. Reader-facing and CI/release work shifts back (old 5.2 bench gates → new 5.5; old 5.3 release E2E → new 5.6; old 5.5 cookbook → new 5.7; old 5.6 first-time-reader docs → new 5.8). Story 5.1, 5.4, 5.9 unchanged. No story content modified; pure resequencing. Source: docs/bmad/planning-artifacts/sprint-change-proposal-2026-05-27-epic-5-resequencing.md.
 ---
 
 # bowerbird - Epic Breakdown
@@ -925,59 +927,117 @@ So that dogfooding has a useful surface to observe — not just JSON in a termin
 **When** the maintainer reaches a "this is the V1 presenter" milestone (subjective)
 **Then** a README in the sibling repo names: required bowerbird version, how to install, how to run, and the one cookbook pattern from `docs/cookbook/` the presenter most directly demonstrates
 
-### Story 5.2: Bench gates converted to load-bearing
+### Story 5.2: Session state projection correctness
 
-As a release manager,
-I want every committed CI bench gate to fail loudly when a real regression lands,
-So that the bench infrastructure is producing signal — not just running.
+As a presenter author,
+I want session-state broadcasts to fire only on actual `current_state` transitions, and Working signals to cover the agent's full active period (user prompt submission through tool completion — not just PreToolUse moments),
+So that ribbon UIs render only on meaningful state changes — no flap between back-to-back tool calls, no false Idle gap during the agent's between-tool thinking, no false Idle gap while the agent composes its first tool call after a user prompt.
 
-Closes Epic 4 retro AI-1, AI-2, AI-3 (per `epic-4-retro-2026-05-25.md` Action Items table).
-
-**Acceptance Criteria:**
-
-**Given** `crates/daemon/benches/baselines/macos.json` and `linux.json` currently contain placeholder zero values
-**When** Story 5.2 lands
-**Then** both files contain non-zero p99 values per shape (solo, fanout3, burst, steady) sourced from the most recent green CI run on `main` (or the Story 5.2 PR's CI run if it's green); the bench gate `daemon-bench-gate` exercises the regression check without auto-skipping any shape
-
-**Given** the daemon-bench gate has never been exercised in failure mode
-**When** Story 5.2 lands
-**Then** the Dev Agent Record documents two chaos-injection sanity PRs (one macOS, one Linux) that injected `tokio::time::sleep(50ms)` between `tx.commit()` and `broadcaster.publish` in `crates/daemon/src/projection/session.rs::write`, verified CI's daemon-bench-gate failed on the burst-shape p99 regression, and were reverted before merge
-
-**Given** the shim hot-path bench gate has never been exercised in failure mode (Story 4.4 Task 4.3 deferred)
-**When** Story 5.2 lands
-**Then** the Dev Agent Record documents two chaos-injection sanity PRs (one per platform) that injected `std::thread::sleep(Duration::from_millis(2))` into the shim's hot path, verified CI's shim-bench-gate failed, and were reverted before merge
-
-**Given** the work is paperwork-flavored (no production code changes after the chaos PRs are reverted)
-**When** Story 5.2 closes
-**Then** the deferred-work entries naming AI-1/AI-2/AI-3 are struck through with a backlink to this story's merge commit
-
-### Story 5.3: Release pipeline end-to-end verification
-
-As a release manager,
-I want the GitHub Releases pipeline driven to a real (non-prerelease) tag, producing artifacts that install and run on a fresh machine,
-So that v0.1.0 is the second release we cut — not the first.
+Closes the dogfooding finding in `sprint-change-proposal-2026-05-27.md`. Resequenced from 5.7 → 5.2 by `sprint-change-proposal-2026-05-27-epic-5-resequencing.md` (dogfooding-first ordering).
 
 **Acceptance Criteria:**
 
-**Given** the release workflow at `.github/workflows/release.yml`
-**When** a `v0.1.0-rc1` tag is pushed
-**Then** the workflow produces tarballs for `aarch64-apple-darwin`, `x86_64-apple-darwin`, and `x86_64-unknown-linux-gnu`, attached to the GitHub Release as draft assets
+**Given** a session in `Working` and an incoming `PostToolUse` event
+**When** the projection writes the new state
+**Then** `last_event_kind` and `last_event_at_ms` are updated AND `current_state` remains `Working` (not `Idle`); subscribers to `state.session.*` and `state.session.<id>` receive NO `state` envelope for this event; subscribers to `events.*` still receive the `event` envelope
 
-**Given** a fresh macOS arm64 machine (or VM, or wiped `~/.bowerbird/` and `~/.claude/settings.json` backup-and-restore)
-**When** the maintainer downloads the `v0.1.0-rc1` tarball, runs `tar -xz`, then `bowerbird install`, and starts a Claude Code session
-**Then** events appear in `~/.bowerbird/bower.db`, the daemon is running, and the first-party presenter from Story 5.1 receives state frames
+**Given** N back-to-back `PreToolUse`/`PostToolUse` pairs for one session
+**When** the events are ingested
+**Then** subscribers to `state.session.*` receive exactly one `state` envelope (the first `PreToolUse`'s `Idle`→`Working`); subscribers to `events.*` receive 2N event envelopes; `last_event_at_ms` still updates on every `PostToolUse`
 
-**Given** the cross-version upgrade contract test `cross_version_upgrade.rs`
+**Given** Claude Code running with bowerbird installed
+**When** the user submits a prompt
+**Then** the `UserPromptSubmit` hook fires; the daemon ingests it; the `EventEnvelope` has `kind=UserPromptSubmit`; `current_state` transitions to `Working` (or remains `Working`); `last_event_at_ms` updates
+
+**Given** a fresh `bowerbird install` against a Claude Code settings file with no prior hooks
+**When** installation completes
+**Then** `~/.claude/settings.json` registers five hooks (`PreToolUse`, `PostToolUse`, `Stop`, `Notification`, `UserPromptSubmit`); `bowerbird uninstall` removes all five; an existing install that pre-dates Story 5.2 surfaces "re-run `bowerbird install` to subscribe UserPromptSubmit" when old-style hooks are detected
+
+**Given** a v1.0 presenter compiled against the pre-Story-5.2 protocol enum
+**When** it receives an event with `kind: "UserPromptSubmit"` from a Story-5.2+ daemon
+**Then** serde decodes it as `EventKind::Unknown` (Story 4.4 catch-all); no crash, no panic, no protocol-violation close frame
+
+**Given** `crates/daemon/src/projection/state.rs` after Story 5.2
+**When** `transition()` is called with each `EventKind` variant
+**Then** `PostToolUse` preserves `prev.current_state`; `UserPromptSubmit` returns `Working`; `PreToolUse` returns `Working`; `Stop` returns `Idle`; `Notification` returns `WaitingInput`; `RecordingStarted`/`RecordingEnded`/`Unknown` preserve prev (unchanged); the 5-minute `STALE_WORKING_MS` fallback is unchanged and now backstops both missing-`Stop` and missing-`PostToolUse`
+
+**Given** the protocol surface
+**When** Story 5.2 lands
+**Then** `crates/protocol/src/event.rs` `EventKind` gains `UserPromptSubmit`; `crates/adapter-claude/src/normalize.rs` maps the string; `HOOK_KINDS` in `crates/adapter-claude/src/install.rs` adds it
+
+**Given** the doc and contract-test surface
+**When** Story 5.2 lands
+**Then** `docs/protocol.md:280` rewrites the broadcast emission rule to transitions-only; `docs/protocol.md:334` and `:338` add `UserPromptSubmit`; `docs/protocol-changelog.md` gains two entries (behavioral: tighten state broadcast to transitions-only; schema: `UserPromptSubmit` `EventKind`); `crates/protocol/tests/contract_protocol.rs` and `crates/daemon/tests/contract_daemon.rs` are updated for both rules
+
+**Given** the planning artifacts
+**When** Story 5.2 lands
+**Then** `prd.md:206` tightens "goes green when Claude finishes" to "goes green when Claude finishes the turn"; `architecture.md:50` and `:1026` amend "no stuck state on missing PostToolUse" to "no stuck state on missing PostToolUse or Stop"
+
+### Story 5.3: Session-process liveness via PID capture
+
+As a presenter author,
+I want a mechanical fact tying each session row to the OS process that last emitted a hook for it,
+So that I can distinguish "user walked away" from "Claude Code process is gone" without smuggling a semantic flag into the substrate, and so my ribbon UI can filter or sort out tombstone sessions on its own.
+
+Closes the dogfooding finding in `sprint-change-proposal-2026-05-27-pid-liveness.md`. Extends the daemon-level PID-liveness pattern (`architecture.md:987-989` `bowerbird.pid` + `kill(pid, 0)`) one layer down to per-session granularity. Resequenced from 5.8 → 5.3 by `sprint-change-proposal-2026-05-27-epic-5-resequencing.md` (dogfooding-first ordering).
+
+**Acceptance Criteria:**
+
+**Given** a Claude Code hook fires and the shim runs
+**When** the shim sends the payload to the daemon's ingest socket
+**Then** the payload JSON includes a `bowerbird_ppid` field whose value is the integer returned by `libc::getppid()` at shim-invocation time; the field is injected by the shim, not present in the upstream Claude Code hook payload; the shim hot-path p99 ≤5ms budget (Story 1.5) is preserved under the shim-bench-gate
+
+**Given** the `adapter-claude` normalize path receives a payload with `bowerbird_ppid` set
+**When** normalize constructs the `EventEnvelope`
+**Then** `EventEnvelope.pid` is `Some(<that value>)`; a payload missing `bowerbird_ppid` or carrying a non-integer value yields `EventEnvelope.pid = None` and is normalized successfully (not a failure mode)
+
+**Given** an `EventEnvelope` with `pid: Some(N)` reaches `projection::session::write`
+**When** the projection writes inside its single transaction
+**Then** the `events` row stores `pid = N`; the upserted `session_projections` row's deserialized `SessionState` carries `last_pid: Some(N)`; the `BroadcastEnvelope::State` published after commit carries the same `last_pid`; the `BroadcastEnvelope::Event` likewise carries `pid: Some(N)`
+
+**Given** a follow-up `EventEnvelope` for the same `(source, session_id)` with `pid: None`
+**When** the projection writes
+**Then** `SessionState.last_pid` retains the prior `Some(N)` (carry-forward semantics); the `events` row stores `pid = NULL` for that specific event
+
+**Given** a follow-up `EventEnvelope` for the same `(source, session_id)` with `pid: Some(M)` where `M != N` (process resumed the session_id under a new PID)
+**When** the projection writes
+**Then** `SessionState.last_pid` becomes `Some(M)` (overwrite-on-Some semantics)
+
+**Given** a daemon restart with a non-empty `events` table that has session rows
+**When** `rebuild_missing_projections` runs
+**Then** for each rebuilt session the reconstructed `SessionState.last_pid` matches what live ingest would have produced from the same event sequence (Story 1.6 AC #5 "storage layer is a pure function of the event sequence" is preserved); rebuilt rows for sessions whose events all have `pid IS NULL` have `last_pid: None`
+
+**Given** `GET /sessions` and `GET /sessions/{id}`
+**When** the daemon serializes the response
+**Then** `SessionListItem` and `SessionDetail.state` each carry `last_pid` as a number-or-null field; the read-time stale-`Working` → `Idle` fallback (Story 1.6 `current_state_for_read`) does NOT alter `last_pid`; the sentinel session row (`source = "__daemon__"`) continues to be filtered out
+
+**Given** a WS subscriber to `state.session.*` receives a `StateFrame`
+**When** the frame is decoded
+**Then** `frame.state.last_pid` carries the same value as the REST `SessionDetail.state.last_pid` would for the same session at the same moment; snapshot-on-subscribe frames (Story 2.3) likewise carry `last_pid`
+
+**Given** a v1.0 presenter compiled against the pre-Story-5.3 protocol type
+**When** it deserializes a `SessionState` frame from a Story-5.3+ daemon
+**Then** serde silently ignores the `last_pid` field (asymmetric outbound permissive policy per project-context.md §Wire format / Story 4.4 catch-all); no decode error, no crash, no protocol-violation close frame; the additive-compat contract test in `contract_protocol.rs` exercises this path
+
+**Given** the SQLite `events` schema before Story 5.3 (v1)
+**When** the daemon starts against an existing v1 database
+**Then** migration v2 runs `ALTER TABLE events ADD COLUMN pid INTEGER`; existing rows have `pid = NULL`; the migration is idempotent (re-running `to_latest` is a no-op per Story 5.4's migration-idempotency contract test)
+
+**Given** the protocol surface
 **When** Story 5.3 lands
-**Then** its SKIP guard (currently load-bearing on the absence of a real prior tag) is removed or asserts against `v0.1.0-rc1`'s data directory, depending on which boundary is tested
+**Then** `crates/protocol/src/state.rs` `SessionState` gains `last_pid: Option<u32>`; `crates/protocol/src/event.rs` `EventEnvelope` gains `pid: Option<u32>` (internal type, ingest boundary) AND `Event` gains `pid: Option<u32>` (stored/wire type, REST + WS emission); `crates/shim/Cargo.toml` adds the workspace `libc` dep; `crates/shim/src/main.rs` injects `bowerbird_ppid` into the payload; `crates/adapter-claude/src/normalize.rs` extracts it
 
-**Given** Gatekeeper warnings on first run of unsigned macOS tarball binaries
-**When** the maintainer follows `INSTALL.md`'s `xattr -d com.apple.quarantine ...` step
-**Then** the binary runs successfully; this is documented as the V1-acceptable path and the deferred-work entry for code-signing/notarization remains open (cost decision: post-V1)
+**Given** the doc and contract-test surface
+**When** Story 5.3 lands
+**Then** `docs/protocol.md` adds `last_pid` to `/sessions`, `/sessions/{id}`, `StateFrame`, and adds `pid` to `EventFrame`; `docs/protocol.md` §Ingest socket contract documents the shim's `bowerbird_ppid` injection; `docs/protocol-changelog.md` gains three entries (schema: `SessionState.last_pid`; schema: `Event.pid` + `events.pid` migration v2; behavioral: shim PPID injection); `crates/protocol/tests/contract_protocol.rs` exercises both round-trip and additive-compat; `crates/daemon/tests/contract_daemon.rs` exercises projection threading and rebuild AC #5; `crates/adapter-claude/tests/contract_adapter.rs` exercises normalize extraction
 
-**Given** the rc1 release surfaces a behavioral, install, or release-pipeline issue
-**When** the maintainer escalates it
-**Then** a `5.X-hotfix-<topic>` story is created inline before moving to Story 5.4
+**Given** the planning artifacts
+**When** Story 5.3 lands
+**Then** `architecture.md` adds a bullet under §State-machine narrative noting `last_pid` is carried by `transition()` but does not influence `current_state`; `architecture.md` §Singletons & discovery (≈L987) gains a forward reference noting the same pattern applies one layer down for sessions
+
+**Given** documented v0.1.0 caveats
+**When** Story 5.3 lands
+**Then** `deferred-work.md` records three follow-up entries: (a) parent-walk past `sh -c` wrappers via `proc_pidinfo` / `/proc/<pid>/stat`; (b) PID-recycle resilience via `started_at` capture; (c) cookbook entry "detecting dead sessions" (gated on the reaction-enum-rule: ship when two independent presenters demonstrate the need)
 
 ### Story 5.4: Install UX polish and middleware closure
 
@@ -1009,22 +1069,78 @@ Folds in five deferred-work entries; no new design surface.
 **When** the daemon processes it
 **Then** the response is `404 Not Found` rather than `200 {events: [], cursor: None, ...}` (Story 4.1 deferred-work entry "/sessions/{id}/events 404 for unknown sessions"); a `type: behavioral` entry lands in `docs/protocol-changelog.md` documenting the alignment; `bowerbird export` drops its pre-check round trip
 
-### Story 5.5: Cookbook consolidation into self-contained directory entries
+### Story 5.5: Bench gates converted to load-bearing
+
+As a release manager,
+I want every committed CI bench gate to fail loudly when a real regression lands,
+So that the bench infrastructure is producing signal — not just running.
+
+Closes Epic 4 retro AI-1, AI-2, AI-3 (per `epic-4-retro-2026-05-25.md` Action Items table). Resequenced from 5.2 → 5.5 by `sprint-change-proposal-2026-05-27-epic-5-resequencing.md` (dogfooding-first ordering: bench-gate work doesn't unblock daily dogfooding).
+
+**Acceptance Criteria:**
+
+**Given** `crates/daemon/benches/baselines/macos.json` and `linux.json` currently contain placeholder zero values
+**When** Story 5.5 lands
+**Then** both files contain non-zero p99 values per shape (solo, fanout3, burst, steady) sourced from the most recent green CI run on `main` (or the Story 5.5 PR's CI run if it's green); the bench gate `daemon-bench-gate` exercises the regression check without auto-skipping any shape
+
+**Given** the daemon-bench gate has never been exercised in failure mode
+**When** Story 5.5 lands
+**Then** the Dev Agent Record documents two chaos-injection sanity PRs (one macOS, one Linux) that injected `tokio::time::sleep(50ms)` between `tx.commit()` and `broadcaster.publish` in `crates/daemon/src/projection/session.rs::write`, verified CI's daemon-bench-gate failed on the burst-shape p99 regression, and were reverted before merge
+
+**Given** the shim hot-path bench gate has never been exercised in failure mode (Story 4.4 Task 4.3 deferred)
+**When** Story 5.5 lands
+**Then** the Dev Agent Record documents two chaos-injection sanity PRs (one per platform) that injected `std::thread::sleep(Duration::from_millis(2))` into the shim's hot path, verified CI's shim-bench-gate failed, and were reverted before merge
+
+**Given** the work is paperwork-flavored (no production code changes after the chaos PRs are reverted)
+**When** Story 5.5 closes
+**Then** the deferred-work entries naming AI-1/AI-2/AI-3 are struck through with a backlink to this story's merge commit
+
+### Story 5.6: Release pipeline end-to-end verification
+
+As a release manager,
+I want the GitHub Releases pipeline driven to a real (non-prerelease) tag, producing artifacts that install and run on a fresh machine,
+So that v0.1.0 is the second release we cut — not the first.
+
+Resequenced from 5.3 → 5.6 by `sprint-change-proposal-2026-05-27-epic-5-resequencing.md` (dogfooding-first ordering: release-pipeline verification doesn't unblock daily dogfooding).
+
+**Acceptance Criteria:**
+
+**Given** the release workflow at `.github/workflows/release.yml`
+**When** a `v0.1.0-rc1` tag is pushed
+**Then** the workflow produces tarballs for `aarch64-apple-darwin`, `x86_64-apple-darwin`, and `x86_64-unknown-linux-gnu`, attached to the GitHub Release as draft assets
+
+**Given** a fresh macOS arm64 machine (or VM, or wiped `~/.bowerbird/` and `~/.claude/settings.json` backup-and-restore)
+**When** the maintainer downloads the `v0.1.0-rc1` tarball, runs `tar -xz`, then `bowerbird install`, and starts a Claude Code session
+**Then** events appear in `~/.bowerbird/bower.db`, the daemon is running, and the first-party presenter from Story 5.1 receives state frames
+
+**Given** the cross-version upgrade contract test `cross_version_upgrade.rs`
+**When** Story 5.6 lands
+**Then** its SKIP guard (currently load-bearing on the absence of a real prior tag) is removed or asserts against `v0.1.0-rc1`'s data directory, depending on which boundary is tested
+
+**Given** Gatekeeper warnings on first run of unsigned macOS tarball binaries
+**When** the maintainer follows `INSTALL.md`'s `xattr -d com.apple.quarantine ...` step
+**Then** the binary runs successfully; this is documented as the V1-acceptable path and the deferred-work entry for code-signing/notarization remains open (cost decision: post-V1)
+
+**Given** the rc1 release surfaces a behavioral, install, or release-pipeline issue
+**When** the maintainer escalates it
+**Then** a `5.X-hotfix-<topic>` story is created inline before moving to Story 5.7
+
+### Story 5.7: Cookbook consolidation into self-contained directory entries
 
 As the bowerbird maintainer,
 I want each cookbook entry to be one self-contained directory under `docs/cookbook/<name>/` containing prose (`README.md`) and runnable code (`src/`, `package.json`, `tsconfig.json`) colocated,
 So that the cookbook is the canonical home of the working examples — no duplication, no drift-check, no separate `examples/` surface to navigate.
 
-Closes Story 4.2 AC at `epics.md:817-819`, Story 4.3 AC at `epics.md:843`, and `project-context.md` §Cookbook discipline directive (L526) "do not hand-copy snippets — they rot." Closes `deferred-work.md:104` ("Cookbook inlining mechanism"). See `sprint-change-proposal-2026-05-26-cookbook-consolidation.md` for the full rationale.
+Closes Story 4.2 AC at `epics.md:817-819`, Story 4.3 AC at `epics.md:843`, and `project-context.md` §Cookbook discipline directive (L526) "do not hand-copy snippets — they rot." Closes `deferred-work.md:104` ("Cookbook inlining mechanism"). See `sprint-change-proposal-2026-05-26-cookbook-consolidation.md` for the full rationale. Resequenced from 5.5 → 5.7 by `sprint-change-proposal-2026-05-27-epic-5-resequencing.md` (dogfooding-first ordering: cookbook consolidation is reader-facing, not load-bearing for the maintainer's daily use).
 
 **Acceptance Criteria:**
 
 **Given** the existing `examples/multi-session-router/`, `examples/event-log-viewer/`, and `examples/reconnect-recovery/` directories
-**When** Story 5.5 lands
+**When** Story 5.7 lands
 **Then** they have been `git mv`'d to `docs/cookbook/state-session-fanout/`, `docs/cookbook/rest-cursor-pagination/`, and `docs/cookbook/dropped-frame-recovery/` respectively; the `examples/` directory no longer exists at the repo root; `cargo build --workspace`, `cargo test --workspace`, and the TypeScript smoke tests all pass against the new paths
 
 **Given** the three standalone cookbook prose files (`docs/cookbook/state-session-fanout.md`, `docs/cookbook/rest-cursor-pagination.md`, `docs/cookbook/dropped-frame-recovery.md`)
-**When** Story 5.5 lands
+**When** Story 5.7 lands
 **Then** they have been deleted; their Problem / Approach / Variants content has been folded into the per-entry `docs/cookbook/<name>/README.md` files alongside the existing per-example README content
 
 **Given** each new `docs/cookbook/<name>/README.md`
@@ -1032,30 +1148,32 @@ Closes Story 4.2 AC at `epics.md:817-819`, Story 4.3 AC at `epics.md:843`, and `
 **Then** the README contains no embedded TypeScript code blocks — only prose sections (*What this is*, *Run it*, *How it works*, *How to apply it*, *Files* with relative links to `src/index.ts` and any sidecar code files); code is read by opening `src/index.ts` directly, matching the pocketflow cookbook pattern
 
 **Given** the `// cookbook-begin:<name>` / `// cookbook-end:<name>` comment markers in each `src/index.ts`
-**When** Story 5.5 lands
+**When** Story 5.7 lands
 **Then** the markers have been deleted; the smoke test `tests/cli_examples.rs::each_example_source_carries_cookbook_anchors` (or its current equivalent) has been deleted; the drift-check test `tests/cli_docs_drift.rs::cookbook_include_directives_match_example_anchors` has been deleted
 
 **Given** the smoke-test crate `tests/cli_examples.rs` and CI workflow at `.github/workflows/ci.yml`
-**When** Story 5.5 lands
+**When** Story 5.7 lands
 **Then** all `examples/*/src/index.ts` path references have been retargeted to `docs/cookbook/*/src/index.ts`; shell loops over `examples/*/` similarly retarget
 
 **Given** the planning and project-context artifacts
-**When** Story 5.5 lands
+**When** Story 5.7 lands
 **Then** `prd.md:327, 445, 448-450`, `architecture.md:760-829, 915, 946`, and `project-context.md:242-258, 524-545` have been updated to reflect the single-directory shape; `deferred-work.md:104` is struck through with a backlink to this story's merge commit; path-retarget edits applied to `deferred-work.md:101, 102, 105, 106, 107`
 
 **Given** the project's update protocol (`project-context.md` L77: "Every merged ADR includes Affects context.md sections: field")
-**When** Story 5.5 lands
+**When** Story 5.7 lands
 **Then** ADR 0005 has been authored at `docs/decisions/0005-cookbook-consolidation.md` documenting the decision, considered alternatives (mdBook `{{#include}}`, hand-rolled preprocessor, pocketflow pattern), the chosen path, and `Affects context.md sections: Repository layout, Cookbook discipline`
 
 **Given** reader-facing docs
-**When** Story 5.5 lands
+**When** Story 5.7 lands
 **Then** `README.md` (entries at L7-8 and L162-166), `docs/quickstart.md:19`, and `docs/presenter-authoring.md` (grep pass) have all `examples/` path references retargeted to `docs/cookbook/<name>/`
 
-### Story 5.6: First-time-reader docs pass
+### Story 5.8: First-time-reader docs pass
 
 As a developer who has never seen bowerbird before,
 I want the README and quickstart to answer "what is this, why would I care, how do I try it in five minutes" before I bounce,
 So that the V1 audience (other developers reachable via the Claude Code community) can decide bowerbird is worth their attention.
+
+Resequenced from 5.6 → 5.8 by `sprint-change-proposal-2026-05-27-epic-5-resequencing.md` (dogfooding-first ordering: first-time-reader docs are reader-facing, not load-bearing for the maintainer's daily use).
 
 **Acceptance Criteria:**
 
@@ -1069,63 +1187,17 @@ So that the V1 audience (other developers reachable via the Claude Code communit
 
 **Given** the docs path Quickstart → presenter-authoring → protocol → cookbook (PRD §Documentation Requirements line 436)
 **When** the first-time reader graduates from Quickstart and reaches `docs/presenter-authoring.md`
-**Then** the first paragraph names the audience switch ("you've seen it work; now you're going to build something") rather than starting directly in technical detail; cross-references to the cookbook target the per-entry directory shape introduced by Story 5.5 (e.g. `docs/cookbook/state-session-fanout/`), not pre-5.5 standalone .md files
+**Then** the first paragraph names the audience switch ("you've seen it work; now you're going to build something") rather than starting directly in technical detail; cross-references to the cookbook target the per-entry directory shape introduced by Story 5.7 (e.g. `docs/cookbook/state-session-fanout/`), not pre-5.7 standalone .md files
 
 **Given** the README in its current state mentions install before motivation
-**When** Story 5.6 lands
-**Then** motivation precedes install; the "Status: V1 in development" framing is removed in favor of "Status: v0.1.0 — first stable release" once Story 5.8 tags it
+**When** Story 5.8 lands
+**Then** motivation precedes install; the "Status: V1 in development" framing is removed in favor of "Status: v0.1.0 — first stable release" once Story 5.9 tags it
 
-**Given** the Story 5.6 PR
+**Given** the Story 5.8 PR
 **When** review runs
 **Then** the review explicitly invokes the `bmad-editorial-review-prose` and `bmad-editorial-review-structure` skills against `README.md` and `docs/quickstart.md`, and the priority-1 findings are addressed in the same PR
 
-### Story 5.7: Session state projection correctness
-
-As a presenter author,
-I want session-state broadcasts to fire only on actual `current_state` transitions, and Working signals to cover the agent's full active period (user prompt submission through tool completion — not just PreToolUse moments),
-So that ribbon UIs render only on meaningful state changes — no flap between back-to-back tool calls, no false Idle gap during the agent's between-tool thinking, no false Idle gap while the agent composes its first tool call after a user prompt.
-
-Closes the dogfooding finding in `sprint-change-proposal-2026-05-27.md`.
-
-**Acceptance Criteria:**
-
-**Given** a session in `Working` and an incoming `PostToolUse` event
-**When** the projection writes the new state
-**Then** `last_event_kind` and `last_event_at_ms` are updated AND `current_state` remains `Working` (not `Idle`); subscribers to `state.session.*` and `state.session.<id>` receive NO `state` envelope for this event; subscribers to `events.*` still receive the `event` envelope
-
-**Given** N back-to-back `PreToolUse`/`PostToolUse` pairs for one session
-**When** the events are ingested
-**Then** subscribers to `state.session.*` receive exactly one `state` envelope (the first `PreToolUse`'s `Idle`→`Working`); subscribers to `events.*` receive 2N event envelopes; `last_event_at_ms` still updates on every `PostToolUse`
-
-**Given** Claude Code running with bowerbird installed
-**When** the user submits a prompt
-**Then** the `UserPromptSubmit` hook fires; the daemon ingests it; the `EventEnvelope` has `kind=UserPromptSubmit`; `current_state` transitions to `Working` (or remains `Working`); `last_event_at_ms` updates
-
-**Given** a fresh `bowerbird install` against a Claude Code settings file with no prior hooks
-**When** installation completes
-**Then** `~/.claude/settings.json` registers five hooks (`PreToolUse`, `PostToolUse`, `Stop`, `Notification`, `UserPromptSubmit`); `bowerbird uninstall` removes all five; an existing install that pre-dates Story 5.7 surfaces "re-run `bowerbird install` to subscribe UserPromptSubmit" when old-style hooks are detected
-
-**Given** a v1.0 presenter compiled against the pre-Story-5.7 protocol enum
-**When** it receives an event with `kind: "UserPromptSubmit"` from a Story-5.7+ daemon
-**Then** serde decodes it as `EventKind::Unknown` (Story 4.4 catch-all); no crash, no panic, no protocol-violation close frame
-
-**Given** `crates/daemon/src/projection/state.rs` after Story 5.7
-**When** `transition()` is called with each `EventKind` variant
-**Then** `PostToolUse` preserves `prev.current_state`; `UserPromptSubmit` returns `Working`; `PreToolUse` returns `Working`; `Stop` returns `Idle`; `Notification` returns `WaitingInput`; `RecordingStarted`/`RecordingEnded`/`Unknown` preserve prev (unchanged); the 5-minute `STALE_WORKING_MS` fallback is unchanged and now backstops both missing-`Stop` and missing-`PostToolUse`
-
-**Given** the protocol surface
-**When** Story 5.7 lands
-**Then** `crates/protocol/src/event.rs` `EventKind` gains `UserPromptSubmit`; `crates/adapter-claude/src/normalize.rs` maps the string; `HOOK_KINDS` in `crates/adapter-claude/src/install.rs` adds it
-
-**Given** the doc and contract-test surface
-**When** Story 5.7 lands
-**Then** `docs/protocol.md:280` rewrites the broadcast emission rule to transitions-only; `docs/protocol.md:334` and `:338` add `UserPromptSubmit`; `docs/protocol-changelog.md` gains two entries (behavioral: tighten state broadcast to transitions-only; schema: `UserPromptSubmit` `EventKind`); `crates/protocol/tests/contract_protocol.rs` and `crates/daemon/tests/contract_daemon.rs` are updated for both rules
-
-**Given** the planning artifacts
-**When** Story 5.7 lands
-**Then** `prd.md:206` tightens "goes green when Claude finishes" to "goes green when Claude finishes the turn"; `architecture.md:50` and `:1026` amend "no stuck state on missing PostToolUse" to "no stuck state on missing PostToolUse or Stop"
-
-### Story 5.8: Crates.io namespace decision and v0.1.0 tag
+### Story 5.9: Crates.io namespace decision and v0.1.0 tag
 
 As the project owner,
 I want a deliberate decision on crates.io publishing,
@@ -1136,17 +1208,17 @@ Closes Epic 3 retro AI-3 / Epic 4 retro AI-5.
 **Acceptance Criteria:**
 
 **Given** `cargo search bowerbird`
-**When** Story 5.8 is started
+**When** Story 5.9 is started
 **Then** the namespace availability is documented (available / squatted / taken-by-related-project); if available, the four workspace crates are published with `description`, `repository`, `keywords`, `categories`, and `[package.metadata.docs.rs]` blocks added to each `Cargo.toml`; if not available, an ADR documents the renaming decision or the decision to publish under a different namespace
 
-**Given** all Epic 5 stories 5.1 through 5.7 are complete and any hotfix stories are merged
+**Given** all Epic 5 stories 5.1 through 5.8 are complete and any hotfix stories are merged
 **When** the maintainer tags `v0.1.0`
 **Then** the release workflow runs end-to-end producing artifacts; the GitHub Release is published (not draft); release notes name the V1 scope, the dogfooding signal that motivated the tag, and the contract-test summary
 
 **Given** the v0.1.0 tag exists
 **When** the maintainer reads `docs/bmad/implementation-artifacts/deferred-work.md`
-**Then** every entry referenced in this Epic 5 (Story 5.2 AI-1/AI-2/AI-3, Story 5.4's five entries, Story 5.5's deferred-work-104 closure, Story 5.8's AI-3/AI-5) is struck through with a backlink to its closing story's merge commit
+**Then** every entry referenced in this Epic 5 (Story 5.5 AI-1/AI-2/AI-3, Story 5.4's five entries, Story 5.7's deferred-work-104 closure, Story 5.9's AI-3/AI-5) is struck through with a backlink to its closing story's merge commit
 
 **Given** the v0.1.0 release notes
-**When** a first-time reader (Story 5.6's audience) finds them
+**When** a first-time reader (Story 5.8's audience) finds them
 **Then** they include the install one-liner, a link to Quickstart, and an honest statement of "what works today and what doesn't" (the deferred-work entries that remain — code-signing, second-adapter, etc.)
