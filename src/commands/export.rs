@@ -70,36 +70,23 @@ pub fn run(args: ExportArgs) -> anyhow::Result<()> {
         }
     };
 
-    // Pre-check: the events endpoint returns 200 with an empty list for an
-    // unknown session_id (it just queries the events table by session_id).
-    // The 404 distinction lives at `GET /sessions/{id}` (session_projections
-    // lookup). Probe that first so AC #2's "session not found" stderr is
-    // unambiguous; a real session with 0 events is structurally impossible
-    // (session_projections rows are created at first-event-write time).
-    match daemon::http_get_session_detail(
-        addr,
-        token.expose_secret(),
-        &args.session_id,
-        EXPORT_PER_ATTEMPT,
-    ) {
-        daemon::SessionDetailResponse::Ok => {}
-        daemon::SessionDetailResponse::NotFound => {
-            anyhow::bail!("session {} not found", args.session_id);
-        }
-        daemon::SessionDetailResponse::Status(401) => {
-            anyhow::bail!(
-                "daemon rejected bearer token; check ~/.bowerbird/config.toml or BOWERBIRD_TOKEN"
-            );
-        }
-        daemon::SessionDetailResponse::Status(code) => {
-            anyhow::bail!("daemon returned HTTP {code}");
-        }
-        daemon::SessionDetailResponse::Unreachable => {
-            anyhow::bail!("cannot reach daemon at {addr}; is it running? (try 'bowerbird start')");
-        }
-    }
+    // Story 5.4 AC #5 — the `/sessions/{id}/events` endpoint now returns 404
+    // for an unknown session_id, so a typo'd id surfaces as
+    // `EventsResponse::NotFound` on the FIRST page fetch. The previous pre-check
+    // via `GET /sessions/{id}` was working around a 200-empty quirk that has
+    // since been fixed at the daemon.
+    //
+    // Fetch (and validate) the first page BEFORE opening the output sink.
+    // `File::create` truncates an existing `-o` target; doing that before we
+    // know the session exists / the daemon is reachable / the token is valid
+    // would destroy the user's file on a typo'd id or an auth failure
+    // (Story 5.4 review).
+    let mut since: i64 = 0;
+    let mut page = fetch_events_page(addr, token.expose_secret(), &args.session_id, since)?;
 
-    // Output sink. BufWriter keeps the per-event write from syscalling.
+    // Only now — after the first fetch succeeded — is it safe to (possibly)
+    // truncate the output path. BufWriter keeps the per-event write from
+    // syscalling.
     let (mut sink, output_label): (BufWriter<Box<dyn Write>>, String) = match args.output.as_deref()
     {
         Some(path) => {
@@ -113,40 +100,9 @@ pub fn run(args: ExportArgs) -> anyhow::Result<()> {
         ),
     };
 
-    let mut since: i64 = 0;
     let mut total_events: usize = 0;
 
     loop {
-        let response = daemon::http_get_events(
-            addr,
-            token.expose_secret(),
-            &args.session_id,
-            since,
-            EXPORT_PER_ATTEMPT,
-        );
-        let body_bytes = match response {
-            EventsResponse::Ok(b) => b,
-            EventsResponse::NotFound => {
-                anyhow::bail!("session {} not found", args.session_id);
-            }
-            EventsResponse::Status(401) => {
-                anyhow::bail!(
-                    "daemon rejected bearer token; check ~/.bowerbird/config.toml or BOWERBIRD_TOKEN"
-                );
-            }
-            EventsResponse::Status(code) => {
-                anyhow::bail!("daemon returned HTTP {code}");
-            }
-            EventsResponse::Unreachable => {
-                anyhow::bail!(
-                    "cannot reach daemon at {addr}; is it running? (try 'bowerbird start')"
-                );
-            }
-        };
-
-        let page: EventListResponse =
-            serde_json::from_slice(&body_bytes).context("parse /sessions/{id}/events response")?;
-
         for event in &page.events {
             // Per-event serialize. Each line is a complete JSON document.
             let line = serde_json::to_string(event).context("serialize Event to JSONL line")?;
@@ -175,6 +131,7 @@ pub fn run(args: ExportArgs) -> anyhow::Result<()> {
             }
             None => break,
         }
+        page = fetch_events_page(addr, token.expose_secret(), &args.session_id, since)?;
     }
 
     sink.flush().context("flush output sink")?;
@@ -186,4 +143,38 @@ pub fn run(args: ExportArgs) -> anyhow::Result<()> {
         args.session_id
     );
     Ok(())
+}
+
+/// Fetch and parse one page of `/sessions/{id}/events?since=<since>`, mapping
+/// the daemon's typed `EventsResponse` to `anyhow` errors. Extracted from the
+/// pagination loop so the first page can be fetched — and any
+/// not-found / auth / unreachable error surfaced — *before* the output file is
+/// opened and truncated (Story 5.4 review).
+fn fetch_events_page(
+    addr: SocketAddr,
+    token: &str,
+    session_id: &str,
+    since: i64,
+) -> anyhow::Result<EventListResponse> {
+    let body_bytes =
+        match daemon::http_get_events(addr, token, session_id, since, EXPORT_PER_ATTEMPT) {
+            EventsResponse::Ok(b) => b,
+            EventsResponse::NotFound => {
+                anyhow::bail!("session {session_id} not found");
+            }
+            EventsResponse::Status(401) => {
+                anyhow::bail!(
+                "daemon rejected bearer token; check ~/.bowerbird/config.toml or BOWERBIRD_TOKEN"
+            );
+            }
+            EventsResponse::Status(code) => {
+                anyhow::bail!("daemon returned HTTP {code}");
+            }
+            EventsResponse::Unreachable => {
+                anyhow::bail!(
+                    "cannot reach daemon at {addr}; is it running? (try 'bowerbird start')"
+                );
+            }
+        };
+    serde_json::from_slice(&body_bytes).context("parse /sessions/{id}/events response")
 }

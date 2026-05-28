@@ -246,6 +246,73 @@ fn install_twice_is_idempotent() {
     );
 }
 
+/// Story 5.4 AC #1: `bowerbird install` seeds the bundled `tool-reactions.toml`
+/// under `$BOWERBIRD_DATA_DIR/adapters/claude/` on first run, and a second
+/// install reports the file as already present without rewriting it.
+#[test]
+fn install_seeds_tool_reactions_on_fresh_bowerbird_dir() {
+    let dir = TempDir::new().expect("tempdir");
+    let settings = settings_path(&dir);
+    let data_dir = dir.path().join("bowerbird-data");
+    let seeded = data_dir
+        .join("adapters")
+        .join("claude")
+        .join("tool-reactions.toml");
+
+    let assertion = bowerbird_bin()
+        .arg("install")
+        .arg("--settings")
+        .arg(&settings)
+        .arg("--no-start")
+        .env("HOME", dir.path())
+        .env("BOWERBIRD_DATA_DIR", &data_dir)
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("seeded "),
+        "first install must announce the seed; stdout={stdout}"
+    );
+
+    assert!(seeded.exists(), "tool-reactions.toml must be seeded");
+    let bytes = fs::read(&seeded).expect("read seeded file");
+    assert!(
+        bytes.starts_with(b"# Claude Code tool name"),
+        "seeded bytes must come from the bundled file (header marker)"
+    );
+
+    // Mutate the seeded file; a second install must leave it untouched.
+    let custom = b"# user-edited\n[tool_reactions]\nCustom = \"Pause\"\n";
+    fs::write(&seeded, custom).expect("overwrite for idempotency probe");
+
+    let assertion = bowerbird_bin()
+        .arg("install")
+        .arg("--settings")
+        .arg(&settings)
+        .arg("--no-start")
+        .env("HOME", dir.path())
+        .env("BOWERBIRD_DATA_DIR", &data_dir)
+        .assert()
+        .success();
+    // The skip hint goes to STDERR so scripted stdout stays clean (Story 5.4
+    // review). stdout must NOT carry the skip line.
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("already exists; leaving user copy in place"),
+        "second install must announce the skip on stderr; stderr={stderr}"
+    );
+    assert!(
+        !stdout.contains("already exists; leaving user copy in place"),
+        "skip hint must not pollute stdout; stdout={stdout}"
+    );
+    let after = fs::read(&seeded).expect("read seeded file after re-install");
+    assert_eq!(
+        after, custom,
+        "second install must NOT overwrite the user-modified file"
+    );
+}
+
 /// CLI surface check: the `bowerbird --help` output mentions both subcommands
 /// story 3.1 wires (`install`, `uninstall`). Catches regressions where the
 /// clap derive grows a typo or a subcommand is accidentally dropped.

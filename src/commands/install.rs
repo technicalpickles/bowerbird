@@ -46,6 +46,32 @@ pub fn run(args: InstallArgs) -> anyhow::Result<()> {
         );
     }
 
+    // Story 5.4 AC #1 — seed the adapter's tool-reactions TOML from the
+    // bundled bytes. Skips silently when the user already has a copy.
+    let bowerbird_dir = super::resolve_bowerbird_dir()?;
+    match adapter_claude::seed_tool_reactions(&bowerbird_dir)
+        .with_context(|| format!("seed tool-reactions.toml under {}", bowerbird_dir.display()))?
+    {
+        adapter_claude::SeedOutcome::Wrote => {
+            println!(
+                "seeded {}/adapters/claude/tool-reactions.toml from bundled defaults",
+                bowerbird_dir.display()
+            );
+        }
+        adapter_claude::SeedOutcome::AlreadyPresent => {
+            // Hint goes to STDERR, not stdout: a script capturing `bowerbird
+            // install` stdout (e.g. to parse the "seeded ..." line) must not
+            // see this skip note interleaved. AC #1 also calls for a WARN-level
+            // log here; the CLI binary has no tracing subscriber wired yet, so
+            // the stderr line IS the operator signal for now. Wiring structured
+            // logging into the CLI is tracked in deferred-work.md.
+            eprintln!(
+                "note: {}/adapters/claude/tool-reactions.toml already exists; leaving user copy in place",
+                bowerbird_dir.display()
+            );
+        }
+    }
+
     if args.no_start {
         return Ok(());
     }

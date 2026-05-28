@@ -38,6 +38,24 @@ pub enum InstallError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to seed {path}: {source}")]
+    SeedWrite {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to rename tmp file over {path}: {source}")]
+    SeedRename {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "{path} exists but is not a regular file ({kind}); refusing to seed over it — \
+         the daemon reads tool-reactions.toml from this exact path, so remove the {kind} \
+         (or point your bowerbird data dir elsewhere) and re-run install"
+    )]
+    SeedTargetNotFile { path: PathBuf, kind: &'static str },
 }
 
 #[derive(Debug, thiserror::Error)]

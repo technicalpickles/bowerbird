@@ -7,6 +7,7 @@ pub mod status;
 pub mod token;
 pub mod ws;
 
+use std::any::Any;
 use std::time::Duration;
 
 use axum::extract::Request;
@@ -17,6 +18,7 @@ use axum::routing::{get, post};
 use axum::Router;
 use serde_json::json;
 use tower::ServiceBuilder;
+use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
@@ -126,22 +128,79 @@ pub fn router(state: AppState) -> Router {
         .layer(RequestBodyLimitLayer::new(BODY_LIMIT_BYTES))
         .layer(axum::middleware::from_fn(timeout_middleware));
 
-    // Cross-cut middleware applied to ALL routes including /ws — the
-    // upgrade itself is an HTTP request, so request-id and trace spans
-    // remain useful for it.
-    let common_stack = ServiceBuilder::new()
-        .layer(SetRequestIdLayer::new(
-            "x-request-id".parse().expect("static header name"),
-            MakeRequestUuid,
-        ))
-        .layer(PropagateRequestIdLayer::new(
-            "x-request-id".parse().expect("static header name"),
-        ))
-        .layer(TraceLayer::new_for_http().make_span_with(RedactedSpan));
+    let routed = Router::new().merge(http_routes).merge(ws_only);
+    apply_common_middleware(routed).with_state(state)
+}
 
-    Router::new()
-        .merge(http_routes)
-        .merge(ws_only)
-        .layer(common_stack)
-        .with_state(state)
+/// Apply the daemon's cross-cutting middleware stack (request-id, redacted
+/// tracing span, panic capture) to `router`.
+///
+/// Applied to ALL routes including `/ws` — the upgrade itself is an HTTP
+/// request, so request-id and trace spans remain useful for it.
+///
+/// Layer order matters. `ServiceBuilder` adds layers OUTSIDE-IN, so the source
+/// order below is also the request-direction order. `CatchPanicLayer` sits
+/// AFTER `TraceLayer` so a panicking handler's `tracing::error!` lands inside
+/// the request span (same `request_id`, method, path), and the 500 response we
+/// emit is still wrapped by `PropagateRequestIdLayer` on the way back out — so
+/// clients see the `x-request-id` header on the structured 500 the same way
+/// they would on a 200. Story 5.4 AC #2 closes the `deferred-work.md:63`
+/// `CatchPanicLayer` entry from Story 2.1.
+///
+/// Exposed (`#[doc(hidden)]`, generic over the router state) so the Story 5.4
+/// `CatchPanicLayer` contract test can drive a panic through this *exact*
+/// production stack while owning its own throwaway `/__panic` route — the
+/// shipped API never serves a panic-triggering route. This is the
+/// "test-only middleware builder" alternative to baking a test route into the
+/// public router.
+#[doc(hidden)]
+pub fn apply_common_middleware<S>(router: Router<S>) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    router.layer(
+        ServiceBuilder::new()
+            .layer(SetRequestIdLayer::new(
+                "x-request-id".parse().expect("static header name"),
+                MakeRequestUuid,
+            ))
+            .layer(PropagateRequestIdLayer::new(
+                "x-request-id".parse().expect("static header name"),
+            ))
+            .layer(TraceLayer::new_for_http().make_span_with(RedactedSpan))
+            .layer(CatchPanicLayer::custom(catch_panic_response)),
+    )
+}
+
+/// `CatchPanicLayer::custom` callback. Turns a captured panic payload into a
+/// structured `500 Internal Server Error` and logs the payload via `tracing`
+/// so the panic shows up in the same request-id-scoped span the trace layer
+/// opens. The single-threaded tokio runtime would otherwise die on an
+/// unwrapped handler panic.
+fn catch_panic_response(panic_payload: Box<dyn Any + Send + 'static>) -> Response {
+    let payload = panic_payload_string(&panic_payload);
+    tracing::error!(
+        panic_payload = %payload,
+        "handler panic caught by CatchPanicLayer"
+    );
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": "internal panic" })),
+    )
+        .into_response()
+}
+
+/// Downcast a panic payload into a human-readable string. Mirrors the in-repo
+/// precedent at `crates/daemon/src/lib.rs::panic_payload_to_string`, which
+/// pulls the same shape out of a `std::panic::PanicHookInfo`. We can't reuse
+/// that function directly here because `CatchPanicLayer` hands us a
+/// `Box<dyn Any>` (no `PanicHookInfo` wrapper).
+fn panic_payload_string(payload: &Box<dyn Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "<non-string panic payload>".to_string()
 }

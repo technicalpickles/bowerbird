@@ -109,19 +109,16 @@ feature so even an env-var injection cannot bypass the real keychain.
 
 ### `tool-reactions.toml` placement
 
-The tarball includes `adapters/claude/tool-reactions.toml`, the bundled data
-file the adapter reads at runtime to classify tool reactions. The install
-flow does NOT auto-copy this into `~/.bowerbird/`. Place it manually:
+`bowerbird install` automatically seeds `~/.bowerbird/adapters/claude/tool-reactions.toml`
+from the copy bundled into the `bowerbird` binary (the same bytes that ship
+in the tarball at `adapters/claude/tool-reactions.toml`). If you have
+previously hand-edited the file the install command leaves it untouched and
+prints a `note:` to that effect, so re-running `bowerbird install` after a
+version bump never clobbers your local additions.
 
-```sh
-mkdir -p ~/.bowerbird/adapters/claude
-cp adapters/claude/tool-reactions.toml ~/.bowerbird/adapters/claude/
-```
-
-The daemon will run without this file — the adapter falls back to
-`Reaction::Unknown` for any tool not present in the TOML — but reactions
-will be unhelpfully generic. Auto-copy on install is tracked in
-`docs/bmad/implementation-artifacts/deferred-work.md`.
+If the daemon ever runs without this file, the adapter falls back to
+`Reaction::Unknown` for any tool not present in the TOML — reactions still
+flow, they just become unhelpfully generic.
 
 ## 4. Confirm Claude Code is hooked
 

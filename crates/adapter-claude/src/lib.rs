@@ -7,7 +7,9 @@ pub mod install;
 pub(crate) mod normalize;
 
 pub use error::InstallError;
-pub use install::{install, uninstall, InstallOutcome, UninstallOutcome};
+pub use install::{
+    install, seed_tool_reactions, uninstall, InstallOutcome, SeedOutcome, UninstallOutcome,
+};
 
 pub struct ClaudeAdapter {
     tool_reactions_path: PathBuf,

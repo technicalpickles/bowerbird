@@ -17,6 +17,12 @@
 # last_updated: 2026-05-28 (Story 5.3 → review; dev-story session complete — 18 tasks done, 19 ACs satisfied, workspace tests + fmt + clippy green, hermetic smoke validated)
 # last_updated: 2026-05-28 (Story 5.3 → in-progress; bmad-code-review documented unresolved decision/patch findings)
 # last_updated: 2026-05-28 (Story 5.3 → review; all seven code-review findings resolved — PID-only documented + carry-forward hardened, stale-snapshot writer-txn guard, ProbeReport surfaces failures, PID 0 filtered at adapter, cancellation in probe per-row loop, deterministic missed-tick test, four new WS-frame additive-compat tests)
+# last_updated: 2026-05-28 (Story 5.3 → done; all code-review findings resolved + intermittent workspace-test hang documented as known issue)
+# last_updated: 2026-05-28 (Story 5.4 install-ux-polish-and-middleware-closure created via bmad-create-story; 5 ACs + 9 tasks; → ready-for-dev)
+# last_updated: 2026-05-28 (Story 5.4 → in-progress; dev-story session started)
+# last_updated: 2026-05-28 (Story 5.4 → review; dev-story session complete — 9 tasks done, 5 ACs satisfied, workspace tests + fmt + clippy + changelog gate green; pre-existing lint-connection-factory violations from Story 5.3 surfaced in completion notes)
+# last_updated: 2026-05-28 (Story 5.4 → in-progress; bmad-code-review documented unresolved patch findings)
+# last_updated: 2026-05-28 (Story 5.4 → review; all nine code-review patch findings resolved — seed atomicity/0700/non-file safety, install stderr hint [WARN-log deferred], export pre-truncation guard, full-row migration snapshot, panic route removed via apply_common_middleware, smoke-test teardown, committed example lockfiles + fixed latent reconnect-recovery typecheck errors)
 # project: bowerbird
 # project_key: NOKEY
 # tracking_system: file-system
@@ -52,7 +58,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-05-16
-last_updated: 2026-05-28 (Story 5.3 → review; all seven code-review findings resolved)
+last_updated: 2026-05-28 (Story 5.4 → review; code-review findings resolved)
 project: bowerbird
 project_key: NOKEY
 tracking_system: file-system
@@ -106,8 +112,8 @@ development_status:
   epic-5: in-progress
   5-1-first-party-presenter-tool: in-progress
   5-2-session-state-projection-correctness: done
-  5-3-session-process-liveness-pid-capture: review
-  5-4-install-ux-polish-and-middleware-closure: backlog
+  5-3-session-process-liveness-pid-capture: done
+  5-4-install-ux-polish-and-middleware-closure: review
   5-5-bench-gates-load-bearing: backlog
   5-6-release-pipeline-end-to-end-verification: backlog
   5-7-cookbook-consolidation: backlog

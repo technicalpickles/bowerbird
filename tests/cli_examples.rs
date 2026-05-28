@@ -523,15 +523,17 @@ fn event_log_viewer_defaults_to_session_alpha_when_no_arg() {
 // null `cursor` for unknown sessions (not HTTP 404), so the example's loop
 // exits its first iteration without printing any rows and returns exit 0.
 //
-// Discovery note: the example's `if (res.status === 404)` branch in
-// `examples/event-log-viewer/src/index.ts:100-103` is structurally dead
-// against the current daemon REST surface — sessions REST returns 200 for
-// any session id. Leaving the branch in place is defensive against a future
-// API tightening; this test pins the *current* "200 OK + empty" contract.
+// Story 5.4 update: `GET /sessions/{id}/events` now returns `404 Not Found`
+// for an id with no `session_projections` row — see protocol-changelog.md
+// v1.0 → v1.1. The example's `if (res.status === 404)` branch in
+// `examples/event-log-viewer/src/index.ts:100-103` (previously structurally
+// dead against the 200-empty quirk) is now load-bearing. This test pins the
+// 404 contract: the example exits non-zero with a `session ... not found`
+// stderr instead of silently rendering an empty stream.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn event_log_viewer_renders_empty_for_unknown_session() {
+fn event_log_viewer_surfaces_404_for_unknown_session() {
     if !node_22_6_available() {
         return;
     }
@@ -547,27 +549,23 @@ fn event_log_viewer_renders_empty_for_unknown_session() {
     );
 
     let status = child.wait().expect("event-log-viewer (unknown) wait");
-    if !status.success() {
-        let diag = dump_child_diagnostics("event-log-viewer-unknown", &mut child);
-        force_stop(&tmp);
-        panic!(
-            "event-log-viewer should exit 0 for an unknown session (daemon \
-             returns 200 OK + empty events); got: {status:?}\n{diag}"
-        );
-    }
+    let diag = dump_child_diagnostics("event-log-viewer-unknown", &mut child);
 
-    use std::io::Read;
-    let mut stdout = String::new();
-    if let Some(mut s) = child.stdout.take() {
-        let _ = s.read_to_string(&mut stdout);
-    }
-    assert!(
-        stdout.trim().is_empty(),
-        "event-log-viewer should print no rows for an unknown session; got stdout:\n{stdout}"
-    );
-
+    // Tear the daemon down BEFORE asserting so a failing assertion can't leave
+    // the test daemon running (Story 5.4 review). Both calls are the standard
+    // idempotent teardown used by the success paths in this file.
     stop_daemon(&tmp);
     force_stop(&tmp);
+
+    assert!(
+        !status.success(),
+        "event-log-viewer should exit non-zero when the daemon returns 404 \
+         for an unknown session; got: {status:?}\n{diag}"
+    );
+    assert!(
+        diag.contains("session definitely-not-a-real-session not found"),
+        "expected 'session ... not found' on stderr per the 404 branch; got:\n{diag}"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -16,7 +16,7 @@ use serde_json::json;
 
 use crate::db::queries::{
     event_kind_from_db_str, reaction_from_db_string, SELECT_EVENTS_FOR_SESSION_SINCE,
-    SELECT_MIN_EVENT_ID,
+    SELECT_MIN_EVENT_ID, SELECT_SESSION_EXISTS_BY_ID,
 };
 use crate::state::AppState;
 
@@ -51,11 +51,30 @@ pub async fn list(
         i64,
         Option<u32>,
     );
+    // Story 5.4 AC #5 — existence probe runs inside the same `interact`
+    // closure as the events SELECT so both reads see the same SQLite
+    // snapshot. A `QueryReturnedNoRows` here means the session_id has never
+    // been observed (no `session_projections` row) and we return 404 — same
+    // shape as `/sessions/{id}` and `/sessions/{id}/stats`. The previous
+    // behavior (`200 {events:[], cursor: null, oldest_available_event_id:
+    // i64::MAX}`) silently masked typos on `?since=0` calls.
+    enum InteractResult {
+        Found {
+            rows: Vec<EventRow>,
+            min: Option<i64>,
+        },
+        SessionNotFound,
+    }
     let interact = conn
         .interact({
             let id_for_select = id.clone();
             let since = params.since;
-            move |c| -> rusqlite::Result<(Vec<EventRow>, Option<i64>)> {
+            move |c| -> rusqlite::Result<InteractResult> {
+                let exists = c.query_row(SELECT_SESSION_EXISTS_BY_ID, [&id_for_select], |_| Ok(()));
+                if matches!(exists, Err(rusqlite::Error::QueryReturnedNoRows)) {
+                    return Ok(InteractResult::SessionNotFound);
+                }
+                exists?;
                 let rows: Vec<EventRow> = {
                     let mut stmt = c.prepare(SELECT_EVENTS_FOR_SESSION_SINCE)?;
                     let mapped = stmt.query_map(rusqlite::params![id_for_select, since], |r| {
@@ -73,12 +92,19 @@ pub async fn list(
                     mapped.collect::<rusqlite::Result<Vec<_>>>()?
                 };
                 let min: Option<i64> = c.query_row(SELECT_MIN_EVENT_ID, [], |r| r.get(0))?;
-                Ok((rows, min))
+                Ok(InteractResult::Found { rows, min })
             }
         })
         .await;
     let (raw_rows, min_event_id) = match interact {
-        Ok(Ok(t)) => t,
+        Ok(Ok(InteractResult::Found { rows, min })) => (rows, min),
+        Ok(Ok(InteractResult::SessionNotFound)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "session not found" })),
+            )
+                .into_response();
+        }
         Ok(Err(e)) => {
             tracing::error!(error = %e, "events query failed in /sessions/{{id}}/events");
             return internal_error();

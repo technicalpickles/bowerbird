@@ -173,9 +173,6 @@ test("recover handles an unrecoverable gap (cursor predates oldest_available)", 
   // Capture stderr writes to assert the gap warning fires. Restore on exit.
   const stderrChunks: string[] = [];
   const origWrite = process.stderr.write.bind(process.stderr);
-  // @ts-expect-error -- Node's stderr.write overloads are awkward to shim
-  // with the bound function's exact signature; the runtime behavior is
-  // identical (write returns boolean, accepts string|Buffer).
   process.stderr.write = (chunk: string | Buffer): boolean => {
     stderrChunks.push(typeof chunk === "string" ? chunk : chunk.toString());
     return true;

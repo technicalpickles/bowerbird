@@ -57,6 +57,16 @@ pub const SELECT_EVENTS_FOR_SESSION_SINCE: &str =
      WHERE source != '__daemon__' AND session_id = ? AND event_id > ? \
      ORDER BY event_id ASC";
 
+/// Story 5.4 — existence probe for `GET /sessions/{id}/events`. Mirrors the
+/// shape of [`SELECT_SESSION_BY_ID`] so the events endpoint and the
+/// `/sessions/{id}` endpoint agree on what "session exists" means: there is
+/// at least one non-sentinel `session_projections` row for the id. Used
+/// before the actual events SELECT inside the same `conn.interact` closure
+/// so both reads see the same SQLite snapshot.
+pub const SELECT_SESSION_EXISTS_BY_ID: &str = "SELECT 1 FROM session_projections \
+     WHERE session_id = ? AND source != '__daemon__' \
+     LIMIT 1";
+
 pub const SELECT_MIN_EVENT_ID: &str =
     "SELECT MIN(event_id) FROM events WHERE source != '__daemon__'";
 

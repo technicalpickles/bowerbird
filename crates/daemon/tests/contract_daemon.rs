@@ -2550,8 +2550,13 @@ mod story_1_7_rest {
         );
     }
 
+    // Story 5.4 AC #5: requesting `/events` for a session_id that has never
+    // had a projection row returns 404, not 200-with-empty. The legitimate
+    // "session exists, no new events past `since`" case is covered by the
+    // `events_list_respects_since_cursor` and `events_200_for_existing_session_with_no_new_events`
+    // (in `story_5_4_events_404` below) tests.
     #[tokio::test(flavor = "current_thread")]
-    async fn events_list_returns_empty_with_none_cursor() {
+    async fn events_list_returns_404_for_unknown_session() {
         let (_tmp, pools) = fresh_pools().await;
         // Do not write any non-sentinel events; the session simply doesn't exist.
         let app = api::router(ready_state(pools));
@@ -2559,11 +2564,9 @@ mod story_1_7_rest {
             .oneshot(auth_get("/sessions/no-such/events?since=0"))
             .await
             .expect("oneshot");
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body: EventListResponse = json_body(resp).await;
-        assert!(body.events.is_empty());
-        assert_eq!(body.cursor, None);
-        assert_eq!(body.oldest_available_event_id.0, i64::MAX);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body: serde_json::Value = json_body(resp).await;
+        assert_eq!(body, serde_json::json!({ "error": "session not found" }));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -8458,5 +8461,373 @@ mod story_5_3_liveness {
 
         shutdown.cancel();
         loop_task.await.expect("loop task");
+    }
+}
+
+// ─── Story 5.4 — CatchPanicLayer middleware ─────────────────────────────────
+
+#[cfg(test)]
+mod story_5_4_catch_panic {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use axum::Router;
+    use tower::ServiceExt;
+
+    /// Story 5.4 AC #2: a handler panic returns `500 Internal Server Error`
+    /// with the structured JSON body `{"error":"internal panic"}` and the
+    /// `x-request-id` header propagated by `PropagateRequestIdLayer`. A
+    /// subsequent request to `/healthz` against the SAME router instance
+    /// proves the daemon survived the panic (the tokio runtime did not die,
+    /// no tower-level connection close left the next handler unreachable).
+    ///
+    /// The panic route lives HERE in the test, not in the shipped API surface.
+    /// We exercise the production middleware via `api::apply_common_middleware`
+    /// so the contract is proven against the real `CatchPanicLayer` stack
+    /// without the daemon binary ever compiling an unauthenticated `/__panic`
+    /// route.
+    #[tokio::test(flavor = "current_thread")]
+    async fn catch_panic_layer_returns_500_and_keeps_daemon_alive() {
+        let app: Router = api::apply_common_middleware(
+            Router::new()
+                .route(
+                    "/__panic",
+                    get(|| async {
+                        panic!("test panic from /__panic");
+                        // The `panic!` diverges; the trailing value only gives
+                        // the closure a concrete `IntoResponse` return type.
+                        #[allow(unreachable_code)]
+                        StatusCode::OK
+                    }),
+                )
+                .route("/healthz", get(|| async { StatusCode::OK })),
+        );
+
+        // Trigger the panic.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/__panic")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("oneshot through CatchPanicLayer");
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "CatchPanicLayer must turn a handler panic into a 500"
+        );
+        assert!(
+            resp.headers().contains_key("x-request-id"),
+            "PropagateRequestIdLayer must still set x-request-id on the 500 response"
+        );
+        let bytes = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read 500 body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("body must be JSON");
+        assert_eq!(body, serde_json::json!({ "error": "internal panic" }));
+
+        // The daemon (the single-threaded tokio runtime + the Router service)
+        // must still serve other routes. /healthz is the cheapest probe.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("oneshot /healthz after caught panic");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "/healthz must still serve 200 after a caught panic"
+        );
+    }
+}
+
+// ─── Story 5.4 — /events 404 for unknown sessions ───────────────────────────
+
+#[cfg(test)]
+mod story_5_4_events_404 {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{header, Request, StatusCode};
+    use protocol::EventListResponse;
+    use tower::ServiceExt;
+
+    fn bearer_header() -> String {
+        format!("Bearer {}", super::TEST_BEARER)
+    }
+
+    fn ready_state(pools: DbPools) -> AppState {
+        let mc = Arc::new(AtomicBool::new(true));
+        super::make_test_state(pools, mc)
+    }
+
+    fn auth_get(uri: &str) -> Request<Body> {
+        Request::builder()
+            .uri(uri)
+            .header(header::AUTHORIZATION, bearer_header())
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    async fn json_body<T: serde::de::DeserializeOwned>(resp: axum::response::Response) -> T {
+        let bytes = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        serde_json::from_slice(&bytes).expect("parse json")
+    }
+
+    /// Story 5.4 AC #5: `GET /sessions/{id}/events?since=<n>` for an id with
+    /// no `session_projections` row returns `404` with body
+    /// `{"error":"session not found"}` — the same shape `/sessions/{id}` and
+    /// `/sessions/{id}/stats` already use. Previously the endpoint returned
+    /// `200 {events:[], cursor:null, oldest_available_event_id:i64::MAX}` for
+    /// any id including typos.
+    #[tokio::test(flavor = "current_thread")]
+    async fn events_404_for_unknown_session() {
+        let (_tmp, pools) = fresh_pools().await;
+        let app = api::router(ready_state(pools));
+        let resp = app
+            .oneshot(auth_get("/sessions/never-existed/events?since=0"))
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body: serde_json::Value = json_body(resp).await;
+        assert_eq!(body, serde_json::json!({ "error": "session not found" }));
+    }
+
+    /// Story 5.4 AC #5: the new 404 gate must not break the legitimate
+    /// "session exists, no events past my cursor" case — that returns 200
+    /// with an empty `events` array and `cursor: None`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn events_200_for_existing_session_with_no_new_events() {
+        let (_tmp, pools) = fresh_pools().await;
+        let hub = BroadcastHub::new(16);
+        let last_id = projection::session::write(
+            &pools.writer,
+            &hub,
+            EventEnvelope {
+                source: "claude".to_string(),
+                session_id: "sess-tail".to_string(),
+                kind: EventKind::PreToolUse,
+                reaction: None,
+                payload: "{}".to_string(),
+                pid: None,
+                notification_type: None,
+            },
+        )
+        .await
+        .expect("write");
+
+        let app = api::router(ready_state(pools));
+        let resp = app
+            .oneshot(auth_get(&format!(
+                "/sessions/sess-tail/events?since={}",
+                last_id.0
+            )))
+            .await
+            .expect("oneshot");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "existing session with no new events must remain 200"
+        );
+        let body: EventListResponse = json_body(resp).await;
+        assert!(body.events.is_empty(), "no new events past cursor");
+        assert_eq!(body.cursor, None);
+    }
+}
+
+// ─── Story 5.4 — Migration idempotency on a populated DB ────────────────────
+
+#[cfg(test)]
+mod story_5_4_migrations {
+    use super::*;
+
+    /// Every column of an `events` row, in schema order
+    /// (`event_id, source, session_id, kind, reaction, payload, created_at, pid`).
+    type EventRow = (
+        i64,
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        i64,
+        Option<i64>,
+    );
+    /// Every column of a `session_projections` row, in schema order
+    /// (`source, session_id, state, updated_at`).
+    type ProjRow = (String, String, String, i64);
+
+    /// Full deterministic snapshot of the schema version and every row in both
+    /// tables. Capturing whole rows (not just counts + one sampled `pid`) is
+    /// what lets the idempotency assertion catch a future migration that
+    /// *rewrites* existing data — payloads, timestamps, projection state — while
+    /// leaving row counts and `user_version` untouched (Story 5.4 review).
+    fn migration_snapshot(
+        c: &rusqlite::Connection,
+    ) -> rusqlite::Result<(i64, Vec<EventRow>, Vec<ProjRow>)> {
+        let user_version: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        let events = c
+            .prepare(
+                "SELECT event_id, source, session_id, kind, reaction, payload, created_at, pid \
+                 FROM events ORDER BY event_id",
+            )?
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<EventRow>>>()?;
+        let projections = c
+            .prepare(
+                "SELECT source, session_id, state, updated_at \
+                 FROM session_projections ORDER BY source, session_id",
+            )?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<rusqlite::Result<Vec<ProjRow>>>()?;
+        Ok((user_version, events, projections))
+    }
+
+    /// Story 5.4 AC #4: re-running `run_migrations` against a populated,
+    /// file-backed SQLite DB is a strict no-op — `PRAGMA user_version` stays
+    /// put, every seeded `events` and `session_projections` row survives,
+    /// the schema-v2 `events.pid` column reads back as written, and no
+    /// `Error::Migration` surfaces. The unit test
+    /// `migrations.rs::tests::migrations_are_idempotent` (Story 5.3) covers
+    /// the `:memory:` baseline; this contract test is the populated-DB
+    /// follow-on the deferred-work entry at `deferred-work.md:17` asked for.
+    #[tokio::test(flavor = "current_thread")]
+    async fn migrations_idempotent_on_populated_db() {
+        let tmp = TempDir::new().expect("tempdir");
+        let db_path = tmp.path().join("bower.db");
+
+        let before = {
+            let pools = init_pools(&db_path).await.expect("init_pools 1");
+            run_migrations(&pools.writer).await.expect("migrate 1");
+
+            // Seed the DB with three events across two sessions; mixed
+            // EventKind variants. One row carries a real PID so the v2
+            // `events.pid` column is exercised end-to-end.
+            let hub = BroadcastHub::new(16);
+            projection::session::write(
+                &pools.writer,
+                &hub,
+                EventEnvelope {
+                    source: "claude".to_string(),
+                    session_id: "sess-A".to_string(),
+                    kind: EventKind::PreToolUse,
+                    reaction: None,
+                    payload: r#"{"tool":"Bash"}"#.to_string(),
+                    pid: Some(4242),
+                    notification_type: None,
+                },
+            )
+            .await
+            .expect("write sess-A PreToolUse");
+            projection::session::write(
+                &pools.writer,
+                &hub,
+                EventEnvelope {
+                    source: "claude".to_string(),
+                    session_id: "sess-A".to_string(),
+                    kind: EventKind::PostToolUse,
+                    reaction: None,
+                    payload: "{}".to_string(),
+                    pid: None,
+                    notification_type: None,
+                },
+            )
+            .await
+            .expect("write sess-A PostToolUse");
+            projection::session::write(
+                &pools.writer,
+                &hub,
+                EventEnvelope {
+                    source: "claude".to_string(),
+                    session_id: "sess-B".to_string(),
+                    kind: EventKind::Stop,
+                    reaction: None,
+                    payload: "{}".to_string(),
+                    pid: None,
+                    notification_type: None,
+                },
+            )
+            .await
+            .expect("write sess-B Stop");
+
+            let conn = pools.reader.get().await.expect("reader get");
+            let snapshot = conn
+                .interact(|c| migration_snapshot(c))
+                .await
+                .expect("interact")
+                .expect("snapshot query");
+            // Pool drops here. WAL is left on disk; the next init_pools picks
+            // it up via WAL recovery on open.
+            snapshot
+        };
+
+        let (user_version_before, ref events_before, ref projections_before) = before;
+        assert!(
+            user_version_before >= 2,
+            "expected user_version >= 2 after initial migrations, got {user_version_before}"
+        );
+        assert_eq!(events_before.len(), 3, "three events seeded");
+        assert_eq!(
+            projections_before.len(),
+            2,
+            "two non-sentinel session projections seeded"
+        );
+        // The schema-v2 `events.pid` column round-trips on the one seeded row
+        // that carried a PID.
+        let seeded_pid = events_before
+            .iter()
+            .find(|e| e.2 == "sess-A" && e.3 == "PreToolUse")
+            .and_then(|e| e.7);
+        assert_eq!(seeded_pid, Some(4242), "v2 pid column round-trips");
+
+        // Re-open the pool against the SAME file and re-run migrations. The
+        // contract: zero schema mutation, zero row mutation, no error.
+        let pools = init_pools(&db_path).await.expect("init_pools 2");
+        run_migrations(&pools.writer)
+            .await
+            .expect("re-running run_migrations against a populated DB must be Ok");
+
+        let conn = pools.reader.get().await.expect("reader get");
+        let after = conn
+            .interact(|c| migration_snapshot(c))
+            .await
+            .expect("interact")
+            .expect("post-migration snapshot query");
+
+        // Whole-snapshot equality is the strong form of "zero rows changed":
+        // user_version, every events row (incl. payload, created_at, pid), and
+        // every session_projections row must be byte-for-byte identical.
+        assert_eq!(
+            after.0, before.0,
+            "PRAGMA user_version must be unchanged after a repeat run_migrations"
+        );
+        assert_eq!(
+            after.1, before.1,
+            "every events row must be byte-for-byte unchanged across a repeat run_migrations"
+        );
+        assert_eq!(
+            after.2, before.2,
+            "every session_projections row must be byte-for-byte unchanged across a repeat run_migrations"
+        );
     }
 }

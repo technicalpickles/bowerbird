@@ -118,7 +118,7 @@ All authenticated routes return `401 Unauthorized` on a missing or malformed bea
 
 - **Auth.** Bearer required.
 - **Request.** `?since=<EventId>` query parameter (i64). `since=0` for the start of history.
-- **Response.** `200 OK` with an `EventListResponse` JSON body:
+- **Response.** `404 Not Found` with body `{"error":"session not found"}` if the `session_id` has never existed (no row in `session_projections`); otherwise `200 OK` with an `EventListResponse` JSON body:
 
   ```json
   {

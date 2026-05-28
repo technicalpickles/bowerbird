@@ -40,6 +40,35 @@ jobs:
       # price for eliminating an entire class of flake source.
       - run: cargo test --workspace -- --test-threads=1
 
+  typecheck-examples:
+    name: Typecheck TypeScript examples (tsc --noEmit)
+    # Story 5.4 / AC #3. Story 4.2's smoke test (`tests/cli_examples.rs`)
+    # exercises the examples via `node --experimental-strip-types` — that
+    # catches runtime regressions but lets type errors that don't manifest at
+    # runtime slip through. This job runs each example's existing `typecheck`
+    # script (`tsc --noEmit`) as a peer job so a TS-only failure is visible
+    # in the GitHub PR status separately from the Rust workspace tests.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.6'
+      - name: Verify Node version (>=22.6 required for --experimental-strip-types)
+        shell: bash
+        run: node --version | grep -E '^v22\.[6-9]|^v22\.[1-9][0-9]+|^v2[3-9]|^v[3-9]'
+      - name: Typecheck each example
+        shell: bash
+        run: |
+          set -euxo pipefail
+          for d in examples/*/; do
+            (cd "$d" && npm ci && npm run typecheck)
+          done
+
   shim-bench-gate:
     name: Shim hot-path bench (p99 ≤ 5ms, +15% regression fails)
     strategy:

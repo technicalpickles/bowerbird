@@ -67,8 +67,9 @@ mod tests {
     use super::*;
 
     // Story 5.3: re-running `to_latest` against an already-migrated DB must be
-    // a no-op (Story 5.4's migration-idempotency contract test will be the
-    // broader gate; this is the bridge until that lands).
+    // a no-op. Story 5.4 added the populated-DB contract test in
+    // `crates/daemon/tests/contract_daemon.rs::story_5_4_migrations`; this unit
+    // test stays as the in-memory baseline canary.
     #[test]
     fn migrations_are_idempotent() {
         let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory connection");

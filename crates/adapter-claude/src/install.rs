@@ -64,6 +64,28 @@ pub struct InstallOutcome {
     pub legacy_upgrade_detected: bool,
 }
 
+/// Outcome of [`seed_tool_reactions`].
+///
+/// `Wrote` when the bundled `tool-reactions.toml` was atomically written into
+/// `bowerbird_dir`'s `adapters/claude/` subdirectory; `AlreadyPresent` when a
+/// file was already on disk and the seed step left it untouched. The CLI uses
+/// this to print a per-outcome line; downstream callers can branch on it for
+/// other UX decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeedOutcome {
+    /// The file did not exist; the bundled bytes were written atomically.
+    Wrote,
+    /// A file already existed at the target path; nothing was written.
+    AlreadyPresent,
+}
+
+/// Bundled `adapters/claude/tool-reactions.toml` contents embedded into the
+/// `bowerbird` CLI binary at compile time. Path is relative to this source
+/// file — `crates/adapter-claude/src/install.rs` → workspace root via three
+/// `..` segments.
+const BUNDLED_TOOL_REACTIONS_TOML: &[u8] =
+    include_bytes!("../../../adapters/claude/tool-reactions.toml");
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UninstallOutcome {
     /// True when `settings.json` existed prior to the call.
@@ -151,6 +173,166 @@ pub fn uninstall(settings_path: &Path) -> Result<UninstallOutcome, InstallError>
         }
     }
     unreachable!("retry loop must either return or exhaust");
+}
+
+/// Seed `<bowerbird_dir>/adapters/claude/tool-reactions.toml` from the bundled
+/// bytes baked into the binary at build time, leaving any pre-existing file
+/// untouched.
+///
+/// Story 5.4 AC #1. The bundled bytes come from
+/// `adapters/claude/tool-reactions.toml` at the workspace root via
+/// `include_bytes!`, so `cargo install --git --tag` users and tarball users
+/// land on the same content without depending on the install command's cwd.
+///
+/// Writes use the same tmp + fsync + rename idiom as [`atomic_write`] but
+/// without the concurrent-writer detection baseline — this is a one-shot
+/// "create only if missing," not a JSON merge.
+pub fn seed_tool_reactions(bowerbird_dir: &Path) -> Result<SeedOutcome, InstallError> {
+    let target = bowerbird_dir
+        .join("adapters")
+        .join("claude")
+        .join("tool-reactions.toml");
+
+    // Decide based on what is *actually* at the path. `symlink_metadata` does
+    // NOT follow symlinks, so a dangling symlink reports as a symlink (not
+    // `NotFound`) and a directory reports as a directory. Both are non-files we
+    // must refuse rather than silently report as "already seeded": the daemon
+    // opens this path expecting a TOML file, and a directory or dangling link
+    // there means install would claim a working state the runtime can't use.
+    match fs::symlink_metadata(&target) {
+        Ok(meta) if meta.file_type().is_file() => return Ok(SeedOutcome::AlreadyPresent),
+        Ok(meta) => {
+            return Err(InstallError::SeedTargetNotFile {
+                path: target,
+                kind: describe_non_file(meta.file_type()),
+            });
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(InstallError::SeedWrite {
+                path: target,
+                source: e,
+            });
+        }
+    }
+
+    let parent = target
+        .parent()
+        .expect("target path is a join of bowerbird_dir + adapters/claude/tool-reactions.toml; parent always exists");
+    // 0700 on Unix: this directory holds the user's adapter config; a default
+    // umask-derived mode could leave it group/world-readable.
+    create_dir_all_private(parent).map_err(|e| InstallError::SeedWrite {
+        path: target.clone(),
+        source: e,
+    })?;
+
+    let tmp_path = tmp_path_for(&target);
+    {
+        let mut file =
+            seed_file_open_for_write(&tmp_path).map_err(|e| InstallError::SeedWrite {
+                path: target.clone(),
+                source: e,
+            })?;
+        file.write_all(BUNDLED_TOOL_REACTIONS_TOML)
+            .map_err(|e| InstallError::SeedWrite {
+                path: target.clone(),
+                source: e,
+            })?;
+        file.sync_all().map_err(|e| InstallError::SeedWrite {
+            path: target.clone(),
+            source: e,
+        })?;
+    }
+
+    // Publish via `link(2)`, NOT `rename(2)`. `rename` silently replaces an
+    // existing target; `link` fails with `EEXIST` if anything already occupies
+    // the path. That closes the check-then-write TOCTOU window: if a concurrent
+    // install (or the user) created the file between our `symlink_metadata`
+    // probe above and now, we lose the link race and leave their copy
+    // untouched instead of clobbering it. The tmp file inherits the 0600 mode
+    // from `create_new`; the published link points at the same inode.
+    let publish = fs::hard_link(&tmp_path, &target);
+    // Always drop the tmp link regardless of outcome — on success the target is
+    // a second link to the same inode; on failure we don't want to leak it.
+    let _ = fs::remove_file(&tmp_path);
+    match publish {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // The target appeared between our probe and the link. Re-stat and
+            // honor the same file-vs-non-file contract as the up-front check.
+            return match fs::symlink_metadata(&target) {
+                Ok(meta) if meta.file_type().is_file() => Ok(SeedOutcome::AlreadyPresent),
+                Ok(meta) => Err(InstallError::SeedTargetNotFile {
+                    path: target,
+                    kind: describe_non_file(meta.file_type()),
+                }),
+                Err(e) => Err(InstallError::SeedRename {
+                    path: target,
+                    source: e,
+                }),
+            };
+        }
+        Err(e) => {
+            return Err(InstallError::SeedRename {
+                path: target,
+                source: e,
+            });
+        }
+    }
+
+    // Best-effort parent fsync so the new link is durable; matches `atomic_write`.
+    if let Ok(dir) = fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+    Ok(SeedOutcome::Wrote)
+}
+
+/// Short human-readable descriptor for a non-regular-file [`fs::FileType`],
+/// used in the [`InstallError::SeedTargetNotFile`] message.
+fn describe_non_file(file_type: fs::FileType) -> &'static str {
+    if file_type.is_dir() {
+        "directory"
+    } else if file_type.is_symlink() {
+        "symlink"
+    } else {
+        "non-regular file"
+    }
+}
+
+/// `create_dir_all` that stamps every directory it creates with mode 0700 on
+/// Unix. 0700 is below any reasonable umask, so the bits survive
+/// `mode & !umask`. Existing ancestors are left as-is (same as
+/// `fs::create_dir_all`).
+#[cfg(unix)]
+fn create_dir_all_private(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+}
+
+#[cfg(not(unix))]
+fn create_dir_all_private(path: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(path)
+}
+
+#[cfg(unix)]
+fn seed_file_open_for_write(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn seed_file_open_for_write(path: &Path) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
 }
 
 #[derive(Default)]
@@ -822,6 +1004,132 @@ mod tests {
         assert!(
             !outcome.legacy_upgrade_detected,
             "an install that already had all five hooks is not a legacy upgrade"
+        );
+    }
+
+    // Story 5.4 Task 1 — `seed_tool_reactions` writes the bundled file when
+    // missing, leaves an existing file untouched, and creates parent dirs.
+
+    #[test]
+    fn seed_tool_reactions_writes_when_missing() {
+        let dir = TempDir::new().unwrap();
+        let outcome = seed_tool_reactions(dir.path()).expect("seed must succeed");
+        assert_eq!(outcome, SeedOutcome::Wrote);
+        let target = dir
+            .path()
+            .join("adapters")
+            .join("claude")
+            .join("tool-reactions.toml");
+        let bytes = fs::read(&target).expect("seeded file must be readable");
+        assert_eq!(
+            bytes, BUNDLED_TOOL_REACTIONS_TOML,
+            "seeded bytes must match the bundled file byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn seed_tool_reactions_skips_when_present() {
+        let dir = TempDir::new().unwrap();
+        let target = dir
+            .path()
+            .join("adapters")
+            .join("claude")
+            .join("tool-reactions.toml");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let preexisting = b"# user-edited tool reactions\n[tool_reactions]\nFooBar = \"Pause\"\n";
+        fs::write(&target, preexisting).unwrap();
+
+        let outcome = seed_tool_reactions(dir.path()).expect("seed must succeed");
+        assert_eq!(outcome, SeedOutcome::AlreadyPresent);
+        let after = fs::read(&target).expect("user file must remain");
+        assert_eq!(
+            after, preexisting,
+            "pre-existing user file must be left untouched"
+        );
+    }
+
+    #[test]
+    fn seed_tool_reactions_creates_parent_directories() {
+        let dir = TempDir::new().unwrap();
+        let adapters = dir.path().join("adapters");
+        assert!(
+            !adapters.exists(),
+            "adapters/ should not exist before seeding"
+        );
+        let outcome = seed_tool_reactions(dir.path()).expect("seed must succeed");
+        assert_eq!(outcome, SeedOutcome::Wrote);
+        assert!(
+            dir.path().join("adapters").join("claude").is_dir(),
+            "seed must create the adapters/claude/ directory chain"
+        );
+    }
+
+    // Story 5.4 review — the created `adapters/` chain must be 0700, not
+    // umask-default. Otherwise the user's adapter config dir could be
+    // group/world-readable.
+    #[cfg(unix)]
+    #[test]
+    fn seed_tool_reactions_creates_parent_directories_with_private_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        seed_tool_reactions(dir.path()).expect("seed must succeed");
+        for sub in ["adapters", "adapters/claude"] {
+            let created = dir.path().join(sub);
+            let mode = fs::metadata(&created).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o700,
+                "{sub} must be created with mode 0700, got {mode:o}"
+            );
+        }
+    }
+
+    // Story 5.4 review — a non-file object at the target path (here a
+    // directory) must fail loudly, not be reported as `AlreadyPresent`. The
+    // daemon expects to read a TOML file from that path.
+    #[test]
+    fn seed_tool_reactions_rejects_directory_at_target() {
+        let dir = TempDir::new().unwrap();
+        let target = dir
+            .path()
+            .join("adapters")
+            .join("claude")
+            .join("tool-reactions.toml");
+        fs::create_dir_all(&target).unwrap(); // a DIRECTORY where the file belongs
+        let err = seed_tool_reactions(dir.path()).expect_err("must reject a non-file target");
+        assert!(
+            matches!(err, InstallError::SeedTargetNotFile { kind, .. } if kind == "directory"),
+            "expected SeedTargetNotFile(directory), got {err:?}"
+        );
+    }
+
+    // Story 5.4 review — a (dangling) symlink at the target must be refused and
+    // left in place, never replaced. `Path::exists()` would have followed it
+    // and returned false for a dangling link, opening the door to clobbering a
+    // user's symlink; `symlink_metadata` does not follow it.
+    #[cfg(unix)]
+    #[test]
+    fn seed_tool_reactions_rejects_symlink_target_and_leaves_it_in_place() {
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new().unwrap();
+        let target = dir
+            .path()
+            .join("adapters")
+            .join("claude")
+            .join("tool-reactions.toml");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        symlink(dir.path().join("does-not-exist"), &target).unwrap();
+
+        let err = seed_tool_reactions(dir.path()).expect_err("must reject a symlink target");
+        assert!(
+            matches!(err, InstallError::SeedTargetNotFile { kind, .. } if kind == "symlink"),
+            "expected SeedTargetNotFile(symlink), got {err:?}"
+        );
+        assert!(
+            fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the user's symlink must be left untouched"
         );
     }
 

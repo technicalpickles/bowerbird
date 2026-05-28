@@ -29,7 +29,11 @@ import { homedir } from "node:os";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-interface Event {
+// Named `BowerbirdEvent`, not `Event`, so it does not shadow the DOM global
+// `Event` — the WebSocket `error` listener below (`addEventListener("error",
+// (ev: Event) => ...)`) needs the DOM `Event` type, and a local `interface
+// Event` would silently capture that annotation.
+interface BowerbirdEvent {
   event_id: number;
   source: string;
   session_id: string;
@@ -40,7 +44,7 @@ interface Event {
 }
 
 interface EventListResponse {
-  events: Event[];
+  events: BowerbirdEvent[];
   cursor: number | null;
   oldest_available_event_id: number;
 }
@@ -52,7 +56,7 @@ interface SessionListItem {
 
 interface EventFrame {
   op: "event";
-  event: Event;
+  event: BowerbirdEvent;
 }
 
 interface DroppedFrame {

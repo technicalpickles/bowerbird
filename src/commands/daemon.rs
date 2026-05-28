@@ -451,58 +451,6 @@ pub fn http_get_events(
     }
 }
 
-/// Outcome of [`http_get_session_detail`]. Distinguishes 404 explicitly so
-/// the export command can render the "session not found" message without
-/// inspecting the body. The 200-body bytes are not surfaced — the caller
-/// only needs the existence signal.
-#[derive(Debug)]
-pub enum SessionDetailResponse {
-    Ok,
-    NotFound,
-    Status(u16),
-    Unreachable,
-}
-
-/// `GET /sessions/{id}` pre-check used by `bowerbird export` to disambiguate
-/// "unknown session" from "session exists with 0 events" (the events
-/// endpoint returns 200 + empty list for both today). The 404 path produces
-/// the AC-specified `session <id> not found` stderr.
-pub fn http_get_session_detail(
-    addr: SocketAddr,
-    bearer: &str,
-    session_id: &str,
-    per_attempt: Duration,
-) -> SessionDetailResponse {
-    let mut stream = match TcpStream::connect_timeout(&addr, per_attempt) {
-        Ok(s) => s,
-        Err(_) => return SessionDetailResponse::Unreachable,
-    };
-    let _ = stream.set_read_timeout(Some(per_attempt));
-    let _ = stream.set_write_timeout(Some(per_attempt));
-
-    let encoded_id = encode_path_segment(session_id);
-    let mut req = String::new();
-    req.push_str(&format!("GET /sessions/{encoded_id} HTTP/1.1\r\n"));
-    req.push_str(&format!("Host: {addr}\r\n"));
-    req.push_str("Connection: close\r\n");
-    req.push_str(&format!("Authorization: Bearer {bearer}\r\n"));
-    req.push_str("Accept: application/json\r\n\r\n");
-
-    if stream.write_all(req.as_bytes()).is_err() {
-        return SessionDetailResponse::Unreachable;
-    }
-
-    let mut response = Vec::with_capacity(2048);
-    let _ = stream.read_to_end(&mut response);
-    let status_code = parse_status_code(&response).unwrap_or(0);
-    match status_code {
-        200 => SessionDetailResponse::Ok,
-        404 => SessionDetailResponse::NotFound,
-        0 => SessionDetailResponse::Unreachable,
-        other => SessionDetailResponse::Status(other),
-    }
-}
-
 fn encode_path_segment(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {
