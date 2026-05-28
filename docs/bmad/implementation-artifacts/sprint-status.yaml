@@ -15,6 +15,7 @@
 # last_updated: 2026-05-28 (Story 5.3 implementation-artifacts file created via bmad-create-story; 19 ACs + 18 tasks; → ready-for-dev)
 # last_updated: 2026-05-28 (Story 5.3 → in-progress; dev-story session started)
 # last_updated: 2026-05-28 (Story 5.3 → review; dev-story session complete — 18 tasks done, 19 ACs satisfied, workspace tests + fmt + clippy green, hermetic smoke validated)
+# last_updated: 2026-05-28 (Story 5.3 → in-progress; bmad-code-review documented unresolved decision/patch findings)
 # project: bowerbird
 # project_key: NOKEY
 # tracking_system: file-system
@@ -50,7 +51,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-05-16
-last_updated: 2026-05-28 (Story 5.3 → review; dev-story session complete — 18 tasks done, 19 ACs satisfied, workspace tests + fmt + clippy green, hermetic smoke validated)
+last_updated: 2026-05-28 (Story 5.3 → in-progress; bmad-code-review documented unresolved decision/patch findings)
 project: bowerbird
 project_key: NOKEY
 tracking_system: file-system
@@ -104,7 +105,7 @@ development_status:
   epic-5: in-progress
   5-1-first-party-presenter-tool: in-progress
   5-2-session-state-projection-correctness: done
-  5-3-session-process-liveness-pid-capture: review
+  5-3-session-process-liveness-pid-capture: in-progress
   5-4-install-ux-polish-and-middleware-closure: backlog
   5-5-bench-gates-load-bearing: backlog
   5-6-release-pipeline-end-to-end-verification: backlog

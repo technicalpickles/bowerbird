@@ -1,6 +1,6 @@
 # Story 5.3: Daemon-observed session liveness + typed-notification WaitingInput
 
-Status: review
+Status: in-progress
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -242,6 +242,16 @@ so that my ribbon UI can render an accurate per-session state without doing its 
   - [x] Start a live Claude Code session; trigger a `permission_prompt` Notification (e.g., a Bash tool that requires confirmation). Confirm the deck shows that session as `WaitingInput`. Resolve the prompt; confirm transition through `Working` → `Idle` on `Stop`.
   - [x] Close the Claude Code terminal mid-session. Wait ≤5s. Confirm the session disappears from the deck (or transitions to `Ended` if the deck renders `Ended` rows as dim).
   - [x] **Out of scope:** formal load testing of the probe loop. The probe touches O(n) rows where n = active sessions; 5s cadence with `MissedTickBehavior::Skip` is comfortable headroom. If dogfooding surfaces probe-cost issues, that's a follow-up.
+
+### Review Findings
+
+- [ ] [Review][Decision] PID-only liveness lacks process identity — `crates/daemon/src/projection/liveness.rs:65` uses only `kill(pid, 0)`, which proves that some process currently has that PID, not that it is the original Claude session. PID reuse can keep a dead session non-`Ended`; wrapper/reparent scenarios can point `bowerbird_ppid` at the wrong long-lived parent. Decide whether V1 accepts this known PID-only risk, defers process-birth validation, or stores/checks an OS-specific process identity marker.
+- [ ] [Review][Patch] Stale liveness snapshots can end a resumed live session [crates/daemon/src/projection/liveness.rs:128] — `probe_once` selects projection rows, drops the DB connection, then later writes synthetic `SessionEnded` from that stale `stored` snapshot. If a real hook arrives between the SELECT and synthetic write, the probe can flip the revived session back to `Ended`; with an old dead PID it can also overwrite the newer live `last_pid`. Re-check the latest projection state/liveness immediately before emitting, or make the synthetic write conditional on the row still matching the probed state.
+- [ ] [Review][Patch] Startup liveness cleanup can fail open or under-report failed rows [crates/daemon/src/main.rs:189] — AC #10 depends on the synchronous startup probe completing before WS bind, but `main.rs` logs `probe_once` errors and continues to bind, and `liveness.rs:171` logs per-row `write(SessionEnded)` failures while still returning `Ok(emitted)`. Presenters can receive stale startup snapshots after failed cleanup, and logs may say no dead sessions were found when writes actually failed. Surface failed rows through the probe result and make the startup guarantee explicit.
+- [ ] [Review][Patch] `bowerbird_ppid = 0` is accepted and probes the process group [crates/adapter-claude/src/normalize.rs:97] — normalize accepts `0` as `Some(0)`, and `liveness.rs:75` calls `kill(0, 0)`, which has process-group semantics rather than single-process semantics. A malformed/custom producer can therefore make a session appear alive indefinitely. Treat PID 0 as invalid (`None` or dead) before it reaches `kill`.
+- [ ] [Review][Patch] Liveness shutdown cancellation does not stop an in-flight probe iteration [crates/daemon/src/projection/liveness.rs:205] — `run` checks `shutdown.cancelled()` only before awaiting `probe_once`; once a probe starts it can continue writing `SessionEnded` events after shutdown is requested. Task 7 explicitly says not to finish an in-flight iteration during shutdown. Pass cancellation into the per-row loop or check it between rows before synthetic writes.
+- [ ] [Review][Patch] Missed-tick/no-queue behavior lacks the required deterministic test [crates/daemon/tests/contract_daemon.rs:7936] — Task 9 requires `liveness_probe_missed_tick_does_not_queue` using paused Tokio time, but the new liveness tests only exercise `probe_once`. The dead-PID test also uses `std::thread::sleep` at `contract_daemon.rs:8052`, contrary to the deterministic timing-test discipline. Add the skipped-tick regression test and remove the real sleep.
+- [ ] [Review][Patch] AC #17 compatibility tests miss the WS frame dispatch paths [crates/protocol/tests/contract_protocol.rs:472] — AC #17 names `SessionState`, `StateFrame`, and `EventFrame` decode paths. Current tests decode local legacy `SessionState` and `Event` structs, but do not cover legacy `StateFrame`, `EventFrame`, or `ServerMessage::{State,Event}` dispatch with the new `last_pid`, `pid`, `Ended`, and `SessionEnded` fields/variants. Add nested-frame compatibility tests so the actual WS payload shape is pinned.
 
 ## Dev Notes
 
