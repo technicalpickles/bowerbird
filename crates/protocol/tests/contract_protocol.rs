@@ -234,6 +234,7 @@ fn session_state_round_trips() {
         current_state: SessionCurrentState::Working,
         last_event_kind: EventKind::PreToolUse,
         last_event_at_ms: 1_747_574_400_000,
+        last_pid: Some(12345),
     };
     let json = serde_json::to_string(&state).unwrap();
     let parsed: SessionState = serde_json::from_str(&json).unwrap();
@@ -292,6 +293,7 @@ fn session_list_item_round_trips() {
         last_event_kind: EventKind::PreToolUse,
         last_event_at_ms: 1_000_000,
         updated_at: 2_000_000,
+        last_pid: Some(42),
     };
     let json = serde_json::to_string(&item).unwrap();
     // Hand-parse back through serde_json::Value so we can also assert specific
@@ -327,6 +329,7 @@ fn session_detail_round_trips_and_accepts_unknown_fields() {
             current_state: SessionCurrentState::WaitingInput,
             last_event_kind: EventKind::Notification,
             last_event_at_ms: 42,
+            last_pid: Some(7),
         },
         updated_at: 100,
     };
@@ -401,4 +404,192 @@ fn server_message_unknown_variant_round_trips_as_unknown() {
         matches!(parsed, protocol::ServerMessage::Close(_)),
         "known op must deserialize to its variant, got {parsed:?}"
     );
+}
+
+// ─── Story 5.3 — wire variants + additive-compat ────────────────────────────
+
+#[test]
+fn session_ended_event_kind_serializes_pascal_case() {
+    assert_eq!(
+        serde_json::to_string(&EventKind::SessionEnded).unwrap(),
+        "\"SessionEnded\""
+    );
+    let parsed: EventKind = serde_json::from_str(r#""SessionEnded""#).unwrap();
+    assert_eq!(parsed, EventKind::SessionEnded);
+}
+
+#[test]
+fn ended_session_current_state_serializes_pascal_case() {
+    assert_eq!(
+        serde_json::to_string(&SessionCurrentState::Ended).unwrap(),
+        "\"Ended\""
+    );
+    let parsed: SessionCurrentState = serde_json::from_str(r#""Ended""#).unwrap();
+    assert_eq!(parsed, SessionCurrentState::Ended);
+}
+
+#[test]
+fn notification_type_wire_form_is_snake_case() {
+    use protocol::NotificationType;
+    // Each known variant has an explicit serde rename to snake_case — pin
+    // the wire string for every one so a future rename can't silently change
+    // the contract.
+    let cases: &[(NotificationType, &str)] = &[
+        (NotificationType::PermissionPrompt, "permission_prompt"),
+        (NotificationType::IdlePrompt, "idle_prompt"),
+        (NotificationType::AuthSuccess, "auth_success"),
+        (NotificationType::ElicitationDialog, "elicitation_dialog"),
+        (
+            NotificationType::ElicitationResponse,
+            "elicitation_response",
+        ),
+        (
+            NotificationType::ElicitationComplete,
+            "elicitation_complete",
+        ),
+    ];
+    for (variant, wire) in cases {
+        let serialized = serde_json::to_string(variant).unwrap();
+        assert_eq!(
+            serialized,
+            format!("\"{wire}\""),
+            "variant {variant:?} should serialize to {wire:?}"
+        );
+        let parsed: NotificationType =
+            serde_json::from_str(&format!("\"{wire}\"")).expect("round trip");
+        assert_eq!(parsed, *variant);
+    }
+    // Future variant decodes to Unknown via #[serde(other)].
+    let future = r#""future_notification_type_v2""#;
+    let parsed: NotificationType = serde_json::from_str(future).unwrap();
+    assert_eq!(parsed, NotificationType::Unknown);
+}
+
+// Story 5.3 AC #17: a v1.0 presenter compiled against the pre-5.3 protocol
+// must decode an `Ended` `current_state` as `Unknown` via the
+// `#[serde(other)]` catch-all — no decode error, no crash. Mock the legacy
+// shape with only the v1.0 variants.
+#[test]
+fn additive_compat_ended_session_current_state_decodes_as_unknown() {
+    use serde::{Deserialize, Serialize};
+    #[derive(Debug, Deserialize, Serialize, PartialEq, Eq, Clone, Copy)]
+    enum LegacySessionCurrentState {
+        Idle,
+        Working,
+        WaitingInput,
+        #[serde(other)]
+        Unknown,
+    }
+    #[derive(Debug, Deserialize)]
+    #[allow(dead_code)]
+    struct LegacySessionState {
+        current_state: LegacySessionCurrentState,
+        last_event_kind: EventKind,
+        last_event_at_ms: i64,
+    }
+    let wire = r#"{
+        "current_state": "Ended",
+        "last_event_kind": "Stop",
+        "last_event_at_ms": 0,
+        "last_pid": 12345
+    }"#;
+    let parsed: LegacySessionState = serde_json::from_str(wire).expect("legacy decode");
+    assert_eq!(parsed.current_state, LegacySessionCurrentState::Unknown);
+}
+
+// Story 5.3 AC #17: a v1.0 presenter must decode a `SessionEnded` `Event`
+// `kind` field as `Unknown` via the same catch-all.
+#[test]
+fn additive_compat_session_ended_event_kind_decodes_as_unknown() {
+    use serde::{Deserialize, Serialize};
+    #[derive(Debug, Deserialize, Serialize, PartialEq, Eq, Clone)]
+    enum LegacyEventKind {
+        UserPromptSubmit,
+        PreToolUse,
+        PostToolUse,
+        Stop,
+        Notification,
+        RecordingStarted,
+        RecordingEnded,
+        #[serde(other)]
+        Unknown,
+    }
+    #[derive(Debug, Deserialize)]
+    #[allow(dead_code)]
+    struct LegacyEvent {
+        event_id: i64,
+        source: String,
+        session_id: String,
+        kind: LegacyEventKind,
+        reaction: Option<String>,
+        payload: String,
+        created_at: i64,
+    }
+    let wire = r#"{
+        "event_id": 1,
+        "source": "claude",
+        "session_id": "s1",
+        "kind": "SessionEnded",
+        "reaction": null,
+        "payload": "{\"reason\":\"pid_dead\",\"pid\":12345,\"observed_at_ms\":0}",
+        "created_at": 0,
+        "pid": 12345
+    }"#;
+    let parsed: LegacyEvent = serde_json::from_str(wire).expect("legacy decode");
+    assert_eq!(parsed.kind, LegacyEventKind::Unknown);
+}
+
+// Story 5.3 AC #17: outbound types must not carry `deny_unknown_fields`, so
+// a v1.0 consumer reading a v1.x SessionState frame with the new `last_pid`
+// field decodes silently — the field is dropped on the legacy side.
+#[test]
+fn additive_compat_last_pid_is_ignored_by_v1_consumer() {
+    use serde::Deserialize;
+    #[derive(Debug, Deserialize)]
+    #[allow(dead_code)]
+    struct LegacySessionState {
+        current_state: SessionCurrentState,
+        last_event_kind: EventKind,
+        last_event_at_ms: i64,
+    }
+    let wire = r#"{
+        "current_state": "Working",
+        "last_event_kind": "PreToolUse",
+        "last_event_at_ms": 42,
+        "last_pid": 12345
+    }"#;
+    let parsed: LegacySessionState = serde_json::from_str(wire).expect("legacy decode");
+    assert_eq!(parsed.current_state, SessionCurrentState::Working);
+    assert_eq!(parsed.last_event_at_ms, 42);
+}
+
+// Same canary for `Event.pid`: a v1.0 presenter must ignore the new
+// `pid` field on stored Event without erroring.
+#[test]
+fn additive_compat_pid_is_ignored_by_v1_consumer() {
+    use serde::Deserialize;
+    #[derive(Debug, Deserialize)]
+    #[allow(dead_code)]
+    struct LegacyEvent {
+        event_id: i64,
+        source: String,
+        session_id: String,
+        kind: EventKind,
+        reaction: Option<String>,
+        payload: String,
+        created_at: i64,
+    }
+    let wire = r#"{
+        "event_id": 5,
+        "source": "claude",
+        "session_id": "s1",
+        "kind": "PreToolUse",
+        "reaction": null,
+        "payload": "{}",
+        "created_at": 0,
+        "pid": 12345
+    }"#;
+    let parsed: LegacyEvent = serde_json::from_str(wire).expect("legacy decode");
+    assert_eq!(parsed.event_id, 5);
+    assert_eq!(parsed.kind, EventKind::PreToolUse);
 }

@@ -10,7 +10,7 @@ mod ws;
 pub use adapter::{AdapterMeta, NormalizeResult, SourceAdapter};
 pub use constants::SHIM_BINARY_NAME;
 pub use error::{Error, Result};
-pub use event::{Event, EventEnvelope, EventId, EventKind};
+pub use event::{Event, EventEnvelope, EventId, EventKind, NotificationType};
 pub use reaction::Reaction;
 pub use rest::{
     DaemonStatus, EventListResponse, ServerInfo, SessionDetail, SessionListItem, SessionStats,

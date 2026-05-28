@@ -44,6 +44,7 @@ subtle             = { workspace = true }
 nix                = { workspace = true }
 keyring            = { workspace = true }
 toml               = { workspace = true }
+libc               = { workspace = true }
 
 [dev-dependencies]
 tempfile          = { workspace = true }

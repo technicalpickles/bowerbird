@@ -973,71 +973,93 @@ Closes the dogfooding finding in `sprint-change-proposal-2026-05-27.md`. Reseque
 **When** Story 5.2 lands
 **Then** `prd.md:206` tightens "goes green when Claude finishes" to "goes green when Claude finishes the turn"; `architecture.md:50` and `:1026` amend "no stuck state on missing PostToolUse" to "no stuck state on missing PostToolUse or Stop"
 
-### Story 5.3: Session-process liveness via PID capture
+### Story 5.3: Daemon-observed session liveness + typed-notification WaitingInput
 
 As a presenter author,
-I want a mechanical fact tying each session row to the OS process that last emitted a hook for it,
-So that I can distinguish "user walked away" from "Claude Code process is gone" without smuggling a semantic flag into the substrate, and so my ribbon UI can filter or sort out tombstone sessions on its own.
+I want the substrate to observe process death and emit a mechanical `SessionEnded` event, and I want `WaitingInput` to reflect Claude's typed `notification_type` field rather than collapse every `Notification` into one bucket,
+So that my ribbon UI can render an accurate per-session state without doing its own liveness syscalls, without doing its own payload regex on `notification_type`, and without breaking when the presenter and daemon are on different machines.
 
-Closes the dogfooding finding in `sprint-change-proposal-2026-05-27-pid-liveness.md`. Extends the daemon-level PID-liveness pattern (`architecture.md:987-989` `bowerbird.pid` + `kill(pid, 0)`) one layer down to per-session granularity. Resequenced from 5.8 → 5.3 by `sprint-change-proposal-2026-05-27-epic-5-resequencing.md` (dogfooding-first ordering).
+**Closes two Story 5.1 dogfooding findings** against `bowerbird-deck`: (1) ~48 sessions stuck at `WaitingInput`, none actually waiting — terminals closed without firing `Stop`, frozen on the last `Notification`; (2) no mechanical signal for "session process is gone" — every presenter would have to call `kill(pid, 0)` itself.
+
+**Operationalizes ADR 0004** (`docs/decisions/0004-daemon-observed-session-liveness.md`). **Refines Story 5.2's** `PostToolUse → preserve prior` rule to `PostToolUse → Working unconditionally`. Resequenced 5.8 → 5.3 by `sprint-change-proposal-2026-05-27-epic-5-resequencing.md`; design amended in `sprint-change-proposal-2026-05-28-daemon-observed-liveness.md`.
 
 **Acceptance Criteria:**
 
 **Given** a Claude Code hook fires and the shim runs
 **When** the shim sends the payload to the daemon's ingest socket
-**Then** the payload JSON includes a `bowerbird_ppid` field whose value is the integer returned by `libc::getppid()` at shim-invocation time; the field is injected by the shim, not present in the upstream Claude Code hook payload; the shim hot-path p99 ≤5ms budget (Story 1.5) is preserved under the shim-bench-gate
+**Then** the payload JSON includes a `bowerbird_ppid` field whose value is the integer returned by `libc::getppid()` at shim-invocation time; the field is injected by the shim, not present in the upstream Claude Code hook payload; the shim hot-path p99 ≤5ms budget (Story 1.5) is preserved under the shim-bench-gate.
 
 **Given** the `adapter-claude` normalize path receives a payload with `bowerbird_ppid` set
 **When** normalize constructs the `EventEnvelope`
-**Then** `EventEnvelope.pid` is `Some(<that value>)`; a payload missing `bowerbird_ppid` or carrying a non-integer value yields `EventEnvelope.pid = None` and is normalized successfully (not a failure mode)
+**Then** `EventEnvelope.pid` is `Some(<that value>)`; a payload missing `bowerbird_ppid` or carrying a non-integer value yields `EventEnvelope.pid = None` and is normalized successfully (not a failure mode).
+
+**Given** the `adapter-claude` normalize path receives a payload with `hook_kind = Notification` and a `notification_type` field
+**When** normalize constructs the `EventEnvelope`
+**Then** `EventEnvelope.notification_type` is `Some(NotificationType::X)` for known values (`permission_prompt`, `idle_prompt`, `auth_success`, `elicitation_dialog`, `elicitation_response`, `elicitation_complete`); an unrecognized value yields `Some(NotificationType::Unknown)`; a missing field yields `None`; the event is normalized successfully in all three cases.
 
 **Given** an `EventEnvelope` with `pid: Some(N)` reaches `projection::session::write`
 **When** the projection writes inside its single transaction
-**Then** the `events` row stores `pid = N`; the upserted `session_projections` row's deserialized `SessionState` carries `last_pid: Some(N)`; the `BroadcastEnvelope::State` published after commit carries the same `last_pid`; the `BroadcastEnvelope::Event` likewise carries `pid: Some(N)`
+**Then** the `events` row stores `pid = N`; the upserted `session_projections` row's deserialized `SessionState` carries `last_pid: Some(N)`; the `BroadcastEnvelope::State` published after commit (if gated through per Story 5.2) carries the same `last_pid`; the `BroadcastEnvelope::Event` likewise carries `pid: Some(N)`.
 
 **Given** a follow-up `EventEnvelope` for the same `(source, session_id)` with `pid: None`
 **When** the projection writes
-**Then** `SessionState.last_pid` retains the prior `Some(N)` (carry-forward semantics); the `events` row stores `pid = NULL` for that specific event
+**Then** `SessionState.last_pid` retains the prior `Some(N)` (carry-forward semantics); the `events` row stores `pid = NULL` for that specific event.
 
-**Given** a follow-up `EventEnvelope` for the same `(source, session_id)` with `pid: Some(M)` where `M != N` (process resumed the session_id under a new PID)
+**Given** a follow-up `EventEnvelope` for the same `(source, session_id)` with `pid: Some(M)` where `M != N`
 **When** the projection writes
-**Then** `SessionState.last_pid` becomes `Some(M)` (overwrite-on-Some semantics)
+**Then** `SessionState.last_pid` becomes `Some(M)` (overwrite-on-Some semantics).
 
-**Given** a daemon restart with a non-empty `events` table that has session rows
+**Given** an `EventEnvelope` for `hook_kind = Notification` with `notification_type` in `{PermissionPrompt, IdlePrompt, ElicitationDialog}`
+**When** the projection's `transition` function runs
+**Then** the resulting `current_state` is `WaitingInput`; the prior state is irrelevant.
+
+**Given** an `EventEnvelope` for `hook_kind = Notification` with `notification_type` in `{AuthSuccess, ElicitationResponse, ElicitationComplete}` OR `notification_type = Unknown` OR `notification_type = None`
+**When** the projection's `transition` function runs
+**Then** the resulting `current_state` preserves the prior state (no transition).
+
+**Given** an `EventEnvelope` for `hook_kind = PostToolUse`
+**When** the projection's `transition` function runs
+**Then** the resulting `current_state` is `Working` unconditionally (refines Story 5.2's "preserve prior" rule — flagged as a `type: behavioral` changelog entry); `last_event_kind` and `last_event_at_ms` update normally.
+
+**Given** the daemon completes `run_migrations` and `rebuild_missing_projections` at startup
+**When** the daemon proceeds to accept connections
+**Then** one synchronous iteration of the liveness probe has run before the WS server binds — for each `session_projections` row where `last_pid IS NULL` OR `libc::kill(last_pid as i32, 0) != 0` (errno = ESRCH), a `SessionEnded` event is written via the normal `projection::session::write` path; the projection row transitions to `current_state = Ended`; the events row carries `source = <row's source>`, `session_id = <row's session_id>`, `kind = SessionEnded`, `payload = {"reason": "no_pid_at_upgrade"|"pid_dead", "pid": <last_pid or null>, "observed_at_ms": <epoch_ms>}`.
+
+**Given** the daemon is running steady-state with the WS server up
+**When** the periodic liveness probe task wakes (5-second cadence via `tokio::time::interval` with `MissedTickBehavior::Skip`)
+**Then** the same per-row logic from the startup iteration runs; `SessionEnded` events are written and broadcast on `events.*`; resulting state transitions are broadcast on `state.session.*`; an in-flight probe iteration that takes longer than the tick interval does NOT queue (next tick skipped).
+
+**Given** a `session_projections` row in `current_state = Ended`
+**When** a subsequent hook `EventEnvelope` arrives for the same `(source, session_id)` (e.g. from `claude --resume`)
+**Then** `transition` runs normally: `UserPromptSubmit`/`PreToolUse`/`PostToolUse → Working`; `Stop → Idle`; `Notification` with input-required `notification_type` → `WaitingInput`; `last_pid` updates from the new envelope's PID via overwrite-on-Some semantics; the row exits `Ended`.
+
+**Given** a daemon restart with a non-empty `events` table that includes `SessionEnded` events
 **When** `rebuild_missing_projections` runs
-**Then** for each rebuilt session the reconstructed `SessionState.last_pid` matches what live ingest would have produced from the same event sequence (Story 1.6 AC #5 "storage layer is a pure function of the event sequence" is preserved); rebuilt rows for sessions whose events all have `pid IS NULL` have `last_pid: None`
+**Then** for each rebuilt session the reconstructed `SessionState.last_pid` AND `current_state` match what live ingest would have produced from the same event sequence (Story 1.6 AC #5 "storage layer is a pure function of the event sequence" is preserved); `SessionEnded` events in the log drive transitions to `Ended` during rebuild exactly as they did during live ingest.
 
 **Given** `GET /sessions` and `GET /sessions/{id}`
 **When** the daemon serializes the response
-**Then** `SessionListItem` and `SessionDetail.state` each carry `last_pid` as a number-or-null field; the read-time stale-`Working` → `Idle` fallback (Story 1.6 `current_state_for_read`) does NOT alter `last_pid`; the sentinel session row (`source = "__daemon__"`) continues to be filtered out
+**Then** `SessionListItem` and `SessionDetail.state` each carry `last_pid` as a number-or-null field; `SessionCurrentState` includes the new `Ended` variant in `current_state` for rows where the liveness probe observed death; the read-time stale-`Working` → `Idle` fallback (Story 1.6 `current_state_for_read`) does NOT alter `last_pid` and does NOT interfere with `Ended` (which passes through unchanged); the sentinel session row (`source = "__daemon__"`) continues to be filtered out.
 
 **Given** a WS subscriber to `state.session.*` receives a `StateFrame`
 **When** the frame is decoded
-**Then** `frame.state.last_pid` carries the same value as the REST `SessionDetail.state.last_pid` would for the same session at the same moment; snapshot-on-subscribe frames (Story 2.3) likewise carry `last_pid`
+**Then** `frame.state.last_pid` carries the same value as the REST `SessionDetail.state.last_pid` would for the same session at the same moment; snapshot-on-subscribe frames (Story 2.3) likewise carry `last_pid`; transitions to `Ended` (driven by the liveness probe) broadcast a `StateFrame` per the Story 5.2 transitions-only policy.
+
+**Given** a WS subscriber to `events.*` receives an `EventFrame`
+**When** the frame is decoded for a `SessionEnded` event
+**Then** the frame carries `kind = "SessionEnded"`, the real `source` and `session_id` of the session that ended, and a payload object with `reason`, `pid` (number or null), and `observed_at_ms`.
 
 **Given** a v1.0 presenter compiled against the pre-Story-5.3 protocol type
-**When** it deserializes a `SessionState` frame from a Story-5.3+ daemon
-**Then** serde silently ignores the `last_pid` field (asymmetric outbound permissive policy per project-context.md §Wire format / Story 4.4 catch-all); no decode error, no crash, no protocol-violation close frame; the additive-compat contract test in `contract_protocol.rs` exercises this path
+**When** it deserializes a `SessionState` frame, a `StateFrame`, or an `EventFrame` from a Story-5.3+ daemon
+**Then** serde silently ignores the `last_pid` field; the `Ended` `SessionCurrentState` variant decodes to `Unknown` via the Story 4.4 `#[serde(other)]` catch-all; the `SessionEnded` `EventKind` decodes to `Unknown` via the same catch-all; no decode error, no crash, no protocol-violation close frame; additive-compat contract tests in `contract_protocol.rs` exercise each path.
 
 **Given** the SQLite `events` schema before Story 5.3 (v1)
 **When** the daemon starts against an existing v1 database
-**Then** migration v2 runs `ALTER TABLE events ADD COLUMN pid INTEGER`; existing rows have `pid = NULL`; the migration is idempotent (re-running `to_latest` is a no-op per Story 5.4's migration-idempotency contract test)
+**Then** migration v2 runs `ALTER TABLE events ADD COLUMN pid INTEGER`; existing rows have `pid = NULL`; the migration is idempotent (re-running `to_latest` is a no-op per Story 5.4's migration-idempotency contract test).
 
 **Given** the protocol surface
 **When** Story 5.3 lands
-**Then** `crates/protocol/src/state.rs` `SessionState` gains `last_pid: Option<u32>`; `crates/protocol/src/event.rs` `EventEnvelope` gains `pid: Option<u32>` (internal type, ingest boundary) AND `Event` gains `pid: Option<u32>` (stored/wire type, REST + WS emission); `crates/shim/Cargo.toml` adds the workspace `libc` dep; `crates/shim/src/main.rs` injects `bowerbird_ppid` into the payload; `crates/adapter-claude/src/normalize.rs` extracts it
-
-**Given** the doc and contract-test surface
-**When** Story 5.3 lands
-**Then** `docs/protocol.md` adds `last_pid` to `/sessions`, `/sessions/{id}`, `StateFrame`, and adds `pid` to `EventFrame`; `docs/protocol.md` §Ingest socket contract documents the shim's `bowerbird_ppid` injection; `docs/protocol-changelog.md` gains three entries (schema: `SessionState.last_pid`; schema: `Event.pid` + `events.pid` migration v2; behavioral: shim PPID injection); `crates/protocol/tests/contract_protocol.rs` exercises both round-trip and additive-compat; `crates/daemon/tests/contract_daemon.rs` exercises projection threading and rebuild AC #5; `crates/adapter-claude/tests/contract_adapter.rs` exercises normalize extraction
-
-**Given** the planning artifacts
-**When** Story 5.3 lands
-**Then** `architecture.md` adds a bullet under §State-machine narrative noting `last_pid` is carried by `transition()` but does not influence `current_state`; `architecture.md` §Singletons & discovery (≈L987) gains a forward reference noting the same pattern applies one layer down for sessions
-
-**Given** documented v0.1.0 caveats
-**When** Story 5.3 lands
-**Then** `deferred-work.md` records three follow-up entries: (a) parent-walk past `sh -c` wrappers via `proc_pidinfo` / `/proc/<pid>/stat`; (b) PID-recycle resilience via `started_at` capture; (c) cookbook entry "detecting dead sessions" (gated on the reaction-enum-rule: ship when two independent presenters demonstrate the need)
+**Then** `crates/protocol/src/state.rs` `SessionState` gains `last_pid: Option<u32>` AND `SessionCurrentState` gains the `Ended` variant; `crates/protocol/src/event.rs` `EventEnvelope` gains `pid: Option<u32>` (internal) AND `notification_type: Option<NotificationType>` (internal), `EventKind` gains the `SessionEnded` variant, a new `NotificationType` enum is added with six known variants + `Unknown`, and stored `Event` gains `pid: Option<u32>`; `crates/shim/Cargo.toml` adds the workspace `libc` dep; `crates/shim/src/main.rs` injects `bowerbird_ppid`; `crates/adapter-claude/src/normalize.rs` extracts both `bowerbird_ppid` and `notification_type`; a new module `crates/daemon/src/projection/liveness.rs` houses the probe loop.
 
 ### Story 5.4: Install UX polish and middleware closure
 

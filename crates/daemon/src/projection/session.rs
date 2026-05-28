@@ -78,6 +78,8 @@ pub async fn write(
     let kind = envelope.kind;
     let reaction = envelope.reaction;
     let payload = envelope.payload;
+    let pid = envelope.pid;
+    let notification_type = envelope.notification_type;
 
     // The closure moves its captures, so duplicate the fields the post-commit
     // publish path needs. SessionState is returned out of the closure to avoid
@@ -142,7 +144,13 @@ pub async fn write(
                     .as_ref()
                     .map(|s| current_state_for_read(s, now_ms));
 
-                let new_state = transition(prev_state.as_ref(), kind_for_transition, now_ms);
+                let new_state = transition(
+                    prev_state.as_ref(),
+                    kind_for_transition,
+                    notification_type,
+                    pid,
+                    now_ms,
+                );
                 let state_json = serde_json::to_string(&new_state).map_err(|e| {
                     rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -167,7 +175,8 @@ pub async fn write(
                         kind_str,
                         reaction_str,
                         payload_for_closure,
-                        now_ms
+                        now_ms,
+                        pid,
                     ],
                 )?;
                 let id = tx.last_insert_rowid();
@@ -200,6 +209,7 @@ pub async fn write(
         reaction,
         payload,
         created_at: now_ms,
+        pid,
     };
     broadcaster.publish(BroadcastEnvelope::Event(event));
 
@@ -271,7 +281,8 @@ pub async fn write_recording_started(
                     kind_str,
                     None::<String>,
                     payload,
-                    now_ms
+                    now_ms,
+                    None::<u32>,
                 ],
             )?;
             let event_id = tx.last_insert_rowid();
@@ -332,7 +343,8 @@ pub async fn write_recording_ended(
                     kind_str,
                     None::<String>,
                     payload,
-                    now_ms
+                    now_ms,
+                    None::<u32>,
                 ],
             )?;
             let event_id = tx.last_insert_rowid();
@@ -398,10 +410,19 @@ pub async fn rebuild_missing_projections(writer_pool: &deadpool_sqlite::Pool) ->
                     continue;
                 }
 
-                let kinds: Vec<(String, i64)> = {
+                // Story 5.3: SELECT now returns (kind, created_at, pid, payload)
+                // so rebuild can thread last_pid carry-forward AND parse
+                // notification_type from Notification payloads (the typed
+                // value lives in events.payload, not on the stored Event).
+                let kinds: Vec<(String, i64, Option<u32>, String)> = {
                     let mut stmt = tx.prepare(SELECT_EVENT_KINDS_FOR_SESSION)?;
                     let rows = stmt.query_map(rusqlite::params![&source, &session_id], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Option<u32>>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
                     })?;
                     rows.collect::<rusqlite::Result<Vec<_>>>()?
                 };
@@ -409,7 +430,7 @@ pub async fn rebuild_missing_projections(writer_pool: &deadpool_sqlite::Pool) ->
                 let mut state: Option<SessionState> = None;
                 let mut last_created_at: i64 = 0;
                 let mut bad_kind = false;
-                for (kind_str, created_at) in kinds {
+                for (kind_str, created_at, pid, payload) in kinds {
                     last_created_at = created_at;
                     let kind = match event_kind_from_db_str(&kind_str) {
                         Ok(k) => k,
@@ -426,10 +447,37 @@ pub async fn rebuild_missing_projections(writer_pool: &deadpool_sqlite::Pool) ->
                             break;
                         }
                     };
+                    // Parse notification_type from payload only for Notification
+                    // events — the same logic the adapter applies at ingest
+                    // (Task 3) but here we read from stored payload at rebuild.
+                    let notification_type = if matches!(kind, protocol::EventKind::Notification) {
+                        serde_json::from_str::<serde_json::Value>(&payload)
+                            .ok()
+                            .as_ref()
+                            .and_then(|v| v.get("notification_type"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| match s {
+                                "permission_prompt" => protocol::NotificationType::PermissionPrompt,
+                                "idle_prompt" => protocol::NotificationType::IdlePrompt,
+                                "auth_success" => protocol::NotificationType::AuthSuccess,
+                                "elicitation_dialog" => {
+                                    protocol::NotificationType::ElicitationDialog
+                                }
+                                "elicitation_response" => {
+                                    protocol::NotificationType::ElicitationResponse
+                                }
+                                "elicitation_complete" => {
+                                    protocol::NotificationType::ElicitationComplete
+                                }
+                                _ => protocol::NotificationType::Unknown,
+                            })
+                    } else {
+                        None
+                    };
                     // Sentinel kinds should be filtered by the source != '__daemon__' clause
                     // on SELECT_DISTINCT_SESSIONS_FROM_EVENTS, but defend against future shape
                     // changes by routing them through transition's defensive branch anyway.
-                    let next = transition(state.as_ref(), kind, created_at);
+                    let next = transition(state.as_ref(), kind, notification_type, pid, created_at);
                     state = Some(next);
                 }
                 if bad_kind {

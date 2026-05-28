@@ -459,6 +459,73 @@ fn shim_accepts_user_prompt_submit_hook_kind() {
     );
 }
 
+// Story 5.3 AC #1: shim injects `bowerbird_ppid` (= libc::getppid()) so the
+// daemon can probe Claude Code's PID for liveness.
+#[test]
+fn shim_injects_bowerbird_ppid_into_payload() {
+    let tmp = TempDir::new().expect("tempdir");
+    let log_tmp = TempDir::new().expect("log tmpdir");
+    let log = log_tmp.path().join("shim.log");
+    let mock = start_mock_ingest(&tmp, b"200\n");
+
+    let stdin = br#"{"session_id":"s1","tool_name":"Bash"}"#;
+    let out = run_shim_with_env(&mock.sock_path, &log, "PreToolUse", stdin, None);
+    assert_eq!(out.status.code(), Some(0));
+
+    let captured = wait_for_capture(&mock);
+    let value = parse_captured_payload(&captured);
+    let obj = value.as_object().expect("object");
+
+    let ppid = obj
+        .get("bowerbird_ppid")
+        .and_then(|v| v.as_i64())
+        .expect("bowerbird_ppid must be present and an integer");
+    assert!(
+        ppid > 0,
+        "bowerbird_ppid must be a positive integer, got {ppid}"
+    );
+    // The shim's parent IS the test runner (assert_cmd::Command spawns the
+    // shim as a direct child of the cargo test binary).
+    let test_runner_pid = std::process::id() as i64;
+    assert_eq!(
+        ppid, test_runner_pid,
+        "bowerbird_ppid should equal the test runner's PID (the shim's parent)"
+    );
+}
+
+// Story 5.3: the shim must NOT extract or strip `notification_type` — that
+// field is the adapter's concern. The shim preserves it verbatim in the
+// payload.
+#[test]
+fn shim_preserves_notification_type_field_verbatim() {
+    let tmp = TempDir::new().expect("tempdir");
+    let log_tmp = TempDir::new().expect("log tmpdir");
+    let log = log_tmp.path().join("shim.log");
+    let mock = start_mock_ingest(&tmp, b"200\n");
+
+    let stdin =
+        br#"{"session_id":"sess-n","notification_type":"permission_prompt","message":"do?"}"#;
+    let out = run_shim_with_env(&mock.sock_path, &log, "Notification", stdin, None);
+    assert_eq!(out.status.code(), Some(0));
+
+    let captured = wait_for_capture(&mock);
+    let value = parse_captured_payload(&captured);
+    let obj = value.as_object().expect("object");
+    assert_eq!(
+        obj.get("notification_type").and_then(|v| v.as_str()),
+        Some("permission_prompt"),
+        "notification_type must survive the shim verbatim"
+    );
+    assert_eq!(
+        obj.get("hook_kind").and_then(|v| v.as_str()),
+        Some("Notification")
+    );
+    assert!(
+        obj.get("bowerbird_ppid").is_some(),
+        "bowerbird_ppid must be injected for Notification hooks too"
+    );
+}
+
 #[test]
 fn shim_preserves_existing_hook_event_name_field() {
     let tmp = TempDir::new().expect("tempdir");

@@ -3,7 +3,11 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# `deny` (not `forbid`) so a narrowly-scoped `#[allow(unsafe_code)]` can opt in
+# at a specific call site (e.g. shim's `libc::getppid()` per Story 5.3). The
+# project-context.md crate-wide invariant calls for `deny`; `forbid` was
+# stricter than spec and prevented Story 5.3's PID injection.
+unsafe_code = "deny"
 
 [workspace.dependencies]
 # Protocol deps

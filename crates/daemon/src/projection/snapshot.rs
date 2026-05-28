@@ -136,6 +136,7 @@ pub async fn snapshot_for_topic(
                 current_state: derived_current,
                 last_event_kind: stored.last_event_kind,
                 last_event_at_ms: stored.last_event_at_ms,
+                last_pid: stored.last_pid,
             },
         });
     }
@@ -187,6 +188,7 @@ mod tests {
             current_state: SessionCurrentState::Working,
             last_event_kind: EventKind::PreToolUse,
             last_event_at_ms: now_ms,
+            last_pid: None,
         }
     }
 
@@ -557,6 +559,7 @@ mod tests {
             current_state: SessionCurrentState::Working,
             last_event_kind: EventKind::PreToolUse,
             last_event_at_ms: 0,
+            last_pid: None,
         };
         upsert_session(&pools.writer, "claude", "sess-A", &stored, 0).await;
 

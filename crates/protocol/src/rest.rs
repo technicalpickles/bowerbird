@@ -42,6 +42,7 @@ pub struct SessionListItem {
     pub last_event_kind: EventKind,
     pub last_event_at_ms: i64,
     pub updated_at: i64,
+    pub last_pid: Option<u32>,
 }
 
 /// Body of `GET /sessions/{id}`.

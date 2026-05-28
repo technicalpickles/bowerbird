@@ -1024,15 +1024,16 @@ on a single OS thread. All SQLite access goes through the deadpool-sqlite pool
 | FR6–FR9: Event persistence | db/ + projection/session.rs atomic transaction ✅ |
 | FR10–FR17: WS streaming | broadcast/ + api/ws.rs; DroppedFrame; SyncFrame; HelloFrame ✅ |
 | FR18–FR23: REST history | api/sessions.rs + events.rs + health.rs; EventListResponse ✅ |
-| FR24–FR26: Session tracking | projection/session.rs UPSERT; no stuck state on missing PostToolUse or Stop (5-min stale-Working fallback) ✅ |
+| FR24–FR26: Session tracking | projection/session.rs UPSERT; no stuck state on missing PostToolUse or Stop (5-min stale-Working fallback); **Story 5.3**: daemon-observed liveness via 5s `kill(pid, 0)` probe → `SessionEnded`; `Notification → WaitingInput` is typed-`notification_type`-driven; `PostToolUse → Working` unconditionally ✅ |
 | FR27–FR30: Install/lifecycle | commands/daemon.rs + adapter-claude/install.rs + config.rs ✅ |
 | FR31–FR35: Developer tools | replay.rs + export.rs + examples/ TypeScript projects + fixtures/ ✅ |
 | FR36–FR39: Protocol compat | protocol/ wire types + additive serde + CHANGELOG CI gate ✅ |
 
 **NFR coverage:** Shim p95 <5ms → criterion benchmark gate. Daemon 2s readiness
 → readyz. WAL durability → rusqlite WAL mode on startup. ENOSPC → log + close.
-Keychain + env-var + file fallback chain defined. `unsafe_code = "forbid"`
-workspace-wide. ✅
+Keychain + env-var + file fallback chain defined. `unsafe_code = "deny"`
+workspace-wide (downgraded from `forbid` in Story 5.3 for shim `libc::getppid()`;
+the single inline `#[allow(unsafe_code)]` is the only opt-in). ✅
 
 ### Implementation Readiness Validation ✅
 

@@ -1,7 +1,7 @@
 use std::io::Write;
 
 use adapter_claude::ClaudeAdapter;
-use protocol::{EventKind, Reaction, SourceAdapter};
+use protocol::{EventKind, NotificationType, Reaction, SourceAdapter};
 use tempfile::TempDir;
 
 const BASH_PAYLOAD: &str = include_str!("fixtures/pre_tool_use_bash.json");
@@ -270,6 +270,142 @@ fn normalize_pretooluse_vendor_overflow_degrades_to_unknown() {
 // `400 unknown hook_kind: ...` wire response. The internal `Error` enum is
 // `pub(crate)`, so this test exercises the boundary via the public `normalize`
 // API rather than constructing the variant directly.
+// ─── Story 5.3: bowerbird_ppid extraction ────────────────────────────────────
+
+#[test]
+fn normalize_extracts_pid_when_bowerbird_ppid_set() {
+    let dir = TempDir::new().unwrap();
+    let toml_path = write_toml(&dir, minimal_toml_with_bash());
+    let adapter = ClaudeAdapter::new(toml_path);
+
+    let payload = r#"{"session_id":"s1","tool_name":"Bash","bowerbird_ppid":12345}"#;
+    let result = adapter.normalize("PreToolUse", payload.as_bytes()).unwrap();
+    assert_eq!(result.envelope.pid, Some(12345));
+}
+
+#[test]
+fn normalize_extracts_pid_none_when_missing() {
+    let dir = TempDir::new().unwrap();
+    let toml_path = write_toml(&dir, minimal_toml_with_bash());
+    let adapter = ClaudeAdapter::new(toml_path);
+
+    let payload = r#"{"session_id":"s1","tool_name":"Bash"}"#;
+    let result = adapter.normalize("PreToolUse", payload.as_bytes()).unwrap();
+    assert_eq!(result.envelope.pid, None);
+}
+
+#[test]
+fn normalize_extracts_pid_none_when_non_integer() {
+    let dir = TempDir::new().unwrap();
+    let toml_path = write_toml(&dir, minimal_toml_with_bash());
+    let adapter = ClaudeAdapter::new(toml_path);
+
+    let payload = r#"{"session_id":"s1","tool_name":"Bash","bowerbird_ppid":"not-an-integer"}"#;
+    let result = adapter.normalize("PreToolUse", payload.as_bytes()).unwrap();
+    assert_eq!(
+        result.envelope.pid, None,
+        "non-integer ppid yields None without failing normalization"
+    );
+}
+
+#[test]
+fn normalize_extracts_pid_none_when_negative() {
+    let dir = TempDir::new().unwrap();
+    let toml_path = write_toml(&dir, minimal_toml_with_bash());
+    let adapter = ClaudeAdapter::new(toml_path);
+
+    // serde_json::Value::as_u64() refuses negatives; u32::try_from also rejects
+    // out-of-range. Both yield None.
+    let payload = r#"{"session_id":"s1","tool_name":"Bash","bowerbird_ppid":-1}"#;
+    let result = adapter.normalize("PreToolUse", payload.as_bytes()).unwrap();
+    assert_eq!(result.envelope.pid, None);
+}
+
+// ─── Story 5.3: notification_type extraction ─────────────────────────────────
+
+#[test]
+fn normalize_extracts_notification_type_for_six_known_values() {
+    let dir = TempDir::new().unwrap();
+    let toml_path = write_toml(&dir, minimal_toml_with_bash());
+    let adapter = ClaudeAdapter::new(toml_path);
+
+    let cases: &[(&str, NotificationType)] = &[
+        ("permission_prompt", NotificationType::PermissionPrompt),
+        ("idle_prompt", NotificationType::IdlePrompt),
+        ("auth_success", NotificationType::AuthSuccess),
+        ("elicitation_dialog", NotificationType::ElicitationDialog),
+        (
+            "elicitation_response",
+            NotificationType::ElicitationResponse,
+        ),
+        (
+            "elicitation_complete",
+            NotificationType::ElicitationComplete,
+        ),
+    ];
+
+    for (wire, expected) in cases {
+        let payload = format!(r#"{{"session_id":"s1","notification_type":"{wire}"}}"#);
+        let result = adapter
+            .normalize("Notification", payload.as_bytes())
+            .unwrap();
+        assert_eq!(
+            result.envelope.notification_type,
+            Some(*expected),
+            "wire value {wire:?} should map to expected variant"
+        );
+    }
+}
+
+#[test]
+fn normalize_extracts_notification_type_unknown_for_future_value() {
+    let dir = TempDir::new().unwrap();
+    let toml_path = write_toml(&dir, minimal_toml_with_bash());
+    let adapter = ClaudeAdapter::new(toml_path);
+
+    let payload = r#"{"session_id":"s1","notification_type":"future_type_v2"}"#;
+    let result = adapter
+        .normalize("Notification", payload.as_bytes())
+        .unwrap();
+    assert_eq!(
+        result.envelope.notification_type,
+        Some(NotificationType::Unknown),
+        "unrecognized notification_type → Unknown (decode-only catch-all)"
+    );
+}
+
+#[test]
+fn normalize_extracts_notification_type_none_when_missing() {
+    let dir = TempDir::new().unwrap();
+    let toml_path = write_toml(&dir, minimal_toml_with_bash());
+    let adapter = ClaudeAdapter::new(toml_path);
+
+    let payload = r#"{"session_id":"s1"}"#;
+    let result = adapter
+        .normalize("Notification", payload.as_bytes())
+        .unwrap();
+    assert_eq!(result.envelope.notification_type, None);
+}
+
+#[test]
+fn normalize_does_not_extract_notification_type_for_non_notification_kinds() {
+    let dir = TempDir::new().unwrap();
+    let toml_path = write_toml(&dir, minimal_toml_with_bash());
+    let adapter = ClaudeAdapter::new(toml_path);
+
+    // A stray notification_type field on a non-Notification payload must be
+    // ignored by the adapter (still preserved verbatim in payload).
+    let payload =
+        r#"{"session_id":"s1","tool_name":"Bash","notification_type":"permission_prompt"}"#;
+    let result = adapter.normalize("PreToolUse", payload.as_bytes()).unwrap();
+    assert_eq!(
+        result.envelope.notification_type, None,
+        "non-Notification kinds must not extract notification_type"
+    );
+    // But the field should still ride in payload verbatim.
+    assert!(result.envelope.payload.contains("permission_prompt"));
+}
+
 #[test]
 fn normalize_unknown_hook_kind_yields_protocol_unknown_hook_kind() {
     let dir = TempDir::new().unwrap();

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
 
-use protocol::{EventEnvelope, EventKind, NormalizeResult, Reaction};
+use protocol::{EventEnvelope, EventKind, NormalizeResult, NotificationType, Reaction};
 use serde::Deserialize;
 
 use crate::error::NormalizeError as Error;
@@ -91,6 +91,34 @@ pub(crate) fn normalize(
         _ => None,
     };
 
+    // Story 5.3 AC #2: extract bowerbird_ppid (injected by the shim). Missing,
+    // non-integer, or out-of-range values all yield pid = None — adapter must
+    // not fail normalization for a missing/malformed ppid.
+    let pid = value
+        .get("bowerbird_ppid")
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u32::try_from(n).ok());
+
+    // Story 5.3 AC #3: extract typed notification_type only for Notification
+    // hooks; non-Notification kinds with a stray notification_type field
+    // ignore it (returns None).
+    let notification_type = if matches!(kind, EventKind::Notification) {
+        value
+            .get("notification_type")
+            .and_then(|v| v.as_str())
+            .map(|s| match s {
+                "permission_prompt" => NotificationType::PermissionPrompt,
+                "idle_prompt" => NotificationType::IdlePrompt,
+                "auth_success" => NotificationType::AuthSuccess,
+                "elicitation_dialog" => NotificationType::ElicitationDialog,
+                "elicitation_response" => NotificationType::ElicitationResponse,
+                "elicitation_complete" => NotificationType::ElicitationComplete,
+                _ => NotificationType::Unknown,
+            })
+    } else {
+        None
+    };
+
     Ok(NormalizeResult {
         envelope: EventEnvelope {
             source: SOURCE.to_string(),
@@ -98,6 +126,8 @@ pub(crate) fn normalize(
             kind,
             reaction,
             payload,
+            pid,
+            notification_type,
         },
     })
 }

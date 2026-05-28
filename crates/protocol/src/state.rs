@@ -19,6 +19,11 @@ pub enum SessionCurrentState {
     Idle,
     Working,
     WaitingInput,
+    /// Daemon-observed: the session's `last_pid` is no longer a live OS process
+    /// (per ADR 0004). `Ended` is **non-terminal** — a session can transition
+    /// out of `Ended` on the next hook event (typically a `UserPromptSubmit`
+    /// from `claude --resume`).
+    Ended,
     #[serde(other)]
     Unknown,
 }
@@ -28,4 +33,5 @@ pub struct SessionState {
     pub current_state: SessionCurrentState,
     pub last_event_kind: EventKind,
     pub last_event_at_ms: i64,
+    pub last_pid: Option<u32>,
 }

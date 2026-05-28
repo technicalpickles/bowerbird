@@ -169,7 +169,8 @@ Every projection write — fired on ingest and on `state.*` subscribe (snapshot)
   "state": {
     "current_state": "Idle",
     "last_event_kind": "PostToolUse",
-    "last_event_at_ms": 1748190001000
+    "last_event_at_ms": 1748190001000,
+    "last_pid": 12345
   }
 }
 ```
@@ -182,7 +183,11 @@ if (msg.op === "state") {
 }
 ```
 
-Source: [`crates/protocol/src/ws.rs:102`](../crates/protocol/src/ws.rs) `StateFrame`, [`crates/protocol/src/state.rs:13`](../crates/protocol/src/state.rs) `SessionState`. `SessionCurrentState` is one of `Idle`, `Working`, `WaitingInput`. The `current_state` is the read-time projection — the daemon's `current_state_for_read` applies a stale-`Working` → `Idle` fallback (Story 1.6) so a session that started a tool call and never recorded a matching `PostToolUse` won't pin to `Working` forever.
+Source: [`crates/protocol/src/ws.rs:102`](../crates/protocol/src/ws.rs) `StateFrame`, [`crates/protocol/src/state.rs:13`](../crates/protocol/src/state.rs) `SessionState`. `SessionCurrentState` is one of `Idle`, `Working`, `WaitingInput`, `Ended`. The `current_state` is the read-time projection — the daemon's `current_state_for_read` applies a stale-`Working` → `Idle` fallback (Story 1.6) so a session that started a tool call and never recorded a matching `PostToolUse` won't pin to `Working` forever.
+
+**Rendering `Ended` sessions** (Story 5.3). `Ended` means the daemon's 5-second liveness probe observed that the session's `last_pid` is no longer a live OS process — typically because the user closed the terminal without firing `Stop`. Default presenter behavior: hide `Ended` rows (they're not actionable). Alternative: dim or strike-through (preserves the deck's last-N-sessions history). **Do NOT call `kill(pid, 0)` from the presenter** — the substrate has already done that and emitted the mechanical observation; presenters subscribe to `state.session.*` and react. `Ended` is **non-terminal**: a `claude --resume` triggers a new `UserPromptSubmit` hook for the same `(source, session_id)`, transitioning the row back to `Working`.
+
+**Rendering `WaitingInput` sessions** (Story 5.3). The substrate uses Claude Code's typed `notification_type` field on `Notification` events to decide whether the session is genuinely waiting for input. Only `permission_prompt`, `idle_prompt`, and `elicitation_dialog` cause `current_state` to transition to `WaitingInput`; transient notifications like `auth_success` preserve prior state. The typed value is NOT surfaced on `SessionState` — it stays in `events.payload` (verbatim). Presenters that want to distinguish "Claude is asking for a tool-use permission" from "Claude is idle and pinging" subscribe to `events.<source>.<session_id>` (or `events.*`) and parse `notification_type` from the payload themselves.
 
 For the canonical per-session fan-out pattern (subscribe to `state.session.*`, route by `(source, session_id)`), see [`cookbook/state-session-fanout.md`](cookbook/state-session-fanout.md). It pairs with [`examples/multi-session-router/`](../examples/multi-session-router/).
 

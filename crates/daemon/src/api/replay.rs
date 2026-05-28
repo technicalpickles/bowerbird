@@ -109,12 +109,35 @@ pub async fn run(State(state): State<AppState>, body: Bytes) -> Response {
             continue;
         }
 
+        // Story 5.3: re-parse notification_type from payload for Notification
+        // events so the replayed envelope drives the same transition() rules
+        // as live ingest. Replayed events carry their stored `pid` forward.
+        let notification_type = if matches!(event.kind, protocol::EventKind::Notification) {
+            serde_json::from_str::<serde_json::Value>(&event.payload)
+                .ok()
+                .as_ref()
+                .and_then(|v| v.get("notification_type"))
+                .and_then(|v| v.as_str())
+                .map(|s| match s {
+                    "permission_prompt" => protocol::NotificationType::PermissionPrompt,
+                    "idle_prompt" => protocol::NotificationType::IdlePrompt,
+                    "auth_success" => protocol::NotificationType::AuthSuccess,
+                    "elicitation_dialog" => protocol::NotificationType::ElicitationDialog,
+                    "elicitation_response" => protocol::NotificationType::ElicitationResponse,
+                    "elicitation_complete" => protocol::NotificationType::ElicitationComplete,
+                    _ => protocol::NotificationType::Unknown,
+                })
+        } else {
+            None
+        };
         let envelope = EventEnvelope {
             source: event.source,
             session_id: event.session_id,
             kind: event.kind,
             reaction: event.reaction,
             payload: event.payload,
+            pid: event.pid,
+            notification_type,
         };
 
         // try_send rather than send: we never block the HTTP handler on a

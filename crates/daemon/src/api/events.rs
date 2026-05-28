@@ -41,7 +41,16 @@ pub async fn list(
         }
     };
 
-    type EventRow = (i64, String, String, String, Option<String>, String, i64);
+    type EventRow = (
+        i64,
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        i64,
+        Option<u32>,
+    );
     let interact = conn
         .interact({
             let id_for_select = id.clone();
@@ -58,6 +67,7 @@ pub async fn list(
                             r.get::<_, Option<String>>(4)?,
                             r.get::<_, String>(5)?,
                             r.get::<_, i64>(6)?,
+                            r.get::<_, Option<u32>>(7)?,
                         ))
                     })?;
                     mapped.collect::<rusqlite::Result<Vec<_>>>()?
@@ -80,7 +90,8 @@ pub async fn list(
     };
 
     let mut events: Vec<Event> = Vec::with_capacity(raw_rows.len());
-    for (event_id, source, session_id, kind_str, reaction_str, payload, created_at) in raw_rows {
+    for (event_id, source, session_id, kind_str, reaction_str, payload, created_at, pid) in raw_rows
+    {
         let kind = match event_kind_from_db_str(&kind_str) {
             Ok(k) => k,
             Err(msg) => {
@@ -114,6 +125,7 @@ pub async fn list(
             reaction,
             payload,
             created_at,
+            pid,
         });
     }
 

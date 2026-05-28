@@ -53,6 +53,16 @@ fn run(_log_path: &Path) -> Result<()> {
         serde_json::Value::String(hook_kind),
     );
 
+    // Inject bowerbird_ppid (Story 5.3). Claude Code is the shim's parent, so
+    // libc::getppid() returns Claude's PID — the daemon uses this as the
+    // session's liveness probe target. getppid is signal-safe and cannot fail.
+    #[allow(unsafe_code)]
+    let ppid = unsafe { libc::getppid() };
+    obj.insert(
+        "bowerbird_ppid".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(ppid)),
+    );
+
     let mut wire = serde_json::to_vec(&value).map_err(Error::StdinJson)?;
     wire.push(b'\n');
 

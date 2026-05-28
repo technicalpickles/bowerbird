@@ -174,6 +174,24 @@ async fn run(config: Config, bowerbird_dir: PathBuf) -> anyhow::Result<()> {
         Err(e) => tracing::error!(error = ?e, "rebuild_missing_projections failed; continuing"),
     }
 
+    // Story 5.3 AC #10: synchronous liveness probe BEFORE the WS server binds.
+    // The broadcaster has to exist by this point — it normally constructs
+    // after the ingest writer task (~line 206), but the probe writes through
+    // `projection::session::write` which publishes via the broadcaster. Moved
+    // up; the broadcaster object is just a fan-out hub and has no startup
+    // dependencies.
+    let broadcaster = Arc::new(BroadcastHub::new(config.ws_broadcast_capacity));
+
+    // Eager startup probe — guarantees presenters connecting at t=0 see the
+    // post-cleanup state in their snapshot (Story 5.3 Dev Notes §"Why the
+    // synchronous startup probe is non-optional"). For an empty event log
+    // this is a single empty SELECT — sub-millisecond.
+    match projection::liveness::probe_once(&pools.writer, &broadcaster).await {
+        Ok(n) if n > 0 => tracing::info!(count = n, "startup liveness probe emitted SessionEnded"),
+        Ok(_) => tracing::debug!("startup liveness probe found no dead sessions"),
+        Err(e) => tracing::error!(error = ?e, "startup liveness probe failed; continuing"),
+    }
+
     let started = projection::session::write_recording_started(&pools.writer)
         .await
         .context("write_recording_started")?;
@@ -200,12 +218,17 @@ async fn run(config: Config, bowerbird_dir: PathBuf) -> anyhow::Result<()> {
             config.ingest_sock_path.display()
         )
     })?;
-    // Construct the broadcaster BEFORE the ingest writer spawn so it can be
-    // threaded into the writer task. The same `Arc` lands in `AppState` below
-    // via `broadcaster.clone()`.
-    let broadcaster = Arc::new(BroadcastHub::new(config.ws_broadcast_capacity));
+    // Story 5.3: broadcaster moved up above the eager liveness probe.
     let ingest_writer_task = tokio::spawn(ingest::writer::run(
         ingest_rx,
+        pools.writer.clone(),
+        broadcaster.clone(),
+        shutdown_requested.clone(),
+    ));
+
+    // Story 5.3 AC #11: periodic liveness probe task. 5s cadence with
+    // MissedTickBehavior::Skip so slow iterations don't queue.
+    let liveness_task = tokio::spawn(projection::liveness::run(
         pools.writer.clone(),
         broadcaster.clone(),
         shutdown_requested.clone(),
@@ -301,6 +324,9 @@ async fn run(config: Config, bowerbird_dir: PathBuf) -> anyhow::Result<()> {
     }
     if let Err(e) = ingest_writer_task.await {
         tracing::error!(error = ?e, "ingest writer task join failed");
+    }
+    if let Err(e) = liveness_task.await {
+        tracing::error!(error = ?e, "liveness probe task join failed");
     }
 
     ws_close_requested.cancel();

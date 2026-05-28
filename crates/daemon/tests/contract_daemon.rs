@@ -13,7 +13,7 @@ use bowerbird_daemon::db::queries::{
 use bowerbird_daemon::db::{init_pools, run_migrations, DbPools};
 use bowerbird_daemon::projection;
 use bowerbird_daemon::state::{AppState, WsConfig};
-use protocol::{EventEnvelope, EventKind, SessionCurrentState, SessionState};
+use protocol::{EventEnvelope, EventKind, NotificationType, SessionCurrentState, SessionState};
 use rusqlite::OptionalExtension;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -118,6 +118,8 @@ async fn wal_durability_after_simulated_crash() {
         kind: EventKind::PreToolUse,
         reaction: None,
         payload: r#"{"hello":"world"}"#.to_string(),
+        pid: None,
+        notification_type: None,
     };
 
     let event_id = {
@@ -218,6 +220,8 @@ async fn state_plus_event_atomicity_rollback() {
         kind: EventKind::PreToolUse,
         reaction: None,
         payload: "{}".to_string(),
+        pid: None,
+        notification_type: None,
     };
     let id = projection::session::write(&pools.writer, &BroadcastHub::new(16), envelope)
         .await
@@ -253,6 +257,8 @@ async fn concurrent_read_during_write() {
                 kind: EventKind::PreToolUse,
                 reaction: None,
                 payload: "{}".to_string(),
+                pid: None,
+                notification_type: None,
             };
             projection::session::write(&writer, &BroadcastHub::new(16), envelope)
                 .await
@@ -495,7 +501,13 @@ fn walk(dir: &std::path::Path, offenders: &mut Vec<String>) {
         let Ok(content) = std::fs::read_to_string(&entry) else {
             continue;
         };
-        if content.contains("rusqlite::Connection::open") {
+        // Forbid `Connection::open(` specifically (with the open paren). This
+        // catches the bypass path that opens a file-backed connection without
+        // the PRAGMA invariants the factory enforces, while permitting
+        // `Connection::open_in_memory()` in self-contained unit tests
+        // (Story 5.3 migration idempotency test) where the in-memory DB is
+        // ephemeral and never has callers depending on the PRAGMA setup.
+        if content.contains("rusqlite::Connection::open(") {
             offenders.push(entry.display().to_string());
         }
     }
@@ -1191,6 +1203,41 @@ fn envelope_for(source: &str, session_id: &str, kind: EventKind) -> EventEnvelop
         kind,
         reaction: None,
         payload: "{}".to_string(),
+        pid: None,
+        notification_type: None,
+    }
+}
+
+/// Story 5.3: Notification envelope helper. The typed `notification_type`
+/// drives the new branching: input-required types (PermissionPrompt,
+/// IdlePrompt, ElicitationDialog) transition to WaitingInput; transient types
+/// preserve prior current_state.
+fn envelope_for_notification(
+    source: &str,
+    session_id: &str,
+    notification_type: Option<NotificationType>,
+) -> EventEnvelope {
+    EventEnvelope {
+        source: source.to_string(),
+        session_id: session_id.to_string(),
+        kind: EventKind::Notification,
+        reaction: None,
+        payload: notification_type
+            .map(|nt| {
+                let wire = match nt {
+                    NotificationType::PermissionPrompt => "permission_prompt",
+                    NotificationType::IdlePrompt => "idle_prompt",
+                    NotificationType::AuthSuccess => "auth_success",
+                    NotificationType::ElicitationDialog => "elicitation_dialog",
+                    NotificationType::ElicitationResponse => "elicitation_response",
+                    NotificationType::ElicitationComplete => "elicitation_complete",
+                    NotificationType::Unknown => "unknown_future_type",
+                };
+                format!(r#"{{"notification_type":"{wire}"}}"#)
+            })
+            .unwrap_or_else(|| "{}".to_string()),
+        pid: None,
+        notification_type,
     }
 }
 
@@ -1350,47 +1397,83 @@ async fn hook_unreliability_tolerance_pretooluse_without_posttooluse() {
 /// AC #4 — Drive a session through a mixed event sequence and assert the
 /// stored `current_state` matches the documented transition table at each step.
 ///
-/// Updated by Story 5.2: the table now encodes PostToolUse-preserves-prev
-/// (no longer flips to Idle), Stop as the canonical "agent done" event, and
-/// UserPromptSubmit as a Working trigger. The shape models a realistic full
-/// turn: prompt → tool work → notify → more tool work → stop.
+/// Updated by Story 5.3: PostToolUse now unconditionally → Working (refines
+/// Story 5.2's "preserve prior"). Notification branches on `notification_type`:
+/// input-required types (PermissionPrompt, IdlePrompt, ElicitationDialog)
+/// transition to WaitingInput; transient types and None preserve prior.
 #[tokio::test(flavor = "current_thread")]
 async fn state_machine_full_sequence_determinism() {
     let (_tmp, pools) = fresh_pools().await;
     let session_id = "sess-determinism";
 
-    let cases: &[(EventKind, SessionCurrentState)] = &[
-        (EventKind::PreToolUse, SessionCurrentState::Working),
-        // Story 5.2: PostToolUse preserves prev (Working), no longer flips Idle.
-        (EventKind::PostToolUse, SessionCurrentState::Working),
+    // Each case: (envelope, expected current_state after write).
+    let cases: Vec<(EventEnvelope, SessionCurrentState)> = vec![
+        (
+            envelope_for("claude", session_id, EventKind::PreToolUse),
+            SessionCurrentState::Working,
+        ),
+        // Story 5.3 AC #9: PostToolUse → Working unconditionally.
+        (
+            envelope_for("claude", session_id, EventKind::PostToolUse),
+            SessionCurrentState::Working,
+        ),
         // Stop is the canonical "agent done" transition.
-        (EventKind::Stop, SessionCurrentState::Idle),
-        // UserPromptSubmit drives Idle → Working (Story 5.2 new variant).
-        (EventKind::UserPromptSubmit, SessionCurrentState::Working),
-        (EventKind::PreToolUse, SessionCurrentState::Working),
-        (EventKind::Notification, SessionCurrentState::WaitingInput),
-        (EventKind::PreToolUse, SessionCurrentState::Working),
-        (EventKind::PostToolUse, SessionCurrentState::Working),
-        (EventKind::Stop, SessionCurrentState::Idle),
+        (
+            envelope_for("claude", session_id, EventKind::Stop),
+            SessionCurrentState::Idle,
+        ),
+        // UserPromptSubmit drives Idle → Working.
+        (
+            envelope_for("claude", session_id, EventKind::UserPromptSubmit),
+            SessionCurrentState::Working,
+        ),
+        (
+            envelope_for("claude", session_id, EventKind::PreToolUse),
+            SessionCurrentState::Working,
+        ),
+        // Story 5.3 AC #7: Notification + PermissionPrompt → WaitingInput.
+        (
+            envelope_for_notification(
+                "claude",
+                session_id,
+                Some(NotificationType::PermissionPrompt),
+            ),
+            SessionCurrentState::WaitingInput,
+        ),
+        // Story 5.3 AC #8: Notification + AuthSuccess → preserve prior
+        // (current_state stays WaitingInput from the previous case).
+        (
+            envelope_for_notification("claude", session_id, Some(NotificationType::AuthSuccess)),
+            SessionCurrentState::WaitingInput,
+        ),
+        (
+            envelope_for("claude", session_id, EventKind::PreToolUse),
+            SessionCurrentState::Working,
+        ),
+        (
+            envelope_for("claude", session_id, EventKind::PostToolUse),
+            SessionCurrentState::Working,
+        ),
+        (
+            envelope_for("claude", session_id, EventKind::Stop),
+            SessionCurrentState::Idle,
+        ),
     ];
 
-    for (kind, expected) in cases {
-        projection::session::write(
-            &pools.writer,
-            &BroadcastHub::new(16),
-            envelope_for("claude", session_id, kind.clone()),
-        )
-        .await
-        .expect("write");
+    for (envelope, expected) in cases {
+        let kind = envelope.kind.clone();
+        projection::session::write(&pools.writer, &BroadcastHub::new(16), envelope)
+            .await
+            .expect("write");
         let stored = read_session_state(&pools.reader, "claude", session_id).await;
         let parsed: SessionState = serde_json::from_str(&stored).expect("parse");
         assert_eq!(
-            parsed.current_state, *expected,
+            parsed.current_state, expected,
             "after {kind:?} current_state must be {expected:?}, got {:?}",
             parsed.current_state
         );
         assert_eq!(
-            parsed.last_event_kind, *kind,
+            parsed.last_event_kind, kind,
             "last_event_kind must always reflect the latest event"
         );
     }
@@ -2259,6 +2342,8 @@ mod story_1_7_rest {
                 kind: EventKind::PreToolUse,
                 reaction: None,
                 payload: "{}".to_string(),
+                pid: None,
+                notification_type: None,
             },
         )
         .await
@@ -2275,6 +2360,8 @@ mod story_1_7_rest {
                 kind: EventKind::PostToolUse,
                 reaction: None,
                 payload: "{}".to_string(),
+                pid: None,
+                notification_type: None,
             },
         )
         .await
@@ -2288,6 +2375,8 @@ mod story_1_7_rest {
                 kind: EventKind::Stop,
                 reaction: None,
                 payload: "{}".to_string(),
+                pid: None,
+                notification_type: None,
             },
         )
         .await
@@ -2329,6 +2418,8 @@ mod story_1_7_rest {
                 kind: EventKind::PreToolUse,
                 reaction: None,
                 payload: "{}".to_string(),
+                pid: None,
+                notification_type: None,
             },
         )
         .await
@@ -2381,6 +2472,8 @@ mod story_1_7_rest {
                 kind: EventKind::PreToolUse,
                 reaction: None,
                 payload: "{}".to_string(),
+                pid: None,
+                notification_type: None,
             },
         )
         .await
@@ -2426,6 +2519,8 @@ mod story_1_7_rest {
                     kind: EventKind::PreToolUse,
                     reaction: None,
                     payload: "{}".to_string(),
+                    pid: None,
+                    notification_type: None,
                 },
             )
             .await
@@ -2485,6 +2580,8 @@ mod story_1_7_rest {
                     kind: EventKind::PreToolUse,
                     reaction: None,
                     payload: "{}".to_string(),
+                    pid: None,
+                    notification_type: None,
                 },
             )
             .await
@@ -2524,6 +2621,8 @@ mod story_1_7_rest {
                     kind: EventKind::PreToolUse,
                     reaction: None,
                     payload: "{}".to_string(),
+                    pid: None,
+                    notification_type: None,
                 },
             )
             .await
@@ -2689,6 +2788,8 @@ mod story_1_7_rest {
                     kind: EventKind::PreToolUse,
                     reaction: None,
                     payload: "{}".to_string(),
+                    pid: None,
+                    notification_type: None,
                 },
             )
             .await
@@ -2732,6 +2833,8 @@ mod story_1_7_rest {
                 kind: EventKind::PreToolUse,
                 reaction: None,
                 payload: "{}".to_string(),
+                pid: None,
+                notification_type: None,
             },
         )
         .await
@@ -2961,6 +3064,7 @@ mod story_2_1_ws {
                 current_state: SessionCurrentState::Working,
                 last_event_kind: EventKind::PreToolUse,
                 last_event_at_ms: 0,
+                last_pid: None,
             },
         }
     }
@@ -2974,6 +3078,7 @@ mod story_2_1_ws {
             reaction: Some(Reaction::Continue),
             payload: "{}".to_string(),
             created_at: 0,
+            pid: None,
         })
     }
 
@@ -3681,6 +3786,7 @@ mod story_2_2_publish {
                 reaction: None,
                 payload: "{}".to_string(),
                 created_at: 0,
+                pid: None,
             }),
             ProbeKind::State { session_id } => BroadcastEnvelope::State {
                 // Token rides in `source` so wildcard or session-keyed
@@ -3692,6 +3798,7 @@ mod story_2_2_publish {
                     current_state: SessionCurrentState::Idle,
                     last_event_kind: EventKind::PreToolUse,
                     last_event_at_ms: 0,
+                    last_pid: None,
                 },
             },
         }
@@ -3892,6 +3999,8 @@ mod story_2_2_publish {
                 kind,
                 reaction,
                 payload: payload.to_string(),
+                pid: None,
+                notification_type: None,
             },
         )
         .await
@@ -4124,6 +4233,7 @@ mod story_2_2_publish {
             reaction: None,
             payload: "{}".to_string(),
             created_at: 0,
+            pid: None,
         }));
 
         let timed = tokio::time::timeout(Duration::from_millis(300), ws.next()).await;
@@ -4279,6 +4389,8 @@ mod story_2_2_publish {
                     kind: kind.clone(),
                     reaction: None,
                     payload: "{}".to_string(),
+                    pid: None,
+                    notification_type: None,
                 },
             )
             .await
@@ -5256,6 +5368,7 @@ mod story_2_4_dropped {
             reaction: None,
             payload: "{}".to_string(),
             created_at: 0,
+            pid: None,
         })
     }
 
@@ -7432,6 +7545,7 @@ mod story_4_1_replay {
             reaction: None,
             payload: "{}".to_string(),
             created_at: 1,
+            pid: None,
         };
         serde_json::to_string(&e).expect("serialize Event")
     }
@@ -7695,6 +7809,7 @@ mod story_4_1_replay {
             reaction: None,
             payload: "{}".to_string(),
             created_at: 1,
+            pid: None,
         };
         let line = serde_json::to_string(&e).unwrap();
 
@@ -7815,5 +7930,321 @@ mod story_4_1_replay {
         let parsed = parse_replay_body(resp).await;
         assert_eq!(parsed.replayed_count, 0);
         assert!(parsed.parse_errors.is_empty());
+    }
+}
+
+// ─── Story 5.3 — Daemon-observed liveness probe ─────────────────────────────
+
+#[cfg(test)]
+mod story_5_3_liveness {
+    use super::*;
+    use bowerbird_daemon::db::queries::SELECT_SESSION_PROJECTION_STATE;
+    use bowerbird_daemon::projection::liveness::probe_once;
+
+    async fn upsert_session(
+        pools: &DbPools,
+        source: &str,
+        session_id: &str,
+        state: &SessionState,
+        updated_at: i64,
+    ) {
+        let state_json = serde_json::to_string(state).expect("serialize state");
+        let source = source.to_string();
+        let session_id = session_id.to_string();
+        let conn = pools.writer.get().await.expect("writer pool");
+        conn.interact(move |c| -> rusqlite::Result<()> {
+            c.execute(
+                UPSERT_SESSION_PROJECTION,
+                rusqlite::params![source, session_id, state_json, updated_at],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("interact")
+        .expect("upsert");
+    }
+
+    async fn read_state(pools: &DbPools, source: &str, session_id: &str) -> Option<SessionState> {
+        let conn = pools.reader.get().await.expect("reader pool");
+        let s = source.to_string();
+        let sid = session_id.to_string();
+        let raw: Option<String> = conn
+            .interact(move |c| -> rusqlite::Result<Option<String>> {
+                c.query_row(
+                    SELECT_SESSION_PROJECTION_STATE,
+                    rusqlite::params![s, sid],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()
+            })
+            .await
+            .expect("interact")
+            .expect("query");
+        raw.map(|s| serde_json::from_str(&s).expect("parse state"))
+    }
+
+    async fn count_session_ended(pools: &DbPools, source: &str, session_id: &str) -> i64 {
+        let conn = pools.reader.get().await.expect("reader pool");
+        let s = source.to_string();
+        let sid = session_id.to_string();
+        conn.interact(move |c| -> rusqlite::Result<i64> {
+            c.query_row(
+                "SELECT COUNT(*) FROM events WHERE source = ? AND session_id = ? AND kind = ?",
+                rusqlite::params![s, sid, "SessionEnded"],
+                |r| r.get::<_, i64>(0),
+            )
+        })
+        .await
+        .expect("interact")
+        .expect("query")
+    }
+
+    // Story 5.3 AC #10: row with last_pid = None → SessionEnded with
+    // reason "no_pid_at_upgrade"; projection transitions to Ended.
+    #[tokio::test(flavor = "current_thread")]
+    async fn liveness_probe_emits_session_ended_for_no_pid_at_upgrade() {
+        let (_tmp, pools) = fresh_pools().await;
+        let hub = BroadcastHub::new(16);
+        upsert_session(
+            &pools,
+            "claude",
+            "sess-no-pid",
+            &SessionState {
+                current_state: SessionCurrentState::Working,
+                last_event_kind: EventKind::PreToolUse,
+                last_event_at_ms: 1_000,
+                last_pid: None,
+            },
+            1_000,
+        )
+        .await;
+
+        let emitted = probe_once(&pools.writer, &hub).await.expect("probe");
+        assert_eq!(emitted, 1);
+
+        let state = read_state(&pools, "claude", "sess-no-pid")
+            .await
+            .expect("state row");
+        assert_eq!(state.current_state, SessionCurrentState::Ended);
+        assert_eq!(state.last_event_kind, EventKind::SessionEnded);
+        assert_eq!(
+            count_session_ended(&pools, "claude", "sess-no-pid").await,
+            1
+        );
+    }
+
+    // Story 5.3 AC #11: row with last_pid = Some(<dead>) → SessionEnded with
+    // reason "pid_dead".
+    #[tokio::test(flavor = "current_thread")]
+    async fn liveness_probe_emits_session_ended_for_dead_pid() {
+        let (_tmp, pools) = fresh_pools().await;
+        let hub = BroadcastHub::new(16);
+
+        // Spawn a short-lived subprocess, wait for it to die, capture its PID.
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn shell");
+        let pid = child.id();
+        let _ = child.wait();
+        // Give the kernel a beat to reap.
+        std::thread::sleep(Duration::from_millis(50));
+
+        upsert_session(
+            &pools,
+            "claude",
+            "sess-dead-pid",
+            &SessionState {
+                current_state: SessionCurrentState::Working,
+                last_event_kind: EventKind::PreToolUse,
+                last_event_at_ms: 1_000,
+                last_pid: Some(pid),
+            },
+            1_000,
+        )
+        .await;
+
+        let emitted = probe_once(&pools.writer, &hub).await.expect("probe");
+        assert_eq!(emitted, 1);
+
+        let state = read_state(&pools, "claude", "sess-dead-pid")
+            .await
+            .expect("state row");
+        assert_eq!(state.current_state, SessionCurrentState::Ended);
+    }
+
+    // Story 5.3 AC #11 negative: row with last_pid pointing at THIS test
+    // runner's PID (definitely alive) → no SessionEnded emitted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn liveness_probe_skips_alive_pid() {
+        let (_tmp, pools) = fresh_pools().await;
+        let hub = BroadcastHub::new(16);
+
+        let alive_pid = std::process::id();
+        upsert_session(
+            &pools,
+            "claude",
+            "sess-alive",
+            &SessionState {
+                current_state: SessionCurrentState::Working,
+                last_event_kind: EventKind::PreToolUse,
+                last_event_at_ms: 1_000,
+                last_pid: Some(alive_pid),
+            },
+            1_000,
+        )
+        .await;
+
+        let emitted = probe_once(&pools.writer, &hub).await.expect("probe");
+        assert_eq!(emitted, 0);
+
+        let state = read_state(&pools, "claude", "sess-alive")
+            .await
+            .expect("state row");
+        assert_eq!(state.current_state, SessionCurrentState::Working);
+        assert_eq!(count_session_ended(&pools, "claude", "sess-alive").await, 0);
+    }
+
+    // Story 5.3 AC #12: from Ended, a UserPromptSubmit drives Working.
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_ended_then_resume_exits_ended() {
+        let (_tmp, pools) = fresh_pools().await;
+        let hub = BroadcastHub::new(16);
+        upsert_session(
+            &pools,
+            "claude",
+            "sess-resume",
+            &SessionState {
+                current_state: SessionCurrentState::Ended,
+                last_event_kind: EventKind::SessionEnded,
+                last_event_at_ms: 1_000,
+                last_pid: Some(100),
+            },
+            1_000,
+        )
+        .await;
+
+        projection::session::write(
+            &pools.writer,
+            &hub,
+            envelope_for("claude", "sess-resume", EventKind::UserPromptSubmit),
+        )
+        .await
+        .expect("write");
+
+        let state = read_state(&pools, "claude", "sess-resume")
+            .await
+            .expect("state row");
+        assert_eq!(state.current_state, SessionCurrentState::Working);
+        // last_pid carry-forward — the new envelope had pid=None, so the
+        // prior Some(100) persists.
+        assert_eq!(state.last_pid, Some(100));
+    }
+
+    // Story 5.3 AC #11: an already-Ended row must not re-emit SessionEnded.
+    #[tokio::test(flavor = "current_thread")]
+    async fn liveness_probe_does_not_re_emit_for_already_ended() {
+        let (_tmp, pools) = fresh_pools().await;
+        let hub = BroadcastHub::new(16);
+        upsert_session(
+            &pools,
+            "claude",
+            "sess-already-ended",
+            &SessionState {
+                current_state: SessionCurrentState::Ended,
+                last_event_kind: EventKind::SessionEnded,
+                last_event_at_ms: 1_000,
+                last_pid: None,
+            },
+            1_000,
+        )
+        .await;
+
+        let emitted = probe_once(&pools.writer, &hub).await.expect("probe");
+        assert_eq!(emitted, 0);
+        assert_eq!(
+            count_session_ended(&pools, "claude", "sess-already-ended").await,
+            0
+        );
+    }
+
+    // Story 5.3 AC #13: rebuild_missing_projections preserves last_pid and
+    // Ended state by replaying events through transition.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rebuild_preserves_last_pid_and_ended() {
+        let (_tmp, pools) = fresh_pools().await;
+        let hub = BroadcastHub::new(16);
+
+        // Ingest a sequence with pids; cap with a synthesized SessionEnded.
+        let pre = EventEnvelope {
+            source: "claude".to_string(),
+            session_id: "sess-rebuild".to_string(),
+            kind: EventKind::PreToolUse,
+            reaction: None,
+            payload: "{}".to_string(),
+            pid: Some(111),
+            notification_type: None,
+        };
+        projection::session::write(&pools.writer, &hub, pre)
+            .await
+            .expect("write 1");
+
+        let stop = EventEnvelope {
+            source: "claude".to_string(),
+            session_id: "sess-rebuild".to_string(),
+            kind: EventKind::Stop,
+            reaction: None,
+            payload: "{}".to_string(),
+            pid: None, // carry-forward leaves last_pid = Some(111)
+            notification_type: None,
+        };
+        projection::session::write(&pools.writer, &hub, stop)
+            .await
+            .expect("write 2");
+
+        let ended = EventEnvelope {
+            source: "claude".to_string(),
+            session_id: "sess-rebuild".to_string(),
+            kind: EventKind::SessionEnded,
+            reaction: None,
+            payload: r#"{"reason":"pid_dead","pid":111,"observed_at_ms":1000}"#.to_string(),
+            pid: Some(111),
+            notification_type: None,
+        };
+        projection::session::write(&pools.writer, &hub, ended)
+            .await
+            .expect("write 3");
+
+        let before = read_state(&pools, "claude", "sess-rebuild")
+            .await
+            .expect("pre-delete state");
+        assert_eq!(before.current_state, SessionCurrentState::Ended);
+        assert_eq!(before.last_pid, Some(111));
+
+        // Delete projections + rebuild.
+        let conn = pools.writer.get().await.expect("writer pool");
+        conn.interact(|c| -> rusqlite::Result<()> {
+            c.execute(
+                "DELETE FROM session_projections WHERE source != '__daemon__'",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("interact")
+        .expect("delete");
+        drop(conn);
+
+        projection::session::rebuild_missing_projections(&pools.writer)
+            .await
+            .expect("rebuild");
+
+        let after = read_state(&pools, "claude", "sess-rebuild")
+            .await
+            .expect("rebuilt state");
+        assert_eq!(after.current_state, SessionCurrentState::Ended);
+        assert_eq!(after.last_pid, Some(111));
+        assert_eq!(after.last_event_kind, EventKind::SessionEnded);
     }
 }

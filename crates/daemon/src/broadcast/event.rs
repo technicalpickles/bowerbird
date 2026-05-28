@@ -152,6 +152,7 @@ mod tests {
             reaction: Some(Reaction::Continue),
             payload: "{}".to_string(),
             created_at: 0,
+            pid: None,
         }
     }
 
@@ -163,6 +164,7 @@ mod tests {
                 current_state: SessionCurrentState::Working,
                 last_event_kind: EventKind::PreToolUse,
                 last_event_at_ms: 0,
+                last_pid: None,
             },
         }
     }

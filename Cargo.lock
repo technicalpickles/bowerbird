@@ -224,6 +224,7 @@ dependencies = [
  "deadpool-sqlite",
  "futures-util",
  "keyring",
+ "libc",
  "nix",
  "protocol",
  "rusqlite",
@@ -251,6 +252,7 @@ name = "bowerbird-shim"
 version = "0.1.0"
 dependencies = [
  "assert_cmd",
+ "libc",
  "serde_json",
  "tempfile",
  "thiserror",
