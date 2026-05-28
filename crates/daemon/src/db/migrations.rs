@@ -62,58 +62,9 @@ pub async fn run_migrations(writer_pool: &deadpool_sqlite::Pool) -> Result<()> {
     interact_res.map_err(Error::Migration)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Story 5.3: re-running `to_latest` against an already-migrated DB must be
-    // a no-op. Story 5.4 added the populated-DB contract test in
-    // `crates/daemon/tests/contract_daemon.rs::story_5_4_migrations`; this unit
-    // test stays as the in-memory baseline canary.
-    #[test]
-    fn migrations_are_idempotent() {
-        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory connection");
-        let m = migrations();
-        m.to_latest(&mut conn).expect("first to_latest");
-        let v1: i64 = conn
-            .query_row("PRAGMA user_version", [], |r| r.get(0))
-            .expect("user_version read");
-        m.to_latest(&mut conn)
-            .expect("second to_latest must succeed");
-        let v2: i64 = conn
-            .query_row("PRAGMA user_version", [], |r| r.get(0))
-            .expect("user_version read");
-        assert_eq!(v1, v2, "user_version must be stable on re-apply");
-        assert!(
-            v1 >= 2,
-            "expected user_version >= 2 after migrations, got {v1}"
-        );
-    }
-
-    // Story 5.3: migration v2 must add `events.pid` as a nullable INTEGER, and
-    // existing rows must default to NULL.
-    #[test]
-    fn migration_v2_adds_nullable_pid_column() {
-        let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory connection");
-        migrations()
-            .to_latest(&mut conn)
-            .expect("migrations must apply");
-
-        // Insert a row and verify pid is NULL by default (the migration uses
-        // ALTER TABLE ADD COLUMN, which yields NULL for pre-existing rows; new
-        // rows that don't set pid also get NULL).
-        conn.execute(
-            "INSERT INTO events (source, session_id, kind, payload, created_at) \
-             VALUES ('claude', 's1', 'Stop', '{}', 0)",
-            [],
-        )
-        .expect("insert");
-
-        let pid: Option<i64> = conn
-            .query_row("SELECT pid FROM events WHERE session_id = 's1'", [], |r| {
-                r.get(0)
-            })
-            .expect("read pid");
-        assert_eq!(pid, None, "default pid must be NULL");
-    }
-}
+// NOTE: the `:memory:` migration unit tests (`migrations_are_idempotent`,
+// `migration_v2_adds_nullable_pid_column`) live in
+// `crates/daemon/tests/contract_daemon.rs`, not here. A `#[cfg(test)]` block in
+// this `src/` file using `Connection::open_in_memory()` trips
+// `scripts/lint-connection-factory.sh`, which exempts `crates/daemon/tests/**`
+// but does not parse `#[cfg(test)]`. See bean gt-5o91.

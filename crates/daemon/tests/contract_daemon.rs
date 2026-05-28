@@ -339,6 +339,63 @@ async fn migrations_apply_on_fresh_db() {
     }
 }
 
+// Story 5.3: re-running `to_latest` against an already-migrated DB must be a
+// no-op. These two `:memory:` unit tests originally lived in
+// `crates/daemon/src/db/migrations.rs::tests`, but `open_in_memory()` inside a
+// `#[cfg(test)]` block in `src/` trips `scripts/lint-connection-factory.sh`
+// (which exempts `crates/daemon/tests/**` but does not parse `#[cfg(test)]`
+// blocks). Moved here so the lint passes while preserving the in-memory
+// baseline coverage, which is distinct from the populated-DB idempotency check
+// in `story_5_4_migrations::migrations_idempotent_on_populated_db`. See bean
+// gt-5o91.
+#[test]
+fn migrations_are_idempotent() {
+    let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory connection");
+    let m = migrations();
+    m.to_latest(&mut conn).expect("first to_latest");
+    let v1: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .expect("user_version read");
+    m.to_latest(&mut conn)
+        .expect("second to_latest must succeed");
+    let v2: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .expect("user_version read");
+    assert_eq!(v1, v2, "user_version must be stable on re-apply");
+    assert!(
+        v1 >= 2,
+        "expected user_version >= 2 after migrations, got {v1}"
+    );
+}
+
+// Story 5.3: migration v2 must add `events.pid` as a nullable INTEGER, and
+// existing rows must default to NULL. Moved here from `migrations.rs::tests`
+// alongside `migrations_are_idempotent` (see that test's note and bean gt-5o91).
+#[test]
+fn migration_v2_adds_nullable_pid_column() {
+    let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory connection");
+    migrations()
+        .to_latest(&mut conn)
+        .expect("migrations must apply");
+
+    // Insert a row and verify pid is NULL by default (the migration uses
+    // ALTER TABLE ADD COLUMN, which yields NULL for pre-existing rows; new
+    // rows that don't set pid also get NULL).
+    conn.execute(
+        "INSERT INTO events (source, session_id, kind, payload, created_at) \
+         VALUES ('claude', 's1', 'Stop', '{}', 0)",
+        [],
+    )
+    .expect("insert");
+
+    let pid: Option<i64> = conn
+        .query_row("SELECT pid FROM events WHERE session_id = 's1'", [], |r| {
+            r.get(0)
+        })
+        .expect("read pid");
+    assert_eq!(pid, None, "default pid must be NULL");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn migration_failure_exits_nonzero() {
     let tmp = TempDir::new().expect("tempdir");
@@ -504,9 +561,12 @@ fn walk(dir: &std::path::Path, offenders: &mut Vec<String>) {
         // Forbid `Connection::open(` specifically (with the open paren). This
         // catches the bypass path that opens a file-backed connection without
         // the PRAGMA invariants the factory enforces, while permitting
-        // `Connection::open_in_memory()` in self-contained unit tests
-        // (Story 5.3 migration idempotency test) where the in-memory DB is
-        // ephemeral and never has callers depending on the PRAGMA setup.
+        // `Connection::open_in_memory()` for ephemeral in-memory DBs that never
+        // have callers depending on the PRAGMA setup. NOTE: this is looser than
+        // the CI bash lint `scripts/lint-connection-factory.sh`, which bans
+        // `open_in_memory()` in `src/` too; that is why the migration unit
+        // tests live in this test crate rather than in `src/db/migrations.rs`.
+        // See bean gt-5o91.
         if content.contains("rusqlite::Connection::open(") {
             offenders.push(entry.display().to_string());
         }
