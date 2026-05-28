@@ -11,6 +11,7 @@
 # last_updated: 2026-05-27 (Story 5.2 → in-progress; code review found unresolved patch findings)
 # last_updated: 2026-05-27 (Story 5.2 → review; six review findings resolved with regression coverage)
 # last_updated: 2026-05-27 (Story 5.2 → done; bmad-code-review pass clean after four final findings resolved)
+# last_updated: 2026-05-28 (Story 5.3 ACs amended for daemon-observed liveness + typed-notification WaitingInput per sprint-change-proposal-2026-05-28-daemon-observed-liveness.md and ADR 0004; story remains backlog)
 # project: bowerbird
 # project_key: NOKEY
 # tracking_system: file-system
