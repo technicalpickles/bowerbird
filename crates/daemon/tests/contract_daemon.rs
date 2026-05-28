@@ -7940,6 +7940,7 @@ mod story_5_3_liveness {
     use super::*;
     use bowerbird_daemon::db::queries::SELECT_SESSION_PROJECTION_STATE;
     use bowerbird_daemon::projection::liveness::probe_once;
+    use tokio_util::sync::CancellationToken;
 
     async fn upsert_session(
         pools: &DbPools,
@@ -8019,8 +8020,12 @@ mod story_5_3_liveness {
         )
         .await;
 
-        let emitted = probe_once(&pools.writer, &hub).await.expect("probe");
-        assert_eq!(emitted, 1);
+        let shutdown = CancellationToken::new();
+        let report = probe_once(&pools.writer, &hub, &shutdown)
+            .await
+            .expect("probe");
+        assert_eq!(report.emitted, 1);
+        assert_eq!(report.failed, 0);
 
         let state = read_state(&pools, "claude", "sess-no-pid")
             .await
@@ -8041,6 +8046,10 @@ mod story_5_3_liveness {
         let hub = BroadcastHub::new(16);
 
         // Spawn a short-lived subprocess, wait for it to die, capture its PID.
+        // `wait()` reaps the child synchronously; once it returns the PID is no
+        // longer a live process — `kill(pid, 0)` will return ESRCH immediately.
+        // No sleep needed, and using one would violate the project's
+        // deterministic-timing test discipline (story 5.3 review finding #6).
         let mut child = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg("exit 0")
@@ -8048,8 +8057,6 @@ mod story_5_3_liveness {
             .expect("spawn shell");
         let pid = child.id();
         let _ = child.wait();
-        // Give the kernel a beat to reap.
-        std::thread::sleep(Duration::from_millis(50));
 
         upsert_session(
             &pools,
@@ -8065,8 +8072,12 @@ mod story_5_3_liveness {
         )
         .await;
 
-        let emitted = probe_once(&pools.writer, &hub).await.expect("probe");
-        assert_eq!(emitted, 1);
+        let shutdown = CancellationToken::new();
+        let report = probe_once(&pools.writer, &hub, &shutdown)
+            .await
+            .expect("probe");
+        assert_eq!(report.emitted, 1);
+        assert_eq!(report.failed, 0);
 
         let state = read_state(&pools, "claude", "sess-dead-pid")
             .await
@@ -8096,8 +8107,12 @@ mod story_5_3_liveness {
         )
         .await;
 
-        let emitted = probe_once(&pools.writer, &hub).await.expect("probe");
-        assert_eq!(emitted, 0);
+        let shutdown = CancellationToken::new();
+        let report = probe_once(&pools.writer, &hub, &shutdown)
+            .await
+            .expect("probe");
+        assert_eq!(report.emitted, 0);
+        assert_eq!(report.failed, 0);
 
         let state = read_state(&pools, "claude", "sess-alive")
             .await
@@ -8161,8 +8176,11 @@ mod story_5_3_liveness {
         )
         .await;
 
-        let emitted = probe_once(&pools.writer, &hub).await.expect("probe");
-        assert_eq!(emitted, 0);
+        let shutdown = CancellationToken::new();
+        let report = probe_once(&pools.writer, &hub, &shutdown)
+            .await
+            .expect("probe");
+        assert_eq!(report.emitted, 0);
         assert_eq!(
             count_session_ended(&pools, "claude", "sess-already-ended").await,
             0
@@ -8246,5 +8264,199 @@ mod story_5_3_liveness {
         assert_eq!(after.current_state, SessionCurrentState::Ended);
         assert_eq!(after.last_pid, Some(111));
         assert_eq!(after.last_event_kind, EventKind::SessionEnded);
+    }
+
+    // Story 5.3 review finding #2: between probe SELECT and the synthetic
+    // SessionEnded write, a real hook event lands on the same session. The
+    // probe must yield — the precondition check inside the writer txn fails,
+    // no SessionEnded event is written, no broadcast is emitted, the row is
+    // counted as skipped_stale.
+    #[tokio::test(flavor = "current_thread")]
+    async fn liveness_probe_skips_stale_row_when_real_hook_interleaved() {
+        let (_tmp, pools) = fresh_pools().await;
+        let hub = BroadcastHub::new(16);
+
+        // Seed a row whose last_pid is dead (PID None → no_pid_at_upgrade
+        // candidate). Then simulate the race: between the probe's read and
+        // the synthetic write, a real hook moves the projection.
+        upsert_session(
+            &pools,
+            "claude",
+            "sess-race",
+            &SessionState {
+                current_state: SessionCurrentState::Working,
+                last_event_kind: EventKind::PreToolUse,
+                last_event_at_ms: 1_000,
+                last_pid: None,
+            },
+            1_000,
+        )
+        .await;
+
+        // Race simulation: build the precondition from the *old* snapshot
+        // (current_state: Working), then change the row to a different
+        // current_state before invoking write_if_state_matches. The
+        // precondition check inside the txn must fail and return Ok(None).
+        upsert_session(
+            &pools,
+            "claude",
+            "sess-race",
+            &SessionState {
+                current_state: SessionCurrentState::WaitingInput,
+                last_event_kind: EventKind::Notification,
+                last_event_at_ms: 2_000,
+                last_pid: Some(999_999),
+            },
+            2_000,
+        )
+        .await;
+
+        // Build the synthetic envelope the probe would have built from the
+        // stale snapshot. last_pid was None at snapshot time.
+        let envelope = EventEnvelope {
+            source: "claude".to_string(),
+            session_id: "sess-race".to_string(),
+            kind: EventKind::SessionEnded,
+            reaction: None,
+            payload: r#"{"reason":"no_pid_at_upgrade","pid":null,"observed_at_ms":1000}"#
+                .to_string(),
+            pid: None,
+            notification_type: None,
+        };
+        let precondition = bowerbird_daemon::projection::session::WritePrecondition {
+            expected_current_state: SessionCurrentState::Working,
+            expected_last_pid: None,
+        };
+        let result = bowerbird_daemon::projection::session::write_if_state_matches(
+            &pools.writer,
+            &hub,
+            envelope,
+            precondition,
+        )
+        .await
+        .expect("call");
+        assert!(
+            result.is_none(),
+            "precondition mismatch must skip the synthetic write (Ok(None))"
+        );
+
+        // Row should retain the post-race state (WaitingInput, pid 999_999).
+        let after = read_state(&pools, "claude", "sess-race")
+            .await
+            .expect("state row");
+        assert_eq!(after.current_state, SessionCurrentState::WaitingInput);
+        assert_eq!(after.last_pid, Some(999_999));
+        // And NO SessionEnded event was inserted.
+        assert_eq!(count_session_ended(&pools, "claude", "sess-race").await, 0);
+    }
+
+    // Story 5.3 review finding #5: shutdown cancellation observed between
+    // rows stops the probe mid-iteration. Verified by pre-cancelling the
+    // token; the probe should exit on the first row check.
+    #[tokio::test(flavor = "current_thread")]
+    async fn liveness_probe_observes_shutdown_mid_iteration() {
+        let (_tmp, pools) = fresh_pools().await;
+        let hub = BroadcastHub::new(16);
+
+        // Seed two rows that would otherwise both emit SessionEnded.
+        for sid in ["sess-a", "sess-b"] {
+            upsert_session(
+                &pools,
+                "claude",
+                sid,
+                &SessionState {
+                    current_state: SessionCurrentState::Working,
+                    last_event_kind: EventKind::PreToolUse,
+                    last_event_at_ms: 1_000,
+                    last_pid: None,
+                },
+                1_000,
+            )
+            .await;
+        }
+
+        let shutdown = CancellationToken::new();
+        shutdown.cancel(); // pre-cancelled
+
+        let report = probe_once(&pools.writer, &hub, &shutdown)
+            .await
+            .expect("probe");
+        assert_eq!(
+            report.emitted, 0,
+            "pre-cancelled shutdown must abort before any row write"
+        );
+        // Neither projection should have transitioned.
+        for sid in ["sess-a", "sess-b"] {
+            let s = read_state(&pools, "claude", sid).await.expect("state");
+            assert_ne!(
+                s.current_state,
+                SessionCurrentState::Ended,
+                "row {sid} must not have been ended"
+            );
+            assert_eq!(count_session_ended(&pools, "claude", sid).await, 0);
+        }
+    }
+
+    // Story 5.3 review finding #6 / Task 9: `MissedTickBehavior::Skip` means
+    // a slow iteration does NOT queue catch-up ticks. With paused virtual
+    // time, advance past TWO tick boundaries while the tick_fn is "slow"
+    // (returns synchronously, but we advance time before the next select);
+    // the loop must NOT fire a second tick to catch up — the interval has
+    // collapsed the missed ticks into one. This pins the contract that
+    // liveness::run depends on.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn liveness_probe_missed_tick_does_not_queue() {
+        use bowerbird_daemon::projection::liveness::run_loop;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::time::advance;
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let shutdown = CancellationToken::new();
+
+        // Spawn the loop with a 5s cadence. Each "tick_fn" increments a
+        // counter and returns synchronously.
+        let loop_task = {
+            let count = count.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                run_loop(Duration::from_secs(5), shutdown, move || {
+                    let count = count.clone();
+                    Box::pin(async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                    })
+                })
+                .await;
+            })
+        };
+
+        // Let the spawned task park on its initial `interval.tick()` (which
+        // resolves immediately in `run_loop` and is consumed before the loop
+        // body). Then advance virtual time past THREE 5-second boundaries
+        // without yielding between them — Burst behavior would catch up with
+        // three queued ticks; Skip collapses them into one.
+        tokio::task::yield_now().await;
+        advance(Duration::from_secs(16)).await;
+        tokio::task::yield_now().await;
+
+        // With Skip, the counter should be exactly 1 (one tick fired,
+        // not three queued). Let one more boundary pass to confirm the loop
+        // is still alive and ticking normally.
+        let after_one_burst = count.load(Ordering::SeqCst);
+        assert_eq!(
+            after_one_burst, 1,
+            "MissedTickBehavior::Skip should collapse missed ticks (saw {after_one_burst})"
+        );
+
+        advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        let after_one_more = count.load(Ordering::SeqCst);
+        assert_eq!(
+            after_one_more, 2,
+            "next scheduled tick must still fire normally (saw {after_one_more})"
+        );
+
+        shutdown.cancel();
+        loop_task.await.expect("loop task");
     }
 }

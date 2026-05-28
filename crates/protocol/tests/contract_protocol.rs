@@ -593,3 +593,207 @@ fn additive_compat_pid_is_ignored_by_v1_consumer() {
     assert_eq!(parsed.event_id, 5);
     assert_eq!(parsed.kind, EventKind::PreToolUse);
 }
+
+// Story 5.3 review finding #7: AC #17 names `SessionState`, `StateFrame`,
+// AND `EventFrame` decode paths. The bare-struct tests above pin the inner
+// shape; the four tests below pin the actual WS wire shape — a v1.0
+// presenter compiled against the pre-5.3 protocol decodes a 5.3+ daemon's
+// `ServerMessage::{Event,State}` frames containing `SessionEnded` /
+// `Ended` / `last_pid` / `pid` without erroring, mapping unknown variants
+// to `Unknown` via `#[serde(other)]` and dropping unknown fields per the
+// asymmetric outbound permissive policy.
+
+// Legacy mocks reused by the four tests below. Each mirrors the v1.0
+// shape: no `Ended` / no `SessionEnded` / no `last_pid` / no `pid`.
+mod legacy_v1_0_mocks {
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Deserialize, Serialize, PartialEq, Eq, Clone, Copy)]
+    pub(super) enum LegacySessionCurrentState {
+        Idle,
+        Working,
+        WaitingInput,
+        #[serde(other)]
+        Unknown,
+    }
+
+    #[derive(Debug, Deserialize, Serialize, PartialEq, Eq, Clone)]
+    pub(super) enum LegacyEventKind {
+        UserPromptSubmit,
+        PreToolUse,
+        PostToolUse,
+        Stop,
+        Notification,
+        RecordingStarted,
+        RecordingEnded,
+        #[serde(other)]
+        Unknown,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[allow(dead_code)]
+    pub(super) struct LegacySessionState {
+        pub current_state: LegacySessionCurrentState,
+        pub last_event_kind: LegacyEventKind,
+        pub last_event_at_ms: i64,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[allow(dead_code)]
+    pub(super) struct LegacyEvent {
+        pub event_id: i64,
+        pub source: String,
+        pub session_id: String,
+        pub kind: LegacyEventKind,
+        pub reaction: Option<String>,
+        pub payload: String,
+        pub created_at: i64,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[allow(dead_code)]
+    pub(super) struct LegacyEventFrame {
+        pub event: LegacyEvent,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[allow(dead_code)]
+    pub(super) struct LegacyStateFrame {
+        pub source: String,
+        pub session_id: String,
+        pub state: LegacySessionState,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(tag = "op", rename_all = "snake_case")]
+    #[allow(dead_code)]
+    pub(super) enum LegacyServerMessage {
+        Hello, // accept any payload silently
+        Sync,  // ditto
+        Event(LegacyEventFrame),
+        State(LegacyStateFrame),
+        Dropped, // ditto
+        Close,   // ditto
+        #[serde(other)]
+        Unknown,
+    }
+}
+
+// Story 5.3 finding #7: full WS `ServerMessage::State` payload with `Ended`
+// + `last_pid` decoded through the legacy ServerMessage dispatcher. The
+// outer op variant matches (`State`), the inner `current_state` falls
+// through to `LegacySessionCurrentState::Unknown`, and the unknown
+// `last_pid` field is silently ignored — no error.
+#[test]
+fn additive_compat_state_frame_with_ended_decodes_through_server_message() {
+    use legacy_v1_0_mocks::*;
+    let wire = r#"{
+        "op": "state",
+        "source": "claude",
+        "session_id": "s1",
+        "state": {
+            "current_state": "Ended",
+            "last_event_kind": "Stop",
+            "last_event_at_ms": 0,
+            "last_pid": 12345
+        }
+    }"#;
+    let parsed: LegacyServerMessage =
+        serde_json::from_str(wire).expect("legacy ServerMessage decode");
+    match parsed {
+        LegacyServerMessage::State(frame) => {
+            assert_eq!(frame.source, "claude");
+            assert_eq!(frame.session_id, "s1");
+            assert_eq!(
+                frame.state.current_state,
+                LegacySessionCurrentState::Unknown,
+                "Ended must decode as Unknown through the legacy SessionCurrentState"
+            );
+        }
+        other => panic!("expected State variant, got {other:?}"),
+    }
+}
+
+// Story 5.3 finding #7: full WS `ServerMessage::Event` payload with
+// `SessionEnded` + `pid` decoded through the legacy dispatcher. The outer
+// op variant matches (`Event`), the inner `kind` falls through to
+// `LegacyEventKind::Unknown`, and the unknown `pid` field on Event is
+// silently dropped.
+#[test]
+fn additive_compat_event_frame_with_session_ended_decodes_through_server_message() {
+    use legacy_v1_0_mocks::*;
+    let wire = r#"{
+        "op": "event",
+        "event": {
+            "event_id": 7,
+            "source": "claude",
+            "session_id": "s1",
+            "kind": "SessionEnded",
+            "reaction": null,
+            "payload": "{\"reason\":\"pid_dead\",\"pid\":12345,\"observed_at_ms\":0}",
+            "created_at": 0,
+            "pid": 12345
+        }
+    }"#;
+    let parsed: LegacyServerMessage =
+        serde_json::from_str(wire).expect("legacy ServerMessage decode");
+    match parsed {
+        LegacyServerMessage::Event(frame) => {
+            assert_eq!(frame.event.event_id, 7);
+            assert_eq!(
+                frame.event.kind,
+                LegacyEventKind::Unknown,
+                "SessionEnded must decode as Unknown through the legacy EventKind"
+            );
+        }
+        other => panic!("expected Event variant, got {other:?}"),
+    }
+}
+
+// Story 5.3 finding #7: `EventFrame` decoded directly (without the outer
+// ServerMessage envelope, as used by replay export / event-stream tools).
+// Same expectation: `SessionEnded` kind maps to Unknown, `pid` is dropped.
+#[test]
+fn additive_compat_event_frame_with_session_ended_decodes_directly() {
+    use legacy_v1_0_mocks::*;
+    let wire = r#"{
+        "event": {
+            "event_id": 7,
+            "source": "claude",
+            "session_id": "s1",
+            "kind": "SessionEnded",
+            "reaction": null,
+            "payload": "{}",
+            "created_at": 0,
+            "pid": 12345
+        }
+    }"#;
+    let parsed: LegacyEventFrame = serde_json::from_str(wire).expect("legacy EventFrame decode");
+    assert_eq!(parsed.event.kind, LegacyEventKind::Unknown);
+    assert_eq!(parsed.event.event_id, 7);
+}
+
+// Story 5.3 finding #7: `StateFrame` decoded directly (without the outer
+// ServerMessage envelope, as used by snapshot-on-subscribe consumers that
+// pull the inner shape via REST `/sessions/{id}` and reuse the type).
+// Same expectation: `Ended` maps to Unknown, `last_pid` is dropped.
+#[test]
+fn additive_compat_state_frame_with_ended_decodes_directly() {
+    use legacy_v1_0_mocks::*;
+    let wire = r#"{
+        "source": "claude",
+        "session_id": "s1",
+        "state": {
+            "current_state": "Ended",
+            "last_event_kind": "Stop",
+            "last_event_at_ms": 0,
+            "last_pid": 12345
+        }
+    }"#;
+    let parsed: LegacyStateFrame = serde_json::from_str(wire).expect("legacy StateFrame decode");
+    assert_eq!(
+        parsed.state.current_state,
+        LegacySessionCurrentState::Unknown
+    );
+    assert_eq!(parsed.source, "claude");
+}

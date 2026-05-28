@@ -321,6 +321,23 @@ fn normalize_extracts_pid_none_when_negative() {
     assert_eq!(result.envelope.pid, None);
 }
 
+#[test]
+fn normalize_rejects_bowerbird_ppid_zero() {
+    let dir = TempDir::new().unwrap();
+    let toml_path = write_toml(&dir, minimal_toml_with_bash());
+    let adapter = ClaudeAdapter::new(toml_path);
+
+    // PID 0 must be filtered at the adapter boundary: kill(0, 0) has process-
+    // group semantics, which would make the liveness probe report any session
+    // with last_pid: Some(0) as eternally alive.
+    let payload = r#"{"session_id":"s1","tool_name":"Bash","bowerbird_ppid":0}"#;
+    let result = adapter.normalize("PreToolUse", payload.as_bytes()).unwrap();
+    assert_eq!(
+        result.envelope.pid, None,
+        "bowerbird_ppid: 0 must be treated as absent so liveness never calls kill(0, 0)"
+    );
+}
+
 // ─── Story 5.3: notification_type extraction ─────────────────────────────────
 
 #[test]

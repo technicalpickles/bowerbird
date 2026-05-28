@@ -25,6 +25,17 @@ pub struct RecordingStarted {
     pub recording_session_id: i64,
 }
 
+/// Conditional-write guard for [`write_if_state_matches`]. The synthetic
+/// liveness probe's SessionEnded write is only committed if the projection
+/// row's `current_state` and `last_pid` still match the snapshot the probe
+/// observed — otherwise a real hook event has already moved the session and
+/// the probe should yield to it (story 5.3 review finding #2).
+#[derive(Debug, Clone, Copy)]
+pub struct WritePrecondition {
+    pub expected_current_state: SessionCurrentState,
+    pub expected_last_pid: Option<u32>,
+}
+
 /// Sole owner of the SQLite write transaction AND the sole publisher of
 /// user-facing `BroadcastEnvelope::Event` / `BroadcastEnvelope::State`
 /// frames (per story 2.2; refined by story 5.2).
@@ -49,6 +60,45 @@ pub async fn write(
     broadcaster: &BroadcastHub,
     envelope: EventEnvelope,
 ) -> Result<EventId> {
+    write_inner(writer_pool, broadcaster, envelope, None)
+        .await?
+        .ok_or_else(|| {
+            Error::Projection("write() with no precondition unexpectedly skipped".into())
+        })
+}
+
+/// Conditional variant of [`write`] used by the liveness probe. Re-reads the
+/// projection row inside the writer transaction and only commits if
+/// `current_state` AND `last_pid` still match `precondition` — otherwise the
+/// txn drops without committing, no broadcast is emitted, and `Ok(None)` is
+/// returned. Story 5.3 review finding #2: a real hook event may land between
+/// the probe's SELECT and the synthetic write; the probe must yield to it.
+#[tracing::instrument(skip_all, fields(source = %envelope.source, session_id = %envelope.session_id))]
+pub async fn write_if_state_matches(
+    writer_pool: &deadpool_sqlite::Pool,
+    broadcaster: &BroadcastHub,
+    envelope: EventEnvelope,
+    precondition: WritePrecondition,
+) -> Result<Option<EventId>> {
+    write_inner(writer_pool, broadcaster, envelope, Some(precondition)).await
+}
+
+/// Closure return type from `write_inner`'s `interact` callback. `None`
+/// means the precondition (if any) was not met — the txn dropped without
+/// committing, no broadcast is owed.
+type WriteInteractResult = Option<(
+    i64,
+    SessionState,
+    Option<SessionCurrentState>,
+    Option<SessionCurrentState>,
+)>;
+
+async fn write_inner(
+    writer_pool: &deadpool_sqlite::Pool,
+    broadcaster: &BroadcastHub,
+    envelope: EventEnvelope,
+    precondition: Option<WritePrecondition>,
+) -> Result<Option<EventId>> {
     // Sentinel kinds route through `write_recording_started` /
     // `write_recording_ended` and must never reach this function
     // (architecture.md:634-641). A runtime guard (not just `debug_assert!`)
@@ -94,105 +144,130 @@ pub async fn write(
     let payload_for_closure = payload.clone();
 
     let interact_res = conn
-        .interact(
-            move |c| -> rusqlite::Result<(
-                i64,
-                SessionState,
-                Option<SessionCurrentState>,
-                Option<SessionCurrentState>,
-            )> {
-                let tx = c.transaction()?;
+        .interact(move |c| -> rusqlite::Result<WriteInteractResult> {
+            let tx = c.transaction()?;
 
-                // Read the prior state inside the transaction so a concurrent
-                // writer cannot interleave between SELECT and UPSERT. Reads do
-                // not break the "exactly two writes" invariant from
-                // architecture.md:634-641 — the invariant is about *writes*.
-                let prev_state: Option<SessionState> = tx
-                    .query_row(
-                        SELECT_SESSION_PROJECTION_STATE,
-                        rusqlite::params![&source_for_closure, &session_id_for_closure],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .optional()?
-                    .and_then(|raw| match serde_json::from_str::<SessionState>(&raw) {
-                        Ok(v) => Some(v),
-                        Err(e) => {
-                            tracing::error!(
-                                error = %e,
-                                raw = %raw,
-                                "session_projections.state failed to deserialize; \
-                                 treating as fresh — next event will overwrite",
-                            );
-                            None
-                        }
-                    });
+            // Read the prior state inside the transaction so a concurrent
+            // writer cannot interleave between SELECT and UPSERT. Reads do
+            // not break the "exactly two writes" invariant from
+            // architecture.md:634-641 — the invariant is about *writes*.
+            let prev_state: Option<SessionState> = tx
+                .query_row(
+                    SELECT_SESSION_PROJECTION_STATE,
+                    rusqlite::params![&source_for_closure, &session_id_for_closure],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .and_then(|raw| match serde_json::from_str::<SessionState>(&raw) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            raw = %raw,
+                            "session_projections.state failed to deserialize; \
+                             treating as fresh — next event will overwrite",
+                        );
+                        None
+                    }
+                });
 
-                // Capture prev's READ-FACING current_state BEFORE the closure
-                // consumes `prev_state` into `transition` — the post-commit
-                // publish path needs both prev and new current_state to decide
-                // whether to emit a `BroadcastEnvelope::State` (story 5.2).
-                //
-                // The read-facing value (via `current_state_for_read`) folds in
-                // the `STALE_WORKING_MS` fallback so a stale stored `Working`
-                // that subscribers were seeing as `Idle` (via snapshot, REST,
-                // or any read path) triggers a State envelope when a new event
-                // restores live `Working`. Comparing raw stored states would
-                // miss that transition because the stored row sat at
-                // `Working` the whole time.
-                let prev_raw_current_state = prev_state.as_ref().map(|s| s.current_state);
-                let prev_read_current_state = prev_state
-                    .as_ref()
-                    .map(|s| current_state_for_read(s, now_ms));
+            // Story 5.3 review finding #2: if the caller supplied a
+            // precondition (only the liveness probe does), bail before any
+            // write if the row no longer matches the snapshot we observed.
+            // A real hook event has already moved the session; the probe
+            // yields to it. Dropping `tx` here rolls back (no rows
+            // touched), so this branch leaves the DB and the broadcast
+            // channel untouched.
+            if let Some(pc) = precondition {
+                let matches = match prev_state.as_ref() {
+                    Some(s) => {
+                        s.current_state == pc.expected_current_state
+                            && s.last_pid == pc.expected_last_pid
+                    }
+                    // No prev row means the projection was deleted (or
+                    // never existed) after the probe SELECT — definitely
+                    // changed since snapshot. Skip.
+                    None => false,
+                };
+                if !matches {
+                    return Ok(None);
+                }
+            }
 
-                let new_state = transition(
-                    prev_state.as_ref(),
-                    kind_for_transition,
-                    notification_type,
-                    pid,
+            // Capture prev's READ-FACING current_state BEFORE the closure
+            // consumes `prev_state` into `transition` — the post-commit
+            // publish path needs both prev and new current_state to decide
+            // whether to emit a `BroadcastEnvelope::State` (story 5.2).
+            //
+            // The read-facing value (via `current_state_for_read`) folds in
+            // the `STALE_WORKING_MS` fallback so a stale stored `Working`
+            // that subscribers were seeing as `Idle` (via snapshot, REST,
+            // or any read path) triggers a State envelope when a new event
+            // restores live `Working`. Comparing raw stored states would
+            // miss that transition because the stored row sat at
+            // `Working` the whole time.
+            let prev_raw_current_state = prev_state.as_ref().map(|s| s.current_state);
+            let prev_read_current_state = prev_state
+                .as_ref()
+                .map(|s| current_state_for_read(s, now_ms));
+
+            let new_state = transition(
+                prev_state.as_ref(),
+                kind_for_transition,
+                notification_type,
+                pid,
+                now_ms,
+            );
+            let state_json = serde_json::to_string(&new_state).map_err(|e| {
+                rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("SessionState serialize failed: {e}"),
+                )))
+            })?;
+
+            tx.execute(
+                UPSERT_SESSION_PROJECTION,
+                rusqlite::params![
+                    source_for_closure,
+                    session_id_for_closure,
+                    state_json,
+                    now_ms
+                ],
+            )?;
+            tx.execute(
+                INSERT_EVENT,
+                rusqlite::params![
+                    source_for_closure,
+                    session_id_for_closure,
+                    kind_str,
+                    reaction_str,
+                    payload_for_closure,
                     now_ms,
-                );
-                let state_json = serde_json::to_string(&new_state).map_err(|e| {
-                    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("SessionState serialize failed: {e}"),
-                    )))
-                })?;
-
-                tx.execute(
-                    UPSERT_SESSION_PROJECTION,
-                    rusqlite::params![
-                        source_for_closure,
-                        session_id_for_closure,
-                        state_json,
-                        now_ms
-                    ],
-                )?;
-                tx.execute(
-                    INSERT_EVENT,
-                    rusqlite::params![
-                        source_for_closure,
-                        session_id_for_closure,
-                        kind_str,
-                        reaction_str,
-                        payload_for_closure,
-                        now_ms,
-                        pid,
-                    ],
-                )?;
-                let id = tx.last_insert_rowid();
-                tx.commit()?;
-                Ok((
-                    id,
-                    new_state,
-                    prev_raw_current_state,
-                    prev_read_current_state,
-                ))
-            },
-        )
+                    pid,
+                ],
+            )?;
+            let id = tx.last_insert_rowid();
+            tx.commit()?;
+            Ok(Some((
+                id,
+                new_state,
+                prev_raw_current_state,
+                prev_read_current_state,
+            )))
+        })
         .await
         .map_err(|e| Error::Pool(format!("interact failed: {e}")))?;
 
-    let (event_id_raw, new_state, prev_raw_current_state, prev_read_current_state) = interact_res?;
+    let (event_id_raw, new_state, prev_raw_current_state, prev_read_current_state) =
+        match interact_res? {
+            Some(t) => t,
+            None => {
+                tracing::debug!(
+                    "write_if_state_matches: precondition not met; skipping synthetic write"
+                );
+                return Ok(None);
+            }
+        };
     let event_id = EventId(event_id_raw);
 
     // Post-commit publish. Event BEFORE State so a presenter consuming both
@@ -237,7 +312,7 @@ pub async fn write(
         "ws: published event envelope; state envelope gated on transition"
     );
 
-    Ok(event_id)
+    Ok(Some(event_id))
 }
 
 /// Write the daemon's `RecordingStarted` sentinel atomically with the

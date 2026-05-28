@@ -186,8 +186,31 @@ async fn run(config: Config, bowerbird_dir: PathBuf) -> anyhow::Result<()> {
     // post-cleanup state in their snapshot (Story 5.3 Dev Notes §"Why the
     // synchronous startup probe is non-optional"). For an empty event log
     // this is a single empty SELECT — sub-millisecond.
-    match projection::liveness::probe_once(&pools.writer, &broadcaster).await {
-        Ok(n) if n > 0 => tracing::info!(count = n, "startup liveness probe emitted SessionEnded"),
+    //
+    // Story 5.3 review finding #3: per-row write failures used to be swallowed
+    // inside probe_once. They now surface via ProbeReport.failed and are
+    // logged at WARN here so the "presenters connecting at t=0 see clean
+    // state" guarantee is observable. We still proceed to bind — failing the
+    // daemon for a partial cleanup would block a workstation from recovering;
+    // a follow-up entry in deferred-work.md tracks whether to flip this to
+    // hard-fail under a config flag.
+    match projection::liveness::probe_once(&pools.writer, &broadcaster, &shutdown_requested).await {
+        Ok(report) if report.failed > 0 => {
+            tracing::warn!(
+                emitted = report.emitted,
+                failed = report.failed,
+                skipped_stale = report.skipped_stale,
+                "startup liveness probe completed with FAILED rows; \
+                 presenters connecting now may see stale session state for those rows"
+            );
+        }
+        Ok(report) if report.emitted > 0 => {
+            tracing::info!(
+                emitted = report.emitted,
+                skipped_stale = report.skipped_stale,
+                "startup liveness probe emitted SessionEnded"
+            );
+        }
         Ok(_) => tracing::debug!("startup liveness probe found no dead sessions"),
         Err(e) => tracing::error!(error = ?e, "startup liveness probe failed; continuing"),
     }

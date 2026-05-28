@@ -27,7 +27,7 @@ use tokio_util::sync::CancellationToken;
 use crate::broadcast::BroadcastHub;
 use crate::db::queries::SELECT_NON_SENTINEL_SESSIONS;
 use crate::error::{Error, Result};
-use crate::projection::session::write;
+use crate::projection::session::{write_if_state_matches, WritePrecondition};
 use crate::time::current_unix_millis;
 
 /// Probe cadence — see ADR 0004 §"Cadence shorter/longer than 5s" for rationale.
@@ -55,6 +55,20 @@ struct EndedPayload {
     reason: EndedReason,
     pid: Option<u32>,
     observed_at_ms: i64,
+}
+
+/// Outcome of one probe iteration. Splits "emitted SessionEnded" from
+/// "considered emitting but the write failed" so the startup probe can fail
+/// loudly when cleanup didn't actually land (story 5.3 review finding #3),
+/// and so the periodic loop's tracing carries actionable signal instead of
+/// silently swallowing per-row write errors. `skipped_stale` counts rows
+/// whose precondition didn't match at write time (finding #2) — informational
+/// only; not a failure.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ProbeReport {
+    pub emitted: usize,
+    pub failed: usize,
+    pub skipped_stale: usize,
 }
 
 /// `kill(pid, 0)` does not send a signal — it returns 0 if the process exists
@@ -87,11 +101,27 @@ fn is_pid_alive(pid: u32) -> bool {
 ///   - `Some(pid)` AND `!is_pid_alive(pid)` → emit `SessionEnded` with `reason: pid_dead`
 ///   - `Some(pid)` AND `is_pid_alive(pid)`  → skip
 ///
-/// Emissions route through `projection::session::write`, so the resulting
-/// state transition is broadcast by Story 5.2's gating logic naturally.
-/// Returns the number of `SessionEnded` events emitted.
+/// Emissions route through `projection::session::write_if_state_matches`
+/// (story 5.3 review finding #2), so a real hook event that interleaves
+/// between the probe's SELECT and the synthetic write wins — the probe
+/// yields and the row is counted as `skipped_stale`.
+///
+/// `shutdown` is polled between rows (story 5.3 review finding #5): once
+/// cancelled, no further synthetic writes happen and the probe returns the
+/// partial [`ProbeReport`] for what it managed to do so far.
+///
+/// Returns the [`ProbeReport`] for this iteration. Per-row write failures
+/// are logged and counted in `report.failed`, NOT propagated as an `Err` —
+/// one bad row should not stop the rest. An `Err` here means the SELECT
+/// itself failed (pool, sqlite, serde) — fatal for the iteration but the
+/// caller decides whether to escalate (startup: log loudly; periodic: log
+/// and try again on next tick).
 #[tracing::instrument(skip_all)]
-pub async fn probe_once(writer_pool: &Pool, broadcaster: &BroadcastHub) -> Result<usize> {
+pub async fn probe_once(
+    writer_pool: &Pool,
+    broadcaster: &BroadcastHub,
+    shutdown: &CancellationToken,
+) -> Result<ProbeReport> {
     // CRITICAL: do NOT hold a writer-pool connection across the per-row
     // `write()` calls below — the writer pool has max_size = 1, and `write()`
     // checks out the same pool. Holding the read connection here would
@@ -123,9 +153,24 @@ pub async fn probe_once(writer_pool: &Pool, broadcaster: &BroadcastHub) -> Resul
     };
 
     let observed_at_ms = current_unix_millis()?;
-    let mut emitted = 0usize;
+    let mut report = ProbeReport::default();
 
     for (source, session_id, state_json) in rows {
+        // Story 5.3 review finding #5: shutdown should stop the per-row loop,
+        // not just gate the next tick. Check before every potential write so
+        // an in-flight probe iteration that's mid-loop when shutdown lands
+        // exits promptly instead of running to completion. The report
+        // returned here is partial — that's the point.
+        if shutdown.is_cancelled() {
+            tracing::info!(
+                emitted = report.emitted,
+                failed = report.failed,
+                skipped_stale = report.skipped_stale,
+                "liveness probe: shutdown observed mid-iteration; exiting early"
+            );
+            return Ok(report);
+        }
+
         let stored: SessionState = match serde_json::from_str(&state_json) {
             Ok(s) => s,
             Err(e) => {
@@ -168,9 +213,19 @@ pub async fn probe_once(writer_pool: &Pool, broadcaster: &BroadcastHub) -> Resul
             pid: stored.last_pid,
             notification_type: None,
         };
-        match write(writer_pool, broadcaster, envelope).await {
-            Ok(_) => {
-                emitted += 1;
+        // Story 5.3 review finding #2: gate the synthetic write on the row
+        // still matching what we observed. If a real hook event interleaved
+        // between the SELECT above and now (which is possible — the writer
+        // pool serializes hook ingests but not against our SELECT), the
+        // precondition fails inside the txn, no row is touched, no event is
+        // broadcast, and the probe yields to the hook ingest.
+        let precondition = WritePrecondition {
+            expected_current_state: stored.current_state,
+            expected_last_pid: stored.last_pid,
+        };
+        match write_if_state_matches(writer_pool, broadcaster, envelope, precondition).await {
+            Ok(Some(_)) => {
+                report.emitted += 1;
                 tracing::info!(
                     source = %source,
                     session_id = %session_id,
@@ -179,7 +234,16 @@ pub async fn probe_once(writer_pool: &Pool, broadcaster: &BroadcastHub) -> Resul
                     "liveness probe: emitted SessionEnded"
                 );
             }
+            Ok(None) => {
+                report.skipped_stale += 1;
+                tracing::debug!(
+                    source = %source,
+                    session_id = %session_id,
+                    "liveness probe: row changed since SELECT; yielding to concurrent hook"
+                );
+            }
             Err(e) => {
+                report.failed += 1;
                 tracing::error!(
                     error = ?e,
                     source = %source,
@@ -189,14 +253,50 @@ pub async fn probe_once(writer_pool: &Pool, broadcaster: &BroadcastHub) -> Resul
             }
         }
     }
-    Ok(emitted)
+    Ok(report)
 }
 
 /// Periodic probe loop. `MissedTickBehavior::Skip` so a slow iteration does
 /// not queue catch-up ticks — see ADR 0004 §"Cadence shorter/longer than 5s."
 /// Exits on shutdown cancellation.
 pub async fn run(writer_pool: Pool, broadcaster: Arc<BroadcastHub>, shutdown: CancellationToken) {
-    let mut interval = tokio::time::interval(PROBE_CADENCE);
+    let probe_shutdown = shutdown.clone();
+    run_loop(PROBE_CADENCE, shutdown, move || {
+        let writer_pool = writer_pool.clone();
+        let broadcaster = broadcaster.clone();
+        let probe_shutdown = probe_shutdown.clone();
+        Box::pin(async move {
+            match probe_once(&writer_pool, &broadcaster, &probe_shutdown).await {
+                Ok(report) if report.failed > 0 || report.emitted > 0 => {
+                    tracing::info!(
+                        emitted = report.emitted,
+                        failed = report.failed,
+                        skipped_stale = report.skipped_stale,
+                        "liveness probe: iteration complete"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!(error = ?e, "liveness probe: iteration failed");
+                }
+            }
+        })
+    })
+    .await;
+}
+
+/// Generic tick-driven loop with `MissedTickBehavior::Skip`. Pulled out of
+/// [`run`] as a testable seam: tests can drive `tick_fn` with a counter to
+/// pin the "slow iteration does not queue catch-up ticks" guarantee under
+/// paused virtual time (story 5.3 review finding #6). `tick_fn` is invoked
+/// at most once per cadence; a slow `tick_fn` returning past the next
+/// scheduled boundary causes the *next* scheduled tick to be skipped, not
+/// queued, per `MissedTickBehavior::Skip`.
+pub async fn run_loop<F>(cadence: Duration, shutdown: CancellationToken, mut tick_fn: F)
+where
+    F: FnMut() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+{
+    let mut interval = tokio::time::interval(cadence);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // The first tick fires immediately. The startup synchronous probe in
     // main.rs has already covered t=0, so skip the immediate fire.
@@ -209,9 +309,7 @@ pub async fn run(writer_pool: Pool, broadcaster: Arc<BroadcastHub>, shutdown: Ca
                 return;
             }
             _ = interval.tick() => {
-                if let Err(e) = probe_once(&writer_pool, &broadcaster).await {
-                    tracing::error!(error = ?e, "liveness probe: iteration failed");
-                }
+                tick_fn().await;
             }
         }
     }

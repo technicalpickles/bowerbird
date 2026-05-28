@@ -94,10 +94,17 @@ pub(crate) fn normalize(
     // Story 5.3 AC #2: extract bowerbird_ppid (injected by the shim). Missing,
     // non-integer, or out-of-range values all yield pid = None — adapter must
     // not fail normalization for a missing/malformed ppid.
+    //
+    // PID 0 is rejected at the boundary: `kill(0, 0)` has process-group
+    // semantics (signals every member of the caller's group), not single-
+    // process semantics, so a `bowerbird_ppid: 0` from a malformed or custom
+    // producer would make the liveness probe always report "alive" and pin the
+    // session as immortal. Treat 0 as if the field were absent.
     let pid = value
         .get("bowerbird_ppid")
         .and_then(|v| v.as_u64())
-        .and_then(|n| u32::try_from(n).ok());
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|n| *n != 0);
 
     // Story 5.3 AC #3: extract typed notification_type only for Notification
     // hooks; non-Notification kinds with a stray notification_type field

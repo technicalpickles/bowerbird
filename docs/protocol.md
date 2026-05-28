@@ -290,6 +290,13 @@ Emitted (a) on every `current_state` transition resulting from a projection writ
 
 `last_pid` (Story 5.3) is the carry-forward PID — set when an envelope carrying `bowerbird_ppid` projects, preserved across subsequent envelopes that don't carry one. Presenters do NOT need to call `kill(pid, 0)` themselves; the daemon runs a 5-second probe and emits `SessionEnded` for dead-or-no-PID rows, transitioning `current_state` to `Ended`.
 
+**V1 PID-only liveness: known limitations.** The probe checks `kill(last_pid, 0)` only — it confirms *some* process holds the PID, not that it's the original Claude Code session. Two scenarios this does not catch:
+
+1. **PID reuse.** On a long-running host the OS will eventually recycle PIDs (Linux's 32k-PID default is small enough to wrap on busy machines). If the original Claude exited and the OS later reassigned its PID to an unrelated process, the probe will report the row alive when it is not.
+2. **Wrong-parent reparenting.** `bowerbird_ppid` captures the shim's immediate parent at shim-invocation time. If a shell wrapper, `nohup`, or sandboxing tool sits between Claude and the shim, `last_pid` points at the wrapper, which may outlive the actual session.
+
+V1 mitigates both via the projection's **overwrite-on-Some** carry-forward: every real hook event from a live session re-binds `last_pid` to the current `bowerbird_ppid`, so a session that's still actually firing hooks remains correctly tracked. A future story may capture process start time alongside the PID (`bowerbird_pstart`) and compare both on probe; see `docs/bmad/implementation-artifacts/deferred-work.md` entry "Process-birth marker for PID identity."
+
 ### `dropped`
 
 ```json

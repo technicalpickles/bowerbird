@@ -50,7 +50,10 @@ libc               = { workspace = true }
 tempfile          = { workspace = true }
 assert_cmd        = { workspace = true }
 nix               = { workspace = true }
-tokio             = { workspace = true }
+# Story 5.3 review finding #6 — `tokio::time::advance` + `#[tokio::test(start_paused = true)]`
+# are gated on the `test-util` feature; required by the deterministic
+# missed-tick regression test in tests/contract_daemon.rs.
+tokio             = { workspace = true, features = ["test-util"] }
 tower             = { workspace = true, features = ["util"] }
 tokio-tungstenite = { workspace = true }
 futures-util      = "0.3"
