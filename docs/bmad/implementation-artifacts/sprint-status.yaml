@@ -61,7 +61,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-05-16
-last_updated: 2026-05-29 (Story 5.6 → review; dev-story session complete — 6 of 7 tasks done [Task 7 deferred manual live-daemon check], 8 ACs satisfied, workspace tests 485-pass serialized + fmt + clippy green, no protocol/migration change)
+last_updated: 2026-05-29 (Story 5.6 code-review findings resolved — 3 [Patch] (stale docs/wording/File List) + 1 [Decision] (targeted one-time startup repair repair_idle_prompt_waiting_input drains pre-5.6 idle_prompt WaitingInput rows, no migration); 487 workspace tests serialized + fmt + clippy green; remains in review)
 project: bowerbird
 project_key: NOKEY
 tracking_system: file-system
