@@ -1,7 +1,7 @@
 # 0004. Daemon-observed session liveness (supersedes Story 5.3's "presenter does `kill()`")
 
 Date: 2026-05-27
-Status: Accepted
+Status: Accepted (§3 `idle_prompt` row amended by ADR 0005, 2026-05-29 — `idle_prompt` reclassified from input-required to transient/preserve-prior)
 Deciders: @pickles
 Related: ADR-0001 (no conflict); sprint-change-proposal-2026-05-27-pid-liveness.md (this ADR amends its presenter-side approach); Story 1.6 (`docs/bmad/implementation-artifacts/1-6-session-projection-and-hook-unreliability-tolerance.md`); Story 5.1 dogfooding (`docs/bmad/implementation-artifacts/5-1-first-party-presenter-tool.md`); Story 5.2 (the PostToolUse "preserve prior" rule this ADR refines)
 Implementation: `crates/daemon/src/projection/state.rs`, `crates/daemon/src/main.rs` (new probe task), `crates/protocol/src/state.rs` (new `Ended` variant), `crates/protocol/src/event.rs` (new `SessionEnded` variant), `crates/adapter-claude/src/normalize.rs` (extract `notification_type`)
