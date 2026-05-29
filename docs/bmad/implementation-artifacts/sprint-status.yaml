@@ -25,6 +25,7 @@
 # last_updated: 2026-05-28 (Story 5.4 → review; all nine code-review patch findings resolved — seed atomicity/0700/non-file safety, install stderr hint [WARN-log deferred], export pre-truncation guard, full-row migration snapshot, panic route removed via apply_common_middleware, smoke-test teardown, committed example lockfiles + fixed latent reconnect-recovery typecheck errors)
 # last_updated: 2026-05-28 (Story 5.4 → done; install UX polish + middleware closure complete, code-review resolved)
 # last_updated: 2026-05-28 (Story 5.5 bench-gates-load-bearing created via bmad-create-story; 4 ACs + 6 tasks; → ready-for-dev)
+# last_updated: 2026-05-29 (Story 5.6 idle-prompt-reclassified-as-transient inserted after 5.5 via bmad-create-story; old 5.6→5.7, 5.7→5.8, 5.8→5.9, 5.9→5.10 per sprint-change-proposal-2026-05-29-idle-prompt-reclassification.md + ADR 0005)
 # project: bowerbird
 # project_key: NOKEY
 # tracking_system: file-system
@@ -60,7 +61,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-05-16
-last_updated: 2026-05-28 (Story 5.5 bench-gates-load-bearing created via bmad-create-story; 4 ACs + 6 tasks; → ready-for-dev)
+last_updated: 2026-05-29 (Story 5.6 idle-prompt-reclassified-as-transient inserted after 5.5 via bmad-create-story; 8 ACs + 7 tasks; → ready-for-dev; old 5.6→5.7, 5.7→5.8, 5.8→5.9, 5.9→5.10 per sprint-change-proposal-2026-05-29-idle-prompt-reclassification.md + ADR 0005)
 project: bowerbird
 project_key: NOKEY
 tracking_system: file-system
@@ -105,7 +106,7 @@ development_status:
   epic-4-retrospective: done
 
   # Dogfooding validation phase (no formal stories; bugs become 5.X-hotfix stories ad-hoc)
-  # Begins after Story 5.1 (presenter) ships; runs in parallel with Stories 5.2–5.7.
+  # Begins after Story 5.1 (presenter) ships; runs in parallel with Stories 5.2–5.10.
   dogfooding-validation-phase: backlog  # transitions to 'in-progress' when 5.1 ships; 'done' on v0.1.0 tag
 
   # Epic 5: V1 Release Readiness (dogfooding → presenter → hardening)
@@ -117,8 +118,9 @@ development_status:
   5-3-session-process-liveness-pid-capture: done
   5-4-install-ux-polish-and-middleware-closure: done
   5-5-bench-gates-load-bearing: ready-for-dev
-  5-6-release-pipeline-end-to-end-verification: backlog
-  5-7-cookbook-consolidation: backlog
-  5-8-first-time-reader-docs-pass: backlog
-  5-9-crates-io-namespace-and-v0-1-0-tag: backlog
+  5-6-idle-prompt-reclassified-as-transient: ready-for-dev
+  5-7-release-pipeline-end-to-end-verification: backlog
+  5-8-cookbook-consolidation: backlog
+  5-9-first-time-reader-docs-pass: backlog
+  5-10-crates-io-namespace-and-v0-1-0-tag: backlog
   epic-5-retrospective: optional

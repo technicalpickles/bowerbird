@@ -14,6 +14,7 @@ revisions:
   - 2026-05-27: Inserted new Story 5.7 (Session state projection correctness) into Epic 5; old 5.7 (crates.io + v0.1.0 tag) → 5.8. Tightens state-broadcast to transitions-only, removes the PostToolUse→Idle flip, adds UserPromptSubmit hook subscription. Surfaced during dogfooding via pickletown /sessions livestream page. Source: docs/bmad/planning-artifacts/sprint-change-proposal-2026-05-27.md.
   - 2026-05-27: Inserted new Story 5.8 (Session-process liveness via PID capture) into Epic 5; old 5.8 (crates.io + v0.1.0 tag) → 5.9. Adds `SessionState.last_pid` (mechanical fact), shim captures `getppid()`, presenters compute liveness via `kill(pid, 0)` per Axiom 1/4. Surfaced during Story 5.1 bowerbird-deck dogfooding (30+ stale session rows visible, no signal to mark dead-process tombstones). Source: docs/bmad/planning-artifacts/sprint-change-proposal-2026-05-27-pid-liveness.md.
   - 2026-05-27: Resequenced Epic 5 for dogfooding-first ordering. The two dogfood-surfaced correctness stories move forward (old 5.7 projection correctness → new 5.2; old 5.8 PID liveness → new 5.3) so they sit adjacent to Story 5.1's presenter and make daily dogfooding actually useful before the CI/release/docs polish work. Reader-facing and CI/release work shifts back (old 5.2 bench gates → new 5.5; old 5.3 release E2E → new 5.6; old 5.5 cookbook → new 5.7; old 5.6 first-time-reader docs → new 5.8). Story 5.1, 5.4, 5.9 unchanged. No story content modified; pure resequencing. Source: docs/bmad/planning-artifacts/sprint-change-proposal-2026-05-27-epic-5-resequencing.md.
+  - 2026-05-29: Inserted new Story 5.6 (`idle_prompt` reclassified as transient) into Epic 5 after bench-gates (5.5); old 5.6 (release pipeline E2E) → 5.7, old 5.7 (cookbook consolidation) → 5.8, old 5.8 (first-time-reader docs) → 5.9, old 5.9 (crates.io + v0.1.0 tag) → 5.10. Moves `idle_prompt` from the input-required bucket to the transient (preserve-prior) bucket in `transition()`, narrowing `WaitingInput` to genuine hard blocks (`permission_prompt`/`elicitation_dialog`). Surfaced during 2026-05-29 bowerbird-deck dogfooding (13 of 15 live sessions falsely `WaitingInput`). Amends ADR 0004 §3; recorded as ADR 0005. Source: docs/bmad/planning-artifacts/sprint-change-proposal-2026-05-29-idle-prompt-reclassification.md.
 ---
 
 # bowerbird - Epic Breakdown
@@ -1117,13 +1118,47 @@ Closes Epic 4 retro AI-1, AI-2, AI-3 (per `epic-4-retro-2026-05-25.md` Action It
 **When** Story 5.5 closes
 **Then** the deferred-work entries naming AI-1/AI-2/AI-3 are struck through with a backlink to this story's merge commit
 
-### Story 5.6: Release pipeline end-to-end verification
+### Story 5.6: `idle_prompt` reclassified as transient (not input-required)
+
+As the bowerbird maintainer dogfooding `bowerbird-deck`,
+I want `idle_prompt` notifications to stop forcing a session into `WaitingInput`,
+So that the deck's `WaitingInput` column contains only sessions genuinely blocked on me (permission / elicitation), and finished-but-idle sessions read `Idle`.
+
+Inserted by `sprint-change-proposal-2026-05-29-idle-prompt-reclassification.md` (Accepted 2026-05-29) after bench-gates (5.5). Operationalizes ADR 0005 (`docs/decisions/0005-idle-prompt-transient-not-input-required.md`), which amends ADR 0004 §3. Surfaced during 2026-05-29 live dogfooding: 13 of 15 *live* sessions rendered `WaitingInput` (aged 5m–1h51m), none blocked — `idle_prompt` (fired ~60s after `Stop → Idle`) was classified as input-required, making the idle nudge a one-way ratchet. Refines Story 5.3's notification-type buckets: one type moves from input-required to transient. No wire-format change, no migration, no new field.
+
+**Acceptance Criteria:**
+
+**Given** the `EventKind::Notification` arm of `crates/daemon/src/projection/state.rs::transition` (Story 5.3)
+**When** Story 5.6 lands
+**Then** `Some(NotificationType::IdlePrompt)` is classified into the preserve-prior branch (joining `AuthSuccess`/`ElicitationResponse`/`ElicitationComplete`/`Unknown`/`None`); `PermissionPrompt` and `ElicitationDialog` remain the only notification types that yield `WaitingInput`; `IdlePrompt` with a prior state returns that prior `current_state` (prior `Idle` → `Idle`; prior `WaitingInput` → `WaitingInput`) and with no prior defaults to `Idle`; `last_event_kind`/`last_event_at_ms` still update; no other arm changes
+
+**Given** the `state.rs` test module
+**When** Story 5.6 lands
+**Then** `transition_notification_input_required_yields_waiting_input` no longer iterates `IdlePrompt`; `transition_notification_transient_preserves_prior` includes `IdlePrompt`; new tests cover `IdlePrompt` + prior `Idle` → `Idle` and `IdlePrompt` + prior `WaitingInput` → `WaitingInput` (a pending block is not clobbered by a subsequent idle nudge)
+
+**Given** ADR 0004 §3's notification-type table
+**When** Story 5.6 lands
+**Then** the `idle_prompt` row changes from `→ WaitingInput` to `→ preserve prior (transient)`, and a top-of-file Status note records "Amended in part by ADR 0005 (idle_prompt reclassified transient) — 2026-05-29"; 0004's liveness probe, `Ended` state, `SessionEnded` event, and `PostToolUse → Working` refinement are unchanged
+
+**Given** `docs/protocol.md` (`SessionCurrentState`, the `notification_type` extraction prose, and the `Notification` hook-kind table row)
+**When** Story 5.6 lands
+**Then** `idle_prompt` is listed in the transient (preserve-prior) bucket, the `WaitingInput` definition is narrowed to "blocked on user input with work queued (`permission_prompt`/`elicitation_dialog`, incl. `AskUserQuestion`)", and it is noted that `idle_prompt` does not produce `WaitingInput`
+
+**Given** `docs/protocol-changelog.md` (the changelog gate fires only on `crates/protocol/src/*.rs` changes, which this story does NOT touch)
+**When** Story 5.6 lands
+**Then** exactly one `type: behavioral` entry is added deliberately under `v1.0 → v1.1` stating `idle_prompt` no longer produces `WaitingInput`, explicitly superseding the Story 5.3 `Notification → WaitingInput` entry's `idle_prompt` classification, `(Resolves: 5.6)`
+
+**Given** the change is strictly a narrowing of `WaitingInput`
+**When** Story 5.6 lands
+**Then** `crates/protocol/src/*.rs` is unmodified, `NotificationType` keeps all seven variants, no SQLite migration is added, and old presenters decoding with `#[serde(other)]` are unaffected (state set unchanged; only `WaitingInput` frequency drops); `cargo test --workspace -- --test-threads=1`, `cargo fmt --check`, and `cargo clippy --all-targets --workspace -- -D warnings` pass
+
+### Story 5.7: Release pipeline end-to-end verification
 
 As a release manager,
 I want the GitHub Releases pipeline driven to a real (non-prerelease) tag, producing artifacts that install and run on a fresh machine,
 So that v0.1.0 is the second release we cut — not the first.
 
-Resequenced from 5.3 → 5.6 by `sprint-change-proposal-2026-05-27-epic-5-resequencing.md` (dogfooding-first ordering: release-pipeline verification doesn't unblock daily dogfooding).
+Resequenced from 5.3 → 5.6 by `sprint-change-proposal-2026-05-27-epic-5-resequencing.md`, then → 5.7 by `sprint-change-proposal-2026-05-29-idle-prompt-reclassification.md` (idle-prompt story inserted at 5.6) (dogfooding-first ordering: release-pipeline verification doesn't unblock daily dogfooding).
 
 **Acceptance Criteria:**
 
@@ -1136,7 +1171,7 @@ Resequenced from 5.3 → 5.6 by `sprint-change-proposal-2026-05-27-epic-5-resequ
 **Then** events appear in `~/.bowerbird/bower.db`, the daemon is running, and the first-party presenter from Story 5.1 receives state frames
 
 **Given** the cross-version upgrade contract test `cross_version_upgrade.rs`
-**When** Story 5.6 lands
+**When** Story 5.7 lands
 **Then** its SKIP guard (currently load-bearing on the absence of a real prior tag) is removed or asserts against `v0.1.0-rc1`'s data directory, depending on which boundary is tested
 
 **Given** Gatekeeper warnings on first run of unsigned macOS tarball binaries
@@ -1145,24 +1180,24 @@ Resequenced from 5.3 → 5.6 by `sprint-change-proposal-2026-05-27-epic-5-resequ
 
 **Given** the rc1 release surfaces a behavioral, install, or release-pipeline issue
 **When** the maintainer escalates it
-**Then** a `5.X-hotfix-<topic>` story is created inline before moving to Story 5.7
+**Then** a `5.X-hotfix-<topic>` story is created inline before moving to Story 5.8
 
-### Story 5.7: Cookbook consolidation into self-contained directory entries
+### Story 5.8: Cookbook consolidation into self-contained directory entries
 
 As the bowerbird maintainer,
 I want each cookbook entry to be one self-contained directory under `docs/cookbook/<name>/` containing prose (`README.md`) and runnable code (`src/`, `package.json`, `tsconfig.json`) colocated,
 So that the cookbook is the canonical home of the working examples — no duplication, no drift-check, no separate `examples/` surface to navigate.
 
-Closes Story 4.2 AC at `epics.md:817-819`, Story 4.3 AC at `epics.md:843`, and `project-context.md` §Cookbook discipline directive (L526) "do not hand-copy snippets — they rot." Closes `deferred-work.md:104` ("Cookbook inlining mechanism"). See `sprint-change-proposal-2026-05-26-cookbook-consolidation.md` for the full rationale. Resequenced from 5.5 → 5.7 by `sprint-change-proposal-2026-05-27-epic-5-resequencing.md` (dogfooding-first ordering: cookbook consolidation is reader-facing, not load-bearing for the maintainer's daily use).
+Closes Story 4.2 AC at `epics.md:817-819`, Story 4.3 AC at `epics.md:843`, and `project-context.md` §Cookbook discipline directive (L526) "do not hand-copy snippets — they rot." Closes `deferred-work.md:104` ("Cookbook inlining mechanism"). See `sprint-change-proposal-2026-05-26-cookbook-consolidation.md` for the full rationale. Resequenced from 5.5 → 5.7 by `sprint-change-proposal-2026-05-27-epic-5-resequencing.md`, then → 5.8 by `sprint-change-proposal-2026-05-29-idle-prompt-reclassification.md` (idle-prompt story inserted at 5.6) (dogfooding-first ordering: cookbook consolidation is reader-facing, not load-bearing for the maintainer's daily use).
 
 **Acceptance Criteria:**
 
 **Given** the existing `examples/multi-session-router/`, `examples/event-log-viewer/`, and `examples/reconnect-recovery/` directories
-**When** Story 5.7 lands
+**When** Story 5.8 lands
 **Then** they have been `git mv`'d to `docs/cookbook/state-session-fanout/`, `docs/cookbook/rest-cursor-pagination/`, and `docs/cookbook/dropped-frame-recovery/` respectively; the `examples/` directory no longer exists at the repo root; `cargo build --workspace`, `cargo test --workspace`, and the TypeScript smoke tests all pass against the new paths
 
 **Given** the three standalone cookbook prose files (`docs/cookbook/state-session-fanout.md`, `docs/cookbook/rest-cursor-pagination.md`, `docs/cookbook/dropped-frame-recovery.md`)
-**When** Story 5.7 lands
+**When** Story 5.8 lands
 **Then** they have been deleted; their Problem / Approach / Variants content has been folded into the per-entry `docs/cookbook/<name>/README.md` files alongside the existing per-example README content
 
 **Given** each new `docs/cookbook/<name>/README.md`
@@ -1170,32 +1205,32 @@ Closes Story 4.2 AC at `epics.md:817-819`, Story 4.3 AC at `epics.md:843`, and `
 **Then** the README contains no embedded TypeScript code blocks — only prose sections (*What this is*, *Run it*, *How it works*, *How to apply it*, *Files* with relative links to `src/index.ts` and any sidecar code files); code is read by opening `src/index.ts` directly, matching the pocketflow cookbook pattern
 
 **Given** the `// cookbook-begin:<name>` / `// cookbook-end:<name>` comment markers in each `src/index.ts`
-**When** Story 5.7 lands
+**When** Story 5.8 lands
 **Then** the markers have been deleted; the smoke test `tests/cli_examples.rs::each_example_source_carries_cookbook_anchors` (or its current equivalent) has been deleted; the drift-check test `tests/cli_docs_drift.rs::cookbook_include_directives_match_example_anchors` has been deleted
 
 **Given** the smoke-test crate `tests/cli_examples.rs` and CI workflow at `.github/workflows/ci.yml`
-**When** Story 5.7 lands
+**When** Story 5.8 lands
 **Then** all `examples/*/src/index.ts` path references have been retargeted to `docs/cookbook/*/src/index.ts`; shell loops over `examples/*/` similarly retarget
 
 **Given** the planning and project-context artifacts
-**When** Story 5.7 lands
+**When** Story 5.8 lands
 **Then** `prd.md:327, 445, 448-450`, `architecture.md:760-829, 915, 946`, and `project-context.md:242-258, 524-545` have been updated to reflect the single-directory shape; `deferred-work.md:104` is struck through with a backlink to this story's merge commit; path-retarget edits applied to `deferred-work.md:101, 102, 105, 106, 107`
 
 **Given** the project's update protocol (`project-context.md` L77: "Every merged ADR includes Affects context.md sections: field")
-**When** Story 5.7 lands
-**Then** ADR 0005 has been authored at `docs/decisions/0005-cookbook-consolidation.md` documenting the decision, considered alternatives (mdBook `{{#include}}`, hand-rolled preprocessor, pocketflow pattern), the chosen path, and `Affects context.md sections: Repository layout, Cookbook discipline`
+**When** Story 5.8 lands
+**Then** ADR 0006 has been authored at `docs/decisions/0006-cookbook-consolidation.md` documenting the decision, considered alternatives (mdBook `{{#include}}`, hand-rolled preprocessor, pocketflow pattern), the chosen path, and `Affects context.md sections: Repository layout, Cookbook discipline` (ADR 0005 is taken by the idle_prompt reclassification per Story 5.6)
 
 **Given** reader-facing docs
-**When** Story 5.7 lands
+**When** Story 5.8 lands
 **Then** `README.md` (entries at L7-8 and L162-166), `docs/quickstart.md:19`, and `docs/presenter-authoring.md` (grep pass) have all `examples/` path references retargeted to `docs/cookbook/<name>/`
 
-### Story 5.8: First-time-reader docs pass
+### Story 5.9: First-time-reader docs pass
 
 As a developer who has never seen bowerbird before,
 I want the README and quickstart to answer "what is this, why would I care, how do I try it in five minutes" before I bounce,
 So that the V1 audience (other developers reachable via the Claude Code community) can decide bowerbird is worth their attention.
 
-Resequenced from 5.6 → 5.8 by `sprint-change-proposal-2026-05-27-epic-5-resequencing.md` (dogfooding-first ordering: first-time-reader docs are reader-facing, not load-bearing for the maintainer's daily use).
+Resequenced from 5.6 → 5.8 by `sprint-change-proposal-2026-05-27-epic-5-resequencing.md`, then → 5.9 by `sprint-change-proposal-2026-05-29-idle-prompt-reclassification.md` (idle-prompt story inserted at 5.6) (dogfooding-first ordering: first-time-reader docs are reader-facing, not load-bearing for the maintainer's daily use).
 
 **Acceptance Criteria:**
 
@@ -1209,17 +1244,17 @@ Resequenced from 5.6 → 5.8 by `sprint-change-proposal-2026-05-27-epic-5-resequ
 
 **Given** the docs path Quickstart → presenter-authoring → protocol → cookbook (PRD §Documentation Requirements line 436)
 **When** the first-time reader graduates from Quickstart and reaches `docs/presenter-authoring.md`
-**Then** the first paragraph names the audience switch ("you've seen it work; now you're going to build something") rather than starting directly in technical detail; cross-references to the cookbook target the per-entry directory shape introduced by Story 5.7 (e.g. `docs/cookbook/state-session-fanout/`), not pre-5.7 standalone .md files
+**Then** the first paragraph names the audience switch ("you've seen it work; now you're going to build something") rather than starting directly in technical detail; cross-references to the cookbook target the per-entry directory shape introduced by Story 5.8 (e.g. `docs/cookbook/state-session-fanout/`), not pre-5.8 standalone .md files
 
 **Given** the README in its current state mentions install before motivation
-**When** Story 5.8 lands
-**Then** motivation precedes install; the "Status: V1 in development" framing is removed in favor of "Status: v0.1.0 — first stable release" once Story 5.9 tags it
+**When** Story 5.9 lands
+**Then** motivation precedes install; the "Status: V1 in development" framing is removed in favor of "Status: v0.1.0 — first stable release" once Story 5.10 tags it
 
-**Given** the Story 5.8 PR
+**Given** the Story 5.9 PR
 **When** review runs
 **Then** the review explicitly invokes the `bmad-editorial-review-prose` and `bmad-editorial-review-structure` skills against `README.md` and `docs/quickstart.md`, and the priority-1 findings are addressed in the same PR
 
-### Story 5.9: Crates.io namespace decision and v0.1.0 tag
+### Story 5.10: Crates.io namespace decision and v0.1.0 tag
 
 As the project owner,
 I want a deliberate decision on crates.io publishing,
@@ -1230,17 +1265,17 @@ Closes Epic 3 retro AI-3 / Epic 4 retro AI-5.
 **Acceptance Criteria:**
 
 **Given** `cargo search bowerbird`
-**When** Story 5.9 is started
+**When** Story 5.10 is started
 **Then** the namespace availability is documented (available / squatted / taken-by-related-project); if available, the four workspace crates are published with `description`, `repository`, `keywords`, `categories`, and `[package.metadata.docs.rs]` blocks added to each `Cargo.toml`; if not available, an ADR documents the renaming decision or the decision to publish under a different namespace
 
-**Given** all Epic 5 stories 5.1 through 5.8 are complete and any hotfix stories are merged
+**Given** all Epic 5 stories 5.1 through 5.9 are complete and any hotfix stories are merged
 **When** the maintainer tags `v0.1.0`
 **Then** the release workflow runs end-to-end producing artifacts; the GitHub Release is published (not draft); release notes name the V1 scope, the dogfooding signal that motivated the tag, and the contract-test summary
 
 **Given** the v0.1.0 tag exists
 **When** the maintainer reads `docs/bmad/implementation-artifacts/deferred-work.md`
-**Then** every entry referenced in this Epic 5 (Story 5.5 AI-1/AI-2/AI-3, Story 5.4's five entries, Story 5.7's deferred-work-104 closure, Story 5.9's AI-3/AI-5) is struck through with a backlink to its closing story's merge commit
+**Then** every entry referenced in this Epic 5 (Story 5.5 AI-1/AI-2/AI-3, Story 5.4's five entries, Story 5.8's deferred-work-104 closure, Story 5.10's AI-3/AI-5) is struck through with a backlink to its closing story's merge commit
 
 **Given** the v0.1.0 release notes
-**When** a first-time reader (Story 5.8's audience) finds them
+**When** a first-time reader (Story 5.9's audience) finds them
 **Then** they include the install one-liner, a link to Quickstart, and an honest statement of "what works today and what doesn't" (the deferred-work entries that remain — code-signing, second-adapter, etc.)
