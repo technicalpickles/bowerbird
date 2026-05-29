@@ -61,7 +61,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-05-16
-last_updated: 2026-05-29 (Story 5.6 → in-progress; bmad-code-review documented unresolved findings — 2 [Decision] + 4 [Patch]; no fixes applied)
+last_updated: 2026-05-29 (Story 5.6 → review; code-review pass 2 resolved — D1 Ended→Idle on notification hook (+test); D2 startup repair REMOVED, existing rows handled operationally + non-schema data-migration deferred; AC wording made precise; final daemon surface is state.rs only; 486 workspace tests + fmt + clippy green)
 project: bowerbird
 project_key: NOKEY
 tracking_system: file-system

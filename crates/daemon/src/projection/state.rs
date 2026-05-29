@@ -65,7 +65,7 @@ pub(crate) fn transition(
         // Story 5.3 AC #7/#8, narrowed by Story 5.6 / ADR 0005: Notification
         // branches on typed notification_type.
         //   PermissionPrompt | ElicitationDialog → WaitingInput
-        //   IdlePrompt | AuthSuccess | ElicitationResponse | ElicitationComplete | Unknown | None → preserve prior
+        //   IdlePrompt | AuthSuccess | ElicitationResponse | ElicitationComplete | Unknown | None → preserve prior (but Ended → Idle)
         // IdlePrompt was reclassified from WaitingInput to preserve-prior in
         // Story 5.6 (ADR 0005): the idle nudge fires ~60s after `Stop`, so it
         // is not a block. "Preserve prior" reads as `Idle` after a normal
@@ -74,6 +74,14 @@ pub(crate) fn transition(
         // session left in WaitingInput stays WaitingInput. PermissionPrompt and
         // ElicitationDialog (incl. AskUserQuestion) are now the ONLY types that
         // yield WaitingInput.
+        //
+        // Exception (Story 5.6 / ADR 0005): a prior `Ended` is NOT preserved. A
+        // notification hook arriving at all is evidence the process is alive
+        // (Claude fired it), so per ADR 0004's non-terminal-`Ended` contract the
+        // session resurrects to `Idle`. This holds for every preserve-prior
+        // type; IdlePrompt joining the branch made the stray-hook-after-Ended
+        // case reachable via the most common notification. (No prior → Idle too.)
+        //
         // The "preserve prior" branch still updates last_event_kind /
         // last_event_at_ms (the event happened) — only current_state is
         // preserved.
@@ -85,9 +93,10 @@ pub(crate) fn transition(
             | Some(NotificationType::ElicitationResponse)
             | Some(NotificationType::ElicitationComplete)
             | Some(NotificationType::Unknown)
-            | None => prev
-                .map(|s| s.current_state)
-                .unwrap_or(SessionCurrentState::Idle),
+            | None => match prev.map(|s| s.current_state) {
+                Some(SessionCurrentState::Ended) | None => SessionCurrentState::Idle,
+                Some(other) => other,
+            },
         },
         // Story 5.3 AC #10/#11: daemon-observed liveness emits SessionEnded
         // via projection::session::write; the projection transitions to
@@ -422,6 +431,44 @@ mod tests {
             3_000,
         );
         assert_eq!(after_n.current_state, SessionCurrentState::WaitingInput);
+    }
+
+    // Story 5.6 / ADR 0005: a preserve-prior notification arriving for an
+    // `Ended` session is evidence the process is alive (Claude fired the hook),
+    // so it must resurrect the session to `Idle` rather than preserve `Ended` —
+    // honoring ADR 0004's non-terminal-`Ended` contract. Without this, a stray
+    // `idle_prompt` after the liveness probe marked a session `Ended` would
+    // leave it hidden, and because `current_state` would not change, no
+    // `state.session.*` frame would be emitted. Covers every preserve-prior
+    // type (idle_prompt joining the branch is what made this reachable via the
+    // most common stray hook).
+    #[test]
+    fn transition_from_ended_preserve_prior_notification_yields_idle() {
+        let ended = SessionState {
+            current_state: SessionCurrentState::Ended,
+            last_event_kind: EventKind::SessionEnded,
+            last_event_at_ms: 0,
+            last_pid: Some(7),
+        };
+        for nt in [
+            NotificationType::IdlePrompt,
+            NotificationType::AuthSuccess,
+            NotificationType::ElicitationResponse,
+            NotificationType::ElicitationComplete,
+            NotificationType::Unknown,
+        ] {
+            let next = transition(Some(&ended), EventKind::Notification, Some(nt), None, 5_000);
+            assert_eq!(
+                next.current_state,
+                SessionCurrentState::Idle,
+                "Ended + {nt:?} must resurrect to Idle, not preserve Ended"
+            );
+            assert_eq!(next.last_event_kind, EventKind::Notification);
+            assert_eq!(next.last_event_at_ms, 5_000);
+        }
+        // A `None` notification_type from Ended also resurrects to Idle.
+        let after_none = transition(Some(&ended), EventKind::Notification, None, None, 5_000);
+        assert_eq!(after_none.current_state, SessionCurrentState::Idle);
     }
 
     // Story 5.3 AC #5/#6: last_pid carry-forward + overwrite-on-Some.

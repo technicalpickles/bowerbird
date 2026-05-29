@@ -5,7 +5,7 @@ use crate::broadcast::{BroadcastEnvelope, BroadcastHub};
 use crate::db::queries::{
     event_kind_as_str, event_kind_from_db_str, reaction_as_db_string, INSERT_EVENT,
     INSERT_RECORDING_SESSION_STARTED, SELECT_DISTINCT_SESSIONS_FROM_EVENTS,
-    SELECT_EVENT_KINDS_FOR_SESSION, SELECT_NON_SENTINEL_SESSIONS, SELECT_SESSION_PROJECTION_STATE,
+    SELECT_EVENT_KINDS_FOR_SESSION, SELECT_SESSION_PROJECTION_STATE,
     UPDATE_RECORDING_SESSION_ENDED, UPSERT_SESSION_PROJECTION,
 };
 use crate::error::{Error, Result};
@@ -485,11 +485,80 @@ pub async fn rebuild_missing_projections(writer_pool: &deadpool_sqlite::Pool) ->
                     continue;
                 }
 
-                let Some((state, last_created_at)) =
-                    recompute_state_from_log(&tx, &source, &session_id)?
-                else {
-                    continue;
+                // Story 5.3: SELECT now returns (kind, created_at, pid, payload)
+                // so rebuild can thread last_pid carry-forward AND parse
+                // notification_type from Notification payloads (the typed
+                // value lives in events.payload, not on the stored Event).
+                let kinds: Vec<(String, i64, Option<u32>, String)> = {
+                    let mut stmt = tx.prepare(SELECT_EVENT_KINDS_FOR_SESSION)?;
+                    let rows = stmt.query_map(rusqlite::params![&source, &session_id], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Option<u32>>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    })?;
+                    rows.collect::<rusqlite::Result<Vec<_>>>()?
                 };
+
+                let mut state: Option<SessionState> = None;
+                let mut last_created_at: i64 = 0;
+                let mut bad_kind = false;
+                for (kind_str, created_at, pid, payload) in kinds {
+                    last_created_at = created_at;
+                    let kind = match event_kind_from_db_str(&kind_str) {
+                        Ok(k) => k,
+                        Err(e) => {
+                            tracing::error!(
+                                source = %source,
+                                session_id = %session_id,
+                                kind = %kind_str,
+                                error = %e,
+                                "rebuild_missing_projections: unknown EventKind in events.kind; \
+                                 skipping this session"
+                            );
+                            bad_kind = true;
+                            break;
+                        }
+                    };
+                    // Parse notification_type from payload only for Notification
+                    // events — the same logic the adapter applies at ingest
+                    // (Task 3) but here we read from stored payload at rebuild.
+                    let notification_type = if matches!(kind, protocol::EventKind::Notification) {
+                        serde_json::from_str::<serde_json::Value>(&payload)
+                            .ok()
+                            .as_ref()
+                            .and_then(|v| v.get("notification_type"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| match s {
+                                "permission_prompt" => protocol::NotificationType::PermissionPrompt,
+                                "idle_prompt" => protocol::NotificationType::IdlePrompt,
+                                "auth_success" => protocol::NotificationType::AuthSuccess,
+                                "elicitation_dialog" => {
+                                    protocol::NotificationType::ElicitationDialog
+                                }
+                                "elicitation_response" => {
+                                    protocol::NotificationType::ElicitationResponse
+                                }
+                                "elicitation_complete" => {
+                                    protocol::NotificationType::ElicitationComplete
+                                }
+                                _ => protocol::NotificationType::Unknown,
+                            })
+                    } else {
+                        None
+                    };
+                    // Sentinel kinds should be filtered by the source != '__daemon__' clause
+                    // on SELECT_DISTINCT_SESSIONS_FROM_EVENTS, but defend against future shape
+                    // changes by routing them through transition's defensive branch anyway.
+                    let next = transition(state.as_ref(), kind, notification_type, pid, created_at);
+                    state = Some(next);
+                }
+                if bad_kind {
+                    continue;
+                }
+                let Some(state) = state else { continue };
                 let state_json = match serde_json::to_string(&state) {
                     Ok(s) => s,
                     Err(e) => {
@@ -521,196 +590,6 @@ pub async fn rebuild_missing_projections(writer_pool: &deadpool_sqlite::Pool) ->
         .map_err(|e| Error::Pool(format!("interact failed: {e}")))??;
 
     Ok(rebuilt)
-}
-
-/// Parse the typed `notification_type` out of a stored `Notification` payload.
-///
-/// Mirrors the adapter's ingest-time mapping (Story 5.3) but reads from the
-/// persisted `events.payload` JSON at replay time — the typed value lives in
-/// the payload, not on the stored `Event`. An absent/unparseable field yields
-/// `None`; an unrecognized string yields `NotificationType::Unknown`.
-fn parse_notification_type(payload: &str) -> Option<protocol::NotificationType> {
-    serde_json::from_str::<serde_json::Value>(payload)
-        .ok()
-        .as_ref()
-        .and_then(|v| v.get("notification_type"))
-        .and_then(|v| v.as_str())
-        .map(|s| match s {
-            "permission_prompt" => protocol::NotificationType::PermissionPrompt,
-            "idle_prompt" => protocol::NotificationType::IdlePrompt,
-            "auth_success" => protocol::NotificationType::AuthSuccess,
-            "elicitation_dialog" => protocol::NotificationType::ElicitationDialog,
-            "elicitation_response" => protocol::NotificationType::ElicitationResponse,
-            "elicitation_complete" => protocol::NotificationType::ElicitationComplete,
-            _ => protocol::NotificationType::Unknown,
-        })
-}
-
-/// Fold [`transition`] over a single session's full event log.
-///
-/// Returns the recomputed `(SessionState, last_event_created_at)`, or `None`
-/// when the session has no usable events (empty log, or an unrecognized
-/// `events.kind` aborted the replay — logged and skipped).
-///
-/// This is the single canonical replay path. Both [`rebuild_missing_projections`]
-/// (missing rows) and [`repair_idle_prompt_waiting_input`] (existing rows the
-/// pre-5.6 rule left falsely `WaitingInput`) call it, so the two can never drift
-/// on transition semantics — a divergence would be a correctness bug.
-fn recompute_state_from_log(
-    tx: &rusqlite::Transaction<'_>,
-    source: &str,
-    session_id: &str,
-) -> rusqlite::Result<Option<(SessionState, i64)>> {
-    // Story 5.3: SELECT returns (kind, created_at, pid, payload) so the fold can
-    // thread last_pid carry-forward AND parse notification_type from payloads.
-    let kinds: Vec<(String, i64, Option<u32>, String)> = {
-        let mut stmt = tx.prepare(SELECT_EVENT_KINDS_FOR_SESSION)?;
-        let rows = stmt.query_map(rusqlite::params![source, session_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, Option<u32>>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-    };
-
-    let mut state: Option<SessionState> = None;
-    let mut last_created_at: i64 = 0;
-    for (kind_str, created_at, pid, payload) in kinds {
-        last_created_at = created_at;
-        let kind = match event_kind_from_db_str(&kind_str) {
-            Ok(k) => k,
-            Err(e) => {
-                tracing::error!(
-                    source = %source,
-                    session_id = %session_id,
-                    kind = %kind_str,
-                    error = %e,
-                    "recompute_state_from_log: unknown EventKind in events.kind; \
-                     skipping this session"
-                );
-                return Ok(None);
-            }
-        };
-        // notification_type only matters for Notification events; the typed
-        // value lives in the stored payload (Sentinel kinds are excluded by the
-        // source != '__daemon__' clause on the calling SELECTs, but transition's
-        // defensive branch handles them anyway).
-        let notification_type = if matches!(kind, protocol::EventKind::Notification) {
-            parse_notification_type(&payload)
-        } else {
-            None
-        };
-        state = Some(transition(
-            state.as_ref(),
-            kind,
-            notification_type,
-            pid,
-            created_at,
-        ));
-    }
-
-    Ok(state.map(|s| (s, last_created_at)))
-}
-
-/// One-time repair (Story 5.6 / ADR 0005): drain `WaitingInput` projection rows
-/// that the pre-5.6 `idle_prompt -> WaitingInput` rule created.
-///
-/// For every existing non-sentinel projection currently in `WaitingInput`, the
-/// post-5.6 `transition` is re-folded over the session's event log
-/// ([`recompute_state_from_log`]). A row whose recompute yields a *different*
-/// `current_state` (the idle_prompt-stuck case — it drains to whatever preceded
-/// the idle nudge, normally `Idle`) is UPSERTed; a genuine block
-/// (`permission_prompt` / `elicitation_dialog`, possibly with a trailing idle
-/// nudge) recomputes back to `WaitingInput` and is left untouched.
-///
-/// Because it targets only `WaitingInput` rows and writes only on change, it is
-/// idempotent — a second run finds nothing to drain. Returns the number of rows
-/// drained. Best-effort + single transaction, mirroring
-/// [`rebuild_missing_projections`]; a failure is a data-correctness warning,
-/// never a startup blocker.
-#[tracing::instrument(skip_all)]
-pub async fn repair_idle_prompt_waiting_input(
-    writer_pool: &deadpool_sqlite::Pool,
-) -> Result<usize> {
-    let conn = writer_pool
-        .get()
-        .await
-        .map_err(|e| Error::Pool(format!("writer pool get failed: {e}")))?;
-
-    let drained = conn
-        .interact(move |c| -> rusqlite::Result<usize> {
-            let tx = c.transaction()?;
-
-            // (source, session_id) of rows currently stored as WaitingInput.
-            // SELECT_NON_SENTINEL_SESSIONS yields (source, session_id, state,
-            // updated_at); we read the first three and filter on current_state.
-            let rows: Vec<(String, String, String)> = {
-                let mut stmt = tx.prepare(SELECT_NON_SENTINEL_SESSIONS)?;
-                let mapped = stmt.query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                })?;
-                mapped.collect::<rusqlite::Result<Vec<_>>>()?
-            };
-            let waiting: Vec<(String, String)> = rows
-                .into_iter()
-                .filter_map(|(source, session_id, state_json)| {
-                    let stored: SessionState = serde_json::from_str(&state_json).ok()?;
-                    (stored.current_state == SessionCurrentState::WaitingInput)
-                        .then_some((source, session_id))
-                })
-                .collect();
-
-            let mut drained = 0usize;
-            for (source, session_id) in waiting {
-                let Some((state, last_created_at)) =
-                    recompute_state_from_log(&tx, &source, &session_id)?
-                else {
-                    continue;
-                };
-                if state.current_state == SessionCurrentState::WaitingInput {
-                    // Genuine block (e.g. permission_prompt, optionally followed
-                    // by an idle nudge). Recompute is a no-op; leave it.
-                    continue;
-                }
-                let state_json = match serde_json::to_string(&state) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::error!(
-                            source = %source,
-                            session_id = %session_id,
-                            error = %e,
-                            "repair_idle_prompt_waiting_input: SessionState serialize failed"
-                        );
-                        continue;
-                    }
-                };
-                tx.execute(
-                    UPSERT_SESSION_PROJECTION,
-                    rusqlite::params![&source, &session_id, &state_json, last_created_at],
-                )?;
-                drained += 1;
-                tracing::info!(
-                    source = %source,
-                    session_id = %session_id,
-                    new_state = ?state.current_state,
-                    "drained stale idle_prompt WaitingInput row"
-                );
-            }
-
-            tx.commit()?;
-            Ok(drained)
-        })
-        .await
-        .map_err(|e| Error::Pool(format!("interact failed: {e}")))??;
-
-    Ok(drained)
 }
 
 use crate::time::current_unix_millis;

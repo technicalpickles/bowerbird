@@ -1144,11 +1144,11 @@ Inserted by `sprint-change-proposal-2026-05-29-idle-prompt-reclassification.md` 
 
 **Given** `docs/protocol.md` (`SessionCurrentState`, the `notification_type` extraction prose, and the `Notification` hook-kind table row)
 **When** Story 5.6 lands
-**Then** `idle_prompt` is listed in the transient (preserve-prior) bucket, the `WaitingInput` definition is narrowed to "blocked on user input with work queued (`permission_prompt`/`elicitation_dialog`, incl. `AskUserQuestion`)", and it is noted that `idle_prompt` does not produce `WaitingInput`
+**Then** `idle_prompt` is listed in the transient (preserve-prior) bucket, the `WaitingInput` definition is narrowed to "blocked on user input with work queued (`permission_prompt`/`elicitation_dialog`, incl. `AskUserQuestion`)", and it is noted that `idle_prompt` does not *transition a session into* `WaitingInput` (it preserves prior state, so a session already in `WaitingInput` stays there)
 
 **Given** `docs/protocol-changelog.md` (the changelog gate fires only on `crates/protocol/src/*.rs` changes, which this story does NOT touch)
 **When** Story 5.6 lands
-**Then** exactly one `type: behavioral` entry is added deliberately under `v1.0 → v1.1` stating `idle_prompt` no longer produces `WaitingInput`, explicitly superseding the Story 5.3 `Notification → WaitingInput` entry's `idle_prompt` classification, `(Resolves: 5.6)`
+**Then** exactly one `type: behavioral` entry is added deliberately under `v1.0 → v1.1` stating `idle_prompt` no longer *transitions a session into* `WaitingInput` (it preserves prior state), explicitly superseding the Story 5.3 `Notification → WaitingInput` entry's `idle_prompt` classification, `(Resolves: 5.6)`
 
 **Given** the change is strictly a narrowing of `WaitingInput`
 **When** Story 5.6 lands

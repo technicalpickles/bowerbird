@@ -174,20 +174,6 @@ async fn run(config: Config, bowerbird_dir: PathBuf) -> anyhow::Result<()> {
         Err(e) => tracing::error!(error = ?e, "rebuild_missing_projections failed; continuing"),
     }
 
-    // Story 5.6 / ADR 0005: one-time drain of `WaitingInput` rows the pre-5.6
-    // `idle_prompt -> WaitingInput` rule left falsely stuck. Runs AFTER rebuild
-    // (freshly rebuilt rows already use the post-5.6 rule, so they're never
-    // re-touched) and BEFORE the liveness probe and WS bind, so presenters get
-    // drained state in their snapshot. Idempotent and best-effort — a failure
-    // does not block startup.
-    match projection::session::repair_idle_prompt_waiting_input(&pools.writer).await {
-        Ok(n) if n > 0 => tracing::info!(count = n, "drained stale idle_prompt WaitingInput rows"),
-        Ok(_) => {}
-        Err(e) => {
-            tracing::error!(error = ?e, "repair_idle_prompt_waiting_input failed; continuing")
-        }
-    }
-
     // Story 5.3 AC #10: synchronous liveness probe BEFORE the WS server binds.
     // The broadcaster has to exist by this point — it normally constructs
     // after the ingest writer task (~line 206), but the probe writes through
