@@ -1269,9 +1269,10 @@ fn envelope_for(source: &str, session_id: &str, kind: EventKind) -> EventEnvelop
 }
 
 /// Story 5.3: Notification envelope helper. The typed `notification_type`
-/// drives the new branching: input-required types (PermissionPrompt,
-/// IdlePrompt, ElicitationDialog) transition to WaitingInput; transient types
-/// preserve prior current_state.
+/// drives the branching: input-required types (PermissionPrompt,
+/// ElicitationDialog) transition to WaitingInput; transient types (IdlePrompt,
+/// AuthSuccess, ElicitationResponse, ElicitationComplete) preserve prior
+/// current_state. (IdlePrompt reclassified transient in Story 5.6 / ADR 0005.)
 fn envelope_for_notification(
     source: &str,
     session_id: &str,
@@ -1459,8 +1460,9 @@ async fn hook_unreliability_tolerance_pretooluse_without_posttooluse() {
 ///
 /// Updated by Story 5.3: PostToolUse now unconditionally → Working (refines
 /// Story 5.2's "preserve prior"). Notification branches on `notification_type`:
-/// input-required types (PermissionPrompt, IdlePrompt, ElicitationDialog)
-/// transition to WaitingInput; transient types and None preserve prior.
+/// input-required types (PermissionPrompt, ElicitationDialog) transition to
+/// WaitingInput; transient types (IdlePrompt, AuthSuccess, ...) and None
+/// preserve prior. (IdlePrompt reclassified transient in Story 5.6 / ADR 0005.)
 #[tokio::test(flavor = "current_thread")]
 async fn state_machine_full_sequence_determinism() {
     let (_tmp, pools) = fresh_pools().await;

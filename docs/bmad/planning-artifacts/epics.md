@@ -1013,10 +1013,12 @@ So that my ribbon UI can render an accurate per-session state without doing its 
 **Given** an `EventEnvelope` for `hook_kind = Notification` with `notification_type` in `{PermissionPrompt, IdlePrompt, ElicitationDialog}`
 **When** the projection's `transition` function runs
 **Then** the resulting `current_state` is `WaitingInput`; the prior state is irrelevant.
+> **Superseded for `IdlePrompt` by Story 5.6 / ADR 0005 (2026-05-29):** `IdlePrompt` moved to the transient (preserve-prior) bucket below. As of 5.6, `PermissionPrompt` and `ElicitationDialog` are the only types that yield `WaitingInput`. This Story 5.3 AC is preserved as-shipped history; see the Story 5.6 section.
 
 **Given** an `EventEnvelope` for `hook_kind = Notification` with `notification_type` in `{AuthSuccess, ElicitationResponse, ElicitationComplete}` OR `notification_type = Unknown` OR `notification_type = None`
 **When** the projection's `transition` function runs
 **Then** the resulting `current_state` preserves the prior state (no transition).
+> **Extended by Story 5.6 / ADR 0005:** `IdlePrompt` also preserves prior state as of 5.6.
 
 **Given** an `EventEnvelope` for `hook_kind = PostToolUse`
 **When** the projection's `transition` function runs
