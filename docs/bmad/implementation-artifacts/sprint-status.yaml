@@ -61,7 +61,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-05-16
-last_updated: 2026-05-29 (Story 5.6 code-review findings resolved — 3 [Patch] (stale docs/wording/File List) + 1 [Decision] (targeted one-time startup repair repair_idle_prompt_waiting_input drains pre-5.6 idle_prompt WaitingInput rows, no migration); 487 workspace tests serialized + fmt + clippy green; remains in review)
+last_updated: 2026-05-29 (Story 5.6 → in-progress; bmad-code-review documented unresolved findings — 2 [Decision] + 4 [Patch]; no fixes applied)
 project: bowerbird
 project_key: NOKEY
 tracking_system: file-system
@@ -118,7 +118,7 @@ development_status:
   5-3-session-process-liveness-pid-capture: done
   5-4-install-ux-polish-and-middleware-closure: done
   5-5-bench-gates-load-bearing: ready-for-dev
-  5-6-idle-prompt-reclassified-as-transient: review
+  5-6-idle-prompt-reclassified-as-transient: in-progress
   5-7-release-pipeline-end-to-end-verification: backlog
   5-8-cookbook-consolidation: backlog
   5-9-first-time-reader-docs-pass: backlog
