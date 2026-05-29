@@ -3,5 +3,6 @@
 /.parkinglot/
 /.claude/settings.local.json
 .claude/.story-automator-active
+.claude/actually-lsp.json
 __pycache__/
 *.pyc
