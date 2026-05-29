@@ -1,6 +1,6 @@
 # Story 5.6: `idle_prompt` reclassified as transient (not input-required)
 
-Status: ready-for-dev
+Status: review
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -46,29 +46,29 @@ This is the deliberate per-type decision ADR 0004 explicitly invited ("if a futu
 
 ## Tasks / Subtasks
 
-- [ ] Task 1: Move `IdlePrompt` to the transient branch in `transition` (AC: #1, #2)
-  - [ ] Edit `crates/daemon/src/projection/state.rs`: in the `EventKind::Notification` match arm, remove `| Some(NotificationType::IdlePrompt)` from the `WaitingInput` pattern and add it to the preserve-prior pattern.
-  - [ ] Rewrite the arm's doc comment (lines ~65–70) to the new two-bucket listing + the ADR 0005 reclassification note.
-- [ ] Task 2: Update and add tests (AC: #3)
-  - [ ] `transition_notification_input_required_yields_waiting_input`: drop `IdlePrompt` from the loop (leave `PermissionPrompt`, `ElicitationDialog`).
-  - [ ] `transition_notification_transient_preserves_prior`: add `Some(NotificationType::IdlePrompt)` to `cases`.
-  - [ ] Add `transition_notification_idle_prompt_prior_idle_yields_idle`.
-  - [ ] Add `transition_notification_idle_prompt_prior_waiting_input_preserved` (the load-bearing "don't clobber a real block" case).
-  - [ ] (Optional) Add `transition_notification_idle_prompt_without_prev_defaults_to_idle`.
-- [ ] Task 3: Amend ADR 0004 (AC: #4)
-  - [ ] Change the §3 table `idle_prompt` row to `→ preserve prior (transient)`.
-  - [ ] Add the top-of-file `Amended in part by ADR 0005 … 2026-05-29` Status note.
-- [ ] Task 4: Correct `docs/protocol.md` (AC: #5)
-  - [ ] Fix the `notification_type` extraction prose (≈line 352).
-  - [ ] Fix the `Notification` hook-kind table row (≈line 366).
-  - [ ] Narrow the `WaitingInput` definition in the `SessionCurrentState` section (≈line 289).
-- [ ] Task 5: Add the changelog entry (AC: #6)
-  - [ ] Append one `type: behavioral` entry under `v1.0 → v1.1`, explicitly noting it supersedes the Story 5.3 `idle_prompt` classification, `(Resolves: 5.6)`.
-- [ ] Task 6: Verify (AC: #7, #8)
-  - [ ] `cargo test --workspace -- --test-threads=1` green (note the serialized-test requirement below).
-  - [ ] `cargo fmt --check` and `cargo clippy --all-targets --workspace -- -D warnings` green.
-  - [ ] Confirm `git diff --stat` touches NO file under `crates/protocol/src/` and adds no migration (AC #7 self-check).
-- [ ] Task 7 (manual, optional — needs a live daemon): re-run `bowerbird-deck` against the live daemon and confirm the live-idle `WaitingInput` wall drains to `Idle`, only genuine `permission_prompt`/`elicitation_dialog`/`AskUserQuestion` blocks remain `WaitingInput` (proposal §5 success criterion). This is external-repo validation, not a CI gate.
+- [x] Task 1: Move `IdlePrompt` to the transient branch in `transition` (AC: #1, #2)
+  - [x] Edit `crates/daemon/src/projection/state.rs`: in the `EventKind::Notification` match arm, remove `| Some(NotificationType::IdlePrompt)` from the `WaitingInput` pattern and add it to the preserve-prior pattern.
+  - [x] Rewrite the arm's doc comment (lines ~65–70) to the new two-bucket listing + the ADR 0005 reclassification note.
+- [x] Task 2: Update and add tests (AC: #3)
+  - [x] `transition_notification_input_required_yields_waiting_input`: drop `IdlePrompt` from the loop (leave `PermissionPrompt`, `ElicitationDialog`).
+  - [x] `transition_notification_transient_preserves_prior`: add `Some(NotificationType::IdlePrompt)` to `cases`.
+  - [x] Add `transition_notification_idle_prompt_prior_idle_yields_idle`.
+  - [x] Add `transition_notification_idle_prompt_prior_waiting_input_preserved` (the load-bearing "don't clobber a real block" case).
+  - [x] (Optional) Add `transition_notification_idle_prompt_without_prev_defaults_to_idle`.
+- [x] Task 3: Amend ADR 0004 (AC: #4)
+  - [x] Change the §3 table `idle_prompt` row to `→ preserve prior (transient)`.
+  - [x] Add the top-of-file `Amended in part by ADR 0005 … 2026-05-29` Status note. (Already present from ADR 0005 creation commit 2a8fa1e; verified.)
+- [x] Task 4: Correct `docs/protocol.md` (AC: #5)
+  - [x] Fix the `notification_type` extraction prose (≈line 352).
+  - [x] Fix the `Notification` hook-kind table row (≈line 366).
+  - [x] Narrow the `WaitingInput` definition in the `SessionCurrentState` section (≈line 289).
+- [x] Task 5: Add the changelog entry (AC: #6)
+  - [x] Append one `type: behavioral` entry under `v1.0 → v1.1`, explicitly noting it supersedes the Story 5.3 `idle_prompt` classification, `(Resolves: 5.6)`.
+- [x] Task 6: Verify (AC: #7, #8)
+  - [x] `cargo test --workspace -- --test-threads=1` green (485 passed, 28 suites).
+  - [x] `cargo fmt --check` and `cargo clippy --all-targets --workspace -- -D warnings` green.
+  - [x] Confirm `git diff --stat` touches NO file under `crates/protocol/src/` and adds no migration (AC #7 self-check — confirmed: only `crates/daemon/src/projection/state.rs` + docs + status files).
+- [ ] Task 7 (manual, optional — needs a live daemon): re-run `bowerbird-deck` against the live daemon and confirm the live-idle `WaitingInput` wall drains to `Idle`, only genuine `permission_prompt`/`elicitation_dialog`/`AskUserQuestion` blocks remain `WaitingInput` (proposal §5 success criterion). This is external-repo validation, not a CI gate. **Deferred** — requires a live daemon + the external `bowerbird-deck` repo; not runnable in this session. Left unchecked deliberately (optional, non-gating).
 
 ## Dev Notes
 
@@ -147,8 +147,34 @@ Documented so the dev doesn't scope-creep (proposal §6, ADR 0005 Boundary):
 
 ### Agent Model Used
 
+claude-opus-4-8[1m] (Opus 4.8, 1M context) via the `bmad-dev-story` workflow.
+
 ### Debug Log References
+
+- TDD red phase: `cargo test -p bowerbird-daemon projection::state` → 3 failures before the code change (`transition_notification_transient_preserves_prior` with the new `IdlePrompt` case, `transition_notification_idle_prompt_prior_idle_yields_idle`, `transition_notification_idle_prompt_without_prev_defaults_to_idle`) — all asserting the new transient behavior against the still-input-required code. Confirms the tests exercise the change.
+- TDD green phase: after the one-arm move, same target → 24 passed.
+- Full verification: `cargo test --workspace -- --test-threads=1` → 485 passed (28 suites, ~27s); `cargo fmt --check` clean; `cargo clippy --all-targets --workspace -- -D warnings` → no issues.
 
 ### Completion Notes List
 
+- **The change is a one-arm move, exactly as the proposal specified.** `Some(NotificationType::IdlePrompt)` moved from the `WaitingInput` match pattern to the preserve-prior pattern in `transition`'s `EventKind::Notification` arm. No other arm, constant, or function touched.
+- **`WaitingInput` is now narrowed to two types:** `permission_prompt` and `elicitation_dialog` (incl. `AskUserQuestion`) are the only `notification_type` values that produce it.
+- **"Preserve prior," not hard `→ Idle`:** an `idle_prompt` after a normal turn-end reads `Idle` (prior was `Idle`), draining the deck's live-idle `WaitingInput` wall; but an `idle_prompt` following a still-pending `permission_prompt` block keeps the session in `WaitingInput` (does not clobber a real block). Locked by `transition_notification_idle_prompt_prior_waiting_input_preserved`.
+- **`last_event_kind`/`last_event_at_ms` still update** on the moved type — the preserve-prior branch already did this; the prior-`Idle` test asserts `last_event_kind == Notification` to pin it.
+- **Changelog entry added deliberately.** The CI changelog gate (`tests/protocol_changelog_gate.rs`) does NOT fire for this story (no `crates/protocol/src/*.rs` edit), so the `type: behavioral` entry under `v1.0 → v1.1` is history hygiene per the story's "changelog gate nuance" note, not a gate-satisfier. It explicitly supersedes (does not delete) the Story 5.3 `idle_prompt` classification entry.
+- **ADR 0004 §3 table row amended** to `→ preserve prior (transient)`; the top-of-file Status amendment note was already present from the ADR 0005 creation commit (2a8fa1e).
+- **AC #7 self-check confirmed:** `git diff --stat` touches no file under `crates/protocol/src/` and adds no migration. `NotificationType` keeps all seven variants.
+- **Task 7 deferred** (manual, optional, non-gating): requires a live daemon + the external `bowerbird-deck` repo to confirm the live-idle wall drains. Not runnable in this session; left unchecked deliberately.
+
 ### File List
+
+- `crates/daemon/src/projection/state.rs` (modified — `transition` Notification arm + doc comment; 3 new tests, 2 updated tests)
+- `docs/decisions/0004-daemon-observed-session-liveness.md` (modified — §3 table `idle_prompt` row)
+- `docs/protocol.md` (modified — `SessionCurrentState`/`WaitingInput` definition, `notification_type` extraction prose, `Notification` hook-kind row)
+- `docs/protocol-changelog.md` (modified — one new `type: behavioral` entry under `v1.0 → v1.1`)
+- `docs/bmad/implementation-artifacts/5-6-idle-prompt-reclassified-as-transient.md` (modified — Status, task checkboxes, Dev Agent Record)
+- `docs/bmad/implementation-artifacts/sprint-status.yaml` (modified — story status + `last_updated`)
+
+### Change Log
+
+- 2026-05-29 — Story 5.6 implemented: `idle_prompt` reclassified from input-required (`→ WaitingInput`) to transient (preserve-prior) per ADR 0005. One-arm change in `transition`, 5 test updates/additions, ADR 0004 §3 amended, `docs/protocol.md` (3 spots) + `docs/protocol-changelog.md` corrected. Verification green (485 tests serialized, fmt, clippy). No wire-format/migration change.

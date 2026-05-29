@@ -46,7 +46,7 @@ The adapter extracts `notification_type` from the `Notification` payload at `cra
 | `notification_type` | Transition |
 |---|---|
 | `permission_prompt` | → `WaitingInput` |
-| `idle_prompt` | → `WaitingInput` |
+| `idle_prompt` | → preserve prior (transient) — *amended by ADR 0005, 2026-05-29* |
 | `elicitation_dialog` | → `WaitingInput` |
 | `auth_success` | preserve prior |
 | `elicitation_response` | preserve prior |
