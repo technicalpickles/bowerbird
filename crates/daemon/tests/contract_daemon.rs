@@ -2303,6 +2303,155 @@ async fn projection_rebuild_from_event_log_is_byte_identical() {
 }
 
 // =====================================================================
+// Story 5.6 / ADR 0005 — one-time idle_prompt WaitingInput repair
+// =====================================================================
+
+/// Overwrite a session's stored projection row, simulating what an older daemon
+/// (pre-5.6 `idle_prompt -> WaitingInput` rule) would have persisted. Goes
+/// straight through `UPSERT_SESSION_PROJECTION` so the event log is untouched —
+/// exactly the post-deploy condition the repair is built to fix.
+async fn overwrite_projection_state(
+    pool: &deadpool_sqlite::Pool,
+    source: &str,
+    session_id: &str,
+    state: SessionState,
+) {
+    let conn = pool.get().await.expect("writer get");
+    let src = source.to_string();
+    let sid = session_id.to_string();
+    let updated_at = state.last_event_at_ms;
+    let json = serde_json::to_string(&state).expect("serialize state");
+    conn.interact(move |c| -> rusqlite::Result<usize> {
+        c.execute(
+            UPSERT_SESSION_PROJECTION,
+            rusqlite::params![src, sid, json, updated_at],
+        )
+    })
+    .await
+    .expect("interact")
+    .expect("upsert");
+}
+
+async fn read_state_struct(
+    pool: &deadpool_sqlite::Pool,
+    source: &str,
+    session_id: &str,
+) -> SessionState {
+    serde_json::from_str(&read_session_state(pool, source, session_id).await).expect("parse state")
+}
+
+/// Story 5.6 / ADR 0005: the startup repair drains a `WaitingInput` row created
+/// by the pre-5.6 rule. We write the event log (which under the post-5.6 rule
+/// lands on `Idle`), then overwrite the projection to `WaitingInput` exactly as
+/// the old daemon would have stored it, then assert the repair drains it back.
+#[tokio::test(flavor = "current_thread")]
+async fn repair_drains_stale_idle_prompt_waiting_input() {
+    let (_tmp, pools) = fresh_pools().await;
+    let hub = BroadcastHub::new(16);
+
+    for env in [
+        envelope_for("claude", "sess-idle", EventKind::UserPromptSubmit),
+        envelope_for("claude", "sess-idle", EventKind::Stop),
+        envelope_for_notification("claude", "sess-idle", Some(NotificationType::IdlePrompt)),
+    ] {
+        projection::session::write(&pools.writer, &hub, env)
+            .await
+            .expect("write");
+    }
+
+    // Post-5.6 fresh write already lands on Idle (idle_prompt preserves prior).
+    assert_eq!(
+        read_state_struct(&pools.reader, "claude", "sess-idle")
+            .await
+            .current_state,
+        SessionCurrentState::Idle,
+    );
+
+    // Simulate the pre-5.6 stored row: a stuck WaitingInput.
+    overwrite_projection_state(
+        &pools.writer,
+        "claude",
+        "sess-idle",
+        SessionState {
+            current_state: SessionCurrentState::WaitingInput,
+            last_event_kind: EventKind::Notification,
+            last_event_at_ms: 999,
+            last_pid: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        read_state_struct(&pools.reader, "claude", "sess-idle")
+            .await
+            .current_state,
+        SessionCurrentState::WaitingInput,
+        "precondition: row is stuck in WaitingInput"
+    );
+
+    let drained = projection::session::repair_idle_prompt_waiting_input(&pools.writer)
+        .await
+        .expect("repair");
+    assert_eq!(drained, 1, "exactly one stale idle_prompt row drained");
+    assert_eq!(
+        read_state_struct(&pools.reader, "claude", "sess-idle")
+            .await
+            .current_state,
+        SessionCurrentState::Idle,
+        "stuck idle_prompt WaitingInput row drains to Idle"
+    );
+
+    // Idempotent: a second run finds nothing to drain.
+    let drained2 = projection::session::repair_idle_prompt_waiting_input(&pools.writer)
+        .await
+        .expect("repair second run");
+    assert_eq!(drained2, 0, "repair is idempotent");
+}
+
+/// Story 5.6 / ADR 0005: the repair must NOT clobber a genuine block. A
+/// `permission_prompt` (→ WaitingInput) followed by an idle nudge recomputes
+/// back to `WaitingInput` (idle_prompt preserves prior), so the row is left
+/// untouched and is not counted as drained.
+#[tokio::test(flavor = "current_thread")]
+async fn repair_preserves_genuine_permission_block() {
+    let (_tmp, pools) = fresh_pools().await;
+    let hub = BroadcastHub::new(16);
+
+    for env in [
+        envelope_for("claude", "sess-block", EventKind::UserPromptSubmit),
+        envelope_for_notification(
+            "claude",
+            "sess-block",
+            Some(NotificationType::PermissionPrompt),
+        ),
+        envelope_for_notification("claude", "sess-block", Some(NotificationType::IdlePrompt)),
+    ] {
+        projection::session::write(&pools.writer, &hub, env)
+            .await
+            .expect("write");
+    }
+
+    assert_eq!(
+        read_state_struct(&pools.reader, "claude", "sess-block")
+            .await
+            .current_state,
+        SessionCurrentState::WaitingInput,
+        "permission_prompt then idle_prompt is a genuine pending block"
+    );
+
+    let drained = projection::session::repair_idle_prompt_waiting_input(&pools.writer)
+        .await
+        .expect("repair");
+    assert_eq!(drained, 0, "a genuine permission block must not be drained");
+    assert_eq!(
+        read_state_struct(&pools.reader, "claude", "sess-block")
+            .await
+            .current_state,
+        SessionCurrentState::WaitingInput,
+        "genuine block stays WaitingInput after repair"
+    );
+}
+
+// =====================================================================
 // Story 1.7 — REST query API contract tests
 // =====================================================================
 
