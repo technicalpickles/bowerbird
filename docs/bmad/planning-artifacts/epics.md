@@ -1013,12 +1013,12 @@ So that my ribbon UI can render an accurate per-session state without doing its 
 **Given** an `EventEnvelope` for `hook_kind = Notification` with `notification_type` in `{PermissionPrompt, IdlePrompt, ElicitationDialog}`
 **When** the projection's `transition` function runs
 **Then** the resulting `current_state` is `WaitingInput`; the prior state is irrelevant.
-> **Superseded for `IdlePrompt` by Story 5.6 / ADR 0005 (2026-05-29):** `IdlePrompt` moved to the transient (preserve-prior) bucket below. As of 5.6, `PermissionPrompt` and `ElicitationDialog` are the only types that yield `WaitingInput`. This Story 5.3 AC is preserved as-shipped history; see the Story 5.6 section.
+> **Superseded for `IdlePrompt` by Story 5.6 / ADR 0005 (2026-05-29):** `IdlePrompt` got its own rule (code-review D3): → `Idle`, except a prior `WaitingInput` is preserved — it does NOT join the generic preserve-prior bucket below. As of 5.6, `PermissionPrompt` and `ElicitationDialog` are the only types that transition a session into `WaitingInput`. This Story 5.3 AC is preserved as-shipped history; see the Story 5.6 section.
 
 **Given** an `EventEnvelope` for `hook_kind = Notification` with `notification_type` in `{AuthSuccess, ElicitationResponse, ElicitationComplete}` OR `notification_type = Unknown` OR `notification_type = None`
 **When** the projection's `transition` function runs
 **Then** the resulting `current_state` preserves the prior state (no transition).
-> **Extended by Story 5.6 / ADR 0005:** `IdlePrompt` also preserves prior state as of 5.6.
+> **Refined by Story 5.6 / ADR 0005:** `IdlePrompt` is NOT in this preserve-prior set — it has its own rule (→ `Idle`, except a prior `WaitingInput` is preserved; code-review D3). And for the types listed here, a prior `Ended` now resurrects to `Idle` (a notification hook proves the process is alive; code-review D1) rather than being preserved.
 
 **Given** an `EventEnvelope` for `hook_kind = PostToolUse`
 **When** the projection's `transition` function runs
@@ -1140,11 +1140,11 @@ Inserted by `sprint-change-proposal-2026-05-29-idle-prompt-reclassification.md` 
 
 **Given** ADR 0004 §3's notification-type table
 **When** Story 5.6 lands
-**Then** the `idle_prompt` row changes from `→ WaitingInput` to `→ preserve prior (transient)`, and a top-of-file Status note records "Amended in part by ADR 0005 (idle_prompt reclassified transient) — 2026-05-29"; 0004's liveness probe, `Ended` state, `SessionEnded` event, and `PostToolUse → Working` refinement are unchanged
+**Then** the `idle_prompt` row changes from `→ WaitingInput` to `→ Idle, except a prior WaitingInput is preserved` (code-review D3), and a top-of-file Status note records the ADR 0005 amendment dated 2026-05-29; 0004's liveness probe, `Ended` state, `SessionEnded` event, and `PostToolUse → Working` refinement are unchanged
 
 **Given** `docs/protocol.md` (`SessionCurrentState`, the `notification_type` extraction prose, and the `Notification` hook-kind table row)
 **When** Story 5.6 lands
-**Then** `idle_prompt` is listed in the transient (preserve-prior) bucket, the `WaitingInput` definition is narrowed to "blocked on user input with work queued (`permission_prompt`/`elicitation_dialog`, incl. `AskUserQuestion`)", and it is noted that `idle_prompt` does not *transition a session into* `WaitingInput` (it preserves prior state, so a session already in `WaitingInput` stays there)
+**Then** `idle_prompt` is documented as resolving to `Idle` (except a prior `WaitingInput` is preserved), the `WaitingInput` definition is narrowed to "blocked on user input with work queued (`permission_prompt`/`elicitation_dialog`, incl. `AskUserQuestion`)", and it is noted that `idle_prompt` does not *transition a session into* `WaitingInput` (a session already in `WaitingInput` stays there — the nudge neither creates nor clears a block)
 
 **Given** `docs/protocol-changelog.md` (the changelog gate fires only on `crates/protocol/src/*.rs` changes, which this story does NOT touch)
 **When** Story 5.6 lands

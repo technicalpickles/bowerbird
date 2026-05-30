@@ -1269,10 +1269,11 @@ fn envelope_for(source: &str, session_id: &str, kind: EventKind) -> EventEnvelop
 }
 
 /// Story 5.3: Notification envelope helper. The typed `notification_type`
-/// drives the branching: input-required types (PermissionPrompt,
-/// ElicitationDialog) transition to WaitingInput; transient types (IdlePrompt,
-/// AuthSuccess, ElicitationResponse, ElicitationComplete) preserve prior
-/// current_state. (IdlePrompt reclassified transient in Story 5.6 / ADR 0005.)
+/// drives the branching (three rules as of Story 5.6 / ADR 0005, code-review
+/// D1+D3): input-required types (PermissionPrompt, ElicitationDialog) → WaitingInput;
+/// IdlePrompt → Idle, except a prior WaitingInput is preserved; the truly-transient
+/// types (AuthSuccess, ElicitationResponse, ElicitationComplete, Unknown, None)
+/// preserve prior current_state, except a prior Ended resurrects to Idle.
 fn envelope_for_notification(
     source: &str,
     session_id: &str,
@@ -1459,10 +1460,12 @@ async fn hook_unreliability_tolerance_pretooluse_without_posttooluse() {
 /// stored `current_state` matches the documented transition table at each step.
 ///
 /// Updated by Story 5.3: PostToolUse now unconditionally → Working (refines
-/// Story 5.2's "preserve prior"). Notification branches on `notification_type`:
-/// input-required types (PermissionPrompt, ElicitationDialog) transition to
-/// WaitingInput; transient types (IdlePrompt, AuthSuccess, ...) and None
-/// preserve prior. (IdlePrompt reclassified transient in Story 5.6 / ADR 0005.)
+/// Story 5.2's "preserve prior"). Notification branches on `notification_type`
+/// (three rules as of Story 5.6 / ADR 0005, code-review D1+D3): input-required
+/// types (PermissionPrompt, ElicitationDialog) → WaitingInput; IdlePrompt → Idle,
+/// except a prior WaitingInput is preserved; the truly-transient types (AuthSuccess,
+/// ElicitationResponse, ElicitationComplete, Unknown) and None preserve prior,
+/// except a prior Ended resurrects to Idle.
 #[tokio::test(flavor = "current_thread")]
 async fn state_machine_full_sequence_determinism() {
     let (_tmp, pools) = fresh_pools().await;
@@ -1537,6 +1540,142 @@ async fn state_machine_full_sequence_determinism() {
         assert_eq!(
             parsed.last_event_kind, kind,
             "last_event_kind must always reflect the latest event"
+        );
+    }
+}
+
+/// Drain a broadcast receiver synchronously (the hub publishes inline), tallying
+/// Event frames and collecting the `current_state` of each State frame.
+fn drain_frames(
+    rx: &mut tokio::sync::broadcast::Receiver<bowerbird_daemon::broadcast::BroadcastEnvelope>,
+) -> (usize, Vec<SessionCurrentState>) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    let mut events = 0usize;
+    let mut states = Vec::new();
+    while std::time::Instant::now() < deadline {
+        match rx.try_recv() {
+            Ok(bowerbird_daemon::broadcast::BroadcastEnvelope::Event(_)) => events += 1,
+            Ok(bowerbird_daemon::broadcast::BroadcastEnvelope::State { state, .. }) => {
+                states.push(state.current_state)
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+            Err(e) => panic!("unexpected recv error: {e:?}"),
+        }
+    }
+    (events, states)
+}
+
+/// Story 5.6 / ADR 0005 (code-review D3), publish-path coverage. The pure
+/// `transition` tests assert `IdlePrompt + prior Working → Idle`; this drives
+/// the full `projection::session::write` path and asserts the persisted row
+/// becomes `Idle` AND a `State` frame carrying `Idle` is published, so a
+/// presenter actually receives the dropped-`Stop` correction. (Finding from
+/// the fourth code-review pass: publish-path coverage missed the new
+/// state-changing notification branches.)
+#[tokio::test(flavor = "current_thread")]
+async fn notification_idle_prompt_after_working_publishes_idle_state() {
+    let (_tmp, pools) = fresh_pools().await;
+    let hub = BroadcastHub::new(64);
+    let session_id = "sess-idle-after-working";
+
+    // Drive the session to Working (simulating a turn whose Stop was dropped).
+    projection::session::write(
+        &pools.writer,
+        &hub,
+        envelope_for("claude", session_id, EventKind::PreToolUse),
+    )
+    .await
+    .expect("write PreToolUse");
+
+    // Subscribe AFTER setup so we observe only the notification write's frames.
+    let mut rx = hub.subscribe();
+
+    projection::session::write(
+        &pools.writer,
+        &hub,
+        envelope_for_notification("claude", session_id, Some(NotificationType::IdlePrompt)),
+    )
+    .await
+    .expect("write Notification(IdlePrompt)");
+
+    let stored = read_session_state(&pools.reader, "claude", session_id).await;
+    let parsed: SessionState = serde_json::from_str(&stored).expect("parse");
+    assert_eq!(
+        parsed.current_state,
+        SessionCurrentState::Idle,
+        "idle_prompt after Working must persist Idle"
+    );
+    assert_eq!(parsed.last_event_kind, EventKind::Notification);
+
+    let (events, states) = drain_frames(&mut rx);
+    assert_eq!(
+        events, 1,
+        "the idle_prompt write must publish its Event frame"
+    );
+    assert_eq!(
+        states,
+        vec![SessionCurrentState::Idle],
+        "Working→Idle must publish exactly one State frame carrying Idle"
+    );
+}
+
+/// Story 5.6 / ADR 0005 (code-review D1), publish-path coverage. A row the
+/// liveness probe marked `Ended` receives a non-blocking notification; the hook
+/// proves the process is alive, so it must resurrect to `Idle` — persisted AND
+/// published as an Event then a State frame. Covers both `IdlePrompt` (its own
+/// arm) and a truly-transient type (`AuthSuccess`) reaching the same outcome.
+#[tokio::test(flavor = "current_thread")]
+async fn notification_after_ended_resurrects_to_idle_state() {
+    for notification_type in [NotificationType::IdlePrompt, NotificationType::AuthSuccess] {
+        let (_tmp, pools) = fresh_pools().await;
+        let hub = BroadcastHub::new(64);
+        let session_id = "sess-ended-resurrect";
+
+        // Drive the row to Ended (as the liveness probe would).
+        projection::session::write(
+            &pools.writer,
+            &hub,
+            envelope_for("claude", session_id, EventKind::SessionEnded),
+        )
+        .await
+        .expect("write SessionEnded");
+        let ended = read_session_state(&pools.reader, "claude", session_id).await;
+        let ended: SessionState = serde_json::from_str(&ended).expect("parse");
+        assert_eq!(
+            ended.current_state,
+            SessionCurrentState::Ended,
+            "setup: row must be Ended before the resurrecting notification"
+        );
+
+        // Subscribe AFTER setup so we observe only the notification write.
+        let mut rx = hub.subscribe();
+
+        projection::session::write(
+            &pools.writer,
+            &hub,
+            envelope_for_notification("claude", session_id, Some(notification_type)),
+        )
+        .await
+        .expect("write Notification");
+
+        let stored = read_session_state(&pools.reader, "claude", session_id).await;
+        let parsed: SessionState = serde_json::from_str(&stored).expect("parse");
+        assert_eq!(
+            parsed.current_state,
+            SessionCurrentState::Idle,
+            "{notification_type:?} from Ended must persist Idle (hook proves process alive)"
+        );
+        assert_eq!(parsed.last_event_kind, EventKind::Notification);
+
+        let (events, states) = drain_frames(&mut rx);
+        assert_eq!(
+            events, 1,
+            "{notification_type:?} write must publish its Event frame"
+        );
+        assert_eq!(
+            states,
+            vec![SessionCurrentState::Idle],
+            "Ended→Idle must publish exactly one State frame carrying Idle for {notification_type:?}"
         );
     }
 }
