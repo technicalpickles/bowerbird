@@ -62,34 +62,41 @@ pub(crate) fn transition(
         // behavioral`.
         EventKind::PostToolUse => SessionCurrentState::Working,
         EventKind::Stop => SessionCurrentState::Idle,
-        // Story 5.3 AC #7/#8, narrowed by Story 5.6 / ADR 0005: Notification
-        // branches on typed notification_type.
-        //   PermissionPrompt | ElicitationDialog → WaitingInput
-        //   IdlePrompt | AuthSuccess | ElicitationResponse | ElicitationComplete | Unknown | None → preserve prior (but Ended → Idle)
-        // IdlePrompt was reclassified from WaitingInput to preserve-prior in
-        // Story 5.6 (ADR 0005): the idle nudge fires ~60s after `Stop`, so it
-        // is not a block. "Preserve prior" reads as `Idle` after a normal
-        // turn-end (the common case, draining the deck's WaitingInput wall) but
-        // does NOT clobber a still-pending permission/elicitation block — a
-        // session left in WaitingInput stays WaitingInput. PermissionPrompt and
-        // ElicitationDialog (incl. AskUserQuestion) are now the ONLY types that
-        // yield WaitingInput.
+        // Story 5.3 AC #7/#8, reworked by Story 5.6 / ADR 0005: Notification
+        // branches on typed notification_type into THREE rules.
+        //   PermissionPrompt | ElicitationDialog → WaitingInput (hard block)
+        //   IdlePrompt → Idle, EXCEPT prior WaitingInput is preserved
+        //   AuthSuccess | ElicitationResponse | ElicitationComplete | Unknown | None → preserve prior (but Ended → Idle)
         //
-        // Exception (Story 5.6 / ADR 0005): a prior `Ended` is NOT preserved. A
-        // notification hook arriving at all is evidence the process is alive
-        // (Claude fired it), so per ADR 0004's non-terminal-`Ended` contract the
-        // session resurrects to `Idle`. This holds for every preserve-prior
-        // type; IdlePrompt joining the branch made the stray-hook-after-Ended
-        // case reachable via the most common notification. (No prior → Idle too.)
+        // IdlePrompt (Story 5.6 / ADR 0005, refined by code-review D3): the idle
+        // nudge fires ~60s after a turn ends, so its arrival is positive
+        // evidence the turn is OVER — Claude does not ping idle mid-work. So it
+        // resolves to `Idle`, which also covers a dropped `Stop` (a finished
+        // session whose `Stop` was lost still lands on `Idle` instead of pinning
+        // to a stale `Working` that the idle nudge would otherwise keep
+        // refreshing past the read-time stale-`Working` fallback). The ONE
+        // exception: a prior `WaitingInput` (a still-pending permission /
+        // elicitation block) is preserved — an idle nudge neither creates nor
+        // clears a real block. So IdlePrompt never *transitions a session into*
+        // WaitingInput; PermissionPrompt and ElicitationDialog (incl.
+        // AskUserQuestion) are the ONLY types that do.
         //
-        // The "preserve prior" branch still updates last_event_kind /
-        // last_event_at_ms (the event happened) — only current_state is
-        // preserved.
+        // Truly-transient types (AuthSuccess / ElicitationResponse /
+        // ElicitationComplete / Unknown / None) preserve prior `current_state`,
+        // EXCEPT a prior `Ended` resurrects to `Idle`: a hook arriving at all is
+        // evidence the process is alive (ADR 0004 non-terminal `Ended`;
+        // code-review D1). (No prior → Idle too.)
+        //
+        // All three rules still update last_event_kind / last_event_at_ms (the
+        // event happened) — only `current_state` follows the rule above.
         EventKind::Notification => match notification_type {
             Some(NotificationType::PermissionPrompt)
             | Some(NotificationType::ElicitationDialog) => SessionCurrentState::WaitingInput,
-            Some(NotificationType::IdlePrompt)
-            | Some(NotificationType::AuthSuccess)
+            Some(NotificationType::IdlePrompt) => match prev.map(|s| s.current_state) {
+                Some(SessionCurrentState::WaitingInput) => SessionCurrentState::WaitingInput,
+                _ => SessionCurrentState::Idle,
+            },
+            Some(NotificationType::AuthSuccess)
             | Some(NotificationType::ElicitationResponse)
             | Some(NotificationType::ElicitationComplete)
             | Some(NotificationType::Unknown)
@@ -249,11 +256,11 @@ mod tests {
         }
     }
 
-    // Story 5.3 AC #8 (extended by Story 5.6 / ADR 0005): the transient
-    // notification_type values + Unknown + None preserve the prior
-    // current_state but still update last_event_kind/last_event_at_ms.
-    // IdlePrompt joined this bucket in Story 5.6 — the idle nudge (~60s after
-    // Stop) must not force a session into WaitingInput.
+    // Story 5.3 AC #8: the truly-transient notification_type values + Unknown +
+    // None preserve the prior current_state but still update
+    // last_event_kind/last_event_at_ms. NOTE: IdlePrompt is NOT in this set as
+    // of Story 5.6 / ADR 0005 code-review D3 — it has its own rule (→ Idle
+    // unless prior WaitingInput), tested separately below.
     #[test]
     fn transition_notification_transient_preserves_prior() {
         let prev = SessionState {
@@ -263,7 +270,6 @@ mod tests {
             last_pid: Some(99),
         };
         let cases: &[Option<NotificationType>] = &[
-            Some(NotificationType::IdlePrompt),
             Some(NotificationType::AuthSuccess),
             Some(NotificationType::ElicitationResponse),
             Some(NotificationType::ElicitationComplete),
@@ -333,10 +339,41 @@ mod tests {
         assert_eq!(next.last_event_at_ms, 2_000);
     }
 
+    // Story 5.6 / ADR 0005 code-review D3: the dropped-Stop case. A session is
+    // Working (mid-turn) and its `Stop` hook is dropped; ~60s later an
+    // idle_prompt arrives. The idle nudge is positive evidence the turn ended,
+    // so the session must resolve to Idle — NOT preserve a stale Working that
+    // the nudge's timestamp refresh would otherwise keep alive past the
+    // read-time stale-Working fallback.
+    #[test]
+    fn transition_notification_idle_prompt_prior_working_yields_idle() {
+        let prev = SessionState {
+            current_state: SessionCurrentState::Working,
+            last_event_kind: EventKind::PreToolUse,
+            last_event_at_ms: 1_000,
+            last_pid: Some(42),
+        };
+        let next = transition(
+            Some(&prev),
+            EventKind::Notification,
+            Some(NotificationType::IdlePrompt),
+            None,
+            2_000,
+        );
+        assert_eq!(
+            next.current_state,
+            SessionCurrentState::Idle,
+            "idle_prompt after a dropped Stop must resolve a stale Working to Idle"
+        );
+        assert_eq!(next.last_event_kind, EventKind::Notification);
+        assert_eq!(next.last_event_at_ms, 2_000);
+    }
+
     // Story 5.6 / ADR 0005: the load-bearing "don't clobber a real block" case.
     // A genuine permission_prompt left the session in WaitingInput; the user
-    // then sat idle long enough to trigger an idle nudge. "Preserve prior" must
-    // keep WaitingInput rather than a hard `→ Idle` masking a real block.
+    // then sat idle long enough to trigger an idle nudge. idle_prompt resolves
+    // to Idle in general (D3), but a prior WaitingInput is the ONE exception —
+    // it is preserved so the nudge does not mask a real pending block.
     #[test]
     fn transition_notification_idle_prompt_prior_waiting_input_preserved() {
         let prev = SessionState {

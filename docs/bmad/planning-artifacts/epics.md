@@ -1132,11 +1132,11 @@ Inserted by `sprint-change-proposal-2026-05-29-idle-prompt-reclassification.md` 
 
 **Given** the `EventKind::Notification` arm of `crates/daemon/src/projection/state.rs::transition` (Story 5.3)
 **When** Story 5.6 lands
-**Then** `Some(NotificationType::IdlePrompt)` is classified into the preserve-prior branch (joining `AuthSuccess`/`ElicitationResponse`/`ElicitationComplete`/`Unknown`/`None`); `PermissionPrompt` and `ElicitationDialog` remain the only notification types that yield `WaitingInput`; `IdlePrompt` with a prior state returns that prior `current_state` (prior `Idle` → `Idle`; prior `WaitingInput` → `WaitingInput`) and with no prior defaults to `Idle`; `last_event_kind`/`last_event_at_ms` still update; no other arm changes
+**Then** `Some(NotificationType::IdlePrompt)` gets its own rule (code-review D3): `idle_prompt → Idle`, EXCEPT a prior `WaitingInput` is preserved; `PermissionPrompt` and `ElicitationDialog` remain the only notification types that *transition a session into* `WaitingInput`; `IdlePrompt` resolves prior `Working`/`Idle`/`Ended` and no-prior to `Idle` (covering a dropped `Stop`) and a prior `WaitingInput` to `WaitingInput`; the truly-transient types (`AuthSuccess`/`ElicitationResponse`/`ElicitationComplete`/`Unknown`/`None`) preserve prior except a prior `Ended` → `Idle` (code-review D1); `last_event_kind`/`last_event_at_ms` still update
 
 **Given** the `state.rs` test module
 **When** Story 5.6 lands
-**Then** `transition_notification_input_required_yields_waiting_input` no longer iterates `IdlePrompt`; `transition_notification_transient_preserves_prior` includes `IdlePrompt`; new tests cover `IdlePrompt` + prior `Idle` → `Idle` and `IdlePrompt` + prior `WaitingInput` → `WaitingInput` (a pending block is not clobbered by a subsequent idle nudge)
+**Then** `transition_notification_input_required_yields_waiting_input` no longer iterates `IdlePrompt`; `transition_notification_transient_preserves_prior` does NOT include `IdlePrompt`; tests cover `IdlePrompt` + prior `Idle`/`Working`/no-prior → `Idle` and `IdlePrompt` + prior `WaitingInput` → `WaitingInput` (a pending block is not clobbered); `transition_from_ended_preserve_prior_notification_yields_idle` covers prior `Ended` → `Idle`
 
 **Given** ADR 0004 §3's notification-type table
 **When** Story 5.6 lands
