@@ -670,6 +670,21 @@ mod legacy_v1_0_mocks {
         pub state: LegacySessionState,
     }
 
+    /// Pre-5.7 shape of one `GET /sessions` array entry — no `cwd` /
+    /// `started_at`. AC #10/#13: a v1.0 presenter must decode a 5.7+ list
+    /// item carrying both new fields without erroring.
+    #[derive(Debug, Deserialize)]
+    #[allow(dead_code)]
+    pub(super) struct LegacySessionListItem {
+        pub source: String,
+        pub session_id: String,
+        pub current_state: LegacySessionCurrentState,
+        pub last_event_kind: LegacyEventKind,
+        pub last_event_at_ms: i64,
+        pub updated_at: i64,
+        pub last_pid: Option<u32>,
+    }
+
     #[derive(Debug, Deserialize)]
     #[serde(tag = "op", rename_all = "snake_case")]
     #[allow(dead_code)]
@@ -865,6 +880,39 @@ fn additive_compat_cwd_and_started_at_ignored_by_v1_consumer() {
         }
         other => panic!("expected Event variant, got {other:?}"),
     }
+}
+
+// Story 5.7 review pass 2 (AC #10/#13): a v1.0 presenter decodes one
+// `GET /sessions` list item from a 5.7+ daemon carrying `cwd` + `started_at`
+// without erroring — the unknown fields drop silently and the known fields
+// decode unchanged. The other compat test decodes `StateFrame`/`EventFrame`
+// through `ServerMessage`; the existing list-item round-trip test uses the
+// CURRENT `SessionListItem` type. This pins the LEGACY `SessionListItem` shape
+// (lacking both fields) the REST `/sessions` array consumer sees.
+#[test]
+fn additive_compat_session_list_item_ignores_cwd_and_started_at() {
+    use legacy_v1_0_mocks::*;
+
+    let item_wire = r#"{
+        "source": "claude",
+        "session_id": "s1",
+        "current_state": "Working",
+        "last_event_kind": "PreToolUse",
+        "last_event_at_ms": 42,
+        "updated_at": 99,
+        "last_pid": 12345,
+        "cwd": "/Users/x/repo",
+        "started_at": 1717200000000
+    }"#;
+    let parsed: LegacySessionListItem = serde_json::from_str(item_wire)
+        .expect("legacy SessionListItem decode with cwd/started_at must succeed");
+    assert_eq!(parsed.source, "claude");
+    assert_eq!(parsed.session_id, "s1");
+    assert_eq!(parsed.current_state, LegacySessionCurrentState::Working);
+    assert_eq!(parsed.last_event_kind, LegacyEventKind::PreToolUse);
+    assert_eq!(parsed.last_event_at_ms, 42);
+    assert_eq!(parsed.updated_at, 99);
+    assert_eq!(parsed.last_pid, Some(12345));
 }
 
 // Story 5.7 AC #13 (inverse direction): a CURRENT `SessionState` deserializes a

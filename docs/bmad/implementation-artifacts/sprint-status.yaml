@@ -33,6 +33,7 @@
 # last_updated: 2026-06-01 (Story 5.7 → in-progress; bmad-code-review found 1 decision-needed upgrade semantics issue and 2 patch findings; findings documented in story Review Findings)
 # last_updated: 2026-06-01 (Story 5.7 → review; all 3 code-review findings resolved — [Decision] legacy started_at backfills from MIN(events.created_at) to preserve the byte-identical-rebuild contract + ADR 0006 note + regression test; [Patch] migration v3 test now file-backed tempfile; [Patch] project-context §Wire format documents the additive outbound fields; 503 workspace tests + fmt + clippy green)
 # last_updated: 2026-06-01 (Story 5.7 → in-progress; bmad-code-review pass 2 documented 5 unresolved patch findings — non-monotonic started_at backfill, v2-row migration coverage, Event.cwd surface coverage, epics ADR-number conflict, SessionListItem additive-compat coverage)
+# last_updated: 2026-06-01 (Story 5.7 → review; all 5 code-review pass-2 findings resolved — started_at backfill now first-event-by-event_id order (matches rebuild, +non-monotonic regression test), v2→v3 migration row-preservation test, Event.cwd e2e coverage (REST events/WS EventFrame/snapshot/replay), epics cookbook ADR 0006→0008 renumber, legacy SessionListItem additive-compat test; 510 workspace tests + fmt + clippy + changelog gate green)
 # project: bowerbird
 # project_key: NOKEY
 # tracking_system: file-system
@@ -68,7 +69,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-05-16
-last_updated: 2026-06-01 (Story 5.7 → in-progress; bmad-code-review pass 2 documented 5 unresolved patch findings)
+last_updated: 2026-06-01 (Story 5.7 → review; all 5 code-review pass-2 findings resolved; 510 workspace tests + fmt + clippy + changelog gate green)
 project: bowerbird
 project_key: NOKEY
 tracking_system: file-system
@@ -129,7 +130,7 @@ development_status:
   5-4-install-ux-polish-and-middleware-closure: done
   5-5-bench-gates-load-bearing: ready-for-dev
   5-6-idle-prompt-reclassified-as-transient: review
-  5-7-session-cwd-on-the-wire: in-progress             # Finding 3 (+ ADR 0006); gates v0.1.0
+  5-7-session-cwd-on-the-wire: review                  # Finding 3 (+ ADR 0006); gates v0.1.0
   5-8-server-side-session-filter: backlog               # Finding 5-filter; gates v0.1.0
   5-9-daemon-start-on-login: backlog                     # Finding 1 (+ ADR 0007); gates v0.1.0
   5-10-shim-names-daemon-down-cause: backlog            # Finding 2 (minor); gates v0.1.0

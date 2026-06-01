@@ -1253,7 +1253,7 @@ As the bowerbird maintainer,
 I want each cookbook entry to be one self-contained directory under `docs/cookbook/<name>/` containing prose (`README.md`) and runnable code (`src/`, `package.json`, `tsconfig.json`) colocated,
 So that the cookbook is the canonical home of the working examples — no duplication, no drift-check, no separate `examples/` surface to navigate.
 
-Closes Story 4.2 AC at `epics.md:817-819`, Story 4.3 AC at `epics.md:843`, and `project-context.md` §Cookbook discipline directive (L526) "do not hand-copy snippets — they rot." Closes `deferred-work.md:104` ("Cookbook inlining mechanism"). See `sprint-change-proposal-2026-05-26-cookbook-consolidation.md` for the full rationale. Resequenced from 5.5 → 5.7 by `sprint-change-proposal-2026-05-27-epic-5-resequencing.md`, then → 5.8 by `sprint-change-proposal-2026-05-29-idle-prompt-reclassification.md` (idle-prompt story inserted at 5.6) (dogfooding-first ordering: cookbook consolidation is reader-facing, not load-bearing for the maintainer's daily use).
+Closes Story 4.2 AC at `epics.md:817-819`, Story 4.3 AC at `epics.md:843`, and `project-context.md` §Cookbook discipline directive (L526) "do not hand-copy snippets — they rot." Closes `deferred-work.md:104` ("Cookbook inlining mechanism"). See `sprint-change-proposal-2026-05-26-cookbook-consolidation.md` for the full rationale. Resequenced from 5.5 → 5.7 by `sprint-change-proposal-2026-05-27-epic-5-resequencing.md`, then → 5.8 by `sprint-change-proposal-2026-05-29-idle-prompt-reclassification.md` (idle-prompt story inserted at 5.6), then → 5.12 by `sprint-change-proposal-2026-06-01-dogfood-triage.md` (four dogfood-triage stories 5.7–5.10 inserted after Story 5.6, renumbering the release-readiness tail; this also reassigned ADR 0006 to Story 5.7's session-cwd decision, so cookbook consolidation's ADR moves to the next free number — see the ADR criterion below) (dogfooding-first ordering: cookbook consolidation is reader-facing, not load-bearing for the maintainer's daily use).
 
 **Acceptance Criteria:**
 
@@ -1283,7 +1283,7 @@ Closes Story 4.2 AC at `epics.md:817-819`, Story 4.3 AC at `epics.md:843`, and `
 
 **Given** the project's update protocol (`project-context.md` L77: "Every merged ADR includes Affects context.md sections: field")
 **When** Story 5.12 lands
-**Then** ADR 0006 has been authored at `docs/decisions/0006-cookbook-consolidation.md` documenting the decision, considered alternatives (mdBook `{{#include}}`, hand-rolled preprocessor, pocketflow pattern), the chosen path, and `Affects context.md sections: Repository layout, Cookbook discipline` (ADR 0005 is taken by the idle_prompt reclassification per Story 5.6)
+**Then** ADR 0008 has been authored at `docs/decisions/0008-cookbook-consolidation.md` documenting the decision, considered alternatives (mdBook `{{#include}}`, hand-rolled preprocessor, pocketflow pattern), the chosen path, and `Affects context.md sections: Repository layout, Cookbook discipline` (ADR 0005 is the idle_prompt reclassification per Story 5.6; ADR 0006 is session cwd + started_at on the wire per Story 5.7; ADR 0007 is reserved for daemon start-on-login per Story 5.9 — 0008 is the next free number. If the number should not be allocated until this story lands, treat the path as TBD and claim the next free ADR number then.)
 
 **Given** reader-facing docs
 **When** Story 5.12 lands

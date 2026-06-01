@@ -456,6 +456,63 @@ fn migration_v3_adds_nullable_cwd_column() {
     assert_eq!(version, version2, "user_version stable on re-apply");
 }
 
+// Story 5.7 review pass 2 (AC #6): prove the v2 -> v3 upgrade path itself, not
+// just the post-migration column shape. The test above runs all migrations up
+// front and only inserts after `events.cwd` exists, so it never exercises a
+// pre-existing v2 row gaining `cwd = NULL`. Here we stop at a real v2 schema
+// (`to_version(_, 2)` applies V1 + V2 → `events.pid`, no `events.cwd`,
+// `PRAGMA user_version = 2`), insert a row WHILE the table has no `cwd` column,
+// THEN run `to_latest` to apply v3. The pre-existing row must read `cwd = NULL`
+// (ALTER TABLE ADD COLUMN backfills NULL) and `user_version` must report 3.
+#[test]
+fn migration_v3_preserves_existing_v2_rows_with_null_cwd() {
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("bower.db");
+    let mut conn = rusqlite::Connection::open(&db_path).expect("file-backed connection");
+    let m = migrations();
+
+    // Stop at v2: events has `pid` but NOT `cwd`.
+    m.to_version(&mut conn, 2).expect("migrate to v2");
+    let v2: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .expect("user_version read");
+    assert_eq!(v2, 2, "expected v2 schema before the v3 upgrade");
+    let has_cwd_at_v2: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('events') WHERE name = 'cwd'")
+        .and_then(|mut s| s.exists([]))
+        .expect("table_info query");
+    assert!(!has_cwd_at_v2, "v2 schema must NOT have events.cwd yet");
+
+    // Insert a pre-existing row against the v2 schema (no cwd column to set).
+    conn.execute(
+        "INSERT INTO events (source, session_id, kind, payload, created_at, pid) \
+         VALUES ('claude', 'pre-v3', 'Stop', '{}', 42, 7)",
+        [],
+    )
+    .expect("insert v2 row");
+
+    // Now run the v3 migration the daemon would run at startup.
+    m.to_latest(&mut conn).expect("upgrade v2 -> v3");
+    let v3: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .expect("user_version read");
+    assert_eq!(v3, 3, "expected user_version 3 after v3 upgrade");
+
+    // The pre-existing v2 row must have gained `cwd = NULL`.
+    let (pid, cwd): (Option<i64>, Option<String>) = conn
+        .query_row(
+            "SELECT pid, cwd FROM events WHERE session_id = 'pre-v3'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("read pre-existing row");
+    assert_eq!(pid, Some(7), "pre-existing pid must survive the v3 upgrade");
+    assert_eq!(
+        cwd, None,
+        "pre-existing v2 row must read cwd = NULL after v3 ALTER TABLE ADD COLUMN"
+    );
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn migration_failure_exits_nonzero() {
     let tmp = TempDir::new().expect("tempdir");
@@ -2813,6 +2870,45 @@ mod story_1_7_rest {
         assert!(item.started_at.is_some());
     }
 
+    // Story 5.7 review pass 2 (AC #9): GET /sessions/{id}/events carries
+    // `Event.cwd` per row. The `/sessions` + `/sessions/{id}` test above pins
+    // the state surface; this pins the per-event REST surface, which threads
+    // `cwd` through a separate column-index path (`SELECT_EVENTS_FOR_SESSION_SINCE`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn events_rest_surfaces_event_cwd() {
+        let (_tmp, pools) = fresh_pools().await;
+        projection::session::write(
+            &pools.writer,
+            &BroadcastHub::new(16),
+            EventEnvelope {
+                source: "claude".to_string(),
+                session_id: "sess-ev-cwd".to_string(),
+                kind: EventKind::PreToolUse,
+                reaction: None,
+                payload: "{}".to_string(),
+                pid: None,
+                notification_type: None,
+                cwd: Some("/repo".to_string()),
+            },
+        )
+        .await
+        .expect("write sess-ev-cwd");
+
+        let app = api::router(ready_state(pools));
+        let resp = app
+            .oneshot(auth_get("/sessions/sess-ev-cwd/events?since=0"))
+            .await
+            .expect("oneshot events");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: EventListResponse = json_body(resp).await;
+        assert_eq!(body.events.len(), 1, "exactly one event written");
+        assert_eq!(
+            body.events[0].cwd,
+            Some("/repo".to_string()),
+            "GET /sessions/{{id}}/events must carry Event.cwd"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn sessions_detail_returns_404_when_unknown() {
         let (_tmp, pools) = fresh_pools().await;
@@ -4343,6 +4439,34 @@ mod story_2_2_publish {
         .expect("projection::session::write")
     }
 
+    /// Like [`publish_via_projection`] but lets the caller set `cwd` (the
+    /// default helper hardcodes `None`). Story 5.7 review pass 2 — used by the
+    /// WS `EventFrame.event.cwd` and snapshot `StateFrame.state.cwd` coverage.
+    pub(super) async fn publish_via_projection_with_cwd(
+        state: &AppState,
+        source: &str,
+        session_id: &str,
+        kind: EventKind,
+        cwd: Option<&str>,
+    ) -> EventId {
+        bowerbird_daemon::projection::session::write(
+            &state.db.writer,
+            &state.broadcaster,
+            EventEnvelope {
+                source: source.to_string(),
+                session_id: session_id.to_string(),
+                kind,
+                reaction: None,
+                payload: "{}".to_string(),
+                pid: None,
+                notification_type: None,
+                cwd: cwd.map(|s| s.to_string()),
+            },
+        )
+        .await
+        .expect("projection::session::write")
+    }
+
     fn default_state(pools: bowerbird_daemon::db::DbPools, ws_max_conns: usize) -> AppState {
         make_test_state_with_ws(
             pools,
@@ -4351,6 +4475,44 @@ mod story_2_2_publish {
             Duration::from_secs(30),
             Duration::from_secs(10),
         )
+    }
+
+    /// Story 5.7 review pass 2 (AC #9): a live `events.*` `EventFrame` must
+    /// carry `event.cwd`. A column-index slip or a dropped field on the live
+    /// broadcast path would otherwise go uncaught by the Story 5.7 tests.
+    #[tokio::test(flavor = "current_thread")]
+    async fn events_frame_carries_cwd() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 4);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"events.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+        wait_subscribe_live(&mut ws, &state, ProbeKind::Event { source: "claude" }).await;
+
+        publish_via_projection_with_cwd(
+            &state,
+            "claude",
+            "sess-ws-cwd",
+            EventKind::PreToolUse,
+            Some("/repo"),
+        )
+        .await;
+
+        let event = parse_event_frame(&read_text_frame_or_close(&mut ws).await);
+        assert_eq!(
+            event.cwd,
+            Some("/repo".to_string()),
+            "live EventFrame.event.cwd must carry the extracted cwd"
+        );
+
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     /// AC #1 — Three subscribers to `events.*` receive byte-identical
@@ -4995,7 +5157,7 @@ mod story_2_3_snapshot {
     };
     use super::story_2_2_publish::{
         connect_until_ready, parse_event_frame, parse_state_frame, publish_via_projection,
-        wait_subscribe_live, ProbeKind, WsStream,
+        publish_via_projection_with_cwd, wait_subscribe_live, ProbeKind, WsStream,
     };
     use super::{fresh_pools, make_test_state_with_ws};
 
@@ -5016,6 +5178,52 @@ mod story_2_3_snapshot {
     /// `ws_max_conns` and want to skip the boilerplate.
     async fn connect_and_skip_hello(addr: std::net::SocketAddr) -> WsStream {
         connect_until_ready(addr).await
+    }
+
+    /// Story 5.7 review pass 2 (AC #9): a snapshot-on-subscribe `StateFrame`
+    /// must carry `state.cwd` and `state.started_at` for a pre-existing
+    /// session. The snapshot path builds `SessionState` from the stored
+    /// projection blob (`snapshot.rs`), a separate surface from the live
+    /// transition the other cwd tests exercise.
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_state_frame_carries_cwd_and_started_at() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 4);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        // Pre-create a session with a cwd BEFORE the subscriber connects, so
+        // the snapshot read includes it.
+        publish_via_projection_with_cwd(
+            &state,
+            "claude",
+            "sess-snap-cwd",
+            EventKind::PreToolUse,
+            Some("/repo"),
+        )
+        .await;
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+
+        let frame = parse_state_frame(&read_text_frame_or_close(&mut ws).await);
+        assert_eq!(frame.session_id, "sess-snap-cwd");
+        assert_eq!(
+            frame.state.cwd,
+            Some("/repo".to_string()),
+            "snapshot StateFrame.state.cwd must carry the stored cwd"
+        );
+        assert!(
+            frame.state.started_at.is_some(),
+            "snapshot StateFrame.state.started_at must be set"
+        );
+
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
     }
 
     /// AC #1 — Three pre-existing sessions surface as snapshot State
@@ -7890,6 +8098,30 @@ mod story_4_1_replay {
         serde_json::to_string(&e).expect("serialize Event")
     }
 
+    /// Like [`event_line`] but sets the stored `Event.cwd`. Story 5.7 review
+    /// pass 2 — the replay path reads `cwd` from the JSONL `Event` (not from
+    /// payload), so a replayed event must carry it onto the broadcast + projection.
+    fn event_line_with_cwd(
+        source: &str,
+        session_id: &str,
+        kind: EventKind,
+        event_id: i64,
+        cwd: Option<&str>,
+    ) -> String {
+        let e = Event {
+            event_id: EventId(event_id),
+            source: source.to_string(),
+            session_id: session_id.to_string(),
+            kind,
+            reaction: None,
+            payload: "{}".to_string(),
+            created_at: 1,
+            pid: None,
+            cwd: cwd.map(|s| s.to_string()),
+        };
+        serde_json::to_string(&e).expect("serialize Event")
+    }
+
     fn auth_post(uri: &str, body: Vec<u8>) -> Request<Body> {
         Request::builder()
             .method("POST")
@@ -7999,6 +8231,60 @@ mod story_4_1_replay {
                 );
             }
         }
+    }
+
+    /// Story 5.7 review pass 2 (AC #9): a replayed event carries its stored
+    /// `cwd` onto BOTH the broadcast `Event` frame and the projected
+    /// `SessionState` (the `State` frame). Replay reconstructs the envelope
+    /// from the JSONL `Event.cwd` (`replay.rs`), a path the other cwd tests
+    /// don't touch.
+    #[tokio::test(flavor = "current_thread")]
+    async fn replay_carries_event_cwd_onto_broadcast_and_projection() {
+        let (_tmp, pools) = fresh_pools().await;
+        let (state, _writer) = wired_state(pools).await;
+        let mut rx = state.broadcaster.subscribe();
+        let app = api::router(state.clone());
+
+        // A single PreToolUse with a cwd: None → Working transitions, so we
+        // expect one Event frame + one State frame.
+        let body = event_line_with_cwd(
+            "claude",
+            "sess-replay-cwd",
+            EventKind::PreToolUse,
+            1000,
+            Some("/repo"),
+        );
+
+        let resp = app
+            .oneshot(auth_post("/replay", body.into_bytes()))
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let parsed = parse_replay_body(resp).await;
+        assert_eq!(parsed.replayed_count, 1);
+
+        let frames = collect_frames(&mut rx, 2).await;
+        assert_eq!(frames.len(), 2, "expected Event + State; got {frames:?}");
+
+        let event_cwd = frames.iter().find_map(|f| match f {
+            BroadcastEnvelope::Event(e) => Some(e.cwd.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            event_cwd,
+            Some(Some("/repo".to_string())),
+            "replayed broadcast Event.cwd must carry the stored cwd"
+        );
+
+        let state_cwd = frames.iter().find_map(|f| match f {
+            BroadcastEnvelope::State { state, .. } => Some(state.cwd.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            state_cwd,
+            Some(Some("/repo".to_string())),
+            "replayed projection State.cwd must carry the stored cwd"
+        );
     }
 
     /// AC #4: events spanning two `(source, session_id)` keys produce
@@ -8678,7 +8964,8 @@ mod story_5_3_liveness {
     // post-upgrade hook must NOT stamp that event's wall clock onto started_at
     // (a false "started just now" age) — it must backfill the true first-event
     // time from the event log so the live projection equals what a full rebuild
-    // produces (MIN(created_at)). This is the byte-identical-rebuild contract
+    // produces (the first event by event_id; see the non-monotonic test below).
+    // This is the byte-identical-rebuild contract
     // and ADR 0006's "reconstructs identically on rebuild" guarantee, pinned
     // against the upgrade edge case raised in code review.
     #[tokio::test(flavor = "current_thread")]
@@ -8741,6 +9028,75 @@ mod story_5_3_liveness {
             Some(1_000),
             "legacy started_at must backfill to the FIRST event's created_at, \
              not the post-upgrade event's wall clock"
+        );
+    }
+
+    // Story 5.7 review pass 2: the legacy backfill must use FIRST-EVENT-ORDER
+    // (lowest event_id), not MIN(created_at). `rebuild_missing_projections`
+    // folds events in `event_id ASC` order and `transition`'s set-once keeps
+    // the FIRST folded event's created_at, so a backfill that used the
+    // aggregate MIN would diverge from a rebuild when timestamps are
+    // non-monotonic (clock skew, manual edits, replayed-out-of-order events).
+    // Here event_id 1 carries created_at=2_000 and event_id 2 carries
+    // created_at=1_000: a rebuild yields 2_000 (first by event_id), but
+    // MIN(created_at) would wrongly yield 1_000. The live backfill must match
+    // the rebuild — the byte-identical-rebuild contract.
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_started_at_backfills_by_first_event_order_under_nonmonotonic_created_at() {
+        let (_tmp, pools) = fresh_pools().await;
+
+        // Seed two pre-upgrade events whose created_at is NON-monotonic vs
+        // event_id: the earliest-inserted row (event_id 1) has the LARGER
+        // created_at. AUTOINCREMENT assigns event_id in insert order.
+        let conn = pools.writer.get().await.expect("writer pool");
+        conn.interact(|c| -> rusqlite::Result<()> {
+            for (kind, created_at) in [("PreToolUse", 2_000_i64), ("Stop", 1_000)] {
+                c.execute(
+                    "INSERT INTO events (source, session_id, kind, payload, created_at) \
+                     VALUES ('claude', 'sess-skew', ?, '{}', ?)",
+                    rusqlite::params![kind, created_at],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("interact")
+        .expect("insert events");
+        drop(conn);
+
+        // Legacy projection blob: started_at None (pre-5.7 shape).
+        upsert_session(
+            &pools,
+            "claude",
+            "sess-skew",
+            &SessionState {
+                current_state: SessionCurrentState::Idle,
+                last_event_kind: EventKind::Stop,
+                last_event_at_ms: 1_000,
+                last_pid: None,
+                cwd: None,
+                started_at: None,
+            },
+            2_000,
+        )
+        .await;
+
+        projection::session::write(
+            &pools.writer,
+            &BroadcastHub::new(16),
+            envelope_for("claude", "sess-skew", EventKind::UserPromptSubmit),
+        )
+        .await
+        .expect("write post-upgrade event");
+
+        let after = read_state(&pools, "claude", "sess-skew")
+            .await
+            .expect("state");
+        assert_eq!(
+            after.started_at,
+            Some(2_000),
+            "legacy started_at must backfill to the FIRST event by event_id \
+             (created_at=2_000), matching rebuild — NOT MIN(created_at)=1_000"
         );
     }
 
