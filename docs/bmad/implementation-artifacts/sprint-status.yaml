@@ -26,6 +26,7 @@
 # last_updated: 2026-05-28 (Story 5.4 → done; install UX polish + middleware closure complete, code-review resolved)
 # last_updated: 2026-05-28 (Story 5.5 bench-gates-load-bearing created via bmad-create-story; 4 ACs + 6 tasks; → ready-for-dev)
 # last_updated: 2026-05-29 (Story 5.6 idle-prompt-reclassified-as-transient inserted after 5.5 via bmad-create-story; old 5.6→5.7, 5.7→5.8, 5.8→5.9, 5.9→5.10 per sprint-change-proposal-2026-05-29-idle-prompt-reclassification.md + ADR 0005)
+# last_updated: 2026-06-01 (Four dogfood-triage stories inserted after 5.6 per sprint-change-proposal-2026-06-01-dogfood-triage.md: 5.7 session-cwd-on-the-wire [+ADR 0006], 5.8 server-side-session-filter, 5.9 daemon-start-on-login [+ADR 0007], 5.10 shim-names-daemon-down-cause; old 5.7→5.11, 5.8→5.12, 5.9→5.13, 5.10→5.14. All four gate v0.1.0 (now Story 5.14). Story files pending bmad-create-story; ADRs pending authoring.)
 # project: bowerbird
 # project_key: NOKEY
 # tracking_system: file-system
@@ -106,12 +107,15 @@ development_status:
   epic-4-retrospective: done
 
   # Dogfooding validation phase (no formal stories; bugs become 5.X-hotfix stories ad-hoc)
-  # Begins after Story 5.1 (presenter) ships; runs in parallel with Stories 5.2–5.10.
+  # Begins after Story 5.1 (presenter) ships; runs in parallel with Stories 5.2–5.14.
   dogfooding-validation-phase: backlog  # transitions to 'in-progress' when 5.1 ships; 'done' on v0.1.0 tag
 
   # Epic 5: V1 Release Readiness (dogfooding → presenter → hardening)
   # Resequenced 2026-05-27 for dogfooding-first ordering: correctness fixes adjacent to 5.1,
   # then install UX, then CI/release hardening, then reader-facing polish, then the tag.
+  # 2026-06-01: four dogfood-triage stories (5.7–5.10) inserted per
+  # sprint-change-proposal-2026-06-01-dogfood-triage.md; old 5.7–5.10 → 5.11–5.14. All four gate v0.1.0.
+  # Story files + ADRs 0006/0007 pending authoring (bmad-create-story / architect).
   epic-5: in-progress
   5-1-first-party-presenter-tool: in-progress
   5-2-session-state-projection-correctness: done
@@ -119,8 +123,12 @@ development_status:
   5-4-install-ux-polish-and-middleware-closure: done
   5-5-bench-gates-load-bearing: ready-for-dev
   5-6-idle-prompt-reclassified-as-transient: review
-  5-7-release-pipeline-end-to-end-verification: backlog
-  5-8-cookbook-consolidation: backlog
-  5-9-first-time-reader-docs-pass: backlog
-  5-10-crates-io-namespace-and-v0-1-0-tag: backlog
+  5-7-session-cwd-on-the-wire: backlog                  # Finding 3 (+ ADR 0006); gates v0.1.0
+  5-8-server-side-session-filter: backlog               # Finding 5-filter; gates v0.1.0
+  5-9-daemon-start-on-login: backlog                     # Finding 1 (+ ADR 0007); gates v0.1.0
+  5-10-shim-names-daemon-down-cause: backlog            # Finding 2 (minor); gates v0.1.0
+  5-11-release-pipeline-end-to-end-verification: backlog
+  5-12-cookbook-consolidation: backlog
+  5-13-first-time-reader-docs-pass: backlog
+  5-14-crates-io-namespace-and-v0-1-0-tag: backlog
   epic-5-retrospective: optional
