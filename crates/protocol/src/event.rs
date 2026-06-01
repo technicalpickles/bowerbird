@@ -77,6 +77,11 @@ pub struct EventEnvelope {
     pub payload: String,
     pub pid: Option<u32>,
     pub notification_type: Option<NotificationType>,
+    /// Session working directory from the source's hook payload (Story 5.7).
+    /// Native Claude Code field (top-level `cwd` on every hook kind), extracted
+    /// by the adapter — not shim-injected like `pid`. Threaded into the
+    /// projection where it follows `last_pid`-style carry-forward.
+    pub cwd: Option<String>,
 }
 
 /// Stored event — includes assigned event_id and created_at timestamp.
@@ -90,4 +95,9 @@ pub struct Event {
     pub payload: String,
     pub created_at: i64,
     pub pid: Option<u32>,
+    /// Session working directory for this event, verbatim (Story 5.7). On the
+    /// wire (`GET /sessions/{id}/events`, WS `EventFrame.event`). `None` when
+    /// the source omitted it. `started_at` is NOT here — it is a session-level
+    /// projection fact on `SessionState`, not a per-event field.
+    pub cwd: Option<String>,
 }

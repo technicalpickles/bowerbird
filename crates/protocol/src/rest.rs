@@ -43,6 +43,13 @@ pub struct SessionListItem {
     pub last_event_at_ms: i64,
     pub updated_at: i64,
     pub last_pid: Option<u32>,
+    /// Session working directory, verbatim (Story 5.7). Parity with
+    /// `SessionDetail.state.cwd` so a presenter listing sessions can group /
+    /// label by directory without fetching each detail.
+    pub cwd: Option<String>,
+    /// Epoch-ms timestamp of the session's first observed event (Story 5.7).
+    /// Lets a presenter render session age directly from the list response.
+    pub started_at: Option<i64>,
 }
 
 /// Body of `GET /sessions/{id}`.

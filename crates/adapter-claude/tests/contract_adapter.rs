@@ -338,6 +338,79 @@ fn normalize_rejects_bowerbird_ppid_zero() {
     );
 }
 
+// ─── Story 5.7: cwd extraction ───────────────────────────────────────────────
+
+#[test]
+fn normalize_extracts_cwd_when_present() {
+    let dir = TempDir::new().unwrap();
+    let toml_path = write_toml(&dir, minimal_toml_with_bash());
+    let adapter = ClaudeAdapter::new(toml_path);
+
+    let payload = r#"{"session_id":"s1","tool_name":"Bash","cwd":"/Users/x/repo"}"#;
+    let result = adapter.normalize("PreToolUse", payload.as_bytes()).unwrap();
+    assert_eq!(result.envelope.cwd, Some("/Users/x/repo".to_string()));
+}
+
+#[test]
+fn normalize_extracts_cwd_none_when_missing() {
+    let dir = TempDir::new().unwrap();
+    let toml_path = write_toml(&dir, minimal_toml_with_bash());
+    let adapter = ClaudeAdapter::new(toml_path);
+
+    let payload = r#"{"session_id":"s1","tool_name":"Bash"}"#;
+    let result = adapter.normalize("PreToolUse", payload.as_bytes()).unwrap();
+    assert_eq!(result.envelope.cwd, None);
+}
+
+#[test]
+fn normalize_extracts_cwd_none_when_non_string() {
+    let dir = TempDir::new().unwrap();
+    let toml_path = write_toml(&dir, minimal_toml_with_bash());
+    let adapter = ClaudeAdapter::new(toml_path);
+
+    // A number, an object, and null all yield cwd: None without failing
+    // normalization (as_str returns None for non-strings).
+    for raw in [
+        r#"{"session_id":"s1","tool_name":"Bash","cwd":123}"#,
+        r#"{"session_id":"s1","tool_name":"Bash","cwd":{"nested":true}}"#,
+        r#"{"session_id":"s1","tool_name":"Bash","cwd":null}"#,
+    ] {
+        let result = adapter.normalize("PreToolUse", raw.as_bytes()).unwrap();
+        assert_eq!(
+            result.envelope.cwd, None,
+            "non-string cwd in {raw} must normalize to None, not error"
+        );
+    }
+}
+
+#[test]
+fn normalize_extracts_cwd_for_all_hook_kinds() {
+    let dir = TempDir::new().unwrap();
+    let toml_path = write_toml(&dir, minimal_toml_with_bash());
+    let adapter = ClaudeAdapter::new(toml_path);
+
+    // cwd is a top-level field on every Claude hook payload — NOT kind-gated
+    // like notification_type (which is Notification-only). PreToolUse also
+    // needs a tool_name; the others don't.
+    let cases: &[(&str, &str)] = &[
+        ("UserPromptSubmit", r#"{"session_id":"s1","cwd":"/p/ups"}"#),
+        (
+            "PreToolUse",
+            r#"{"session_id":"s1","tool_name":"Bash","cwd":"/p/pre"}"#,
+        ),
+        ("PostToolUse", r#"{"session_id":"s1","cwd":"/p/post"}"#),
+        ("Stop", r#"{"session_id":"s1","cwd":"/p/stop"}"#),
+        ("Notification", r#"{"session_id":"s1","cwd":"/p/notif"}"#),
+    ];
+    for (hook_kind, payload) in cases {
+        let result = adapter.normalize(hook_kind, payload.as_bytes()).unwrap();
+        assert!(
+            result.envelope.cwd.is_some(),
+            "cwd must be extracted for hook kind {hook_kind}"
+        );
+    }
+}
+
 // ─── Story 5.3: notification_type extraction ─────────────────────────────────
 
 #[test]

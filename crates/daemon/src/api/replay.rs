@@ -138,6 +138,10 @@ pub async fn run(State(state): State<AppState>, body: Bytes) -> Response {
             payload: event.payload,
             pid: event.pid,
             notification_type,
+            // Story 5.7: a replayed event carries its stored `cwd` forward so
+            // the rebuilt projection matches live ingest. `started_at`
+            // reconstructs from the replayed events' timestamps in transition.
+            cwd: event.cwd,
         };
 
         // try_send rather than send: we never block the HTTP handler on a

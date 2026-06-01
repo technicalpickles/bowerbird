@@ -50,6 +50,7 @@ pub async fn list(
         String,
         i64,
         Option<u32>,
+        Option<String>,
     );
     // Story 5.4 AC #5 — existence probe runs inside the same `interact`
     // closure as the events SELECT so both reads see the same SQLite
@@ -87,6 +88,7 @@ pub async fn list(
                             r.get::<_, String>(5)?,
                             r.get::<_, i64>(6)?,
                             r.get::<_, Option<u32>>(7)?,
+                            r.get::<_, Option<String>>(8)?,
                         ))
                     })?;
                     mapped.collect::<rusqlite::Result<Vec<_>>>()?
@@ -116,7 +118,8 @@ pub async fn list(
     };
 
     let mut events: Vec<Event> = Vec::with_capacity(raw_rows.len());
-    for (event_id, source, session_id, kind_str, reaction_str, payload, created_at, pid) in raw_rows
+    for (event_id, source, session_id, kind_str, reaction_str, payload, created_at, pid, cwd) in
+        raw_rows
     {
         let kind = match event_kind_from_db_str(&kind_str) {
             Ok(k) => k,
@@ -152,6 +155,7 @@ pub async fn list(
             payload,
             created_at,
             pid,
+            cwd,
         });
     }
 

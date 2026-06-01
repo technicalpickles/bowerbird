@@ -93,6 +93,10 @@ type WriteInteractResult = Option<(
     Option<SessionCurrentState>,
 )>;
 
+/// One row read by `rebuild_missing_projections` from
+/// `SELECT_EVENT_KINDS_FOR_SESSION`: `(kind, created_at, pid, cwd, payload)`.
+type RebuildEventRow = (String, i64, Option<u32>, Option<String>, String);
+
 async fn write_inner(
     writer_pool: &deadpool_sqlite::Pool,
     broadcaster: &BroadcastHub,
@@ -130,6 +134,7 @@ async fn write_inner(
     let payload = envelope.payload;
     let pid = envelope.pid;
     let notification_type = envelope.notification_type;
+    let cwd = envelope.cwd;
 
     // The closure moves its captures, so duplicate the fields the post-commit
     // publish path needs. SessionState is returned out of the closure to avoid
@@ -142,6 +147,7 @@ async fn write_inner(
     let kind_str = event_kind_as_str(&kind);
     let reaction_str = reaction.as_ref().map(reaction_as_db_string);
     let payload_for_closure = payload.clone();
+    let cwd_for_closure = cwd.clone();
 
     let interact_res = conn
         .interact(move |c| -> rusqlite::Result<WriteInteractResult> {
@@ -216,6 +222,7 @@ async fn write_inner(
                 kind_for_transition,
                 notification_type,
                 pid,
+                cwd_for_closure.clone(),
                 now_ms,
             );
             let state_json = serde_json::to_string(&new_state).map_err(|e| {
@@ -244,6 +251,7 @@ async fn write_inner(
                     payload_for_closure,
                     now_ms,
                     pid,
+                    cwd_for_closure,
                 ],
             )?;
             let id = tx.last_insert_rowid();
@@ -285,6 +293,7 @@ async fn write_inner(
         payload,
         created_at: now_ms,
         pid,
+        cwd,
     };
     broadcaster.publish(BroadcastEnvelope::Event(event));
 
@@ -358,6 +367,7 @@ pub async fn write_recording_started(
                     payload,
                     now_ms,
                     None::<u32>,
+                    None::<String>,
                 ],
             )?;
             let event_id = tx.last_insert_rowid();
@@ -420,6 +430,7 @@ pub async fn write_recording_ended(
                     payload,
                     now_ms,
                     None::<u32>,
+                    None::<String>,
                 ],
             )?;
             let event_id = tx.last_insert_rowid();
@@ -485,18 +496,23 @@ pub async fn rebuild_missing_projections(writer_pool: &deadpool_sqlite::Pool) ->
                     continue;
                 }
 
-                // Story 5.3: SELECT now returns (kind, created_at, pid, payload)
-                // so rebuild can thread last_pid carry-forward AND parse
-                // notification_type from Notification payloads (the typed
-                // value lives in events.payload, not on the stored Event).
-                let kinds: Vec<(String, i64, Option<u32>, String)> = {
+                // Story 5.3 / 5.7: SELECT returns (kind, created_at, pid, cwd,
+                // payload) so rebuild threads last_pid + cwd carry-forward AND
+                // parses notification_type from Notification payloads (the
+                // typed value lives in events.payload, not on the stored
+                // Event). `started_at` needs no extra column — the set-once
+                // rule in `transition` derives it from each event's stored
+                // `created_at` (passed as `now_ms`), so the first replayed
+                // event sets it and the rest preserve it.
+                let kinds: Vec<RebuildEventRow> = {
                     let mut stmt = tx.prepare(SELECT_EVENT_KINDS_FOR_SESSION)?;
                     let rows = stmt.query_map(rusqlite::params![&source, &session_id], |row| {
                         Ok((
                             row.get::<_, String>(0)?,
                             row.get::<_, i64>(1)?,
                             row.get::<_, Option<u32>>(2)?,
-                            row.get::<_, String>(3)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, String>(4)?,
                         ))
                     })?;
                     rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -505,7 +521,7 @@ pub async fn rebuild_missing_projections(writer_pool: &deadpool_sqlite::Pool) ->
                 let mut state: Option<SessionState> = None;
                 let mut last_created_at: i64 = 0;
                 let mut bad_kind = false;
-                for (kind_str, created_at, pid, payload) in kinds {
+                for (kind_str, created_at, pid, cwd, payload) in kinds {
                     last_created_at = created_at;
                     let kind = match event_kind_from_db_str(&kind_str) {
                         Ok(k) => k,
@@ -552,7 +568,14 @@ pub async fn rebuild_missing_projections(writer_pool: &deadpool_sqlite::Pool) ->
                     // Sentinel kinds should be filtered by the source != '__daemon__' clause
                     // on SELECT_DISTINCT_SESSIONS_FROM_EVENTS, but defend against future shape
                     // changes by routing them through transition's defensive branch anyway.
-                    let next = transition(state.as_ref(), kind, notification_type, pid, created_at);
+                    let next = transition(
+                        state.as_ref(),
+                        kind,
+                        notification_type,
+                        pid,
+                        cwd,
+                        created_at,
+                    );
                     state = Some(next);
                 }
                 if bad_kind {

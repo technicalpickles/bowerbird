@@ -470,7 +470,7 @@ Splitting liveness from readiness lets a supervisor restart on `/readyz` failure
 
 **Auth:** all non-`/healthz` and non-`/readyz` endpoints require the bearer token from `~/.bowerbird/server.json`. Token is rotated per daemon start (Pixel Agents pattern).
 
-**Data endpoints:** `GET /sessions`, `GET /sessions/:id`, `GET /sessions/:id/events?since=<cursor>`, `GET /sessions/:id/stats`. These exist both for polling-based presenters and as the implementation backing for the WS `snapshot` frame.
+**Data endpoints:** `GET /sessions`, `GET /sessions/:id`, `GET /sessions/:id/events?since=<cursor>`, `GET /sessions/:id/stats`. These exist both for polling-based presenters and as the implementation backing for the WS `snapshot` frame. Each session carries `last_pid` (Story 5.3) plus `cwd` and `started_at` (Story 5.7) — `cwd`/`started_at` ride `SessionListItem` and `SessionDetail.state` (and `cwd` also rides each `Event` in `/sessions/:id/events`); all are mechanical facts, with repo/age derivations left to presenters (Axiom 4, ADR 0006).
 
 **Cursor-based pagination on `events`:** `since=<event_id>`. The event log is append-only and monotonically growing.
 
@@ -694,6 +694,7 @@ These aren't language rules; they're the project's load-bearing semantics. Easy 
 
 - **`(source, session_id)` is the natural key.** Never assume `session_id` is globally unique. Claude session IDs and Codex session IDs can collide; just because they haven't yet doesn't mean they won't. Every query, every cache key, every log line that names a session uses both.
 - **Native hook payloads ride verbatim.** The daemon does NOT strip or rename fields in the `payload` column. Presenters that want full fidelity get it. If a presenter wants a derived field, it computes it itself — that's why the substrate is small.
+- **Carried mechanical facts on `SessionState` are observations, never interpretations.** The projection carries a small set of facts the daemon directly observes and threads forward: `last_pid` (Story 5.3, shim-injected PID, carry-forward/overwrite-on-Some), `cwd` (Story 5.7, the source's native hook working directory, stored verbatim — no path canonicalization/`~`-expansion/symlink resolution — carry-forward/overwrite-on-Some), and `started_at` (Story 5.7, epoch-ms of the session's first observed event, daemon-derived set-once). Derivations *from* these (repo/project/branch from `cwd`, session age from `started_at`) are presenter concerns, never daemon fields (Axiom 4, ADR 0006).
 - **Exactly one normalization is applied: tool name → reaction enum.** Eleven values from OpenPets. Mapping table lives in `adapters/<source>/tool-reactions.toml`. No other normalization sneaks in. If you find yourself adding a field like `is_user_attention_needed` to the projection, that's a presenter concern — stop, file a discussion.
 
 - **The reaction enum follows demand; it does not anticipate it** (Quinn's catch). New reaction values require *two independent presenters* to demonstrate the need in their cookbook examples first. Without this rule, the enum grows from 11 to 47 over two years and the daemon becomes a sentiment-analysis engine. The bar isn't "this seems reasonable"; it's "two unrelated use cases independently produced the same gap."

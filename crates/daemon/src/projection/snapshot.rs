@@ -137,6 +137,8 @@ pub async fn snapshot_for_topic(
                 last_event_kind: stored.last_event_kind,
                 last_event_at_ms: stored.last_event_at_ms,
                 last_pid: stored.last_pid,
+                cwd: stored.cwd,
+                started_at: stored.started_at,
             },
         });
     }
@@ -189,6 +191,8 @@ mod tests {
             last_event_kind: EventKind::PreToolUse,
             last_event_at_ms: now_ms,
             last_pid: None,
+            cwd: None,
+            started_at: None,
         }
     }
 
@@ -560,6 +564,8 @@ mod tests {
             last_event_kind: EventKind::PreToolUse,
             last_event_at_ms: 0,
             last_pid: None,
+            cwd: None,
+            started_at: None,
         };
         upsert_session(&pools.writer, "claude", "sess-A", &stored, 0).await;
 

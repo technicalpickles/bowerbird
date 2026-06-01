@@ -106,6 +106,15 @@ pub(crate) fn normalize(
         .and_then(|n| u32::try_from(n).ok())
         .filter(|n| *n != 0);
 
+    // Story 5.7: cwd is a NATIVE Claude Code hook field (top-level, present on
+    // every hook kind), not shim-injected like bowerbird_ppid. Extracted for
+    // all kinds; absent/non-string → None (as_str returns None for non-strings,
+    // so normalization does not fail).
+    let cwd = value
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_owned());
+
     // Story 5.3 AC #3: extract typed notification_type only for Notification
     // hooks; non-Notification kinds with a stray notification_type field
     // ignore it (returns None).
@@ -135,6 +144,7 @@ pub(crate) fn normalize(
             payload,
             pid,
             notification_type,
+            cwd,
         },
     })
 }

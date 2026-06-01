@@ -120,6 +120,7 @@ async fn wal_durability_after_simulated_crash() {
         payload: r#"{"hello":"world"}"#.to_string(),
         pid: None,
         notification_type: None,
+        cwd: None,
     };
 
     let event_id = {
@@ -222,6 +223,7 @@ async fn state_plus_event_atomicity_rollback() {
         payload: "{}".to_string(),
         pid: None,
         notification_type: None,
+        cwd: None,
     };
     let id = projection::session::write(&pools.writer, &BroadcastHub::new(16), envelope)
         .await
@@ -259,6 +261,7 @@ async fn concurrent_read_during_write() {
                 payload: "{}".to_string(),
                 pid: None,
                 notification_type: None,
+                cwd: None,
             };
             projection::session::write(&writer, &BroadcastHub::new(16), envelope)
                 .await
@@ -394,6 +397,57 @@ fn migration_v2_adds_nullable_pid_column() {
         })
         .expect("read pid");
     assert_eq!(pid, None, "default pid must be NULL");
+}
+
+// Story 5.7: migration v3 must add `events.cwd` as a nullable TEXT column;
+// existing rows default to NULL; PRAGMA user_version reports 3; re-applying is
+// a no-op (idempotency contract, mirrors migration_v2_adds_nullable_pid_column).
+#[test]
+fn migration_v3_adds_nullable_cwd_column() {
+    let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory connection");
+    let m = migrations();
+    m.to_latest(&mut conn).expect("migrations must apply");
+
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .expect("user_version read");
+    assert_eq!(version, 3, "expected user_version 3 after v3 migration");
+
+    // A row inserted without cwd defaults to NULL (ALTER TABLE ADD COLUMN
+    // behavior for new and pre-existing rows alike).
+    conn.execute(
+        "INSERT INTO events (source, session_id, kind, payload, created_at) \
+         VALUES ('claude', 's1', 'Stop', '{}', 0)",
+        [],
+    )
+    .expect("insert");
+    let cwd: Option<String> = conn
+        .query_row("SELECT cwd FROM events WHERE session_id = 's1'", [], |r| {
+            r.get(0)
+        })
+        .expect("read cwd");
+    assert_eq!(cwd, None, "default cwd must be NULL");
+
+    // A row that sets cwd reads it back verbatim (TEXT affinity).
+    conn.execute(
+        "INSERT INTO events (source, session_id, kind, payload, created_at, cwd) \
+         VALUES ('claude', 's2', 'Stop', '{}', 0, '/Users/x/repo')",
+        [],
+    )
+    .expect("insert with cwd");
+    let cwd2: Option<String> = conn
+        .query_row("SELECT cwd FROM events WHERE session_id = 's2'", [], |r| {
+            r.get(0)
+        })
+        .expect("read cwd");
+    assert_eq!(cwd2, Some("/Users/x/repo".to_string()));
+
+    // Idempotent re-run.
+    m.to_latest(&mut conn).expect("second to_latest is a no-op");
+    let version2: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .expect("user_version read");
+    assert_eq!(version, version2, "user_version stable on re-apply");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1265,6 +1319,7 @@ fn envelope_for(source: &str, session_id: &str, kind: EventKind) -> EventEnvelop
         payload: "{}".to_string(),
         pid: None,
         notification_type: None,
+        cwd: None,
     }
 }
 
@@ -1300,6 +1355,7 @@ fn envelope_for_notification(
             .unwrap_or_else(|| "{}".to_string()),
         pid: None,
         notification_type,
+        cwd: None,
     }
 }
 
@@ -2545,6 +2601,7 @@ mod story_1_7_rest {
                 payload: "{}".to_string(),
                 pid: None,
                 notification_type: None,
+                cwd: None,
             },
         )
         .await
@@ -2563,6 +2620,7 @@ mod story_1_7_rest {
                 payload: "{}".to_string(),
                 pid: None,
                 notification_type: None,
+                cwd: None,
             },
         )
         .await
@@ -2578,6 +2636,7 @@ mod story_1_7_rest {
                 payload: "{}".to_string(),
                 pid: None,
                 notification_type: None,
+                cwd: None,
             },
         )
         .await
@@ -2621,6 +2680,7 @@ mod story_1_7_rest {
                 payload: "{}".to_string(),
                 pid: None,
                 notification_type: None,
+                cwd: None,
             },
         )
         .await
@@ -2675,6 +2735,7 @@ mod story_1_7_rest {
                 payload: "{}".to_string(),
                 pid: None,
                 notification_type: None,
+                cwd: None,
             },
         )
         .await
@@ -2691,6 +2752,59 @@ mod story_1_7_rest {
         assert_eq!(detail.session_id, "sess-x");
         assert_eq!(detail.state.current_state, SessionCurrentState::Working);
         assert_eq!(detail.state.last_event_kind, EventKind::PreToolUse);
+    }
+
+    // Story 5.7 AC #8: GET /sessions and /sessions/{id} carry cwd + started_at;
+    // the read-time stale-Working → Idle fallback does NOT alter them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sessions_rest_surfaces_cwd_and_started_at() {
+        let (_tmp, pools) = fresh_pools().await;
+        projection::session::write(
+            &pools.writer,
+            &BroadcastHub::new(16),
+            EventEnvelope {
+                source: "claude".to_string(),
+                session_id: "sess-cwd".to_string(),
+                kind: EventKind::PreToolUse,
+                reaction: None,
+                payload: "{}".to_string(),
+                pid: None,
+                notification_type: None,
+                cwd: Some("/Users/x/repo".to_string()),
+            },
+        )
+        .await
+        .expect("write sess-cwd");
+
+        let app = api::router(ready_state(pools));
+
+        // Detail.
+        let resp = app
+            .clone()
+            .oneshot(auth_get("/sessions/sess-cwd"))
+            .await
+            .expect("oneshot detail");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let detail: SessionDetail = json_body(resp).await;
+        assert_eq!(detail.state.cwd, Some("/Users/x/repo".to_string()));
+        assert!(
+            detail.state.started_at.is_some(),
+            "started_at must be set on the first event"
+        );
+
+        // List.
+        let resp = app
+            .oneshot(auth_get("/sessions"))
+            .await
+            .expect("oneshot list");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let items: Vec<SessionListItem> = json_body(resp).await;
+        let item = items
+            .iter()
+            .find(|i| i.session_id == "sess-cwd")
+            .expect("sess-cwd in list");
+        assert_eq!(item.cwd, Some("/Users/x/repo".to_string()));
+        assert!(item.started_at.is_some());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2722,6 +2836,7 @@ mod story_1_7_rest {
                     payload: "{}".to_string(),
                     pid: None,
                     notification_type: None,
+                    cwd: None,
                 },
             )
             .await
@@ -2786,6 +2901,7 @@ mod story_1_7_rest {
                     payload: "{}".to_string(),
                     pid: None,
                     notification_type: None,
+                    cwd: None,
                 },
             )
             .await
@@ -2827,6 +2943,7 @@ mod story_1_7_rest {
                     payload: "{}".to_string(),
                     pid: None,
                     notification_type: None,
+                    cwd: None,
                 },
             )
             .await
@@ -2994,6 +3111,7 @@ mod story_1_7_rest {
                     payload: "{}".to_string(),
                     pid: None,
                     notification_type: None,
+                    cwd: None,
                 },
             )
             .await
@@ -3039,6 +3157,7 @@ mod story_1_7_rest {
                 payload: "{}".to_string(),
                 pid: None,
                 notification_type: None,
+                cwd: None,
             },
         )
         .await
@@ -3269,6 +3388,8 @@ mod story_2_1_ws {
                 last_event_kind: EventKind::PreToolUse,
                 last_event_at_ms: 0,
                 last_pid: None,
+                cwd: None,
+                started_at: None,
             },
         }
     }
@@ -3283,6 +3404,7 @@ mod story_2_1_ws {
             payload: "{}".to_string(),
             created_at: 0,
             pid: None,
+            cwd: None,
         })
     }
 
@@ -3991,6 +4113,7 @@ mod story_2_2_publish {
                 payload: "{}".to_string(),
                 created_at: 0,
                 pid: None,
+                cwd: None,
             }),
             ProbeKind::State { session_id } => BroadcastEnvelope::State {
                 // Token rides in `source` so wildcard or session-keyed
@@ -4003,6 +4126,8 @@ mod story_2_2_publish {
                     last_event_kind: EventKind::PreToolUse,
                     last_event_at_ms: 0,
                     last_pid: None,
+                    cwd: None,
+                    started_at: None,
                 },
             },
         }
@@ -4205,6 +4330,7 @@ mod story_2_2_publish {
                 payload: payload.to_string(),
                 pid: None,
                 notification_type: None,
+                cwd: None,
             },
         )
         .await
@@ -4438,6 +4564,7 @@ mod story_2_2_publish {
             payload: "{}".to_string(),
             created_at: 0,
             pid: None,
+            cwd: None,
         }));
 
         let timed = tokio::time::timeout(Duration::from_millis(300), ws.next()).await;
@@ -4595,6 +4722,7 @@ mod story_2_2_publish {
                     payload: "{}".to_string(),
                     pid: None,
                     notification_type: None,
+                    cwd: None,
                 },
             )
             .await
@@ -5573,6 +5701,7 @@ mod story_2_4_dropped {
             payload: "{}".to_string(),
             created_at: 0,
             pid: None,
+            cwd: None,
         })
     }
 
@@ -7750,6 +7879,7 @@ mod story_4_1_replay {
             payload: "{}".to_string(),
             created_at: 1,
             pid: None,
+            cwd: None,
         };
         serde_json::to_string(&e).expect("serialize Event")
     }
@@ -8014,6 +8144,7 @@ mod story_4_1_replay {
             payload: "{}".to_string(),
             created_at: 1,
             pid: None,
+            cwd: None,
         };
         let line = serde_json::to_string(&e).unwrap();
 
@@ -8219,6 +8350,8 @@ mod story_5_3_liveness {
                 last_event_kind: EventKind::PreToolUse,
                 last_event_at_ms: 1_000,
                 last_pid: None,
+                cwd: None,
+                started_at: None,
             },
             1_000,
         )
@@ -8271,6 +8404,8 @@ mod story_5_3_liveness {
                 last_event_kind: EventKind::PreToolUse,
                 last_event_at_ms: 1_000,
                 last_pid: Some(pid),
+                cwd: None,
+                started_at: None,
             },
             1_000,
         )
@@ -8306,6 +8441,8 @@ mod story_5_3_liveness {
                 last_event_kind: EventKind::PreToolUse,
                 last_event_at_ms: 1_000,
                 last_pid: Some(alive_pid),
+                cwd: None,
+                started_at: None,
             },
             1_000,
         )
@@ -8339,6 +8476,8 @@ mod story_5_3_liveness {
                 last_event_kind: EventKind::SessionEnded,
                 last_event_at_ms: 1_000,
                 last_pid: Some(100),
+                cwd: None,
+                started_at: None,
             },
             1_000,
         )
@@ -8375,6 +8514,8 @@ mod story_5_3_liveness {
                 last_event_kind: EventKind::SessionEnded,
                 last_event_at_ms: 1_000,
                 last_pid: None,
+                cwd: None,
+                started_at: None,
             },
             1_000,
         )
@@ -8407,6 +8548,7 @@ mod story_5_3_liveness {
             payload: "{}".to_string(),
             pid: Some(111),
             notification_type: None,
+            cwd: None,
         };
         projection::session::write(&pools.writer, &hub, pre)
             .await
@@ -8420,6 +8562,7 @@ mod story_5_3_liveness {
             payload: "{}".to_string(),
             pid: None, // carry-forward leaves last_pid = Some(111)
             notification_type: None,
+            cwd: None,
         };
         projection::session::write(&pools.writer, &hub, stop)
             .await
@@ -8433,6 +8576,7 @@ mod story_5_3_liveness {
             payload: r#"{"reason":"pid_dead","pid":111,"observed_at_ms":1000}"#.to_string(),
             pid: Some(111),
             notification_type: None,
+            cwd: None,
         };
         projection::session::write(&pools.writer, &hub, ended)
             .await
@@ -8470,6 +8614,58 @@ mod story_5_3_liveness {
         assert_eq!(after.last_event_kind, EventKind::SessionEnded);
     }
 
+    // Story 5.7 AC #7/#12: rebuild reconstructs cwd (last non-NULL,
+    // carry-forward) and started_at (first event's created_at, set-once) purely
+    // from the event log — Story 1.6 AC #5 "storage is a pure function of the
+    // event sequence." Insert raw rows with mixed cwd and ascending created_at,
+    // delete projections, rebuild, assert.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rebuild_preserves_cwd_and_started_at() {
+        let (_tmp, pools) = fresh_pools().await;
+
+        // Insert events directly (controlled created_at + cwd, including a
+        // NULL, a value, a NULL-carry, and an overwrite).
+        let conn = pools.writer.get().await.expect("writer pool");
+        conn.interact(|c| -> rusqlite::Result<()> {
+            let rows: &[(&str, i64, Option<&str>)] = &[
+                ("PreToolUse", 1_000, None), // first event → started_at=1000, cwd None
+                ("PreToolUse", 2_000, Some("/repo/a")), // cwd → /repo/a
+                ("Stop", 3_000, None),       // cwd None → carry /repo/a
+                ("PreToolUse", 4_000, Some("/repo/b")), // overwrite → /repo/b
+            ];
+            for (kind, created_at, cwd) in rows {
+                c.execute(
+                    "INSERT INTO events (source, session_id, kind, payload, created_at, cwd) \
+                     VALUES ('claude', 'sess-cwd', ?, '{}', ?, ?)",
+                    rusqlite::params![kind, created_at, cwd],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("interact")
+        .expect("insert events");
+        drop(conn);
+
+        projection::session::rebuild_missing_projections(&pools.writer)
+            .await
+            .expect("rebuild");
+
+        let after = read_state(&pools, "claude", "sess-cwd")
+            .await
+            .expect("rebuilt state");
+        assert_eq!(
+            after.cwd,
+            Some("/repo/b".to_string()),
+            "cwd must reconstruct as the last non-NULL value (overwrite-on-Some)"
+        );
+        assert_eq!(
+            after.started_at,
+            Some(1_000),
+            "started_at must reconstruct as the FIRST event's created_at (set-once)"
+        );
+    }
+
     // Story 5.3 review finding #2: between probe SELECT and the synthetic
     // SessionEnded write, a real hook event lands on the same session. The
     // probe must yield — the precondition check inside the writer txn fails,
@@ -8492,6 +8688,8 @@ mod story_5_3_liveness {
                 last_event_kind: EventKind::PreToolUse,
                 last_event_at_ms: 1_000,
                 last_pid: None,
+                cwd: None,
+                started_at: None,
             },
             1_000,
         )
@@ -8510,6 +8708,8 @@ mod story_5_3_liveness {
                 last_event_kind: EventKind::Notification,
                 last_event_at_ms: 2_000,
                 last_pid: Some(999_999),
+                cwd: None,
+                started_at: None,
             },
             2_000,
         )
@@ -8526,6 +8726,7 @@ mod story_5_3_liveness {
                 .to_string(),
             pid: None,
             notification_type: None,
+            cwd: None,
         };
         let precondition = bowerbird_daemon::projection::session::WritePrecondition {
             expected_current_state: SessionCurrentState::Working,
@@ -8573,6 +8774,8 @@ mod story_5_3_liveness {
                     last_event_kind: EventKind::PreToolUse,
                     last_event_at_ms: 1_000,
                     last_pid: None,
+                    cwd: None,
+                    started_at: None,
                 },
                 1_000,
             )
@@ -8821,6 +9024,7 @@ mod story_5_4_events_404 {
                 payload: "{}".to_string(),
                 pid: None,
                 notification_type: None,
+                cwd: None,
             },
         )
         .await
@@ -8936,6 +9140,7 @@ mod story_5_4_migrations {
                     payload: r#"{"tool":"Bash"}"#.to_string(),
                     pid: Some(4242),
                     notification_type: None,
+                    cwd: None,
                 },
             )
             .await
@@ -8951,6 +9156,7 @@ mod story_5_4_migrations {
                     payload: "{}".to_string(),
                     pid: None,
                     notification_type: None,
+                    cwd: None,
                 },
             )
             .await
@@ -8966,6 +9172,7 @@ mod story_5_4_migrations {
                     payload: "{}".to_string(),
                     pid: None,
                     notification_type: None,
+                    cwd: None,
                 },
             )
             .await

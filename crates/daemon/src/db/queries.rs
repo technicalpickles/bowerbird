@@ -1,8 +1,8 @@
 use protocol::{EventKind, Reaction};
 
 pub const INSERT_EVENT: &str =
-    "INSERT INTO events (source, session_id, kind, reaction, payload, created_at, pid) \
-     VALUES (?, ?, ?, ?, ?, ?, ?)";
+    "INSERT INTO events (source, session_id, kind, reaction, payload, created_at, pid, cwd) \
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
 
 pub const UPSERT_SESSION_PROJECTION: &str =
     "INSERT INTO session_projections (source, session_id, state, updated_at) \
@@ -17,7 +17,7 @@ pub const UPDATE_RECORDING_SESSION_ENDED: &str =
     "UPDATE recording_sessions SET ended_event_id = ? WHERE id = ?";
 
 pub const SELECT_EVENT_BY_ID: &str =
-    "SELECT event_id, source, session_id, kind, reaction, payload, created_at, pid \
+    "SELECT event_id, source, session_id, kind, reaction, payload, created_at, pid, cwd \
      FROM events WHERE event_id = ?";
 
 pub const SELECT_SESSION_PROJECTION_STATE: &str =
@@ -27,7 +27,7 @@ pub const SELECT_DISTINCT_SESSIONS_FROM_EVENTS: &str =
     "SELECT DISTINCT source, session_id FROM events WHERE source != '__daemon__'";
 
 pub const SELECT_EVENT_KINDS_FOR_SESSION: &str =
-    "SELECT kind, created_at, pid, payload FROM events WHERE source = ? AND session_id = ? \
+    "SELECT kind, created_at, pid, cwd, payload FROM events WHERE source = ? AND session_id = ? \
      ORDER BY event_id ASC";
 
 // Story 1.7 — REST query API SQL constants.
@@ -52,7 +52,7 @@ pub const SELECT_SESSION_BY_ID: &str =
      ORDER BY updated_at DESC LIMIT 1";
 
 pub const SELECT_EVENTS_FOR_SESSION_SINCE: &str =
-    "SELECT event_id, source, session_id, kind, reaction, payload, created_at, pid \
+    "SELECT event_id, source, session_id, kind, reaction, payload, created_at, pid, cwd \
      FROM events \
      WHERE source != '__daemon__' AND session_id = ? AND event_id > ? \
      ORDER BY event_id ASC";

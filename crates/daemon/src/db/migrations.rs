@@ -35,8 +35,14 @@ const V1_UP: &str = "
 // ("no_pid_at_upgrade" reason).
 const V2_UP: &str = "ALTER TABLE events ADD COLUMN pid INTEGER";
 
+// Story 5.7 — add `events.cwd` for session-location carry-forward. Existing
+// rows get `cwd = NULL`; rebuild carries forward the last non-NULL value,
+// mirroring `last_pid`. `cwd` is the session's working directory as reported
+// verbatim by the source's hook payload (a mechanical fact, ADR 0006).
+const V3_UP: &str = "ALTER TABLE events ADD COLUMN cwd TEXT";
+
 pub fn migrations() -> Migrations<'static> {
-    Migrations::new(vec![M::up(V1_UP), M::up(V2_UP)])
+    Migrations::new(vec![M::up(V1_UP), M::up(V2_UP), M::up(V3_UP)])
 }
 
 /// Run all pending migrations against the writer pool.
@@ -63,7 +69,7 @@ pub async fn run_migrations(writer_pool: &deadpool_sqlite::Pool) -> Result<()> {
 }
 
 // NOTE: the `:memory:` migration unit tests (`migrations_are_idempotent`,
-// `migration_v2_adds_nullable_pid_column`) live in
+// `migration_v2_adds_nullable_pid_column`, `migration_v3_adds_nullable_cwd_column`) live in
 // `crates/daemon/tests/contract_daemon.rs`, not here. A `#[cfg(test)]` block in
 // this `src/` file using `Connection::open_in_memory()` trips
 // `scripts/lint-connection-factory.sh`, which exempts `crates/daemon/tests/**`

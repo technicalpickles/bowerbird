@@ -34,4 +34,14 @@ pub struct SessionState {
     pub last_event_kind: EventKind,
     pub last_event_at_ms: i64,
     pub last_pid: Option<u32>,
+    /// Session working directory as reported by the source's hook payload,
+    /// verbatim (Story 5.7). Carry-forward / overwrite-on-Some, identical to
+    /// `last_pid`. A mechanical fact — *repo* is a presenter derivation, not a
+    /// daemon field (ADR 0006).
+    pub cwd: Option<String>,
+    /// Epoch-ms timestamp of the session's FIRST observed event, daemon-derived
+    /// (Story 5.7). Set-once / keep-earliest — NOT carry-forward-overwrite like
+    /// `cwd`/`last_pid`. `None` only for projection rows written before Story
+    /// 5.7.
+    pub started_at: Option<i64>,
 }
