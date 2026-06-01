@@ -27,6 +27,7 @@
 # last_updated: 2026-05-28 (Story 5.5 bench-gates-load-bearing created via bmad-create-story; 4 ACs + 6 tasks; → ready-for-dev)
 # last_updated: 2026-05-29 (Story 5.6 idle-prompt-reclassified-as-transient inserted after 5.5 via bmad-create-story; old 5.6→5.7, 5.7→5.8, 5.8→5.9, 5.9→5.10 per sprint-change-proposal-2026-05-29-idle-prompt-reclassification.md + ADR 0005)
 # last_updated: 2026-06-01 (Four dogfood-triage stories inserted after 5.6 per sprint-change-proposal-2026-06-01-dogfood-triage.md: 5.7 session-cwd-on-the-wire [+ADR 0006], 5.8 server-side-session-filter, 5.9 daemon-start-on-login [+ADR 0007], 5.10 shim-names-daemon-down-cause; old 5.7→5.11, 5.8→5.12, 5.9→5.13, 5.10→5.14. All four gate v0.1.0 (now Story 5.14). Story files pending bmad-create-story; ADRs pending authoring.)
+# last_updated: 2026-06-01 (Story 5.7 session-cwd-on-the-wire created via bmad-create-story; 14 ACs + 14 tasks; cwd mirrors Story 5.3 last_pid additive-field pattern, native-Claude-cwd so no shim change; started_at bundled in per proposal §6 [daemon-derived set-once, no migration]; ADR 0006 authored 2026-06-01 [Accepted, covers cwd + started_at]; epics.md insert+tail-renumber in Task 11; → ready-for-dev)
 # project: bowerbird
 # project_key: NOKEY
 # tracking_system: file-system
@@ -123,7 +124,7 @@ development_status:
   5-4-install-ux-polish-and-middleware-closure: done
   5-5-bench-gates-load-bearing: ready-for-dev
   5-6-idle-prompt-reclassified-as-transient: review
-  5-7-session-cwd-on-the-wire: backlog                  # Finding 3 (+ ADR 0006); gates v0.1.0
+  5-7-session-cwd-on-the-wire: ready-for-dev            # Finding 3 (+ ADR 0006); gates v0.1.0
   5-8-server-side-session-filter: backlog               # Finding 5-filter; gates v0.1.0
   5-9-daemon-start-on-login: backlog                     # Finding 1 (+ ADR 0007); gates v0.1.0
   5-10-shim-names-daemon-down-cause: backlog            # Finding 2 (minor); gates v0.1.0

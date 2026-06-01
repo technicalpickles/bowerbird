@@ -1,0 +1,300 @@
+# Story 5.7: Session working directory and start time on the wire
+
+Status: ready-for-dev
+
+<!-- Story key / filename stays `5-7-session-cwd-on-the-wire` (renaming complicates sprint-status + diff review, per Story 5.3 Task 15). `started_at` was bundled in at create-story time per the proposal §6 option. -->
+
+<!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
+
+## Story
+
+As a presenter author,
+I want each session's working directory (`cwd`) carried as a mechanical fact on `SessionState` / the stored `Event` / the REST/WS surfaces, AND each session's start time (`started_at`) carried on `SessionState`,
+so that I can group, filter, and label sessions by their repo/directory (the most natural multi-session triage axis) and render "started N minutes ago" from the snapshot without a side fetch — all without reading transcript content, without parsing source-specific payload shapes myself, and without inventing a persona model the substrate deliberately refuses.
+
+**Closes dogfooding Finding 3 and Finding 4** from `docs/dogfooding-feedback.md` (2026-06-01, "presenters can only triage on what the wire carries"). Building the pickletown web `/sessions` triage radar against `bowerbird-deck` exposed that the wire carries `source`, `session_id`, `current_state`, `last_event_kind`, `last_event_at_ms`, `last_pid`, and the verbatim payload, but nothing about *where* a session runs. A presenter cannot group or filter by repo because the daemon never surfaces the cwd. Finding 4 (sessions are only identifiable by an 8-char id hash) is the labeling side of the same gap and is **resolved by this story** — cwd is the recognizable raw fact a presenter can build a label from. The persona/agent-role model stays a no-list cut; only the missing *mechanical fact* is added here.
+
+**Operationalizes ADR 0006** (`docs/decisions/0006-session-cwd-on-the-wire.md` — authored 2026-06-01, Status Accepted; covers both `cwd` and `started_at`). Read it first. **`cwd` mirrors the Story 5.3 `bowerbird_ppid` / `last_pid` precedent exactly** — additive `Option<T>` field, overwrite-on-Some carry-forward, schema migration, `#[serde(other)]`-safe for old presenters — with one deliberate divergence: `cwd` rides the **native Claude Code hook payload** (Claude already sends a top-level `cwd` on every hook), so there is **no shim change**. The adapter reads it in `normalize`.
+
+**`started_at` is the deferred Story 5.3 item #3** (`deferred-work.md`), bundled in here per proposal §6. It is a DIFFERENT shape from cwd, do not conflate them:
+- **Source:** daemon-derived from the first event's `created_at` (the `now_ms` already passed to `transition`). NO payload field, NO adapter change, NO shim change.
+- **Semantics:** set-once / keep-earliest (`prev.started_at.or(Some(now_ms))`) — the FIRST event for a session sets it, every later event preserves it. This is the OPPOSITE direction from cwd/pid's overwrite-on-Some.
+- **Storage:** lives ONLY in the serialized `SessionState` blob. NO `events` column, NO migration — it's derivable, and old projection rows missing the field deserialize to `None` (serde defaults absent `Option` fields, same as `last_pid`).
+
+Source proposal: `docs/bmad/planning-artifacts/sprint-change-proposal-2026-06-01-dogfood-triage.md` §3 (rationale), §4.1 (cwd spec), §6 (started_at bundle option). First of four dogfood-triage stories (5.7–5.10); all four gate the v0.1.0 tag (now Story 5.14).
+
+**Important — epics.md is stale.** `docs/bmad/planning-artifacts/epics.md` does NOT yet contain this story; its §"Story 5.7" still describes the OLD "Release pipeline end-to-end verification" (now renumbered to 5.11 in `sprint-status.yaml` but not yet in epics.md). The ACs below come from `sprint-change-proposal-2026-06-01-dogfood-triage.md` §4.1 and are authoritative. **Task 11 inserts this story into epics.md and renumbers the release tail** (old 5.7–5.10 → 5.11–5.14). Do NOT read epics.md §"Story 5.7" as the spec for this story — it is the soon-to-be-5.11 story.
+
+## Acceptance Criteria
+
+1. **Given** the four dogfood-triage stories need a recorded decision for the wire-protocol change **When** Story 5.7 lands **Then** `docs/decisions/0006-session-cwd-on-the-wire.md` exists, Status `Accepted`, and records: (a) `cwd` is a mechanical fact the daemon observes from the hook payload (consistent with Axiom 1 and Axiom 4); (b) *repo* / *project name* / *branch* are presenter derivations from `cwd`, NOT daemon fields; (c) the daemon applies no normalization to `cwd` beyond carry-forward (no path canonicalization, no `~` expansion, no symlink resolution — the value is whatever Claude Code reported, verbatim); the ADR carries `Affects context.md sections: Substrate-not-actor invariants, HTTP surface, Wire format` and `Implementation:` pointing at this story's file globs.
+
+2. **Given** the `adapter-claude` normalize path receives a hook payload with a top-level `cwd` string **When** normalize constructs the `EventEnvelope` **Then** `EventEnvelope.cwd` is `Some(<that string>)`; a payload missing `cwd`, or carrying a non-string `cwd` (number, object, null), yields `EventEnvelope.cwd = None` and is normalized successfully (NOT a failure mode); `cwd` is extracted for **all** hook kinds (`UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, `Notification`) — it is not kind-gated like `notification_type`.
+
+3. **Given** an `EventEnvelope` with `cwd: Some(p)` reaches `projection::session::write` **When** the projection writes inside its single transaction **Then** the `events` row stores `cwd = p`; the upserted `session_projections` row's deserialized `SessionState` carries `cwd: Some(p)`; the stored `Event` carries `cwd: Some(p)`; the `BroadcastEnvelope::State` published after commit (per Story 5.2 transition gating) carries `SessionState.cwd = Some(p)`; the `BroadcastEnvelope::Event` carries `cwd: Some(p)`.
+
+4. **Given** a follow-up `EventEnvelope` for the same `(source, session_id)` with `cwd: None` **When** the projection writes **Then** `SessionState.cwd` retains the prior `Some(p)` (carry-forward semantics — identical to `last_pid`); the `events` row stores `cwd = NULL` for that specific event.
+
+5. **Given** a follow-up `EventEnvelope` for the same `(source, session_id)` with `cwd: Some(q)` where `q != p` **When** the projection writes **Then** `SessionState.cwd` becomes `Some(q)` (overwrite-on-Some semantics).
+
+6. **Given** the SQLite `events` schema before Story 5.7 (v2) **When** the daemon starts against an existing v2 database **Then** migration v3 runs `ALTER TABLE events ADD COLUMN cwd TEXT`; existing rows have `cwd = NULL`; the migration is idempotent (re-running `to_latest` is a no-op per the Story 5.4 migration-idempotency contract test); `PRAGMA user_version` reports `3` after migration.
+
+7. **Given** a daemon restart with a non-empty `events` table **When** `rebuild_missing_projections` runs **Then** for each rebuilt session the reconstructed `SessionState.cwd` matches what live ingest would have produced from the same event sequence (Story 1.6 AC #5 "storage layer is a pure function of the event sequence" preserved); rebuild reads `cwd` from the `events.cwd` column (NOT re-parsed from `payload`), carrying forward the last non-NULL value; rows written before migration v3 have `cwd = NULL` and carry forward as `cwd: None`.
+
+8. **Given** `GET /sessions` and `GET /sessions/{id}` **When** the daemon serializes the response **Then** `SessionListItem` and `SessionDetail.state` each carry `cwd` as a string-or-null field; the read-time stale-`Working` → `Idle` fallback (Story 1.6 `current_state_for_read`) does NOT alter `cwd`; the `__daemon__` sentinel filter is unchanged (daemon-emitted lifecycle rows have no cwd and are filtered out anyway).
+
+9. **Given** a WS subscriber to `state.session.*` receives a `StateFrame` **When** the frame is decoded **Then** `frame.state.cwd` carries the same value the REST `SessionDetail.state.cwd` would for the same session at the same moment; snapshot-on-subscribe frames (Story 2.3) likewise carry `cwd`. **Given** a WS subscriber to `events.*` receives an `EventFrame` **When** the frame is decoded **Then** `frame.event.cwd` carries the value extracted for that event (or `null`).
+
+10. **Given** a v1.0 / pre-Story-5.7 presenter compiled against the older protocol type **When** it deserializes a `SessionState`, `StateFrame`, `Event`, `EventFrame`, or `SessionListItem` from a Story-5.7+ daemon **Then** serde silently ignores the `cwd` field; no decode error, no crash, no protocol-violation close frame (asymmetric `deny_unknown_fields` policy — outbound types are permissive); additive-compat contract tests in `contract_protocol.rs` exercise the `cwd` field exactly as the Story 5.3 tests do for `last_pid` and `pid`.
+
+11. **Given** the protocol surface **When** Story 5.7 lands **Then** `crates/protocol/src/state.rs` `SessionState` gains `cwd: Option<String>` AND `started_at: Option<i64>` (epoch ms); `crates/protocol/src/event.rs` `EventEnvelope` gains `cwd: Option<String>` (internal carrier) AND stored `Event` gains `cwd: Option<String>` (on the wire) — `started_at` is NOT on `EventEnvelope` or `Event` (it is a session-level projection fact, daemon-derived, not a per-event field); `crates/protocol/src/rest.rs` `SessionListItem` gains BOTH `cwd: Option<String>` and `started_at: Option<i64>` for parity with `SessionDetail.state`; `crates/adapter-claude/src/normalize.rs` extracts `cwd` only (NOT `started_at`); `crates/daemon/src/db/migrations.rs` adds migration v3 for `events.cwd` only (no column for `started_at`). **No shim change** (`crates/shim/src/main.rs` already forwards the payload verbatim, so Claude's native `cwd` rides through untouched). **No state-machine change** (`transition`'s `current_state` arms are untouched — both `cwd` and `started_at` are pure projection fields independent of state).
+
+12. **Given** an `EventEnvelope` reaches `projection::session::write` for a `(source, session_id)` with NO prior projection row **When** the projection writes **Then** `SessionState.started_at` is set to that event's timestamp (the `now_ms` / `created_at` of the first event); **Given** a follow-up event for the same session **When** the projection writes **Then** `SessionState.started_at` retains the prior value unchanged (set-once / keep-earliest — `prev.and_then(|s| s.started_at).or(Some(now_ms))`); it is NEVER overwritten by a later event. This holds identically during live ingest and `rebuild_missing_projections` (the rebuild loop passes each event's stored `created_at` as `now_ms`, so the reconstructed `started_at` equals the first event's `created_at` — Story 1.6 AC #5 pure-function-of-event-log preserved).
+
+13. **Given** `GET /sessions`, `GET /sessions/{id}`, WS `StateFrame`, and snapshot-on-subscribe **When** serialized **Then** `SessionListItem.started_at` and `SessionDetail.state.started_at` / `StateFrame.state.started_at` carry the session start time as a number-or-null (epoch ms); a v1.0 / pre-5.7 presenter ignores it via the permissive-outbound serde policy (no decode error); pre-5.7 projection rows whose stored `SessionState` JSON lacks the field deserialize to `started_at: None` (serde defaults the absent `Option`, same as `last_pid` did in 5.3) — no migration rewrites old state blobs; an additive-compat test in `contract_protocol.rs` covers `started_at` alongside `cwd`.
+
+14. **Given** the documentation surface **When** Story 5.7 lands **Then** `docs/protocol.md` documents BOTH `cwd` and `started_at` on `/sessions`, `/sessions/{id}`, `StateFrame`, and the `SessionState` narrative (cwd also on `EventFrame` / `Event`; `started_at` is state-only), explicitly stating both are mechanical facts and that *repo* (from cwd) is a presenter derivation (Axiom 4); `docs/protocol-changelog.md` gains one `type: schema` entry under v1.0 → v1.1 covering both fields, marked `(Resolves: 5.7)`; `docs/presenter-authoring.md` gains a short note on grouping/labeling sessions by `cwd` (with the `cwd != repo` caveat) and rendering session age from `started_at`.
+
+## Tasks / Subtasks
+
+- [x] **Task 1: ADR 0006 (DONE — authored 2026-06-01)** (AC: #1)
+  - [x] `docs/decisions/0006-session-cwd-on-the-wire.md` exists, Status `Accepted`, Deciders @pickles. Records: cwd is a mechanical fact (Axiom 4); repo/project/branch are presenter derivations; cwd is stored verbatim (no path normalization); the four rejected alternatives (shim-inject, presenter-parses-payload, daemon-emits-`repo`, no-column-reparse-from-payload); and `started_at` as a daemon-derived set-once sibling fact. `Affects context.md sections: Substrate-not-actor invariants, HTTP surface, Wire format`.
+  - [ ] **The `Affects context.md sections` touch is enforced from the code-changing tasks, not here.** The ADR is accepted ahead of the code, so `project-context.md` §Substrate-not-actor invariants / §HTTP surface / §Wire format are stale-until-5.7-lands. Those one-line updates are subtasks of **Task 2** (Wire format + Substrate-not-actor invariants — the protocol-field change) and **Task 7** (HTTP surface — the REST-shape change), so they ship in the same PR as the fields they describe, per the file's same-PR update protocol.
+
+- [ ] **Task 2: Add `cwd` + `started_at` to the protocol crate** (AC: #1, #3, #10, #11, #12, #13)
+  - [ ] Edit `crates/protocol/src/state.rs`. Add `pub cwd: Option<String>` to `SessionState` (currently `current_state`, `last_event_kind`, `last_event_at_ms`, `last_pid`). Place it after `last_pid`. Doc comment: "Session working directory as reported by the source's hook payload, verbatim (Story 5.7). Carry-forward / overwrite-on-Some, identical to `last_pid`. A mechanical fact — *repo* is a presenter derivation, not a daemon field (ADR 0006)."
+  - [ ] In the same file, add `pub started_at: Option<i64>` to `SessionState` (after `cwd`). Doc comment: "Epoch-ms timestamp of the session's FIRST observed event, daemon-derived (Story 5.7). Set-once / keep-earliest — NOT carry-forward-overwrite like `cwd`/`last_pid`. `None` only for projection rows written before Story 5.7."
+  - [ ] Edit `crates/protocol/src/event.rs`. Add `pub cwd: Option<String>` to `EventEnvelope` (internal pre-storage carrier; the adapter populates it, the projection threads it). Add `pub cwd: Option<String>` to stored `Event` (this IS on the wire — REST `GET /sessions/{id}/events`, WS `EventFrame.event`). Place `cwd` after `pid` in both. **Do NOT add `started_at`** to `EventEnvelope` or `Event` — it is a session-level projection fact derived in `transition`, not a per-event field.
+  - [ ] Edit `crates/protocol/src/rest.rs`. Add `pub cwd: Option<String>` AND `pub started_at: Option<i64>` to `SessionListItem` (after `last_pid`, for parity with `SessionDetail.state` — presenters listing sessions to render the deck need both per row without fetching each detail).
+  - [ ] Run `cargo build -p protocol`. No new dependencies, no new derive. `SessionState` already derives `Serialize`/`Deserialize`; the new fields ride automatically. Confirm a `SessionState` JSON missing `started_at` / `cwd` still deserializes (serde defaults absent `Option` fields to `None` — this is what lets old projection blobs read back; same mechanism `last_pid` relied on in 5.3).
+  - [ ] **project-context.md (ADR 0006 same-PR protocol) — REQUIRED in this PR, not deferrable.** This task is the wire-format change that triggers ADR 0006's `Affects context.md sections`. In the same PR, edit `docs/bmad/project-context.md`: add `cwd` and `started_at` to the named-field list in §"Substrate-not-actor invariants" (the "native hook payloads ride verbatim" / `(source, session_id)`-key area, where `last_pid`'s carried facts are described) and to §"Wire format" if it enumerates `SessionState`/`Event` fields. One line each. The CI doc-touch gate on `crates/protocol/src/*.rs` (project-context §"Documentation co-update") fires for this task — `protocol-changelog.md` (Task 10) satisfies the gate mechanically, but the ADR's protocol additionally requires the context.md sections themselves be updated, not just touched. Do it here so it ships with the field, not as a follow-up.
+
+- [ ] **Task 3: Adapter extracts `cwd`** (AC: #2, #11)
+  - [ ] Edit `crates/adapter-claude/src/normalize.rs::normalize`. After the `pid` extraction block (currently lines ~94–107) add: `let cwd = value.get("cwd").and_then(|v| v.as_str()).map(|s| s.to_owned());`. A missing field or non-string value yields `None` (`as_str` returns `None` for non-strings) without failing normalization. Add a one-line comment: "Story 5.7: cwd is a NATIVE Claude Code hook field (top-level, present on every hook kind), not shim-injected like bowerbird_ppid. Extracted for all kinds; absent/non-string → None."
+  - [ ] Thread `cwd` onto the `EventEnvelope` construction at the end of `normalize` (after `pid`).
+  - [ ] **Out of scope:** the shim does NOT touch `cwd` — it already forwards the whole payload verbatim (`crates/shim/src/main.rs` re-serializes the full JSON object after inserting only `hook_kind` and `bowerbird_ppid`), so Claude's native `cwd` survives. Do not add a shim inject. The adapter does NOT extract `started_at` either — `started_at` is daemon-derived in the projection (Task 5), not a payload field.
+  - [ ] Add tests in `crates/adapter-claude/tests/contract_adapter.rs` (mirror the `normalize_extracts_pid_*` family at lines ~273–339):
+    - `normalize_extracts_cwd_when_present` — payload with `"cwd": "/Users/x/repo"` → `envelope.cwd == Some("/Users/x/repo".into())`.
+    - `normalize_extracts_cwd_none_when_missing` — payload without the field → `envelope.cwd == None`.
+    - `normalize_extracts_cwd_none_when_non_string` — payload with `"cwd": 123` (and one with `"cwd": null`) → `envelope.cwd == None`, no error.
+    - `normalize_extracts_cwd_for_all_hook_kinds` — table-driven over `UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `Stop` / `Notification`, each with a `cwd` → all yield `Some(..)` (contrast with `notification_type`, which is Notification-only).
+
+- [ ] **Task 4: Migration v3 — add `events.cwd` column + query updates** (AC: #6, #11)
+  - [ ] Edit `crates/daemon/src/db/migrations.rs`. Add `const V3_UP: &str = "ALTER TABLE events ADD COLUMN cwd TEXT";` with a comment mirroring the V2 comment ("Story 5.7 — add `events.cwd` for session-location carry-forward. Existing rows get `cwd = NULL`; rebuild carries forward the last non-NULL value, mirroring `last_pid`."). Append `M::up(V3_UP)` to the `migrations()` vec.
+  - [ ] Migration unit test lives in `crates/daemon/tests/contract_daemon.rs` (NOT in `migrations.rs` `src/` — the connection-factory lint exempts `tests/**` but not `#[cfg(test)]` in `src/`; see the NOTE at the bottom of `migrations.rs` and bean `gt-5o91`). Add `migration_v3_adds_nullable_cwd_column` mirroring the existing `migration_v2_adds_nullable_pid_column`: apply migrations to a tempfile DB, assert the `cwd` column exists and is nullable, assert `PRAGMA user_version = 3`, assert idempotent re-run.
+  - [ ] Update `crates/daemon/src/db/queries.rs`:
+    - `INSERT_EVENT`: extend column list and placeholders to include `cwd` (8 columns / 8 placeholders now — `cwd` last, after `pid`).
+    - `SELECT_EVENT_BY_ID`: add `cwd` to the select column list (after `pid`).
+    - `SELECT_EVENTS_FOR_SESSION_SINCE`: add `cwd` to the select column list.
+    - `SELECT_EVENT_KINDS_FOR_SESSION`: add `cwd` (currently `SELECT kind, created_at, pid, payload` → `SELECT kind, created_at, pid, cwd, payload`). This is the rebuild query (Task 6).
+
+- [ ] **Task 5: Thread `cwd` + `started_at` through `projection::session::write` + `transition`** (AC: #3, #4, #5, #9, #12, #13)
+  - [ ] Edit `crates/daemon/src/projection/state.rs::transition`. Add a `cwd: Option<String>` parameter (positional, after `pid`). **Do NOT touch any `current_state` arm** — both new fields are independent of the state machine. At EVERY `SessionState { ... }` construction (the final one AND the `prev.cloned().unwrap_or(SessionState { ... })` constructions in the defensive / preserve-prior branches), set two new fields:
+    - `cwd: cwd.clone().or(prev.and_then(|s| s.cwd.clone()))` — carry-forward / overwrite-on-Some, identical in shape to `last_pid: pid.or(prev.and_then(|s| s.last_pid))`. `cwd` is `String` (not `Copy`), so `.clone()`.
+    - `started_at: prev.and_then(|s| s.started_at).or(Some(now_ms))` — **set-once / keep-earliest** (the OPPOSITE direction from cwd: prefer the PRIOR value, fall back to current). `transition` already receives `now_ms`, so NO new parameter is needed for `started_at`. `now_ms` is the live write-time clock on ingest and the stored `created_at` on rebuild — both make `started_at` the first event's timestamp.
+    - **Bind-once for clarity** before the match arms: `let next_cwd = cwd.or_else(|| prev.and_then(|s| s.cwd.clone()));` and `let next_started_at = prev.and_then(|s| s.started_at).or(Some(now_ms));`, then move each into every construction. This avoids re-deriving in each arm and sidesteps borrow-checker friction with the owned `String`.
+    - **Anti-footgun:** do NOT write `started_at` with cwd's `.or(prev...)` direction — that would reset start time to every event's clock. The prior value wins for `started_at`; the new value wins for `cwd`.
+  - [ ] Edit `crates/daemon/src/projection/session.rs::write_inner`. The `pid` is bound at line ~131 (`let pid = envelope.pid;`). Add `let cwd = envelope.cwd.clone();` (clone because `String`; the envelope is still needed for `payload` etc.). Pass `cwd` into the `transition(...)` call (line ~214, after `pid`). Pass `cwd` into the `INSERT_EVENT` `params!` (line ~238, last positional after `pid`). Pass `cwd` into the stored `Event { ... }` construction (line ~279, after `pid`). Story 5.2's broadcast-gating logic (`prev_raw_current_state` / `prev_read_current_state`) is unchanged — `cwd` does not affect `current_state`, so a cwd-only change to a session that doesn't change `current_state` produces NO new `State` broadcast (correct: the `events.*` frame carries the cwd; presenters tracking cwd-on-state get it on the next genuine state transition or on snapshot/REST). **Call this out** — a presenter that wants instantaneous cwd on the state topic for a session sitting in steady `Working` won't get a `State` push for a cwd-only change; this is consistent with the Story 5.2 transitions-only policy and is acceptable (cwd is stable per session and the first event of a session always transitions `None → Some(state)`, carrying the initial cwd).
+  - [ ] Check `write_if_state_matches` / `WritePrecondition` (Story 5.3, line ~77 / ~36): the precondition matches on `expected_current_state` and `expected_last_pid`. **Do NOT add `cwd` to the precondition** — the liveness probe's stale-snapshot guard is about state+pid identity, not cwd. The synthetic `SessionEnded` envelope from the probe carries `cwd: None`, so carry-forward preserves the session's existing `cwd` (correct — an ended session keeps its last-known location). Verify the probe's synthetic envelope construction in `liveness.rs` sets `cwd: None` (it should, by adding the field; if it constructs `EventEnvelope { .. }` positionally it must be updated — see Task 9).
+  - [ ] Update the existing `transition` unit tests in `state.rs::tests` to pass `cwd: None` (or a value) where they construct calls. Add `transition_carry_forward_cwd` mirroring `transition_carry_forward_last_pid`: the four cases (prev `None`+new `None` → `None`; prev `None`+new `Some(a)` → `Some(a)`; prev `Some(a)`+new `None` → `Some(a)` carry; prev `Some(a)`+new `Some(b)` → `Some(b)` overwrite).
+  - [ ] Add `transition_set_once_started_at`: prev `None` → result `started_at == Some(now_ms)` (first event sets it); prev `Some(t0)` with a later `now_ms = t1 > t0` → result `started_at == Some(t0)` (preserved, NOT t1); assert across multiple event kinds (the rule is state-independent). This is the regression guard against the cwd-vs-started_at direction footgun.
+
+- [ ] **Task 6: Thread `cwd` through `rebuild_missing_projections`; `started_at` falls out** (AC: #7, #12)
+  - [ ] Edit `crates/daemon/src/projection/session.rs::rebuild_missing_projections` (line ~457). The rebuild loop reads from `SELECT_EVENT_KINDS_FOR_SESSION` (now extended to include `cwd` in Task 4) — pull the new `cwd` column out of each row (it sits between `pid` and `payload` per the Task 4 column order). Pass the parsed `Option<String>` into the `transition(...)` call (line ~555, after `pid`).
+  - [ ] **`started_at` needs NO extra rebuild plumbing.** The loop already passes each event's stored `created_at` as `transition`'s `now_ms` argument; the set-once rule in Task 5 (`prev.and_then(|s| s.started_at).or(Some(now_ms))`) makes the FIRST event in the replayed sequence set `started_at = its created_at`, preserved by all later events. So `started_at` reconstructs correctly purely from the existing `created_at` column — no new column, no new read.
+  - [ ] Rows written before migration v3 have `cwd = NULL` → `cwd: None` → carry-forward retains whatever the prior event in the sequence set (likely also `None` for pre-v3 rows, so the session's `SessionState.cwd` stays `None` until the first post-upgrade event with a cwd). This is correct and needs no special-casing (unlike Story 5.3's no-pid-at-upgrade probe, there is no cwd-equivalent cleanup — a missing cwd is simply absent, not a liveness signal).
+  - [ ] Add a contract test in `crates/daemon/tests/contract_daemon.rs::rebuild_preserves_cwd_and_started_at` (mirror `rebuild_preserves_last_pid_and_ended`): insert event rows with mixed `cwd` (some `NULL`, some strings, including an overwrite) and known ascending `created_at`s; delete `session_projections`; restart / call `rebuild_missing_projections`; assert reconstructed `SessionState.cwd` matches the last non-NULL cwd AND `SessionState.started_at` matches the FIRST event's `created_at` (pure-function-of-event-log, Story 1.6 AC #5).
+
+- [ ] **Task 7: REST API serialization** (AC: #1, #8, #9, #13)
+  - [ ] Edit `crates/daemon/src/api/sessions.rs`. `SessionDetail.state` is a `SessionState` deserialized from the projection blob, so `cwd` AND `started_at` flow automatically (verify). `SessionListItem` is constructed field-by-field (line ~89) — add `cwd: stored.cwd` AND `started_at: stored.started_at` (or `derived_state.*`) to the push, populated from the deserialized state, mirroring how `last_pid: stored.last_pid` is set.
+  - [ ] Edit `crates/daemon/src/api/events.rs` — the `EventRow` tuple / `Event` reconstruction threads `pid` (Story 5.3, line ref drifts); add `cwd` alongside it so REST `GET /sessions/{id}/events` and the `EventListResponse` carry `cwd`. (`started_at` is NOT on `Event` — skip it here.)
+  - [ ] Edit `crates/daemon/src/api/replay.rs` — replayed envelopes carry `pid` forward (Story 5.3); add `cwd` so a replayed event's cwd projects identically to live ingest. (For Claude payloads the cwd is in the replayed `payload`; the adapter re-extracts it on the replay path the same as live, OR if replay reconstructs the envelope directly from stored columns, thread the stored `cwd`. Match whatever pattern `pid` uses in replay.rs.) `started_at` reconstructs in the projection from the replayed events' timestamps — no replay-specific work.
+  - [ ] Verify `current_state_for_read` (Story 1.6) passes `cwd` AND `started_at` through unchanged — it only special-cases stale `Working` → `Idle` and must not touch either field. Add/extend a unit test asserting both survive the read-time fallback.
+  - [ ] **project-context.md (ADR 0006 same-PR protocol) — REQUIRED in this PR.** This task changes the HTTP surface (`/sessions`, `/sessions/{id}` response shapes), the second of ADR 0006's `Affects context.md sections`. In the same PR, edit `docs/bmad/project-context.md` §"HTTP surface": add `cwd` / `started_at` to the `/sessions` data-endpoints field description (where `last_pid` is listed). One line.
+
+- [ ] **Task 8: Protocol crate additive-compat tests** (AC: #10, #13)
+  - [ ] Edit `crates/protocol/tests/contract_protocol.rs`. Add `additive_compat_cwd_and_started_at_ignored_by_v1_consumer` mirroring the existing `additive_compat_last_pid_is_ignored_by_v1_consumer` (~line 546) and `additive_compat_pid_is_ignored_by_v1_consumer` (~line 569): a LOCAL mock `SessionState`-shaped struct WITHOUT `cwd`/`started_at` deserializes a full JSON frame WITH `"cwd": "/some/path"` and `"started_at": 1717200000000` successfully, silently dropping them (no `deny_unknown_fields`); a LOCAL mock `Event`-shaped struct WITHOUT `cwd` deserializes a frame carrying `cwd`. Use the full nested-frame shape (`StateFrame`, `EventFrame` via `ServerMessage`) per the Story 5.3 review finding #7 lesson — decode through the actual WS payload shape, not just the bare struct. Reuse the `legacy_v1_0_mocks` module added in Story 5.3 if present.
+  - [ ] **Also test the inverse direction (the old-blob-reads-back case):** a CURRENT `SessionState` deserializes a JSON object that LACKS both `cwd` and `started_at` (a pre-5.7 projection blob) → `cwd: None, started_at: None`, no error. This pins the serde-defaults-absent-`Option` behavior AC #13 depends on for the no-migration read path.
+  - [ ] Extend any existing `SessionState` / `Event` round-trip test to assert `cwd` and `started_at` round-trip through serialize → deserialize (both `Some` and `None`).
+
+- [ ] **Task 9: Audit all `EventEnvelope` / `SessionState` / `Event` constructors** (AC: #11)
+  - [ ] `cwd` is a NEW field on three structs (`EventEnvelope`, stored `Event`, `SessionState`); `started_at` is a NEW field on `SessionState` (and `SessionListItem`) only. Every literal constructor in the workspace needs the new field(s) or the build fails (forcing function). Grep for `EventEnvelope {`, `EventEnvelope::new`, `SessionState {`, `Event {`, `SessionListItem {` across `crates/**/src/` and `crates/**/tests/`. `SessionState { ... }` literals need BOTH `cwd` and `started_at`; `EventEnvelope`/`Event` literals need `cwd` only.
+  - [ ] Known sites from the Story 5.3 file list (line numbers drift): `crates/daemon/src/projection/session.rs` (write_recording_started / write_recording_ended sentinel envelopes → `cwd: None`), `crates/daemon/src/projection/liveness.rs` (synthetic `SessionEnded` envelope → `cwd: None`), `crates/daemon/src/broadcast/event.rs` + `hub.rs` + `crates/daemon/src/projection/snapshot.rs` (`#[cfg(test)]` test helpers), `crates/daemon/src/api/replay.rs`, all `contract_daemon.rs` / `contract_protocol.rs` test fixtures.
+  - [ ] **Consider** (do NOT implement here unless trivial) whether the third field added to `EventEnvelope` since Story 5.3 (`pid`, `notification_type`, now `cwd`) justifies a builder pattern. Story 5.3's dev notes flagged this as the trigger point. **Recommended:** still NOT in this story (scope creep); if the constructor audit is painful, file a `deferred-work.md` entry for an `EventEnvelope::builder()`.
+
+- [ ] **Task 10: Documentation updates** (AC: #14)
+  - [ ] Edit `docs/protocol.md`:
+    - §`GET /sessions` example object (~line 85, next to `"last_pid"`): add `"cwd": "/Users/x/code/myrepo"` (or `null`) AND `"started_at": 1717200000000` (or `null`).
+    - §`GET /sessions/{id}` `state` sub-object (~line 107): add `"cwd"` AND `"started_at"`.
+    - §`StateFrame` example (~line 282): add `"cwd"` AND `"started_at"` to the `state` sub-object.
+    - §`EventFrame` / `Event` shape (~line 267, 392): add `"cwd"` only (string-or-null). **`started_at` is NOT on `Event`** — it is a session-state-only field.
+    - §`SessionCurrentState` / state narrative (~line 291, next to the `last_pid` paragraph): add a `cwd` paragraph — "`cwd` (Story 5.7) is the session's working directory as the source's hook payload reported it, carry-forwarded across events (overwrite-on-Some). It is a **mechanical fact**: the daemon stores it verbatim (no path canonicalization, no `~` expansion). *repo*, *project name*, and *branch* are presenter derivations from `cwd`, not daemon fields (Axiom 4, ADR 0006)." — and a `started_at` paragraph: "`started_at` (Story 5.7) is the epoch-ms timestamp of the session's first observed event, daemon-derived and set once (never updated). Presenters render session age from it without a side fetch. `null` for sessions projected before Story 5.7."
+    - §Ingest socket contract (~line 344): add a bullet — "`cwd` extraction (Story 5.7). Unlike `bowerbird_ppid` (shim-injected), `cwd` is a NATIVE Claude Code hook field present on every payload; the shim forwards it verbatim and the `adapter-claude` normalize step reads it as `EventEnvelope.cwd`. A custom producer that wants location tracking includes a top-level `cwd` string; absent or non-string → `SessionState.cwd` stays `None`. (`started_at` needs no producer cooperation — the daemon derives it from the first event it sees.)"
+  - [ ] Edit `docs/protocol-changelog.md`. Add ONE `type: schema` entry under `## v1.0 → v1.1` (after the Story 5.6 entry), `(Resolves: 5.7)`. Cover: `SessionState.cwd` + `Event.cwd` + `SessionListItem.cwd` (string-or-null, carry-forward/overwrite-on-Some, native Claude field not shim-injected, SQLite migration v3 `events.cwd TEXT NULL`) AND `SessionState.started_at` + `SessionListItem.started_at` (number-or-null epoch ms, daemon-derived set-once from the first event's `created_at`, NO migration / NO events column — lives in the projection blob, absent in pre-5.7 rows → `null`); v1.0 presenters discard both via the asymmetric permissive-outbound policy. Match the prose density of the Story 5.3 `last_pid` / `Event.pid` entries (changelog lines 46–47).
+  - [ ] `docs/bmad/project-context.md` edits for ADR 0006's `Affects context.md sections` are **owned by the tasks that change each surface** (so they ship with the code per the same-PR protocol): §"Substrate-not-actor invariants" + §"Wire format" in **Task 2**, §"HTTP surface" in **Task 7**. Nothing to do here beyond confirming all three sections were touched before the PR opens.
+  - [ ] Edit `docs/presenter-authoring.md`. Add a short subsection "Grouping and labeling by `cwd`": presenters can group/filter the session list by `cwd` (the natural multi-session triage axis) and build a human-recognizable label from it (e.g. the last path segment as a repo name). Caveat: `cwd != repo` — the daemon does not resolve git roots; a presenter derives repo/branch from cwd itself. Note that a session's `cwd` may be `null` (pre-5.7 rows, non-Claude sources, or a producer that omits it) — render a fallback. Add a brief note that `started_at` gives session age directly (no need to track the earliest `last_event_at_ms` client-side), and is `null` for pre-5.7 rows.
+
+- [ ] **Task 11: Update `epics.md` (insert + renumber) and `sprint-status.yaml`** (AC: implicit)
+  - [ ] Edit `docs/bmad/planning-artifacts/epics.md`. **Renumber the release tail first:** old §"Story 5.7: Release pipeline end-to-end verification" → 5.11; old 5.8 (cookbook) → 5.12; old 5.9 (first-time-reader docs) → 5.13; old 5.10 (crates.io + v0.1.0 tag) → 5.14. Update each H3 heading, internal cross-references, and the renumber breadcrumbs (mirror the existing breadcrumb style at epics.md lines 13–17). Then **insert the four dogfood-triage story sections** (5.7 cwd, 5.8 server-side filter, 5.9 daemon-start-on-login, 5.10 shim-names-cause) after Story 5.6, deriving ACs from `sprint-change-proposal-2026-06-01-dogfood-triage.md` §4.1–4.4. Add a change-log header entry (lines 13–17 block) referencing the proposal. **Scope note:** this story (5.7, the first of the four to land) owns the tail renumber + inserting ALL FOUR section stubs; stories 5.8–5.10 fill in / refine their own sections as they are created via `bmad-create-story`. If that is too much for one PR, the minimum this story MUST do is insert its own §Story 5.7 and renumber the tail enough that the slot is unambiguous — coordinate with the dev session.
+  - [ ] Edit `docs/bmad/implementation-artifacts/sprint-status.yaml`. The story key `5-7-session-cwd-on-the-wire` is already present (status `backlog`). Transition `backlog → ready-for-dev` at create-story time (this file write); `→ in-progress` at dev-story start; `→ review` post dev-story; `→ done` post code-review. Add a `last_updated` comment line per transition.
+  - [ ] Edit `docs/bmad/implementation-artifacts/deferred-work.md`. Mark §"Deferred from: Story 5.3" entry #3 (`started_at` on `SessionState`) as resolved by Story 5.7 (strike-through + note, matching the existing resolved-entry style in that file). The `gt-3cnt` retention bean and the Finding-5 filter stay open (Story 5.8).
+
+- [ ] **Task 12: Satisfy the protocol-changelog gate** (AC: implicit)
+  - [ ] Story 5.7 touches `crates/protocol/src/state.rs`, `event.rs`, and `rest.rs`, so `tests/protocol_changelog_gate.rs` fires. The single `type: schema` entry from Task 10 satisfies it. Verify locally with `BOWERBIRD_CHANGELOG_GATE_BASE=origin/main cargo test --workspace -- protocol_changelog_gate --test-threads=1`.
+
+- [ ] **Task 13: Full workspace test suite serialized** (AC: all)
+  - [ ] `cargo test --workspace -- --test-threads=1` (serialized per Epic 2 retro AI-3).
+  - [ ] `cargo fmt --check` — workspace-wide.
+  - [ ] `cargo clippy --all-targets --workspace -- -D warnings` — workspace-wide.
+  - [ ] The audit (Task 9) is the bulk of the effort: every `EventEnvelope { ... }` / `SessionState { ... }` / `Event { ... }` literal in tests needs `cwd: None`. The compiler enforces it — fix until green.
+
+- [ ] **Task 14: Manual smoke against running daemon** (AC: #2, #3, #6, #8, #9)
+  - [ ] After tests pass, build release, `bowerbird uninstall && bowerbird install`, restart the daemon. Confirm `~/.bowerbird/bower.db` migrates v2 → v3 cleanly (`sqlite3 ~/.bowerbird/bower.db 'PRAGMA user_version'` → `3`; existing rows `cwd = NULL`).
+  - [ ] Start a live Claude Code session in a known repo. Confirm `sqlite3 ~/.bowerbird/bower.db 'SELECT session_id, cwd FROM events ORDER BY event_id DESC LIMIT 5'` shows the repo path, and `GET /sessions` (`curl` with bearer token) shows `"cwd"` AND `"started_at"` on the session (started_at = the first event's timestamp, stable as more events arrive).
+  - [ ] Subscribe `bowerbird-deck` (or `wscat` to `state.session.*`); confirm the snapshot frame carries `cwd` and `started_at`. Confirm a presenter can now group the live sessions by directory and render session age (the dogfooding success criterion: "cwd renders in deck/web triage").
+  - [ ] **Out of scope:** the server-side `?state=`/`?since=` filter (Story 5.8), daemon supervision (5.9), shim diagnostic (5.10). This story is cwd-on-the-wire only.
+
+## Dev Notes
+
+### Why this story exists (the user-visible gap)
+
+Dogfooding the pickletown web `/sessions` triage radar against `bowerbird-deck`: a human triaging many sessions asks "which repo or directory is the one waiting on me?" The wire carried mechanical state but no location, so neither the deck nor the web page could group or filter by repo — they fell back to keying cards on the last 8 chars of the session-id UUID, which is unrecognizable. `cwd` is the one *mechanical fact* that closes this (Finding 3) and gives presenters a recognizable label to build from (Finding 4). The persona/role model stays a no-list cut; this adds only the raw fact.
+
+### This is the `last_pid` pattern, re-run for a `String`
+
+Story 5.3 added `last_pid: Option<u32>` with overwrite-on-Some carry-forward. Story 5.7 is the same shape for `cwd: Option<String>`. The carry-forward table (identical to `last_pid`):
+
+| Prev `cwd` | New envelope `cwd` | New `cwd` |
+|---|---|---|
+| `None` | `None` | `None` |
+| `None` | `Some(a)` | `Some(a)` |
+| `Some(a)` | `None` | `Some(a)` (carry-forward) |
+| `Some(a)` | `Some(b)` | `Some(b)` (overwrite, even if a == b) |
+
+One expression, mirroring `pid.or(prev.and_then(|s| s.last_pid))`: `cwd.or_else(|| prev.and_then(|s| s.cwd.clone()))`. The only mechanical difference from `last_pid` is `String` is not `Copy`, so you `.clone()` — bind `let next_cwd = ...;` once before the match arms to keep the arms clean.
+
+### `started_at` is the INVERSE of cwd — read this twice
+
+`started_at` is bundled in (proposal §6) but it is **not** the cwd pattern. The differences, every one of which is a footgun if you copy-paste cwd:
+
+| Aspect | `cwd` | `started_at` |
+|---|---|---|
+| Source | adapter extracts from payload (`value.get("cwd")`) | daemon-derived from `transition`'s `now_ms` — NO payload field, NO adapter code |
+| Carry-forward direction | overwrite-on-Some (`new.or(prev)`) | set-once / keep-earliest (`prev.or(Some(now_ms))`) |
+| On `EventEnvelope` / `Event`? | yes (cwd is per-event) | NO (session-level only) |
+| `events` column + migration? | yes (v3) | NO (derivable; lives in the `SessionState` blob) |
+| `transition` new parameter? | yes (`cwd`) | NO (reuses existing `now_ms`) |
+
+The expression: `started_at: prev.and_then(|s| s.started_at).or(Some(now_ms))`. Prior value wins. The first event a session ever projects has `prev = None`, so `started_at = Some(now_ms)` = that event's `created_at`; every subsequent event sees `prev.started_at = Some(t0)` and keeps it. During rebuild the loop feeds events oldest-first with each one's stored `created_at` as `now_ms`, so the reconstructed value is the first event's `created_at` — same as live. No migration is needed because old projection blobs lacking the field deserialize to `None` (serde defaults absent `Option`), exactly as `last_pid` did when 5.3 added it to `SessionState`.
+
+### The ONE divergence from the `pid` precedent: native field, no shim change
+
+`bowerbird_ppid` is **injected by the shim** (`libc::getppid()`), because Claude doesn't report its own PID. `cwd` is **already a native Claude Code hook field** — every hook payload carries a top-level `cwd` (alongside `session_id`, `transcript_path`, `hook_event_name`). The shim re-serializes the whole payload verbatim after inserting only `hook_kind` + `bowerbird_ppid` (`crates/shim/src/main.rs:42–67`), so Claude's `cwd` rides through to the daemon untouched. **There is no shim change in this story, and no shim hot-path cost.** The adapter reads `value.get("cwd")` in `normalize`, exactly where it reads `bowerbird_ppid` — but unextracted for all hook kinds (cwd is on every payload), not Notification-gated like `notification_type`.
+
+### Why an `events.cwd` column (and not re-parse from payload)
+
+The proposal (§4.1) and this story add a typed `events.cwd` column and migration v3, mirroring `pid`. The tempting alternative is to skip the column and re-extract cwd from the stored `payload` during rebuild (Story 5.3 already does this for `notification_type`). Rejected because: a typed column keeps `rebuild_missing_projections` decoupled from source-specific payload shape (the rebuild reads one column, not "Claude puts cwd at top-level"), and it mirrors `last_pid` exactly so the pattern is one pattern, not two. Captured in ADR 0006's Alternatives. (`notification_type` is re-parsed from payload during rebuild only because it is NOT stored in its own column — that was a 5.3 scope decision, not a precedent to copy here.)
+
+### `cwd` does NOT touch the state machine
+
+Unlike Story 5.3 (which changed `transition`'s `Notification` and `PostToolUse` arms), `cwd` is orthogonal to `current_state`. The ONLY change to `transition` is a new `cwd` parameter and the carry-forward expression at each `SessionState` construction. Do not add a `cwd`-based state arm. A consequence of Story 5.2's transitions-only broadcast gating: a cwd-only change on a session whose `current_state` doesn't change produces NO live `State` frame — the cwd reaches presenters on the `events.*` frame, on the next genuine state transition, and on snapshot/REST. This is fine: cwd is stable per session, and a session's first event always transitions `None → Some(state)`, carrying the initial cwd on a `State` frame.
+
+### `cwd` is verbatim — the daemon does not normalize paths
+
+Per Axiom 1 + ADR 0006: store whatever Claude reported. No `~` expansion, no `realpath`/symlink resolution, no trailing-slash normalization, no lowercasing. If a presenter wants a canonical form or a git root, that's a presenter derivation. This keeps the daemon out of the path-semantics business (which is OS- and filesystem-specific — APFS case-insensitivity, symlinks, etc.).
+
+### `String` field hygiene
+
+`cwd: Option<String>` is the first owned-`String` field added to `EventEnvelope` / `SessionState` (prior additions were `Copy` scalars or small enums). Watch for: (a) `.clone()` where the envelope is consumed after extracting cwd; (b) the 1 MiB shim stdin cap already bounds payload size, so cwd length is implicitly bounded — no extra validation needed; (c) no `deny_unknown_fields` on outbound types means a malicious/huge cwd just rides through — acceptable for a localhost substrate, same trust model as `payload`.
+
+### Files this story touches
+
+**Source (10–12 files):** `protocol/src/state.rs`, `protocol/src/event.rs`, `protocol/src/rest.rs`, `adapter-claude/src/normalize.rs`, `daemon/src/db/migrations.rs`, `daemon/src/db/queries.rs`, `daemon/src/projection/state.rs`, `daemon/src/projection/session.rs`, `daemon/src/api/sessions.rs`, `daemon/src/api/events.rs`, `daemon/src/api/replay.rs`, plus `#[cfg(test)]` helper touch-ups in `daemon/src/broadcast/{event,hub}.rs` and `daemon/src/projection/{snapshot,liveness}.rs`.
+
+**Tests (3 files):** `protocol/tests/contract_protocol.rs`, `daemon/tests/contract_daemon.rs`, `adapter-claude/tests/contract_adapter.rs`. **No** `shim/tests/contract_shim.rs` change (no shim change) — though an OPTIONAL `shim_preserves_cwd_field_verbatim` test (assert the shim doesn't strip the native `cwd`) would mirror `shim_preserves_notification_type_field_verbatim` and is cheap insurance; include it if quick.
+
+**Docs (4 files):** `protocol.md`, `protocol-changelog.md`, `presenter-authoring.md`, `project-context.md` (ADR 0006's Affects-sections touch).
+
+**Decisions (1 file, already authored 2026-06-01):** `docs/decisions/0006-session-cwd-on-the-wire.md`.
+
+**Planning artifacts (2 files):** `epics.md` (insert + renumber tail), `sprint-status.yaml`.
+
+**Files explicitly NOT touched:** `crates/shim/**` (native field, no inject), `daemon/src/projection/state.rs` `current_state` arms (cwd is state-independent), `daemon/src/main.rs` (no startup/probe change), `prd.md` (Marcus narrative unchanged).
+
+### Project Structure Notes
+
+- `crates/protocol/src/state.rs` — UPDATE — `SessionState` gains `cwd: Option<String>` AND `started_at: Option<i64>`.
+- `crates/protocol/src/event.rs` — UPDATE — `EventEnvelope` gains `cwd` (internal); stored `Event` gains `cwd` (wire). NOT `started_at`.
+- `crates/protocol/src/rest.rs` — UPDATE — `SessionListItem` gains `cwd` AND `started_at`.
+- `crates/adapter-claude/src/normalize.rs` — UPDATE — extract `value.get("cwd")` for all kinds. NOT `started_at` (daemon-derived).
+- `crates/daemon/src/db/migrations.rs` — UPDATE — append `V3_UP = ALTER TABLE events ADD COLUMN cwd TEXT`.
+- `crates/daemon/src/db/queries.rs` — UPDATE — `INSERT_EVENT` + `SELECT_EVENT_BY_ID` + `SELECT_EVENTS_FOR_SESSION_SINCE` + `SELECT_EVENT_KINDS_FOR_SESSION` gain `cwd`.
+- `crates/daemon/src/projection/state.rs` — UPDATE — `transition` gains `cwd` param + cwd carry-forward AND `started_at` set-once (derived from existing `now_ms`, no new param); no `current_state` arm change.
+- `crates/daemon/src/projection/session.rs` — UPDATE — `write_inner` threads `cwd`; `rebuild_missing_projections` reads + threads `cwd` (`started_at` falls out of the existing `created_at`); sentinel writers pass `cwd: None`.
+- `crates/daemon/src/api/{sessions,events,replay}.rs` — UPDATE — carry `cwd` in REST responses + replay path.
+- `crates/protocol/tests/contract_protocol.rs` — UPDATE — `additive_compat_cwd_and_started_at_ignored_by_v1_consumer` + old-blob-reads-back test + round-trip.
+- `crates/daemon/tests/contract_daemon.rs` — UPDATE — `migration_v3_adds_nullable_cwd_column`, `rebuild_preserves_cwd_and_started_at`, envelope-constructor audit.
+- `crates/adapter-claude/tests/contract_adapter.rs` — UPDATE — four `normalize_extracts_cwd_*` tests.
+- `docs/protocol.md`, `docs/protocol-changelog.md`, `docs/presenter-authoring.md`, `docs/bmad/project-context.md` — UPDATE.
+- `docs/decisions/0006-session-cwd-on-the-wire.md` — DONE (authored 2026-06-01; Status Accepted).
+- `docs/bmad/planning-artifacts/epics.md` — UPDATE — insert §5.7 + renumber tail (5.7–5.10 → 5.11–5.14).
+- `docs/bmad/implementation-artifacts/sprint-status.yaml` — UPDATE — status transitions.
+
+### Testing Standards
+
+Per `docs/bmad/project-context.md` §"Required contract tests" and §"Deterministic test discipline":
+- Additive-compat test (Task 8) follows Story 4.4's pattern: a LOCAL mock struct lacking `cwd` deserializes a full JSON frame with `cwd` and silently drops it. Decode through the actual nested-frame shape (`StateFrame`/`EventFrame` via `ServerMessage`) per Story 5.3 review finding #7.
+- Rebuild test (Task 6) preserves Story 1.6 AC #5 ("storage layer is a pure function of the event sequence").
+- Migration test (Task 4) lives in `tests/` not `src/` (connection-factory lint; see `migrations.rs` NOTE + bean `gt-5o91`).
+- Tempfile DBs, not `:memory:`, for anything exercising WAL/migration. `unwrap()` is fine in tests.
+
+### Previous story intelligence (Story 5.3 — done)
+
+Story 5.3 is the exact precedent; read its file (`5-3-session-process-liveness-pid-capture.md`) for the `last_pid` mechanics. Key carry-forward lessons that apply here:
+- **The envelope-constructor audit is the bulk of the work.** 5.3 added two fields and every `EventEnvelope { ... }` literal in tests broke until updated. `cwd` is one more field — grep `EventEnvelope {`, `SessionState {`, `Event {` and fix all literals. The compiler is the forcing function.
+- **Forward-compat tests need the full frame shape, not the bare struct** (5.3 review finding #7). Reuse the `legacy_v1_0_mocks` module 5.3 added.
+- **The changelog gate fires on any `protocol/src/*.rs` touch** — the one `type: schema` entry covers it; verify with `BOWERBIRD_CHANGELOG_GATE_BASE=origin/main`.
+- **Story 5.2's transitions-only broadcast gating is inherited** — cwd-only changes don't push a `State` frame; that's correct (see Dev Notes above).
+
+### What is explicitly NOT in this story (scope fence)
+
+- **Server-side `?state=`/`?since=`/`?limit=` filter on `/sessions`** — that is Story 5.8 (Finding 5-filter). Do not add query-param filtering here.
+- **Daemon supervision / start-on-login** (Story 5.9), **shim names the daemon-down cause** (Story 5.10) — separate stories.
+- **A derived `repo`/`branch`/`project` field on the projection** — Axiom 4 violation; presenter derivation. Not now, not without a two-presenter demand bar.
+- **Path normalization** — verbatim only (see Dev Notes).
+
+### References
+
+- `docs/bmad/planning-artifacts/sprint-change-proposal-2026-06-01-dogfood-triage.md` — **the canonical spec.** §3 (rationale: why adapter-from-payload not shim-inject; why filter-only is a separate story), §4.1 (this story's change list), §6 (deferred / `started_at` option).
+- `docs/dogfooding-feedback.md` — 2026-06-01 "presenters can only triage on what the wire carries" (Findings 1/3/4 in the second entry). The trigger.
+- `docs/bmad/implementation-artifacts/deferred-work.md` — §"Deferred from: Story 5.3" entry #3 (`started_at` on `SessionState`): the source/semantics of the bundled `started_at` field — daemon-derived from the earliest event's `created_at`, simplifies the snapshot-on-subscribe path. **Remove / mark resolved** entry #3 when this story lands (Task 11 territory — note it in `deferred-work.md`).
+- `docs/bmad/implementation-artifacts/5-3-session-process-liveness-pid-capture.md` — **the exact precedent** (`last_pid` / `pid` additive field, carry-forward, migration, additive-compat tests). Mirror it.
+- `docs/decisions/0005-idle-prompt-transient-not-input-required.md` — most-recent ADR; format reference for ADR 0006 (Task 1).
+- `docs/decisions/0004-daemon-observed-session-liveness.md` — ADR 0006's sibling; the `last_pid` decision cwd mirrors.
+- `docs/bmad/project-context.md` — Axiom 1 (substrate observes, does not interpret) + Axiom 4 (mechanical facts in protocol, semantics in presenter) + §"ADR format" + §"Substrate-not-actor invariants" (the `(source, session_id)` natural key; native payloads verbatim). Read before any call about whether cwd-derived fields belong in the substrate.
+- `crates/protocol/src/state.rs` — `SessionState`; gains `cwd`.
+- `crates/protocol/src/event.rs` — `EventEnvelope` (internal) + `Event` (wire); both gain `cwd`.
+- `crates/protocol/src/rest.rs:38–45` — `SessionListItem`; gains `cwd` after `last_pid`.
+- `crates/protocol/src/ws.rs:123–126` — `StateFrame.state` is `SessionState`; gets `cwd` automatically.
+- `crates/adapter-claude/src/normalize.rs:94–139` — `normalize`; extract `cwd` after the `pid` block, thread onto the envelope.
+- `crates/shim/src/main.rs:42–67` — confirms the shim forwards the payload verbatim (no change needed; cwd rides through).
+- `crates/daemon/src/db/migrations.rs` — append v3; current latest is v2.
+- `crates/daemon/src/db/queries.rs:3–31` — `INSERT_EVENT` + the three SELECTs that carry per-event columns.
+- `crates/daemon/src/projection/state.rs::transition` — add `cwd` param + carry-forward; do NOT touch `current_state` arms.
+- `crates/daemon/src/projection/session.rs::write_inner` (~96–300) + `rebuild_missing_projections` (~457–560) — thread `cwd`.
+- `crates/daemon/src/api/{sessions,events,replay}.rs` — REST + replay carry `cwd`.
+- `crates/protocol/tests/contract_protocol.rs:546,569` — `additive_compat_last_pid/pid_is_ignored_by_v1_consumer`; copy for `cwd`.
+- `crates/adapter-claude/tests/contract_adapter.rs:273–339` — `normalize_extracts_pid_*` family; copy for `cwd`.
+- `crates/daemon/tests/contract_daemon.rs` — `migration_v2_adds_nullable_pid_column`, `rebuild_preserves_last_pid_and_ended`; copy for cwd.
+- `docs/protocol.md:70,85,107,267,282,291,344` — REST/WS/state-narrative/ingest anchors where `last_pid` is documented; add `cwd` beside each.
+- `docs/protocol-changelog.md:46–47` — the Story 5.3 `last_pid` / `Event.pid` entries; match prose density for the cwd entry.
+
+## Dev Agent Record
+
+### Agent Model Used
+
+### Debug Log References
+
+### Completion Notes List
+
+### File List
