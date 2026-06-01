@@ -182,6 +182,8 @@ JSON wire format. Serialize/Deserialize on all public protocol types. Versioned 
 
 This is the inverse of Postel and it's the right call here because additive forward-compat is the substrate's whole value prop. Encode the asymmetry in a test that asserts an outbound envelope with an extra field round-trips through `protocol`.
 
+**Additive v1.x outbound fields (live examples of the policy):** `cwd` (`SessionState` / `SessionListItem` / `Event`) and `started_at` (`SessionState` / `SessionListItem`, state/list-only) were added under v1.0 → v1.1 (Story 5.7, ADR 0006) as `Option<T>` fields on outbound types. A pre-5.7 presenter decodes a frame carrying them and silently drops them; a pre-5.7 projection blob lacking them deserializes to `None`. No version bump, no blob rewrite — exactly the additive forward-compat this policy exists to enable.
+
 ### Adapter configs: TOML — Decided
 
 TOML for `adapters/<source>/*.toml` (capabilities, tool-reactions, settings-merge templates). Schemas in `crates/protocol/schemas/`.

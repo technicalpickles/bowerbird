@@ -70,6 +70,17 @@ pub const SELECT_SESSION_EXISTS_BY_ID: &str = "SELECT 1 FROM session_projections
 pub const SELECT_MIN_EVENT_ID: &str =
     "SELECT MIN(event_id) FROM events WHERE source != '__daemon__'";
 
+/// Story 5.7 review — true first-event timestamp for one session. Used to
+/// backfill `SessionState.started_at` for legacy (pre-5.7) projection rows
+/// whose stored blob deserializes with `started_at: None`. Reading the earliest
+/// `created_at` from the event log keeps the live projection equal to what a
+/// full rebuild would produce (`started_at = MIN(created_at)`), preserving the
+/// byte-identical-rebuild contract and ADR 0006's "reconstructs identically on
+/// rebuild" guarantee. Fires only for legacy rows — a post-5.7 session sets
+/// `started_at` on its first event and never reaches this path.
+pub const SELECT_MIN_CREATED_AT_FOR_SESSION: &str =
+    "SELECT MIN(created_at) FROM events WHERE source = ? AND session_id = ?";
+
 /// Story 2.1 — Hello frame `history_begins_cleanly` probe.
 ///
 /// Returns `1` if there exists a `recording_sessions` row whose

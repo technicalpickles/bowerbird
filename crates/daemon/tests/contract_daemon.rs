@@ -404,7 +404,13 @@ fn migration_v2_adds_nullable_pid_column() {
 // a no-op (idempotency contract, mirrors migration_v2_adds_nullable_pid_column).
 #[test]
 fn migration_v3_adds_nullable_cwd_column() {
-    let mut conn = rusqlite::Connection::open_in_memory().expect("in-memory connection");
+    // Story 5.7 review: exercise the file-backed migration path the story's
+    // Task 4 and the Testing Standards section ask for (tempfile DB, not
+    // `:memory:`), so this covers the on-disk ALTER TABLE the daemon actually
+    // runs at startup rather than only the in-memory column shape.
+    let tmp = TempDir::new().expect("tempdir");
+    let db_path = tmp.path().join("bower.db");
+    let mut conn = rusqlite::Connection::open(&db_path).expect("file-backed connection");
     let m = migrations();
     m.to_latest(&mut conn).expect("migrations must apply");
 
@@ -8663,6 +8669,78 @@ mod story_5_3_liveness {
             after.started_at,
             Some(1_000),
             "started_at must reconstruct as the FIRST event's created_at (set-once)"
+        );
+    }
+
+    // Story 5.7 review (legacy started_at policy): a session whose projection
+    // predates Story 5.7 has `started_at: None` in its stored blob, and
+    // `rebuild_missing_projections` skips it (the row already exists). The next
+    // post-upgrade hook must NOT stamp that event's wall clock onto started_at
+    // (a false "started just now" age) — it must backfill the true first-event
+    // time from the event log so the live projection equals what a full rebuild
+    // produces (MIN(created_at)). This is the byte-identical-rebuild contract
+    // and ADR 0006's "reconstructs identically on rebuild" guarantee, pinned
+    // against the upgrade edge case raised in code review.
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_started_at_backfills_from_event_log_not_post_upgrade_clock() {
+        let (_tmp, pools) = fresh_pools().await;
+
+        // Seed two pre-upgrade events directly (old created_at, far in the
+        // past) as if written before this story landed.
+        let conn = pools.writer.get().await.expect("writer pool");
+        conn.interact(|c| -> rusqlite::Result<()> {
+            for (kind, created_at) in [("PreToolUse", 1_000_i64), ("Stop", 2_000)] {
+                c.execute(
+                    "INSERT INTO events (source, session_id, kind, payload, created_at) \
+                     VALUES ('claude', 'sess-legacy', ?, '{}', ?)",
+                    rusqlite::params![kind, created_at],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("interact")
+        .expect("insert events");
+        drop(conn);
+
+        // A legacy projection blob: started_at None, exactly how a pre-5.7
+        // SessionState deserializes (serde defaults the absent Option).
+        upsert_session(
+            &pools,
+            "claude",
+            "sess-legacy",
+            &SessionState {
+                current_state: SessionCurrentState::Idle,
+                last_event_kind: EventKind::Stop,
+                last_event_at_ms: 2_000,
+                last_pid: None,
+                cwd: None,
+                started_at: None,
+            },
+            2_000,
+        )
+        .await;
+
+        // A post-upgrade hook arrives. `write` stamps the real wall clock as
+        // this event's created_at / now_ms — orders of magnitude larger than
+        // the seeded 1_000/2_000, so a regression (now_ms leaking into
+        // started_at) would be unmistakable.
+        projection::session::write(
+            &pools.writer,
+            &BroadcastHub::new(16),
+            envelope_for("claude", "sess-legacy", EventKind::UserPromptSubmit),
+        )
+        .await
+        .expect("write post-upgrade event");
+
+        let after = read_state(&pools, "claude", "sess-legacy")
+            .await
+            .expect("state");
+        assert_eq!(
+            after.started_at,
+            Some(1_000),
+            "legacy started_at must backfill to the FIRST event's created_at, \
+             not the post-upgrade event's wall clock"
         );
     }
 

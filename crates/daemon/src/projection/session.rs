@@ -5,8 +5,8 @@ use crate::broadcast::{BroadcastEnvelope, BroadcastHub};
 use crate::db::queries::{
     event_kind_as_str, event_kind_from_db_str, reaction_as_db_string, INSERT_EVENT,
     INSERT_RECORDING_SESSION_STARTED, SELECT_DISTINCT_SESSIONS_FROM_EVENTS,
-    SELECT_EVENT_KINDS_FOR_SESSION, SELECT_SESSION_PROJECTION_STATE,
-    UPDATE_RECORDING_SESSION_ENDED, UPSERT_SESSION_PROJECTION,
+    SELECT_EVENT_KINDS_FOR_SESSION, SELECT_MIN_CREATED_AT_FOR_SESSION,
+    SELECT_SESSION_PROJECTION_STATE, UPDATE_RECORDING_SESSION_ENDED, UPSERT_SESSION_PROJECTION,
 };
 use crate::error::{Error, Result};
 use crate::projection::state::{current_state_for_read, transition};
@@ -157,7 +157,7 @@ async fn write_inner(
             // writer cannot interleave between SELECT and UPSERT. Reads do
             // not break the "exactly two writes" invariant from
             // architecture.md:634-641 — the invariant is about *writes*.
-            let prev_state: Option<SessionState> = tx
+            let mut prev_state: Option<SessionState> = tx
                 .query_row(
                     SELECT_SESSION_PROJECTION_STATE,
                     rusqlite::params![&source_for_closure, &session_id_for_closure],
@@ -216,6 +216,33 @@ async fn write_inner(
             let prev_read_current_state = prev_state
                 .as_ref()
                 .map(|s| current_state_for_read(s, now_ms));
+
+            // Story 5.7 review (legacy started_at): a pre-5.7 projection blob
+            // deserializes with `started_at: None`. `transition`'s set-once rule
+            // (`prev.started_at.or(Some(now_ms))`) would otherwise stamp THIS
+            // post-upgrade event's clock onto it — a false "started just now"
+            // for a session that began before the upgrade, and a divergence from
+            // what a full rebuild produces (rebuild replays oldest-first, so it
+            // yields MIN(created_at)). Restore the value the event log already
+            // holds so the live projection equals a rebuild — the byte-identical
+            // rebuild contract, and ADR 0006's "reconstructs identically on
+            // rebuild" guarantee. The current event is not yet INSERTed, so MIN
+            // is over the prior events (the legacy session always has some);
+            // a session with no prior events falls back to now_ms in transition.
+            // Fires only for legacy rows — post-5.7 sessions carry a non-None
+            // started_at and skip the query entirely.
+            if let Some(s) = prev_state.as_mut() {
+                if s.started_at.is_none() {
+                    s.started_at = tx
+                        .query_row(
+                            SELECT_MIN_CREATED_AT_FOR_SESSION,
+                            rusqlite::params![&source_for_closure, &session_id_for_closure],
+                            |row| row.get::<_, Option<i64>>(0),
+                        )
+                        .optional()?
+                        .flatten();
+                }
+            }
 
             let new_state = transition(
                 prev_state.as_ref(),
