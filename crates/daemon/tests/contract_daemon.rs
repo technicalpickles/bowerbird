@@ -9490,7 +9490,7 @@ mod story_5_4_migrations {
     use super::*;
 
     /// Every column of an `events` row, in schema order
-    /// (`event_id, source, session_id, kind, reaction, payload, created_at, pid`).
+    /// (`event_id, source, session_id, kind, reaction, payload, created_at, pid, cwd`).
     type EventRow = (
         i64,
         String,
@@ -9500,6 +9500,7 @@ mod story_5_4_migrations {
         String,
         i64,
         Option<i64>,
+        Option<String>,
     );
     /// Every column of a `session_projections` row, in schema order
     /// (`source, session_id, state, updated_at`).
@@ -9516,7 +9517,7 @@ mod story_5_4_migrations {
         let user_version: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         let events = c
             .prepare(
-                "SELECT event_id, source, session_id, kind, reaction, payload, created_at, pid \
+                "SELECT event_id, source, session_id, kind, reaction, payload, created_at, pid, cwd \
                  FROM events ORDER BY event_id",
             )?
             .query_map([], |r| {
@@ -9529,6 +9530,7 @@ mod story_5_4_migrations {
                     r.get(5)?,
                     r.get(6)?,
                     r.get(7)?,
+                    r.get(8)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<EventRow>>>()?;
@@ -9561,7 +9563,10 @@ mod story_5_4_migrations {
 
             // Seed the DB with three events across two sessions; mixed
             // EventKind variants. One row carries a real PID so the v2
-            // `events.pid` column is exercised end-to-end.
+            // `events.pid` column is exercised end-to-end, and a real `cwd` so
+            // the v3 `events.cwd` column is in the idempotency snapshot too
+            // (Story 5.7 review pass 3 — guards against a future migration
+            // silently dropping/rewriting `cwd`).
             let hub = BroadcastHub::new(16);
             projection::session::write(
                 &pools.writer,
@@ -9574,7 +9579,7 @@ mod story_5_4_migrations {
                     payload: r#"{"tool":"Bash"}"#.to_string(),
                     pid: Some(4242),
                     notification_type: None,
-                    cwd: None,
+                    cwd: Some("/repo".to_string()),
                 },
             )
             .await
@@ -9641,6 +9646,16 @@ mod story_5_4_migrations {
             .find(|e| e.2 == "sess-A" && e.3 == "PreToolUse")
             .and_then(|e| e.7);
         assert_eq!(seeded_pid, Some(4242), "v2 pid column round-trips");
+        // The schema-v3 `events.cwd` column round-trips on the same seeded row.
+        let seeded_cwd = events_before
+            .iter()
+            .find(|e| e.2 == "sess-A" && e.3 == "PreToolUse")
+            .and_then(|e| e.8.clone());
+        assert_eq!(
+            seeded_cwd,
+            Some("/repo".to_string()),
+            "v3 cwd column round-trips"
+        );
 
         // Re-open the pool against the SAME file and re-run migrations. The
         // contract: zero schema mutation, zero row mutation, no error.
@@ -9657,8 +9672,8 @@ mod story_5_4_migrations {
             .expect("post-migration snapshot query");
 
         // Whole-snapshot equality is the strong form of "zero rows changed":
-        // user_version, every events row (incl. payload, created_at, pid), and
-        // every session_projections row must be byte-for-byte identical.
+        // user_version, every events row (incl. payload, created_at, pid, cwd),
+        // and every session_projections row must be byte-for-byte identical.
         assert_eq!(
             after.0, before.0,
             "PRAGMA user_version must be unchanged after a repeat run_migrations"

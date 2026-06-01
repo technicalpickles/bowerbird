@@ -90,7 +90,7 @@ All authenticated routes return `401 Unauthorized` on a missing or malformed bea
   ```
 
 - **Field source.** [`crates/protocol/src/rest.rs:38`](../crates/protocol/src/rest.rs) `SessionListItem`.
-- **Notes.** `current_state` is the read-time projection (stale-`Working` → `Idle` fallback per Story 1.6's `current_state_for_read`), NOT the raw stored value. Sentinel-source sessions (`source = "__daemon__"`) are filtered out. `last_pid` (Story 5.3) is the carry-forwarded PID from the most recent envelope whose `bowerbird_ppid` was set — `null` for sessions ingested before Story 5.3. `cwd` and `started_at` (Story 5.7) carry the session's working directory and start time — both `null` for sessions projected before Story 5.7. See the `SessionState` narrative below.
+- **Notes.** `current_state` is the read-time projection (stale-`Working` → `Idle` fallback per Story 1.6's `current_state_for_read`), NOT the raw stored value. Sentinel-source sessions (`source = "__daemon__"`) are filtered out. `last_pid` (Story 5.3) is the carry-forwarded PID from the most recent envelope whose `bowerbird_ppid` was set — `null` for sessions ingested before Story 5.3. `cwd` and `started_at` (Story 5.7) carry the session's working directory and start time. `cwd` is `null` for sessions projected before Story 5.7 (and stays `null` until a post-upgrade event reports one). `started_at` is initially `null` for pre-5.7 rows, but the daemon backfills it from the session's first stored event (by `event_id` order) on the row's next projection write — so it does not stay `null` forever. See the `SessionState` narrative below.
 
 ### `GET /sessions/{id}`
 
@@ -301,7 +301,7 @@ Emitted (a) on every `current_state` transition resulting from a projection writ
 
 `cwd` (Story 5.7) is the session's working directory as the source's hook payload reported it, carry-forwarded across events (overwrite-on-Some, identical to `last_pid`). It is a **mechanical fact**: the daemon stores it verbatim — no path canonicalization, no `~` expansion, no symlink resolution. *repo*, *project name*, and *branch* are presenter derivations from `cwd`, not daemon fields (Axiom 4, ADR 0006). `null` for sessions projected before Story 5.7, for non-Claude sources, or for a producer that omits it. `cwd` also rides each `Event` (above); `started_at` does not.
 
-`started_at` (Story 5.7) is the epoch-ms timestamp of the session's first observed event, daemon-derived and set once (never updated). Presenters render session age from it without a side fetch. `null` for sessions projected before Story 5.7.
+`started_at` (Story 5.7) is the epoch-ms timestamp of the session's first observed event, daemon-derived and set once (never updated). Presenters render session age from it without a side fetch. Initially `null` for sessions projected before Story 5.7, but the daemon backfills it on the row's next projection write from the session's first stored event (by `event_id ASC` order, **not** `MIN(created_at)` — first-by-`event_id` is what a full rebuild reconstructs, and the two diverge under non-monotonic timestamps). So a pre-5.7 row reads `null` only until its next event lands; no migration rewrites the stored blob.
 
 **V1 PID-only liveness: known limitations.** The probe checks `kill(last_pid, 0)` only — it confirms *some* process holds the PID, not that it's the original Claude Code session. Two scenarios this does not catch:
 
