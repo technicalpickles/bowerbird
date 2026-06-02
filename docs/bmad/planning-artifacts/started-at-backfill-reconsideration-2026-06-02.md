@@ -7,9 +7,11 @@ Author: dev-story (Amelia) at @pickles' request
 
 ## TL;DR
 
-The legacy-`started_at` backfill has thrown a code-review finding on **every one of the four passes** Story 5.7 has been through. That is not four unrelated bugs — it is one design (reconstruct `started_at` from the event log on the fly, inside the live write path) leaking a new edge each time. This brief lays out *why* it keeps leaking and asks for a deliberate choice between **keeping the backfill** and **dropping it for preserve-`None`**, with the four-pass cost as the evidence.
+The legacy-`started_at` backfill has thrown a code-review finding on **every one of the four passes** Story 5.7 has been through. That is not four unrelated bugs — it is one design (reconstruct `started_at` from the event log on the fly, inside the live write path) leaking a new edge each time. This brief lays out *why* it keeps leaking and asks for a deliberate choice, with the four-pass cost as the evidence.
 
-Pass 4's fix is correct and tested; this brief does not block it. But the fix stands or falls with the same choice — preserve-`None` would delete the backfill *and* the pass-4 predicate term together.
+**Recommendation: Option D — delete the backfill entirely.** Given bowerbird is pre-release and the upgrade story is "nuke `~/.bowerbird/bower.db` and restart," the legacy-row scenario the backfill serves is *unreachable* in practice — a `started_at: None`-with-prior row only comes from a pre-5.7 blob. Reverting to the plain set-once rule removes the entire recurring-finding surface (including pass 4's fix, which only existed to propagate the backfill). See Option D below.
+
+Pass 4's fix is correct and tested; this brief does not block it. But the fix stands or falls with the same choice — D (and B) both delete it along with the backfill.
 
 ## The pattern (the evidence)
 
@@ -67,23 +69,48 @@ Change `transition` so a legacy row keeps `started_at: None` instead of stamping
 
 Let the set-once rule stamp `now_ms` on the legacy row's next event (the pre-pass-1 behavior).
 
-- **Rejected then, still worse than B:** a legacy session renders a false "started just now," which is actively misleading, vs. B's honest `null`. Same simplicity as B with worse UX. Not recommended.
+- **Rejected then, still worse than B:** a legacy session renders a false "started just now," which is actively misleading, vs. B's honest `null`. Same simplicity as B with worse UX. Not recommended *unless* legacy rows are an unsupported path (see D).
+
+### D. Do nothing special — pre-release "nuke the db" makes legacy rows unreachable  ← recommended
+
+**Added 2026-06-02 after @pickles noted this is pre-release software with no real users to protect — the operational guidance on a schema/projection change is "nuke `~/.bowerbird/bower.db` and restart."**
+
+The whole legacy-row problem exists *only* across an in-place upgrade from a pre-5.7 db. A `started_at: None` row **with a prior projection** is reachable only from a pre-5.7 blob: in a fresh 5.7+ db every session sets `started_at` on its first event via the set-once rule, and the deserialize-failure path treats a bad blob as fresh (`prev = None`), so even that lands on `Some(now_ms)`, never `None`-with-prior. If the upgrade story is "nuke and restart," that scenario does not occur.
+
+This collapses A/B/C into one move:
+
+- Revert `transition` to the plain set-once rule the story originally shipped: `started_at: prev.and_then(|s| s.started_at).or(Some(now_ms))`. No special-casing.
+- Delete the backfill query, the write-path read, the `prev_started_at` capture, **and** the pass-4 `started_at_changed` predicate term (it only existed to propagate the backfill).
+- The byte-identical-rebuild contract holds **trivially** for every row in a fresh db — no narrowing of the wording needed, because there are no legacy rows to diverge.
+- **Caveat:** `cwd` ships a real schema migration (v3), so the daemon *can* start against an old db without nuking — it is not force-wiped. If someone upgrades in place and does not nuke, a session straddling the upgrade renders an approximate "started just now." In pre-release this is a shrug; an optional one-line startup log ("`started_at` is approximate for pre-upgrade sessions; remove the db for exact values") would cover it, but is almost certainly overkill.
+
+D is strictly simpler than B (B still special-cases preserve-`None`; D special-cases nothing) and removes the entire recurring-finding surface rather than managing it.
 
 ## Recommendation
 
-**Option B (preserve-`None`).** The backfill buys byte-identical-across-upgrade for a field that is `null`-tolerant by construction and only `null` during a one-time upgrade window. That guarantee is stricter than the contract test verifies, and paying for it has cost four review passes. Preserve-`None` is simpler, honest (`null` = unknown), and removes the surface that keeps generating findings. The byte-identical guarantee stays intact for everything the daemon writes going forward — we just stop trying to retroactively satisfy it for rows that predate the field.
+**Option D**, given the pre-release "nuke the db" reality. The backfill — and pass 4's fix, and the preserve-`None` idea — all exist only to make pre-5.7 rows behave sensibly. When the supported upgrade path is "wipe and restart," none of that machinery is load-bearing: every row in a fresh db is a v5.7+ row, the set-once rule handles it, and the byte-identical guarantee holds for free. Delete the surface that surprised us four times.
 
-This is @pickles' call: it refines an **Accepted** ADR (0006) and narrows a documented contract. Both are legitimate to change with a new/updated ADR, but it should be deliberate, not a quiet code edit.
+(If bowerbird had shipped a release whose dbs must survive upgrades, the calculus flips to B — honest `null` over a wrong timestamp — and then to A only if byte-identical-across-upgrade is judged worth the complexity. It has not shipped, so D wins today.)
+
+This is @pickles' call: D refines an **Accepted** ADR (0006), which is legitimate to change with an updated ADR, but should be deliberate, not a quiet code edit.
+
+## If we pick D — what it takes
+
+- `crates/daemon/src/projection/state.rs::transition` — keep the plain set-once rule; no `prev.is_none()` special case (it is already this shape — the backfill lives in `write_inner`, not `transition`).
+- `crates/daemon/src/projection/session.rs::write_inner` — delete the legacy-backfill read, the `prev_started_at` capture, and the 5th closure-result tuple element; revert the publish predicate to `current_state`-only (drop the pass-4 `started_at_changed` term).
+- `crates/daemon/src/db/queries.rs` — remove `SELECT_FIRST_EVENT_CREATED_AT_FOR_SESSION`.
+- Tests — remove `legacy_started_at_backfills_by_first_event_order_under_nonmonotonic_created_at` and `legacy_started_at_backfill_publishes_state_frame_on_same_state_event`. No replacement needed (the case is unsupported); optionally keep a comment in the test module noting why.
+- ADR 0006 — replace the "Legacy projection rows backfill" consequence (line 49) with a short "pre-release upgrade = nuke the db; legacy rows are unsupported, `started_at` is approximate if you upgrade in place" note.
+- Docs — `protocol.md`, `presenter-authoring.md`, `protocol-changelog.md`: pre-5.7 `started_at` reads approximate-or-nuke (drop the "backfilled on next write" wording).
+- `deferred-work.md` — update the Story-5.3 item #3 resolution note to match.
 
 ## If we pick B — what it takes
 
 - `crates/daemon/src/projection/state.rs::transition` — set `started_at` only when there is no prior projection (`prev.is_none()`); a prior row with `started_at: None` keeps `None`.
-- `crates/daemon/src/projection/session.rs::write_inner` — delete the legacy-backfill read and the `prev_started_at` capture; revert the publish predicate to `current_state`-only (the pass-4 `started_at_changed` term is no longer needed — `started_at` no longer changes on a legacy same-state write).
+- `crates/daemon/src/projection/session.rs::write_inner` — delete the legacy-backfill read and the `prev_started_at` capture; revert the publish predicate to `current_state`-only.
 - `crates/daemon/src/db/queries.rs` — remove `SELECT_FIRST_EVENT_CREATED_AT_FOR_SESSION`.
-- Tests — remove `legacy_started_at_backfills_by_first_event_order_under_nonmonotonic_created_at` and `legacy_started_at_backfill_publishes_state_frame_on_same_state_event`; add one asserting a legacy row stays `None` on its next write and reconstructs on a full rebuild.
-- ADR 0006 — replace the "Legacy projection rows backfill" consequence (line 49) with the preserve-`None` decision + the narrowed byte-identical wording; add a "Revisit when" or supersede note.
-- Docs — `protocol.md`, `presenter-authoring.md`, `protocol-changelog.md`: pre-5.7 `started_at` reads `null` until rebuilt (drop the "backfilled on next write" wording).
-- `deferred-work.md` — update the Story-5.3 item #3 resolution note to match.
+- Tests — remove the two `legacy_started_at_*` tests; add one asserting a legacy row stays `None` on its next write and reconstructs on a full rebuild.
+- ADR 0006 / docs / `deferred-work.md` — narrate preserve-`None` + the narrowed byte-identical wording.
 
 ## If we pick A — what it takes
 
@@ -91,4 +118,4 @@ This is @pickles' call: it refines an **Accepted** ADR (0006) and narrows a docu
 
 ## Suggested vehicle
 
-If B: run `bmad-correct-course` (this is a mid-sprint design change to an in-flight story) or author an ADR refining 0006, then the code/doc edits above land in the same PR. If A: no process change; proceed to pass 5.
+If D or B: run `bmad-correct-course` (mid-sprint design change to an in-flight story) or author an ADR refining 0006, then the code/doc edits land in the same PR. If A: no process change; proceed to pass 5.
