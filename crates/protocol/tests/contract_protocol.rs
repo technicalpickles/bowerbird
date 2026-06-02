@@ -181,6 +181,43 @@ fn inbound_type_rejects_unknown_fields() {
     assert!(serde_json::from_str::<ClientMessage>(with_unknown).is_err());
 }
 
+// Story 5.8 (ADR 0008) AC #13: the `Subscribe.states` field is additive. A
+// pre-5.8 presenter omits it; `#[serde(default)]` fills it empty (= unfiltered)
+// so the wire shape still parses with no behavior change. NOTE this is the
+// INBOUND/strict mirror of the permissive-outbound `additive_compat_*` family
+// (`ClientMessage` carries `deny_unknown_fields`, so an *unknown* extra key
+// still errors — see `inbound_type_rejects_unknown_fields` above).
+#[test]
+fn subscribe_without_states_deserializes_to_empty() {
+    let no_states = r#"{"op":"subscribe","topic":"state.session.*"}"#;
+    let parsed: ClientMessage =
+        serde_json::from_str(no_states).expect("pre-5.8 subscribe must still deserialize");
+    match parsed {
+        ClientMessage::Subscribe { topic, states } => {
+            assert_eq!(topic, "state.session.*");
+            assert!(
+                states.is_empty(),
+                "absent states must default to empty (unfiltered)"
+            );
+        }
+        other => panic!("expected Subscribe, got {other:?}"),
+    }
+}
+
+#[test]
+fn subscribe_with_states_round_trips() {
+    let with_states = r#"{"op":"subscribe","topic":"state.session.*","states":["working","idle"]}"#;
+    let parsed: ClientMessage =
+        serde_json::from_str(with_states).expect("subscribe with states must deserialize");
+    match parsed {
+        ClientMessage::Subscribe { topic, states } => {
+            assert_eq!(topic, "state.session.*");
+            assert_eq!(states, vec!["working".to_string(), "idle".to_string()]);
+        }
+        other => panic!("expected Subscribe, got {other:?}"),
+    }
+}
+
 #[test]
 fn session_current_state_serializes_pascal_case() {
     assert_eq!(

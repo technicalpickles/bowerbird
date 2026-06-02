@@ -8,21 +8,59 @@
 //! `current_state_for_read`) is applied to `current_state` only — `list` and
 //! `detail` both call it. The stored row is never mutated at read time.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use protocol::{SessionCurrentState, SessionDetail, SessionListItem, SessionState, SessionStats};
+use serde::Deserialize;
 use serde_json::json;
 
-use crate::db::queries::{
-    SELECT_NON_SENTINEL_SESSIONS, SELECT_SESSION_BY_ID, SELECT_STATS_FOR_SESSION,
-};
+use crate::api::filter::{parse_state_filter, state_matches};
+use crate::db::queries::{build_sessions_query, SELECT_SESSION_BY_ID, SELECT_STATS_FOR_SESSION};
 use crate::projection::state::current_state_for_read;
 use crate::state::AppState;
 use crate::time::current_unix_millis;
 
-#[tracing::instrument(skip_all)]
-pub async fn list(State(state): State<AppState>) -> Response {
+/// Query params for `GET /sessions` (Story 5.8, ADR 0008). All optional;
+/// absent = unfiltered, preserving pre-5.8 behavior. Mirrors
+/// [`crate::api::events::EventsParams`] (`deny_unknown_fields` +
+/// `#[serde(default)]`), so an unknown query key is a 400 (strict-inbound
+/// policy).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionsParams {
+    /// CSV of `SessionCurrentState` tokens (case-insensitive). `None` =
+    /// unfiltered. Applied in Rust against the read-time `current_state`.
+    #[serde(default)]
+    pub state: Option<String>,
+    /// Exclusive `updated_at` lower bound (epoch-ms). `0`/absent = no bound.
+    #[serde(default)]
+    pub since: i64,
+    /// SQL row cap on the ordered, since-filtered set. `None` = no cap.
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+#[tracing::instrument(skip_all, fields(state_filter = ?params.state, since = params.since, limit = ?params.limit))]
+pub async fn list(State(state): State<AppState>, Query(params): Query<SessionsParams>) -> Response {
+    // Parse + validate up front; 400 on bad input (AC #4/#5/#6). Done before
+    // the reader checkout so a malformed query never touches the DB.
+    let state_filter: Vec<SessionCurrentState> = match &params.state {
+        Some(raw) => match parse_state_filter(raw) {
+            Ok(v) => v,
+            Err(msg) => return bad_request(msg),
+        },
+        None => Vec::new(),
+    };
+    if params.since < 0 {
+        return bad_request("since must be a non-negative epoch-ms integer".to_string());
+    }
+    if let Some(n) = params.limit {
+        if n <= 0 {
+            return bad_request("limit must be a positive integer".to_string());
+        }
+    }
+
     let conn = match state.db.reader.get().await {
         Ok(c) => c,
         Err(e) => {
@@ -31,11 +69,15 @@ pub async fn list(State(state): State<AppState>) -> Response {
         }
     };
 
+    // `since`/`limit` are pushed to SQL (they shrink the scan); `?state=` is
+    // applied in Rust below against the read-derived `current_state` (ADR 0008
+    // — a SQL filter on the stored JSON would contradict the rendered field).
+    let (sql, sql_params) = build_sessions_query(params.since, params.limit);
     let rows = conn
         .interact(
-            |c| -> rusqlite::Result<Vec<(String, String, String, i64)>> {
-                let mut stmt = c.prepare(SELECT_NON_SENTINEL_SESSIONS)?;
-                let rows = stmt.query_map([], |r| {
+            move |c| -> rusqlite::Result<Vec<(String, String, String, i64)>> {
+                let mut stmt = c.prepare(&sql)?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(sql_params), |r| {
                     Ok((
                         r.get::<_, String>(0)?,
                         r.get::<_, String>(1)?,
@@ -50,7 +92,7 @@ pub async fn list(State(state): State<AppState>) -> Response {
     let rows = match rows {
         Ok(Ok(rs)) => rs,
         Ok(Err(e)) => {
-            tracing::error!(error = %e, "SELECT_NON_SENTINEL_SESSIONS failed");
+            tracing::error!(error = %e, "sessions list query failed");
             return internal_error();
         }
         Err(e) => {
@@ -86,6 +128,12 @@ pub async fn list(State(state): State<AppState>) -> Response {
             }
         };
         let current_state = current_state_for_read(&stored, now_ms);
+        // Story 5.8: `?state=` filters on the read-derived `current_state`
+        // (never the stored value), so the filter matches the rendered field
+        // exactly. Empty filter = match all (unfiltered default).
+        if !state_matches(&state_filter, current_state) {
+            continue;
+        }
         items.push(SessionListItem {
             source,
             session_id,
@@ -241,4 +289,10 @@ fn internal_error() -> Response {
         Json(json!({ "error": "internal error" })),
     )
         .into_response()
+}
+
+/// `400 Bad Request` with a `{"error": msg}` body — the strict-inbound
+/// response for a malformed `GET /sessions` query param (Story 5.8).
+fn bad_request(msg: String) -> Response {
+    (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response()
 }

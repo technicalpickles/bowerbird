@@ -42,6 +42,7 @@ use protocol::{
     ServerMessage, StateFrame,
 };
 
+use crate::api::filter::parse_state_filter;
 use crate::broadcast::{BroadcastEnvelope, Topic};
 use crate::db::queries::SELECT_HELLO_DB_FIELDS;
 use crate::state::AppState;
@@ -445,103 +446,127 @@ async fn handle_text_frame(
         // drain after [D] — that would dispatch buffered envelopes under
         // the new set BEFORE the snapshot is emitted, reversing the
         // documented snapshot-first ordering.
-        ClientMessage::Subscribe { topic } => match Topic::parse(&topic) {
-            Ok(t) => {
-                // [A] Drain pre-existing in-flight envelopes under the
-                //     OLD subscription set.
-                if !drain_backlog_under_state(
-                    socket,
-                    subscriptions,
-                    rx,
-                    last_delivered_event_id,
-                    last_dropped_at,
-                    pending_drop_count,
-                    pending_dropped_first,
-                    state.ws_config.coalesce_window,
-                )
-                .await
-                {
-                    return false;
-                }
-
-                // [B] Best-effort clock read. Failure logs and falls back
-                //     to 0 — `current_state_for_read` then never triggers
-                //     the stale-Working derivation in this rare window;
-                //     the stored `current_state` rides through.
-                let now_ms = match crate::time::current_unix_millis() {
-                    Ok(n) => n,
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            "ws snapshot: clock read failed; proceeding without stale-Working fallback",
-                        );
-                        0
-                    }
-                };
-
-                // [C] Build the snapshot. On reader pool/interact/serde
-                //     error, log and emit an EMPTY snapshot — but still
-                //     insert the topic at [D] so live frames flow. The
-                //     trade-off is documented in the Subscribe-arm
-                //     header above: snapshot is best-effort
-                //     initialisation aid; the live stream is the
-                //     primary contract. If the snapshot is essential,
-                //     the client reconnects (which is the canonical WS
-                //     retry mechanism and the only path that gets a
-                //     fresh `pre_existing` set). Returning early
-                //     without inserting the topic would leave the
-                //     client silently unsubscribed for this topic
-                //     because the protocol has no Subscribe ack/error
-                //     frame in V1 (see protocol-changelog.md).
-                let snapshot_frames = match crate::projection::snapshot_for_topic(
-                    &state.db.reader,
-                    &t,
-                    subscriptions,
-                    now_ms,
-                )
-                .await
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            "ws snapshot: snapshot_for_topic failed; emitting empty snapshot, subscription remains live",
-                        );
-                        Vec::new()
-                    }
-                };
-
-                // [D] Insert the new topic. Envelopes published between
-                //     [C] and here stay buffered in rx and dispatch under
-                //     the new set at [F], after snapshot emission.
-                subscriptions.insert(t);
-
-                // [E] Emit snapshot frames. Order is the SQL row order:
-                //     `updated_at DESC, source ASC, session_id ASC`.
-                for frame in snapshot_frames {
-                    let json = match serde_json::to_string(&ServerMessage::State(frame)) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::error!(
-                                error = ?e,
-                                "ws snapshot: failed to serialize StateFrame; dropping",
-                            );
-                            continue;
-                        }
-                    };
-                    if let Err(e) = socket.send(Message::Text(json.into())).await {
-                        tracing::debug!(error = ?e, "ws snapshot: send failed; closing");
+        ClientMessage::Subscribe { topic, states } => {
+            // Story 5.8 (ADR 0008): parse the optional snapshot-scoping
+            // `states` filter before anything else. An invalid token closes
+            // the connection with `bad message` (same loud-reject as an
+            // invalid topic — strict-inbound policy). Empty/absent `states`
+            // yields an empty filter (unfiltered, the v1.0 default); we skip
+            // `parse_state_filter` entirely in that case because it treats an
+            // empty token as an error. A non-empty `states` is joined into the
+            // same CSV shape the REST `?state=` parser consumes, so both
+            // surfaces share one token table.
+            let state_filter = if states.is_empty() {
+                Vec::new()
+            } else {
+                match parse_state_filter(&states.join(",")) {
+                    Ok(f) => f,
+                    Err(msg) => {
+                        close_with_bad_message(socket, &msg).await;
                         return false;
                     }
                 }
+            };
+            match Topic::parse(&topic) {
+                Ok(t) => {
+                    // [A] Drain pre-existing in-flight envelopes under the
+                    //     OLD subscription set.
+                    if !drain_backlog_under_state(
+                        socket,
+                        subscriptions,
+                        rx,
+                        last_delivered_event_id,
+                        last_dropped_at,
+                        pending_drop_count,
+                        pending_dropped_first,
+                        state.ws_config.coalesce_window,
+                    )
+                    .await
+                    {
+                        return false;
+                    }
 
-                true
+                    // [B] Best-effort clock read. Failure logs and falls back
+                    //     to 0 — `current_state_for_read` then never triggers
+                    //     the stale-Working derivation in this rare window;
+                    //     the stored `current_state` rides through.
+                    let now_ms = match crate::time::current_unix_millis() {
+                        Ok(n) => n,
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                "ws snapshot: clock read failed; proceeding without stale-Working fallback",
+                            );
+                            0
+                        }
+                    };
+
+                    // [C] Build the snapshot. On reader pool/interact/serde
+                    //     error, log and emit an EMPTY snapshot — but still
+                    //     insert the topic at [D] so live frames flow. The
+                    //     trade-off is documented in the Subscribe-arm
+                    //     header above: snapshot is best-effort
+                    //     initialisation aid; the live stream is the
+                    //     primary contract. If the snapshot is essential,
+                    //     the client reconnects (which is the canonical WS
+                    //     retry mechanism and the only path that gets a
+                    //     fresh `pre_existing` set). Returning early
+                    //     without inserting the topic would leave the
+                    //     client silently unsubscribed for this topic
+                    //     because the protocol has no Subscribe ack/error
+                    //     frame in V1 (see protocol-changelog.md).
+                    let snapshot_frames = match crate::projection::snapshot_for_topic(
+                        &state.db.reader,
+                        &t,
+                        subscriptions,
+                        now_ms,
+                        &state_filter,
+                    )
+                    .await
+                    {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                "ws snapshot: snapshot_for_topic failed; emitting empty snapshot, subscription remains live",
+                            );
+                            Vec::new()
+                        }
+                    };
+
+                    // [D] Insert the new topic. Envelopes published between
+                    //     [C] and here stay buffered in rx and dispatch under
+                    //     the new set at [F], after snapshot emission.
+                    subscriptions.insert(t);
+
+                    // [E] Emit snapshot frames. Order is the SQL row order:
+                    //     `updated_at DESC, source ASC, session_id ASC`.
+                    for frame in snapshot_frames {
+                        let json = match serde_json::to_string(&ServerMessage::State(frame)) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::error!(
+                                    error = ?e,
+                                    "ws snapshot: failed to serialize StateFrame; dropping",
+                                );
+                                continue;
+                            }
+                        };
+                        if let Err(e) = socket.send(Message::Text(json.into())).await {
+                            tracing::debug!(error = ?e, "ws snapshot: send failed; closing");
+                            return false;
+                        }
+                    }
+
+                    true
+                }
+                Err(()) => {
+                    close_with_bad_message(socket, &format!("invalid subscribe topic: {topic}"))
+                        .await;
+                    false
+                }
             }
-            Err(()) => {
-                close_with_bad_message(socket, &format!("invalid subscribe topic: {topic}")).await;
-                false
-            }
-        },
+        }
         ClientMessage::Unsubscribe { topic } => match Topic::parse(&topic) {
             Ok(t) => {
                 if !drain_backlog_under_state(

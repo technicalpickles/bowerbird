@@ -184,6 +184,8 @@ This is the inverse of Postel and it's the right call here because additive forw
 
 **Additive v1.x outbound fields (live examples of the policy):** `cwd` (`SessionState` / `SessionListItem` / `Event`) and `started_at` (`SessionState` / `SessionListItem`, state/list-only) were added under v1.0 → v1.1 (Story 5.7, ADR 0006) as `Option<T>` fields on outbound types. A pre-5.7 presenter decodes a frame carrying them and silently drops them; a pre-5.7 projection blob lacking them deserializes to `None`. No version bump, no blob rewrite — exactly the additive forward-compat this policy exists to enable.
 
+**Additive v1.x inbound field (the inverse direction):** `ClientMessage::Subscribe.states` (Story 5.8, ADR 0008) is an optional `Vec<String>` snapshot-scoping filter added with `#[serde(default)]`, so a v1.0 presenter omitting it still parses under the strict-inbound `deny_unknown_fields` (the field is *known*; a typo'd *other* key still 1008-closes). The known forward-compat edge: a *newer* presenter sending `states` to an *older* daemon is rejected (WS close 1008) — the acceptable "client ahead of daemon" direction.
+
 ### Adapter configs: TOML — Decided
 
 TOML for `adapters/<source>/*.toml` (capabilities, tool-reactions, settings-merge templates). Schemas in `crates/protocol/schemas/`.
@@ -472,7 +474,7 @@ Splitting liveness from readiness lets a supervisor restart on `/readyz` failure
 
 **Auth:** all non-`/healthz` and non-`/readyz` endpoints require the bearer token from `~/.bowerbird/server.json`. Token is rotated per daemon start (Pixel Agents pattern).
 
-**Data endpoints:** `GET /sessions`, `GET /sessions/:id`, `GET /sessions/:id/events?since=<cursor>`, `GET /sessions/:id/stats`. These exist both for polling-based presenters and as the implementation backing for the WS `snapshot` frame. Each session carries `last_pid` (Story 5.3) plus `cwd` and `started_at` (Story 5.7) — `cwd`/`started_at` ride `SessionListItem` and `SessionDetail.state` (and `cwd` also rides each `Event` in `/sessions/:id/events`); all are mechanical facts, with repo/age derivations left to presenters (Axiom 4, ADR 0006).
+**Data endpoints:** `GET /sessions`, `GET /sessions/:id`, `GET /sessions/:id/events?since=<cursor>`, `GET /sessions/:id/stats`. These exist both for polling-based presenters and as the implementation backing for the WS `snapshot` frame. Each session carries `last_pid` (Story 5.3) plus `cwd` and `started_at` (Story 5.7) — `cwd`/`started_at` ride `SessionListItem` and `SessionDetail.state` (and `cwd` also rides each `Event` in `/sessions/:id/events`); all are mechanical facts, with repo/age derivations left to presenters (Axiom 4, ADR 0006). `GET /sessions` accepts optional `?state=<csv>` (read-time `current_state` tokens, filtered in Rust), `?since=<updated_at_ms>` (exclusive recency bound, SQL), and `?limit=<n>` (SQL row cap) filters — all default-unfiltered, invalid values `400` (Story 5.8, ADR 0008); the presenter expresses intent and the daemon filters by the mechanical `current_state`, never deciding relevance on its own (Axiom 1). The matching WS surface is the optional `Subscribe.states` snapshot filter.
 
 **Cursor-based pagination on `events`:** `since=<event_id>`. The event log is append-only and monotonically growing.
 

@@ -42,6 +42,40 @@ pub const SELECT_NON_SENTINEL_SESSIONS: &str =
      WHERE source != '__daemon__' \
      ORDER BY updated_at DESC, source ASC, session_id ASC";
 
+/// Story 5.8 (ADR 0008) — build the `GET /sessions` list query with optional
+/// `since` (exclusive `updated_at` lower bound) and `limit` (SQL row cap)
+/// clauses appended to the [`SELECT_NON_SENTINEL_SESSIONS`] shape.
+///
+/// `?state=` is deliberately NOT pushed to SQL — it filters the *read-derived*
+/// `current_state` in Rust (after `current_state_for_read`), so it can't shrink
+/// the SQL scan; only `since`/`limit` do (see ADR 0008 / the story Dev Note).
+///
+/// Values are bound via `?` placeholders (never string-interpolated — no
+/// injection surface) and returned as a positional `i64` param vector
+/// (`params_from_iter`). Returns the base query string verbatim when both are
+/// absent, so the unfiltered path is byte-identical to pre-5.8
+/// ([`SELECT_NON_SENTINEL_SESSIONS`]) — pinned by `unfiltered_query_matches_const`.
+pub fn build_sessions_query(since: i64, limit: Option<i64>) -> (String, Vec<i64>) {
+    let mut sql = String::from(
+        "SELECT source, session_id, state, updated_at FROM session_projections \
+         WHERE source != '__daemon__'",
+    );
+    let mut params: Vec<i64> = Vec::new();
+    // `since <= 0` imposes no lower bound (all real `updated_at` are > 0); the
+    // handler 400s a negative `since` before reaching here, so this only sees
+    // 0 (= no bound) or a positive bound.
+    if since > 0 {
+        sql.push_str(" AND updated_at > ?");
+        params.push(since);
+    }
+    sql.push_str(" ORDER BY updated_at DESC, source ASC, session_id ASC");
+    if let Some(n) = limit {
+        sql.push_str(" LIMIT ?");
+        params.push(n);
+    }
+    (sql, params)
+}
+
 // V1 only has the `"claude"` source, so the `ORDER BY ... LIMIT 1` ordering
 // never matters in practice. When a second adapter ships (Codex, OpenCode),
 // callers should disambiguate with an explicit `?source=` query param or by
@@ -197,6 +231,44 @@ pub fn reaction_from_db_string(s: &str) -> Result<Reaction, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Story 5.8 AC #1: the no-filter query is byte-identical to the pre-5.8
+    // constant, so the unfiltered `/sessions` path is unchanged.
+    #[test]
+    fn unfiltered_query_matches_const() {
+        let (sql, params) = build_sessions_query(0, None);
+        assert_eq!(sql, SELECT_NON_SENTINEL_SESSIONS);
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn since_clause_binds_lower_bound() {
+        let (sql, params) = build_sessions_query(1_700, None);
+        assert!(sql.contains("AND updated_at > ?"));
+        assert!(
+            sql.find("AND updated_at > ?").unwrap() < sql.find("ORDER BY").unwrap(),
+            "since clause must precede ORDER BY"
+        );
+        assert_eq!(params, vec![1_700]);
+    }
+
+    #[test]
+    fn limit_clause_binds_after_order_by() {
+        let (sql, params) = build_sessions_query(0, Some(5));
+        assert!(sql.trim_end().ends_with("LIMIT ?"));
+        assert!(sql.find("ORDER BY").unwrap() < sql.find("LIMIT ?").unwrap());
+        assert_eq!(params, vec![5]);
+    }
+
+    #[test]
+    fn since_and_limit_bind_in_positional_order() {
+        let (sql, params) = build_sessions_query(99, Some(3));
+        assert!(sql.contains("AND updated_at > ?"));
+        assert!(sql.trim_end().ends_with("LIMIT ?"));
+        // since binds first (before ORDER BY), limit second (after) — the
+        // positional order the params vec must match.
+        assert_eq!(params, vec![99, 3]);
+    }
 
     #[test]
     fn event_kind_db_string_round_trip_all_variants() {

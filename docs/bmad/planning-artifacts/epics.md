@@ -1193,13 +1193,19 @@ Inserted by `sprint-change-proposal-2026-06-01-dogfood-triage.md` (§4.1, Findin
 **When** Story 5.7 lands
 **Then** `crates/protocol/src/{state,event,rest}.rs` gain the fields (`cwd` on `SessionState`/`EventEnvelope`/`Event`/`SessionListItem`; `started_at` on `SessionState`/`SessionListItem` only); NO shim change; NO state-machine change; `docs/protocol.md` + `docs/protocol-changelog.md` (one `type: schema` entry, `Resolves: 5.7`) + `docs/presenter-authoring.md` (group/label-by-cwd note, `cwd != repo` caveat, session-age-from-started_at) + `project-context.md` (ADR 0006 `Affects context.md sections`) updated; `cargo test --workspace -- --test-threads=1`, `cargo fmt --check`, `cargo clippy --all-targets --workspace -- -D warnings` pass
 
-### Story 5.8: Server-side session filter (stub — refine at create-story)
+### Story 5.8: Server-side session filter (+ ADR 0008)
 
 As a presenter author,
-I want `GET /sessions` (and the snapshot-on-subscribe burst) to accept `?state=`/`?since=`/`?limit=` filters,
-So that a new presenter isn't blasted with the full `Ended` graveyard and can fetch only active sessions.
+I want `GET /sessions` to accept `?state=`/`?since=`/`?limit=` filters AND the WS snapshot-on-subscribe burst to be scopeable by an optional `states` filter,
+So that a new presenter isn't blasted with the full `Ended` graveyard and can fetch (and be handed) only the sessions it cares about.
 
-Inserted by `sprint-change-proposal-2026-06-01-dogfood-triage.md` (§4.2, Finding 5-filter). Gates v0.1.0 (Story 5.14). **Stub** — ACs to be derived from proposal §4.2 at `bmad-create-story` time. Scope: `api/sessions.rs::list` accepts `?state=<active|ended|...>`, `?since=<cursor>`, `?limit=<n>`; filtered `SELECT_NON_SENTINEL_SESSIONS` variants in `db/queries.rs`; `api/ws.rs` scopes the snapshot burst by the same predicate; `docs/protocol.md` + `docs/protocol-changelog.md` `type: behavioral` entry (additive; default unfiltered preserves current behavior). Folds in the deferred-work "no pagination / no page-size limit on `GET /sessions`" items. **Partially resolves `gt-3cnt`** (filter half; the retention sweep stays open on the bean, a no-list "no `gc`" deferral). Additive REST, post-tag-safe but cheap now.
+Inserted by `sprint-change-proposal-2026-06-01-dogfood-triage.md` (§4.2, Finding 5-filter); operationalized by **ADR 0008** (presenter-controlled filtering on both surfaces — the maintainer's choice to scope the snapshot by a presenter-supplied predicate modified the wire protocol, which §4.2's "no ADR" assumption did not anticipate). Gates v0.1.0 (Story 5.14). ACs (see `implementation-artifacts/5-8-server-side-session-filter.md` for the full set):
+
+- **REST `GET /sessions`** gains optional `?state=<csv>` (case-insensitive `SessionCurrentState` tokens, filtered in Rust on the read-time `current_state`), `?since=<updated_at_ms>` (exclusive recency lower bound, SQL), and `?limit=<n>` (SQL row cap) — all default-unfiltered so pre-5.8 behavior is byte-identical; invalid values `400`. `limit` caps the pre-state-filter set, so `?state=`+`?limit=` may return fewer than `n` (documented; paginate via `?since=`).
+- **WS `ClientMessage::Subscribe` gains an optional `states: Vec<String>`** (`#[serde(default)]`) that scopes the snapshot-on-subscribe burst by the same read-time `current_state` predicate; empty/absent = unfiltered. An invalid token closes the connection (`bad message`/1008). Scopes ONLY the snapshot — the live stream is unchanged.
+- **No schema migration** (`events`/`session_projections` unchanged; query/transport-shape only). `docs/protocol.md` + a `type: schema` `docs/protocol-changelog.md` entry + the ADR-0008 `project-context.md` `Affects context.md sections: Wire format, HTTP surface` same-PR touch. `?state=` filters in Rust (not SQL `json_extract`) so the filter matches the rendered `current_state`, never a divergent stored value.
+
+Folds in the deferred-work "no pagination on `GET /sessions`" item (the sibling `/sessions/{id}/events` page-size limit stays deferred — different endpoint). **Partially resolves `gt-3cnt`** (filter half; the retention sweep stays open on the bean, a no-list "no `gc`" deferral).
 
 ### Story 5.9: Daemon start-on-login supervision (stub — refine at create-story) + ADR 0007
 

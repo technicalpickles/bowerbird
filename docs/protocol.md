@@ -70,7 +70,11 @@ All authenticated routes return `401 Unauthorized` on a missing or malformed bea
 ### `GET /sessions`
 
 - **Auth.** Bearer required.
-- **Request.** None.
+- **Request.** All query params optional; absent = unfiltered (the default preserves pre-5.8 behavior exactly). Filters compose.
+  - `?state=<csv>` (Story 5.8) — comma-separated, case-insensitive `SessionCurrentState` tokens: `idle`, `working`, `waitinginput`, `ended`, `unknown`. Returns only sessions whose **read-time** `current_state` (after the stale-`Working`→`Idle` fallback, i.e. the value the response actually carries) is in the set. The canonical triage call is `?state=working,waitinginput,idle` (drops the `Ended` graveyard); `?state=ended` is the inverse (a history/audit view). An unrecognized token → `400`.
+  - `?since=<updated_at_ms>` (Story 5.8) — exclusive lower bound on the `updated_at` column (a **recency** filter, not an opaque cursor): returns only sessions with `updated_at > <updated_at_ms>`, the same `updated_at` each item carries. Poll "what changed since my last poll" by passing the max `updated_at` you have seen. `0`/absent = no bound. A non-integer or negative value → `400`.
+  - `?limit=<n>` (Story 5.8) — positive integer SQL `LIMIT` on the ordered (`updated_at DESC, source ASC, session_id ASC`), `since`-filtered row set. Absent = no cap. `0`, negative, or non-integer → `400`.
+  - **`?state=` + `?limit=` interaction.** `limit` caps the **pre-state-filter** set, then `?state=` filters in Rust — so a page MAY return fewer than `<n>` items when some of the `<n>` fetched rows are filtered out by state. A presenter needing exactly-N active sessions paginates via `?since=`.
 - **Response.** `200 OK` with a JSON array of `SessionListItem`:
 
   ```json
@@ -205,10 +209,12 @@ The two inbound shapes — tool → daemon. Both are strict-`deny_unknown_fields
 ### `subscribe`
 
 ```json
-{ "op": "subscribe", "topic": "state.session.*" }
+{ "op": "subscribe", "topic": "state.session.*", "states": ["working", "waitinginput", "idle"] }
 ```
 
 Subscribes the current connection to one topic (see [§Topic grammar](#topic-grammar) for the supported set). Subscribing to the same topic twice on one connection is idempotent (no double-delivery). Subscribing to a wildcard then a specific sub-topic deduplicates snapshots — `state.session.*` followed by `state.session.<id>` emits zero additional snapshot frames for that id.
+
+**`states` (optional, Story 5.8).** A list of `SessionCurrentState` tokens (case-insensitive: `idle`, `working`, `waitinginput`, `ended`, `unknown`) that scopes the **snapshot-on-subscribe burst** to sessions whose read-time `current_state` is in the set — keyed identically to the REST `GET /sessions?state=`. Absent or empty = unfiltered (the v1.0 default; every matching session is bursted). A triage presenter passes `["working","waitinginput","idle"]` to drop the `Ended` graveyard from the connect burst. The filter scopes **only** the initial snapshot — the live `state.*`/`events.*` stream is unaffected, so a session that transitions to/from `Ended` after subscribe still delivers a live `state` frame, and the full history (including `Ended`) is always available via REST `GET /sessions` (`?state=ended` for the graveyard alone). An invalid token closes the connection with `bad message` (close code 1008), the same way an invalid topic does. `states` is additive: a v1.0 presenter omitting it is unaffected (`#[serde(default)]`).
 
 ### `unsubscribe`
 

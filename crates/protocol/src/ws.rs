@@ -51,8 +51,26 @@ pub enum ServerMessage {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClientMessage {
-    Subscribe { topic: String },
-    Unsubscribe { topic: String },
+    Subscribe {
+        topic: String,
+        /// Optional snapshot-scoping filter (Story 5.8, ADR 0008). When
+        /// non-empty, the snapshot-on-subscribe burst includes only sessions
+        /// whose read-time `current_state` is in this set (tokens are
+        /// `SessionCurrentState` wire values, case-insensitive, parsed
+        /// daemon-side like `topic`). Empty/absent = unfiltered. Scopes ONLY
+        /// the snapshot; the live stream is unaffected.
+        ///
+        /// `#[serde(default)]` keeps it optional for v1.0 presenters (absent →
+        /// empty vec → unfiltered) while the enum's `deny_unknown_fields` still
+        /// rejects a typo'd *other* key. `Vec<String>` (not
+        /// `Vec<SessionCurrentState>`) so a typo'd token is loud-rejected
+        /// daemon-side rather than silently mapped to `Unknown`.
+        #[serde(default)]
+        states: Vec<String>,
+    },
+    Unsubscribe {
+        topic: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -19,8 +19,9 @@
 
 use std::collections::HashSet;
 
-use protocol::{SessionState, StateFrame};
+use protocol::{SessionCurrentState, SessionState, StateFrame};
 
+use crate::api::filter::state_matches;
 use crate::broadcast::{BroadcastEnvelope, Topic};
 use crate::db::queries::SELECT_NON_SENTINEL_SESSIONS;
 use crate::error::{Error, Result};
@@ -33,6 +34,10 @@ use crate::projection::state::current_state_for_read;
 /// session is already covered by an entry in `pre_existing` (snapshot
 /// dedup against overlapping subscriptions).
 ///
+/// `state_filter` (Story 5.8, ADR 0008) scopes the burst by the presenter's
+/// requested `SessionCurrentState` set, keyed on the read-derived
+/// `current_state`. An empty slice matches everything (the v1.0 default).
+///
 /// Errors propagate reader-pool checkout and `interact` failures. The
 /// caller in `handle_text_frame` logs and proceeds with an empty
 /// snapshot — a transient DB issue must not close a healthy WS connection.
@@ -42,6 +47,7 @@ pub async fn snapshot_for_topic(
     new_topic: &Topic,
     pre_existing: &HashSet<Topic>,
     now_ms: i64,
+    state_filter: &[SessionCurrentState],
 ) -> Result<Vec<StateFrame>> {
     if !matches!(
         new_topic,
@@ -129,6 +135,14 @@ pub async fn snapshot_for_topic(
         }
 
         let derived_current = current_state_for_read(&stored, now_ms);
+        // Story 5.8 (ADR 0008): scope the snapshot burst by the presenter's
+        // `states` filter, keyed on the read-derived `current_state` (matching
+        // the REST `?state=` semantics). Empty filter = match all (the v1.0
+        // default). Only the initial snapshot is scoped — the live stream is
+        // untouched.
+        if !state_matches(state_filter, derived_current) {
+            continue;
+        }
         out.push(StateFrame {
             source,
             session_id,
@@ -196,10 +210,21 @@ mod tests {
         }
     }
 
+    fn state_with(cs: SessionCurrentState, last_event_at_ms: i64) -> SessionState {
+        SessionState {
+            current_state: cs,
+            last_event_kind: EventKind::PreToolUse,
+            last_event_at_ms,
+            last_pid: None,
+            cwd: None,
+            started_at: None,
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn empty_projection_table_returns_empty_vec() {
         let (tmp, reader) = fresh_db().await;
-        let frames = snapshot_for_topic(&reader, &Topic::StateAll, &HashSet::new(), 1_000)
+        let frames = snapshot_for_topic(&reader, &Topic::StateAll, &HashSet::new(), 1_000, &[])
             .await
             .expect("snapshot ok");
         assert!(frames.is_empty());
@@ -230,9 +255,10 @@ mod tests {
         )
         .await;
 
-        let frames = snapshot_for_topic(&pools.reader, &Topic::StateAll, &HashSet::new(), 3_000)
-            .await
-            .expect("snapshot ok");
+        let frames =
+            snapshot_for_topic(&pools.reader, &Topic::StateAll, &HashSet::new(), 3_000, &[])
+                .await
+                .expect("snapshot ok");
         let ids: Vec<String> = frames.iter().map(|f| f.session_id.clone()).collect();
         assert_eq!(ids.len(), 2);
         // updated_at DESC — sess-B was updated more recently.
@@ -268,6 +294,7 @@ mod tests {
             &Topic::StateSession("sess-A".to_string()),
             &HashSet::new(),
             3_000,
+            &[],
         )
         .await
         .expect("snapshot ok");
@@ -296,6 +323,7 @@ mod tests {
             &Topic::StateSession("sess-other".to_string()),
             &HashSet::new(),
             3_000,
+            &[],
         )
         .await
         .expect("snapshot ok");
@@ -325,6 +353,7 @@ mod tests {
             &Topic::StateSessionCurrent("sess-A".to_string()),
             &HashSet::new(),
             1_500,
+            &[],
         )
         .await
         .expect("snapshot ok");
@@ -360,7 +389,7 @@ mod tests {
             Topic::EventsBySource("claude".to_string()),
             Topic::EventsBySourceSession("claude".to_string(), "sess-A".to_string()),
         ] {
-            let frames = snapshot_for_topic(&pools.reader, &t, &HashSet::new(), 3_000)
+            let frames = snapshot_for_topic(&pools.reader, &t, &HashSet::new(), 3_000, &[])
                 .await
                 .expect("snapshot ok");
             assert!(
@@ -400,9 +429,10 @@ mod tests {
         )
         .await;
 
-        let frames = snapshot_for_topic(&pools.reader, &Topic::StateAll, &HashSet::new(), 3_000)
-            .await
-            .expect("snapshot ok");
+        let frames =
+            snapshot_for_topic(&pools.reader, &Topic::StateAll, &HashSet::new(), 3_000, &[])
+                .await
+                .expect("snapshot ok");
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].session_id, "sess-A");
         assert_ne!(frames[0].source, "__daemon__");
@@ -437,7 +467,7 @@ mod tests {
         let mut pre = HashSet::new();
         pre.insert(Topic::StateSession("sess-A".to_string()));
 
-        let frames = snapshot_for_topic(&pools.reader, &Topic::StateAll, &pre, 3_000)
+        let frames = snapshot_for_topic(&pools.reader, &Topic::StateAll, &pre, 3_000, &[])
             .await
             .expect("snapshot ok");
         // sess-B is new, sess-A is dedup'd.
@@ -479,6 +509,7 @@ mod tests {
             &Topic::StateSession("sess-A".to_string()),
             &pre,
             3_000,
+            &[],
         )
         .await
         .expect("snapshot ok");
@@ -510,6 +541,7 @@ mod tests {
             &Topic::StateSessionCurrent("sess-A".to_string()),
             &pre,
             1_000,
+            &[],
         )
         .await
         .expect("sibling short-circuit must not touch the (closed) reader pool");
@@ -523,6 +555,7 @@ mod tests {
             &Topic::StateSession("sess-A".to_string()),
             &pre2,
             1_000,
+            &[],
         )
         .await
         .expect("symmetric sibling short-circuit must not touch the (closed) reader pool");
@@ -543,7 +576,7 @@ mod tests {
         let mut pre = HashSet::new();
         pre.insert(Topic::StateAll);
 
-        let frames = snapshot_for_topic(&pools.reader, &Topic::StateAll, &pre, 1_000)
+        let frames = snapshot_for_topic(&pools.reader, &Topic::StateAll, &pre, 1_000, &[])
             .await
             .expect("idempotent re-sub must not touch the (closed) reader pool");
         assert!(frames.is_empty());
@@ -571,13 +604,179 @@ mod tests {
 
         // 6 minutes > STALE_WORKING_MS (5 minutes).
         let now_ms = 6 * 60 * 1_000;
-        let frames = snapshot_for_topic(&pools.reader, &Topic::StateAll, &HashSet::new(), now_ms)
-            .await
-            .expect("snapshot ok");
+        let frames = snapshot_for_topic(
+            &pools.reader,
+            &Topic::StateAll,
+            &HashSet::new(),
+            now_ms,
+            &[],
+        )
+        .await
+        .expect("snapshot ok");
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].state.current_state, SessionCurrentState::Idle);
         // Stored fields ride through unchanged.
         assert_eq!(frames[0].state.last_event_kind, EventKind::PreToolUse);
         assert_eq!(frames[0].state.last_event_at_ms, 0);
+    }
+
+    // Story 5.8 (ADR 0008) AC #10: a non-empty `states` filter scopes the
+    // snapshot burst to sessions whose read-derived current_state is in the
+    // set. The `Ended` graveyard is excluded when the presenter asks for the
+    // active states.
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_states_filter_excludes_unmatched() {
+        let tmp = TempDir::new().expect("tempdir");
+        let pools = init_pools(&tmp.path().join("snap.db"))
+            .await
+            .expect("init_pools");
+        run_migrations(&pools.writer).await.expect("migrate");
+
+        // Fresh now_ms so the Working row reads as Working (not stale).
+        let now = 10_000;
+        upsert_session(
+            &pools.writer,
+            "claude",
+            "sess-working",
+            &state_with(SessionCurrentState::Working, now),
+            4_000,
+        )
+        .await;
+        upsert_session(
+            &pools.writer,
+            "claude",
+            "sess-waiting",
+            &state_with(SessionCurrentState::WaitingInput, now),
+            3_000,
+        )
+        .await;
+        upsert_session(
+            &pools.writer,
+            "claude",
+            "sess-idle",
+            &state_with(SessionCurrentState::Idle, now),
+            2_000,
+        )
+        .await;
+        upsert_session(
+            &pools.writer,
+            "claude",
+            "sess-ended",
+            &state_with(SessionCurrentState::Ended, now),
+            1_000,
+        )
+        .await;
+
+        let frames = snapshot_for_topic(
+            &pools.reader,
+            &Topic::StateAll,
+            &HashSet::new(),
+            now,
+            &[
+                SessionCurrentState::Working,
+                SessionCurrentState::WaitingInput,
+                SessionCurrentState::Idle,
+            ],
+        )
+        .await
+        .expect("snapshot ok");
+        let ids: Vec<&str> = frames.iter().map(|f| f.session_id.as_str()).collect();
+        assert_eq!(ids.len(), 3, "the Ended graveyard must be excluded");
+        assert!(!ids.contains(&"sess-ended"), "Ended must not appear");
+        assert!(ids.contains(&"sess-working"));
+        assert!(ids.contains(&"sess-waiting"));
+        assert!(ids.contains(&"sess-idle"));
+    }
+
+    // Story 5.8 AC #11: an empty filter is the v1.0 default — every matching
+    // session (including `Ended`) appears.
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_empty_filter_returns_all() {
+        let tmp = TempDir::new().expect("tempdir");
+        let pools = init_pools(&tmp.path().join("snap.db"))
+            .await
+            .expect("init_pools");
+        run_migrations(&pools.writer).await.expect("migrate");
+
+        let now = 10_000;
+        upsert_session(
+            &pools.writer,
+            "claude",
+            "sess-working",
+            &state_with(SessionCurrentState::Working, now),
+            2_000,
+        )
+        .await;
+        upsert_session(
+            &pools.writer,
+            "claude",
+            "sess-ended",
+            &state_with(SessionCurrentState::Ended, now),
+            1_000,
+        )
+        .await;
+
+        let frames = snapshot_for_topic(&pools.reader, &Topic::StateAll, &HashSet::new(), now, &[])
+            .await
+            .expect("snapshot ok");
+        assert_eq!(
+            frames.len(),
+            2,
+            "empty filter = unfiltered (includes Ended)"
+        );
+    }
+
+    // Story 5.8 AC #10: the snapshot filter keys on the read-derived
+    // current_state, consistent with the REST `?state=` surface. A stale
+    // Working row (renders Idle) is INCLUDED by `&[Idle]` and EXCLUDED by
+    // `&[Working]`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_states_filter_matches_read_derived() {
+        let tmp = TempDir::new().expect("tempdir");
+        let pools = init_pools(&tmp.path().join("snap.db"))
+            .await
+            .expect("init_pools");
+        run_migrations(&pools.writer).await.expect("migrate");
+
+        // Stored Working, last_event_at_ms = 0; read at 6 min > STALE_WORKING_MS
+        // renders Idle.
+        upsert_session(
+            &pools.writer,
+            "claude",
+            "sess-stale",
+            &state_with(SessionCurrentState::Working, 0),
+            0,
+        )
+        .await;
+        let now_ms = 6 * 60 * 1_000;
+
+        let as_idle = snapshot_for_topic(
+            &pools.reader,
+            &Topic::StateAll,
+            &HashSet::new(),
+            now_ms,
+            &[SessionCurrentState::Idle],
+        )
+        .await
+        .expect("snapshot ok");
+        assert_eq!(
+            as_idle.len(),
+            1,
+            "stale Working renders Idle and must match the Idle filter"
+        );
+
+        let as_working = snapshot_for_topic(
+            &pools.reader,
+            &Topic::StateAll,
+            &HashSet::new(),
+            now_ms,
+            &[SessionCurrentState::Working],
+        )
+        .await
+        .expect("snapshot ok");
+        assert!(
+            as_working.is_empty(),
+            "the Working filter must NOT match a row that renders Idle"
+        );
     }
 }

@@ -3785,6 +3785,33 @@ mod story_2_1_ws {
         state.ws_close_requested.cancel();
     }
 
+    // Story 5.8 (ADR 0008) AC #10: an invalid `states` token on Subscribe
+    // closes the connection with `bad message` (1008), via the same
+    // `close_with_bad_message` path an invalid topic uses — NOT a silent empty
+    // snapshot. The token `nope` is not a `SessionCurrentState` wire value.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_invalid_states_token_closes_with_policy_violation() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = make_test_state_with_ws(
+            pools,
+            Arc::new(AtomicBool::new(true)),
+            4,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        );
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _hello = read_text_frame_or_close(&mut ws).await;
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.*","states":["nope"]}"#.into(),
+        ))
+        .await
+        .expect("send subscribe with bad states token");
+        assert_closes_with_1008(&mut ws).await;
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn ws_401_when_no_auth() {
         let (_tmp, pools) = fresh_pools().await;
@@ -5456,6 +5483,83 @@ mod story_2_3_snapshot {
             "live frame must strictly postdate the snapshot (live={}, max snapshot={})",
             live.state.last_event_at_ms,
             max_snapshot_last_event_at_ms
+        );
+
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
+    }
+
+    /// Story 5.8 (ADR 0008) AC #10/#11: a `Subscribe` with `states` scopes the
+    /// snapshot burst to the requested read-derived states — the `Ended`
+    /// graveyard is excluded — while a live transition INTO `Ended` after
+    /// subscribe still arrives (the live stream is never scoped by `states`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_states_filter_excludes_ended_live_transition_still_arrives() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 4);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        // sess-W: PreToolUse → Working (active). sess-E: SessionEnded → Ended
+        // (graveyard). sess-E is published LAST so it has the largest
+        // updated_at and would LEAD the snapshot if it weren't filtered out —
+        // making the exclusion assertion meaningful.
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-W",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-E",
+            EventKind::SessionEnded,
+            None,
+            "{}",
+        )
+        .await;
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.*","states":["working","waitinginput","idle"]}"#
+                .into(),
+        ))
+        .await
+        .expect("send subscribe with states filter");
+
+        // Only sess-W is in the snapshot; sess-E (Ended) is filtered out even
+        // though its updated_at is newer (would otherwise lead the burst).
+        let first = parse_state_frame(&read_text_frame_or_close(&mut ws).await);
+        assert_eq!(
+            first.session_id, "sess-W",
+            "snapshot must include the active session, not the Ended one"
+        );
+        assert_eq!(first.state.current_state, SessionCurrentState::Working);
+
+        // A live transition INTO Ended after subscribe still arrives — `states`
+        // scopes only the snapshot, never live `state.*` delivery. Flip sess-W
+        // (currently Working) to Ended.
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-W",
+            EventKind::SessionEnded,
+            None,
+            "{}",
+        )
+        .await;
+        let live = parse_state_frame(&read_text_frame_or_close(&mut ws).await);
+        assert_eq!(live.session_id, "sess-W");
+        assert_eq!(
+            live.state.current_state,
+            SessionCurrentState::Ended,
+            "a live transition to Ended must arrive even though Ended was filtered from the snapshot"
         );
 
         state.shutdown_requested.cancel();
@@ -9667,6 +9771,410 @@ mod story_5_4_migrations {
         assert_eq!(
             after.2, before.2,
             "every session_projections row must be byte-for-byte unchanged across a repeat run_migrations"
+        );
+    }
+}
+
+// =====================================================================
+// Story 5.8 (ADR 0008) — server-side session filter: GET /sessions
+// `?state=`/`?since=`/`?limit=` query params.
+// =====================================================================
+
+mod story_5_8_session_filter {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{header, Request, StatusCode};
+    use protocol::{SessionCurrentState, SessionListItem};
+    use tower::ServiceExt;
+
+    fn ready_state(pools: DbPools) -> AppState {
+        super::make_test_state(pools, Arc::new(AtomicBool::new(true)))
+    }
+
+    fn auth_get(uri: &str) -> Request<Body> {
+        Request::builder()
+            .uri(uri)
+            .header(
+                header::AUTHORIZATION,
+                format!("Bearer {}", super::TEST_BEARER),
+            )
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    async fn json_body<T: serde::de::DeserializeOwned>(resp: axum::response::Response) -> T {
+        let bytes = to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        serde_json::from_slice(&bytes).expect("parse json")
+    }
+
+    /// `last_event_at_ms` far in the future so `current_state_for_read` treats a
+    /// stored `Working` as fresh (renders `Working`) regardless of the real
+    /// wall-clock the handler reads. `Idle`/`WaitingInput`/`Ended` render
+    /// verbatim either way.
+    const FRESH: i64 = i64::MAX / 2;
+
+    fn st(cs: SessionCurrentState, last_event_at_ms: i64) -> SessionState {
+        SessionState {
+            current_state: cs,
+            last_event_kind: EventKind::PreToolUse,
+            last_event_at_ms,
+            last_pid: None,
+            cwd: None,
+            started_at: Some(1),
+        }
+    }
+
+    async fn seed(pools: &DbPools, source: &str, sid: &str, state: &SessionState, updated_at: i64) {
+        let conn = pools.writer.get().await.expect("writer get");
+        let json = serde_json::to_string(state).expect("serialize state");
+        let source = source.to_string();
+        let sid = sid.to_string();
+        conn.interact(move |c| -> rusqlite::Result<()> {
+            c.execute(
+                UPSERT_SESSION_PROJECTION,
+                rusqlite::params![source, sid, json, updated_at],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("interact")
+        .expect("upsert");
+    }
+
+    async fn list_ids(app: axum::Router, uri: &str) -> Vec<String> {
+        let resp = app.oneshot(auth_get(uri)).await.expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::OK, "expected 200 for {uri}");
+        let items: Vec<SessionListItem> = json_body(resp).await;
+        items.into_iter().map(|i| i.session_id).collect()
+    }
+
+    // AC #1 / #8: no params → the full non-sentinel list in documented order,
+    // every field intact. The unfiltered regression canary.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sessions_unfiltered_unchanged() {
+        let (_tmp, pools) = fresh_pools().await;
+        seed(
+            &pools,
+            "__daemon__",
+            "__daemon__",
+            &st(SessionCurrentState::Idle, FRESH),
+            9_999,
+        )
+        .await;
+        seed(
+            &pools,
+            "claude",
+            "sess-a",
+            &st(SessionCurrentState::Working, FRESH),
+            3_000,
+        )
+        .await;
+        seed(
+            &pools,
+            "claude",
+            "sess-b",
+            &st(SessionCurrentState::Idle, FRESH),
+            2_000,
+        )
+        .await;
+        seed(
+            &pools,
+            "claude",
+            "sess-c",
+            &st(SessionCurrentState::Ended, FRESH),
+            1_000,
+        )
+        .await;
+
+        let app = api::router(ready_state(pools));
+        let resp = app.oneshot(auth_get("/sessions")).await.expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let items: Vec<SessionListItem> = json_body(resp).await;
+        // Sentinel excluded; updated_at DESC order.
+        let ids: Vec<&str> = items.iter().map(|i| i.session_id.as_str()).collect();
+        assert_eq!(ids, vec!["sess-a", "sess-b", "sess-c"]);
+        // Fields intact on the Working row.
+        let a = &items[0];
+        assert_eq!(a.current_state, SessionCurrentState::Working);
+        assert_eq!(a.started_at, Some(1));
+        assert_eq!(a.updated_at, 3_000);
+    }
+
+    // AC #2: ?state=<single> filters on the read-derived current_state.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sessions_state_filter_single() {
+        let (_tmp, pools) = fresh_pools().await;
+        seed(
+            &pools,
+            "claude",
+            "sess-w",
+            &st(SessionCurrentState::Working, FRESH),
+            3_000,
+        )
+        .await;
+        seed(
+            &pools,
+            "claude",
+            "sess-i",
+            &st(SessionCurrentState::Idle, FRESH),
+            2_000,
+        )
+        .await;
+        let app = api::router(ready_state(pools));
+        let ids = list_ids(app, "/sessions?state=working").await;
+        assert_eq!(ids, vec!["sess-w"]);
+    }
+
+    // AC #3: ?state=working,waitinginput,idle drops the Ended graveyard.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sessions_state_filter_multi_drops_ended() {
+        let (_tmp, pools) = fresh_pools().await;
+        seed(
+            &pools,
+            "claude",
+            "sess-w",
+            &st(SessionCurrentState::Working, FRESH),
+            4_000,
+        )
+        .await;
+        seed(
+            &pools,
+            "claude",
+            "sess-wi",
+            &st(SessionCurrentState::WaitingInput, FRESH),
+            3_000,
+        )
+        .await;
+        seed(
+            &pools,
+            "claude",
+            "sess-i",
+            &st(SessionCurrentState::Idle, FRESH),
+            2_000,
+        )
+        .await;
+        seed(
+            &pools,
+            "claude",
+            "sess-e",
+            &st(SessionCurrentState::Ended, FRESH),
+            1_000,
+        )
+        .await;
+        let app = api::router(ready_state(pools));
+        let ids = list_ids(app, "/sessions?state=working,waitinginput,idle").await;
+        assert_eq!(ids, vec!["sess-w", "sess-wi", "sess-i"]);
+        assert!(!ids.contains(&"sess-e".to_string()));
+    }
+
+    // AC #3 (inverse): ?state=ended returns only the graveyard.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sessions_state_filter_ended_only() {
+        let (_tmp, pools) = fresh_pools().await;
+        seed(
+            &pools,
+            "claude",
+            "sess-w",
+            &st(SessionCurrentState::Working, FRESH),
+            2_000,
+        )
+        .await;
+        seed(
+            &pools,
+            "claude",
+            "sess-e",
+            &st(SessionCurrentState::Ended, FRESH),
+            1_000,
+        )
+        .await;
+        let app = api::router(ready_state(pools));
+        let ids = list_ids(app, "/sessions?state=ended").await;
+        assert_eq!(ids, vec!["sess-e"]);
+    }
+
+    // AC #4: an unrecognized token → 400 naming the bad token, not a 500 or
+    // silent empty list.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sessions_state_filter_invalid_token_400() {
+        let (_tmp, pools) = fresh_pools().await;
+        seed(
+            &pools,
+            "claude",
+            "sess-w",
+            &st(SessionCurrentState::Working, FRESH),
+            1_000,
+        )
+        .await;
+        let app = api::router(ready_state(pools));
+        let resp = app
+            .oneshot(auth_get("/sessions?state=running"))
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = json_body(resp).await;
+        let msg = body["error"].as_str().expect("error string");
+        assert!(
+            msg.contains("running"),
+            "message must name the bad token: {msg}"
+        );
+    }
+
+    // AC #5: ?since=<updated_at_ms> exclusive lower bound; non-integer → 400.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sessions_since_lower_bound() {
+        let (_tmp, pools) = fresh_pools().await;
+        seed(
+            &pools,
+            "claude",
+            "sess-old",
+            &st(SessionCurrentState::Idle, FRESH),
+            1_000,
+        )
+        .await;
+        seed(
+            &pools,
+            "claude",
+            "sess-mid",
+            &st(SessionCurrentState::Idle, FRESH),
+            2_000,
+        )
+        .await;
+        seed(
+            &pools,
+            "claude",
+            "sess-new",
+            &st(SessionCurrentState::Idle, FRESH),
+            3_000,
+        )
+        .await;
+        let app = api::router(ready_state(pools));
+
+        let ids = list_ids(app.clone(), "/sessions?since=1500").await;
+        // updated_at > 1500 → 2000, 3000 (DESC order).
+        assert_eq!(ids, vec!["sess-new", "sess-mid"]);
+
+        // Non-integer since → 400 (axum Query rejection).
+        let resp = app
+            .oneshot(auth_get("/sessions?since=notanint"))
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // AC #6: ?limit=<n> caps rows in order; limit=0 / negative → 400.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sessions_limit_caps_rows() {
+        let (_tmp, pools) = fresh_pools().await;
+        seed(
+            &pools,
+            "claude",
+            "sess-a",
+            &st(SessionCurrentState::Idle, FRESH),
+            3_000,
+        )
+        .await;
+        seed(
+            &pools,
+            "claude",
+            "sess-b",
+            &st(SessionCurrentState::Idle, FRESH),
+            2_000,
+        )
+        .await;
+        seed(
+            &pools,
+            "claude",
+            "sess-c",
+            &st(SessionCurrentState::Idle, FRESH),
+            1_000,
+        )
+        .await;
+        let app = api::router(ready_state(pools));
+
+        let ids = list_ids(app.clone(), "/sessions?limit=2").await;
+        assert_eq!(ids, vec!["sess-a", "sess-b"]);
+
+        let zero = app
+            .clone()
+            .oneshot(auth_get("/sessions?limit=0"))
+            .await
+            .expect("oneshot");
+        assert_eq!(zero.status(), StatusCode::BAD_REQUEST);
+
+        let neg = app
+            .oneshot(auth_get("/sessions?limit=-1"))
+            .await
+            .expect("oneshot");
+        assert_eq!(neg.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // AC #7: limit caps the PRE-state-filter set, then state filters in Rust —
+    // so a page may return fewer than `limit`. Seed [Ended, Ended, Working] in
+    // updated_at DESC; ?state=working&limit=2 fetches the 2 newest (both Ended),
+    // state-filters to 0 → empty array. This is the documented interaction, not
+    // a bug.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sessions_limit_plus_state_may_return_fewer() {
+        let (_tmp, pools) = fresh_pools().await;
+        seed(
+            &pools,
+            "claude",
+            "sess-e1",
+            &st(SessionCurrentState::Ended, FRESH),
+            3_000,
+        )
+        .await;
+        seed(
+            &pools,
+            "claude",
+            "sess-e2",
+            &st(SessionCurrentState::Ended, FRESH),
+            2_000,
+        )
+        .await;
+        seed(
+            &pools,
+            "claude",
+            "sess-w",
+            &st(SessionCurrentState::Working, FRESH),
+            1_000,
+        )
+        .await;
+        let app = api::router(ready_state(pools));
+        let ids = list_ids(app, "/sessions?state=working&limit=2").await;
+        assert!(
+            ids.is_empty(),
+            "limit=2 fetches the 2 newest (both Ended); state=working filters them out → empty"
+        );
+    }
+
+    // AC #2/#8: the filter matches the RENDERED current_state, not the stored
+    // value. A stale Working row (renders Idle) is INCLUDED by ?state=idle and
+    // EXCLUDED by ?state=working — mirrors the snapshot read-derived test.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sessions_state_filter_read_derived() {
+        let (_tmp, pools) = fresh_pools().await;
+        // Stored Working, last_event_at_ms = 0 → at real now, age > STALE_WORKING_MS
+        // → renders Idle.
+        seed(
+            &pools,
+            "claude",
+            "sess-stale",
+            &st(SessionCurrentState::Working, 0),
+            1_000,
+        )
+        .await;
+        let app = api::router(ready_state(pools));
+
+        let as_idle = list_ids(app.clone(), "/sessions?state=idle").await;
+        assert_eq!(as_idle, vec!["sess-stale"], "stale Working renders Idle");
+
+        let as_working = list_ids(app, "/sessions?state=working").await;
+        assert!(
+            as_working.is_empty(),
+            "the Working filter must not match a row that renders Idle"
         );
     }
 }

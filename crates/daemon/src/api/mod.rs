@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod events;
+pub mod filter;
 pub mod health;
 pub mod replay;
 pub mod sessions;

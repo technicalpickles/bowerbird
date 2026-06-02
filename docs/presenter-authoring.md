@@ -97,6 +97,14 @@ The supported topics:
 
 Subscribing to the same topic twice on one connection is idempotent. Subscribing to a wildcard first, then a specific sub-topic, deduplicates the snapshot — `state.session.*` followed by `state.session.<id>` does not double-emit the matching session.
 
+**Triage presenters: filter server-side, don't hide `Ended` client-side (Story 5.8).** A multi-session triage view that only cares about live sessions should request the active states directly instead of fetching everything and filtering in the presenter (which both the deck and the pickletown web presenter did before 5.8, each re-implementing the same hide-ended pass). Pass `?state=working,waitinginput,idle` to `GET /sessions`, and add the matching `states` to the WS subscribe so the snapshot-on-subscribe burst skips the `Ended` graveyard too:
+
+```js
+ws.send(JSON.stringify({ op: "subscribe", topic: "state.session.*", states: ["working", "waitinginput", "idle"] }));
+```
+
+`states` scopes only the snapshot burst — the live stream is never filtered, so a session that **becomes** `Ended` after you subscribe still arrives as a live `state` frame (drop it then), and a revived session (`Ended` is non-terminal — `claude --resume`) reappears on the live stream and on the next unfiltered fetch. Need the graveyard? Omit `states` (or `GET /sessions?state=ended` for it alone).
+
 See [`protocol.md` §Topic grammar](protocol.md#topic-grammar) for the full grammar.
 
 ## Handling each ServerMessage frame
