@@ -70,24 +70,6 @@ pub const SELECT_SESSION_EXISTS_BY_ID: &str = "SELECT 1 FROM session_projections
 pub const SELECT_MIN_EVENT_ID: &str =
     "SELECT MIN(event_id) FROM events WHERE source != '__daemon__'";
 
-/// Story 5.7 review — true first-event timestamp for one session. Used to
-/// backfill `SessionState.started_at` for legacy (pre-5.7) projection rows
-/// whose stored blob deserializes with `started_at: None`. Returns the
-/// `created_at` of the FIRST event by `event_id` order (not the aggregate
-/// `MIN(created_at)`), because `rebuild_missing_projections` folds events in
-/// `event_id ASC` order and `transition`'s set-once rule keeps the FIRST folded
-/// event's `created_at`. Using the aggregate would diverge from a rebuild when
-/// timestamps are non-monotonic vs `event_id` (clock skew, manual edits,
-/// out-of-order replay): event_id 1 with `created_at = 2000` and event_id 2
-/// with `created_at = 1000` rebuilds to `2000`, but `MIN` would yield `1000`.
-/// First-event-order keeps the live projection byte-identical to a rebuild
-/// (ADR 0006's "reconstructs identically on rebuild" guarantee). Fires only for
-/// legacy rows — a post-5.7 session sets `started_at` on its first event and
-/// never reaches this path.
-pub const SELECT_FIRST_EVENT_CREATED_AT_FOR_SESSION: &str =
-    "SELECT created_at FROM events WHERE source = ? AND session_id = ? \
-     ORDER BY event_id ASC LIMIT 1";
-
 /// Story 2.1 — Hello frame `history_begins_cleanly` probe.
 ///
 /// Returns `1` if there exists a `recording_sessions` row whose

@@ -5,8 +5,8 @@ use crate::broadcast::{BroadcastEnvelope, BroadcastHub};
 use crate::db::queries::{
     event_kind_as_str, event_kind_from_db_str, reaction_as_db_string, INSERT_EVENT,
     INSERT_RECORDING_SESSION_STARTED, SELECT_DISTINCT_SESSIONS_FROM_EVENTS,
-    SELECT_EVENT_KINDS_FOR_SESSION, SELECT_FIRST_EVENT_CREATED_AT_FOR_SESSION,
-    SELECT_SESSION_PROJECTION_STATE, UPDATE_RECORDING_SESSION_ENDED, UPSERT_SESSION_PROJECTION,
+    SELECT_EVENT_KINDS_FOR_SESSION, SELECT_SESSION_PROJECTION_STATE,
+    UPDATE_RECORDING_SESSION_ENDED, UPSERT_SESSION_PROJECTION,
 };
 use crate::error::{Error, Result};
 use crate::projection::state::{current_state_for_read, transition};
@@ -85,18 +85,12 @@ pub async fn write_if_state_matches(
 
 /// Closure return type from `write_inner`'s `interact` callback. `None`
 /// means the precondition (if any) was not met — the txn dropped without
-/// committing, no broadcast is owed. The tuple is
-/// `(event_id, new_state, prev_raw_current_state, prev_read_current_state,
-/// prev_started_at)` — the trailing `prev_started_at` is the value the row
-/// held BEFORE any legacy backfill, so the publish path can detect a
-/// started_at correction that left `current_state` unchanged (Story 5.7
-/// review pass 4).
+/// committing, no broadcast is owed.
 type WriteInteractResult = Option<(
     i64,
     SessionState,
     Option<SessionCurrentState>,
     Option<SessionCurrentState>,
-    Option<i64>,
 )>;
 
 /// One row read by `rebuild_missing_projections` from
@@ -163,7 +157,7 @@ async fn write_inner(
             // writer cannot interleave between SELECT and UPSERT. Reads do
             // not break the "exactly two writes" invariant from
             // architecture.md:634-641 — the invariant is about *writes*.
-            let mut prev_state: Option<SessionState> = tx
+            let prev_state: Option<SessionState> = tx
                 .query_row(
                     SELECT_SESSION_PROJECTION_STATE,
                     rusqlite::params![&source_for_closure, &session_id_for_closure],
@@ -222,42 +216,17 @@ async fn write_inner(
             let prev_read_current_state = prev_state
                 .as_ref()
                 .map(|s| current_state_for_read(s, now_ms));
-            // The started_at the row held BEFORE the legacy backfill below —
-            // i.e. the value any already-connected subscriber last saw. Used
-            // post-commit to publish a corrected State frame when a legacy
-            // backfill changed started_at without changing current_state
-            // (Story 5.7 review pass 4).
-            let prev_started_at = prev_state.as_ref().and_then(|s| s.started_at);
 
-            // Story 5.7 review (legacy started_at): a pre-5.7 projection blob
-            // deserializes with `started_at: None`. `transition`'s set-once rule
-            // (`prev.started_at.or(Some(now_ms))`) would otherwise stamp THIS
-            // post-upgrade event's clock onto it — a false "started just now"
-            // for a session that began before the upgrade, and a divergence from
-            // what a full rebuild produces. Restore the value the event log
-            // already holds so the live projection equals a rebuild — the
-            // byte-identical rebuild contract, and ADR 0006's "reconstructs
-            // identically on rebuild" guarantee. Rebuild folds events in
-            // `event_id ASC` order and keeps the FIRST event's `created_at`, so
-            // the backfill reads the first event BY EVENT_ID (not the aggregate
-            // MIN) — the two diverge under non-monotonic timestamps (review
-            // pass 2). The current event is not yet INSERTed, so the lookup is
-            // over the prior events (the legacy session always has some); a
-            // session with no prior events falls back to now_ms in transition.
-            // Fires only for legacy rows — post-5.7 sessions carry a non-None
-            // started_at and skip the query entirely.
-            if let Some(s) = prev_state.as_mut() {
-                if s.started_at.is_none() {
-                    s.started_at = tx
-                        .query_row(
-                            SELECT_FIRST_EVENT_CREATED_AT_FOR_SESSION,
-                            rusqlite::params![&source_for_closure, &session_id_for_closure],
-                            |row| row.get::<_, Option<i64>>(0),
-                        )
-                        .optional()?
-                        .flatten();
-                }
-            }
+            // Story 5.7 / correct-course 2026-06-02 (Option D): `started_at` is
+            // set-once in `transition` (`prev.started_at.or(Some(now_ms))`). A
+            // `started_at: None`-with-prior row is only reachable from a pre-5.7
+            // projection blob; in a fresh v5.7+ db every session sets it on its
+            // first event. bowerbird is pre-release and the documented upgrade
+            // path is "nuke ~/.bowerbird/bower.db and restart," so that legacy
+            // case is unsupported — no event-log backfill here. A real
+            // migration-era backfill strategy lands when bowerbird ships a
+            // release whose dbs must survive upgrades (deferred-work.md). See
+            // docs/bmad/planning-artifacts/started-at-backfill-reconsideration-2026-06-02.md.
 
             let new_state = transition(
                 prev_state.as_ref(),
@@ -303,13 +272,12 @@ async fn write_inner(
                 new_state,
                 prev_raw_current_state,
                 prev_read_current_state,
-                prev_started_at,
             )))
         })
         .await
         .map_err(|e| Error::Pool(format!("interact failed: {e}")))?;
 
-    let (event_id_raw, new_state, prev_raw_current_state, prev_read_current_state, prev_started_at) =
+    let (event_id_raw, new_state, prev_raw_current_state, prev_read_current_state) =
         match interact_res? {
             Some(t) => t,
             None => {
@@ -349,22 +317,8 @@ async fn write_inner(
     // - raw catches a delayed `Stop` after stale stored `Working` (Working→Idle)
     // - read-facing catches renewed activity after stale stored `Working`
     //   (Idle-as-read→Working)
-    //
-    // Story 5.7 review pass 4: also publish when a legacy backfill changed
-    // `started_at` without changing `current_state`. `started_at` is set-once,
-    // so it only ever transitions `None → Some` — either the first event for a
-    // session (which already publishes via the `None → Some(current_state)`
-    // transition above) or a one-time legacy backfill on a pre-5.7 row. Without
-    // this term, an already-connected `state.session.*` subscriber that
-    // snapshotted `started_at: null` would miss the correction on a same-state
-    // post-upgrade event (e.g. `Idle → Stop`) until a later transition or
-    // reconnect. Steady-state writes keep `started_at` equal and add no frames;
-    // cwd-only changes stay gated by current_state (Story 5.2 policy unchanged —
-    // cwd rides the `events.*` frame).
-    let started_at_changed = prev_started_at != new_state.started_at;
     let state_changed = prev_raw_current_state != Some(new_state.current_state)
-        || prev_read_current_state != Some(new_state.current_state)
-        || started_at_changed;
+        || prev_read_current_state != Some(new_state.current_state);
     if state_changed {
         broadcaster.publish(BroadcastEnvelope::State {
             source,
@@ -375,7 +329,6 @@ async fn write_inner(
     tracing::debug!(
         event_id = event_id.0,
         state_published = state_changed,
-        started_at_backfilled = started_at_changed,
         "ws: published event envelope; state envelope gated on transition"
     );
 

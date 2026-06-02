@@ -38,6 +38,8 @@
 # last_updated: 2026-06-01 (Story 5.7 → review; all 3 code-review pass-3 patch findings resolved (docs/test only, no production-code change) — ADR 0006 + protocol/presenter/changelog docs corrected to first-event-by-event_id started_at backfill (not MIN, not null-forever), populated migration idempotency snapshot now captures + asserts events.cwd; liveness same-state race deferred to deferred-work.md; 510 workspace tests + fmt + clippy + changelog gate green)
 # last_updated: 2026-06-02 (Story 5.7 → in-progress; bmad-code-review pass 4 documented 3 unresolved patch findings — legacy started_at WS same-state publish gap, replay retimestamping wording/test clarity, deferred-work started_at backfill caveat)
 # last_updated: 2026-06-02 (Story 5.7 → review; all 3 code-review pass-4 findings resolved — legacy started_at backfill now publishes a live StateFrame on same-state writes (started_at_changed predicate term + RED→GREEN regression test), replay started_at wording corrected to Story 4.1 wall-clock retimestamping (+ replay test assertion), deferred-work started_at note amended; 511 workspace tests + fmt + clippy + changelog gate green)
+# last_updated: 2026-06-02 (Story 5.7 → in-progress; bmad-code-review pass 5 documented 4 unresolved patch findings — state-frame emission docs need legacy-started_at exception, REST events example missing Event.cwd, stats timestamp aggregate semantics vs started_at, dogfood proposal cwd type typo — plus 1 deferred protocol-crate Rust source-compat policy item)
+# last_updated: 2026-06-02 (Story 5.7 correct-course Option D: removed the legacy started_at event-log backfill entirely — pre-release "nuke the db" upgrade path makes pre-5.7 rows unsupported, and the backfill drew a finding on all 4 review passes; deleted write_inner backfill + pass-4 predicate term + SELECT_FIRST_EVENT_CREATED_AT_FOR_SESSION + 3 tests, transition keeps plain set-once; ADR 0006 + docs rewritten, real migration-era backfill deferred to release-readiness; MOOTS pass-5 finding #1; 508 tests + fmt + clippy + changelog gate green. Stays in-progress — pass-5 findings #2/#3/#4 + deferred protocol-source-compat remain.)
 # last_updated: 2026-06-02 (Story 5.11 release-pipeline-end-to-end-verification created via bmad-create-story on isolation-audit branch; merged main first to pick up the dogfood-triage 5.7–5.10 insert, story re-homed 5.7→5.11; 7 ACs + 7 tasks; → ready-for-dev)
 # project: bowerbird
 # project_key: NOKEY
@@ -135,7 +137,7 @@ development_status:
   5-4-install-ux-polish-and-middleware-closure: done
   5-5-bench-gates-load-bearing: ready-for-dev
   5-6-idle-prompt-reclassified-as-transient: review
-  5-7-session-cwd-on-the-wire: review                  # Finding 3 (+ ADR 0006); gates v0.1.0
+  5-7-session-cwd-on-the-wire: in-progress             # Finding 3 (+ ADR 0006); gates v0.1.0
   5-8-server-side-session-filter: backlog               # Finding 5-filter; gates v0.1.0
   5-9-daemon-start-on-login: backlog                     # Finding 1 (+ ADR 0007); gates v0.1.0
   5-10-shim-names-daemon-down-cause: backlog            # Finding 2 (minor); gates v0.1.0
