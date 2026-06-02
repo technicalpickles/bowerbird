@@ -138,6 +138,18 @@ pub async fn run(State(state): State<AppState>, body: Bytes) -> Response {
             payload: event.payload,
             pid: event.pid,
             notification_type,
+            // Story 5.7: a replayed event carries its stored `cwd` forward so
+            // the rebuilt projection matches live ingest. `started_at` is NOT
+            // threaded here — it follows replay's existing Story 4.1
+            // retimestamping contract: replay drops each JSONL line's
+            // `event_id` and `created_at`, and `projection::session::write`
+            // stamps a fresh `current_unix_millis()` at write time. So the
+            // projected `started_at` is the replay wall-clock of the FIRST
+            // replayed write for the session (set-once / keep-earliest in
+            // transition), NOT the original exported timestamp. Do not thread
+            // the JSONL `created_at` through here unless intentionally changing
+            // Story 4.1's replay semantics.
+            cwd: event.cwd,
         };
 
         // try_send rather than send: we never block the HTTP handler on a

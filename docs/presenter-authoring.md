@@ -170,7 +170,9 @@ Every projection write — fired on ingest and on `state.*` subscribe (snapshot)
     "current_state": "Idle",
     "last_event_kind": "PostToolUse",
     "last_event_at_ms": 1748190001000,
-    "last_pid": 12345
+    "last_pid": 12345,
+    "cwd": "/Users/x/code/myrepo",
+    "started_at": 1748190000000
   }
 }
 ```
@@ -188,6 +190,14 @@ Source: [`crates/protocol/src/ws.rs:102`](../crates/protocol/src/ws.rs) `StateFr
 **Rendering `Ended` sessions** (Story 5.3). `Ended` means the daemon's 5-second liveness probe observed that the session's `last_pid` is no longer a live OS process — typically because the user closed the terminal without firing `Stop`. Default presenter behavior: hide `Ended` rows (they're not actionable). Alternative: dim or strike-through (preserves the deck's last-N-sessions history). **Do NOT call `kill(pid, 0)` from the presenter** — the substrate has already done that and emitted the mechanical observation; presenters subscribe to `state.session.*` and react. `Ended` is **non-terminal**: a `claude --resume` triggers a new `UserPromptSubmit` hook for the same `(source, session_id)`, transitioning the row back to `Working`.
 
 **Rendering `WaitingInput` sessions** (Story 5.3; reworked by Story 5.6 / ADR 0005). The substrate uses Claude Code's typed `notification_type` field on `Notification` events to decide whether the session is genuinely waiting for input. Only `permission_prompt` and `elicitation_dialog` (incl. `AskUserQuestion`) cause `current_state` to transition into `WaitingInput`. `idle_prompt` (the idle nudge Claude fires ~60s after a turn ends) resolves to `Idle` — it is not a block — EXCEPT a session already in `WaitingInput` stays there (an idle nudge neither creates nor clears a block). The remaining transient notifications (`auth_success`, `elicitation_response`, `elicitation_complete`, unknown/missing) preserve prior state, except a prior `Ended` resurrects to `Idle` (any notification hook is evidence the process is alive). The typed value is NOT surfaced on `SessionState` — it stays in `events.payload` (verbatim). Presenters that want to distinguish "Claude is asking for a tool-use permission" from "Claude is idle and pinging" subscribe to `events.<source>.<session_id>` (or `events.*`) and parse `notification_type` from the payload themselves.
+
+**Grouping and labeling by `cwd`** (Story 5.7). The most natural multi-session triage axis is *where* a session runs. Group or filter the session list by `state.cwd` (the working directory the source reported), and build a human-recognizable label from it — e.g. the last path segment as a stand-in repo name:
+
+```ts
+const label = state.cwd ? state.cwd.split("/").filter(Boolean).pop() : msg.session_id.slice(0, 8);
+```
+
+Caveats: **`cwd != repo`** — the daemon stores the path verbatim and does NOT resolve git roots, expand `~`, or follow symlinks; deriving repo/branch/project from `cwd` is the presenter's job (Axiom 4). A session's `cwd` may be `null` (rows projected before Story 5.7, non-Claude sources, or a producer that omits it) — always render a fallback (the `session_id` prefix above). `started_at` (epoch ms) gives you session age directly — render "started N minutes ago" from `state.started_at` without tracking the earliest `last_event_at_ms` yourself or making a side fetch; it is `null` for pre-5.7 rows only until the row's next projection write, when the daemon backfills it from the session's first stored event (so an active pre-5.7 session populates `started_at` on its next hook — still render a fallback for the `null` window).
 
 For the canonical per-session fan-out pattern (subscribe to `state.session.*`, route by `(source, session_id)`), see [`cookbook/state-session-fanout.md`](cookbook/state-session-fanout.md). It pairs with [`examples/multi-session-router/`](../examples/multi-session-router/).
 

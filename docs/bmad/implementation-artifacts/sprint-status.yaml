@@ -26,6 +26,19 @@
 # last_updated: 2026-05-28 (Story 5.4 → done; install UX polish + middleware closure complete, code-review resolved)
 # last_updated: 2026-05-28 (Story 5.5 bench-gates-load-bearing created via bmad-create-story; 4 ACs + 6 tasks; → ready-for-dev)
 # last_updated: 2026-05-29 (Story 5.6 idle-prompt-reclassified-as-transient inserted after 5.5 via bmad-create-story; old 5.6→5.7, 5.7→5.8, 5.8→5.9, 5.9→5.10 per sprint-change-proposal-2026-05-29-idle-prompt-reclassification.md + ADR 0005)
+# last_updated: 2026-06-01 (Four dogfood-triage stories inserted after 5.6 per sprint-change-proposal-2026-06-01-dogfood-triage.md: 5.7 session-cwd-on-the-wire [+ADR 0006], 5.8 server-side-session-filter, 5.9 daemon-start-on-login [+ADR 0007], 5.10 shim-names-daemon-down-cause; old 5.7→5.11, 5.8→5.12, 5.9→5.13, 5.10→5.14. All four gate v0.1.0 (now Story 5.14). Story files pending bmad-create-story; ADRs pending authoring.)
+# last_updated: 2026-06-01 (Story 5.7 session-cwd-on-the-wire created via bmad-create-story; 14 ACs + 14 tasks; cwd mirrors Story 5.3 last_pid additive-field pattern, native-Claude-cwd so no shim change; started_at bundled in per proposal §6 [daemon-derived set-once, no migration]; ADR 0006 authored 2026-06-01 [Accepted, covers cwd + started_at]; epics.md insert+tail-renumber in Task 11; → ready-for-dev)
+# last_updated: 2026-06-01 (Story 5.7 → in-progress; dev-story session started)
+# last_updated: 2026-06-01 (Story 5.7 → review; dev-story complete — cwd + started_at on the wire, migration v3, no shim/state-machine change; 14 tasks done; protocol/adapter/shim/daemon-lib + contract_daemon [156 passed] + cli_auth green, fmt + clippy + changelog-gate green; sentinel-writer INSERT_EVENT 8th-param regression caught at smoke and fixed)
+# last_updated: 2026-06-01 (Story 5.7 → in-progress; bmad-code-review found 1 decision-needed upgrade semantics issue and 2 patch findings; findings documented in story Review Findings)
+# last_updated: 2026-06-01 (Story 5.7 → review; all 3 code-review findings resolved — [Decision] legacy started_at backfills from MIN(events.created_at) to preserve the byte-identical-rebuild contract + ADR 0006 note + regression test; [Patch] migration v3 test now file-backed tempfile; [Patch] project-context §Wire format documents the additive outbound fields; 503 workspace tests + fmt + clippy green)
+# last_updated: 2026-06-01 (Story 5.7 → in-progress; bmad-code-review pass 2 documented 5 unresolved patch findings — non-monotonic started_at backfill, v2-row migration coverage, Event.cwd surface coverage, epics ADR-number conflict, SessionListItem additive-compat coverage)
+# last_updated: 2026-06-01 (Story 5.7 → review; all 5 code-review pass-2 findings resolved — started_at backfill now first-event-by-event_id order (matches rebuild, +non-monotonic regression test), v2→v3 migration row-preservation test, Event.cwd e2e coverage (REST events/WS EventFrame/snapshot/replay), epics cookbook ADR 0006→0008 renumber, legacy SessionListItem additive-compat test; 510 workspace tests + fmt + clippy + changelog gate green)
+# last_updated: 2026-06-01 (Story 5.7 → in-progress; bmad-code-review pass 3 documented 3 unresolved patch findings + 1 deferred pre-existing liveness race)
+# last_updated: 2026-06-01 (Story 5.7 → review; all 3 code-review pass-3 patch findings resolved (docs/test only, no production-code change) — ADR 0006 + protocol/presenter/changelog docs corrected to first-event-by-event_id started_at backfill (not MIN, not null-forever), populated migration idempotency snapshot now captures + asserts events.cwd; liveness same-state race deferred to deferred-work.md; 510 workspace tests + fmt + clippy + changelog gate green)
+# last_updated: 2026-06-02 (Story 5.7 → in-progress; bmad-code-review pass 4 documented 3 unresolved patch findings — legacy started_at WS same-state publish gap, replay retimestamping wording/test clarity, deferred-work started_at backfill caveat)
+# last_updated: 2026-06-02 (Story 5.7 → review; all 3 code-review pass-4 findings resolved — legacy started_at backfill now publishes a live StateFrame on same-state writes (started_at_changed predicate term + RED→GREEN regression test), replay started_at wording corrected to Story 4.1 wall-clock retimestamping (+ replay test assertion), deferred-work started_at note amended; 511 workspace tests + fmt + clippy + changelog gate green)
+# last_updated: 2026-06-02 (Story 5.11 release-pipeline-end-to-end-verification created via bmad-create-story on isolation-audit branch; merged main first to pick up the dogfood-triage 5.7–5.10 insert, story re-homed 5.7→5.11; 7 ACs + 7 tasks; → ready-for-dev)
 # project: bowerbird
 # project_key: NOKEY
 # tracking_system: file-system
@@ -61,7 +74,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 
 generated: 2026-05-16
-last_updated: 2026-06-02 (Story 5.7 release-pipeline-end-to-end-verification created via bmad-create-story; 7 ACs + 7 tasks; human-in-the-loop ops/verification story — pipeline built in 3.4 but never run against a real tag, this is the first rc1 smoke; flagged draft-vs-prerelease decision, cross-version SKIP reconciliation, AI-9 release-checklist; → ready-for-dev)
+last_updated: 2026-06-02 (Story 5.11 release-pipeline-end-to-end-verification created via bmad-create-story on the isolation-audit branch [merged main first to pick up the dogfood-triage 5.7–5.10 insert; story re-homed 5.7→5.11]; 7 ACs + 7 tasks; human-in-the-loop ops/verification story — pipeline built in 3.4 but never run against a real tag, this is the first rc1 smoke; flagged draft-vs-prerelease decision, cross-version SKIP reconciliation, AI-9 release-checklist; → ready-for-dev)
 project: bowerbird
 project_key: NOKEY
 tracking_system: file-system
@@ -106,12 +119,15 @@ development_status:
   epic-4-retrospective: done
 
   # Dogfooding validation phase (no formal stories; bugs become 5.X-hotfix stories ad-hoc)
-  # Begins after Story 5.1 (presenter) ships; runs in parallel with Stories 5.2–5.10.
+  # Begins after Story 5.1 (presenter) ships; runs in parallel with Stories 5.2–5.14.
   dogfooding-validation-phase: backlog  # transitions to 'in-progress' when 5.1 ships; 'done' on v0.1.0 tag
 
   # Epic 5: V1 Release Readiness (dogfooding → presenter → hardening)
   # Resequenced 2026-05-27 for dogfooding-first ordering: correctness fixes adjacent to 5.1,
   # then install UX, then CI/release hardening, then reader-facing polish, then the tag.
+  # 2026-06-01: four dogfood-triage stories (5.7–5.10) inserted per
+  # sprint-change-proposal-2026-06-01-dogfood-triage.md; old 5.7–5.10 → 5.11–5.14. All four gate v0.1.0.
+  # Story files + ADRs 0006/0007 pending authoring (bmad-create-story / architect).
   epic-5: in-progress
   5-1-first-party-presenter-tool: in-progress
   5-2-session-state-projection-correctness: done
@@ -119,8 +135,12 @@ development_status:
   5-4-install-ux-polish-and-middleware-closure: done
   5-5-bench-gates-load-bearing: ready-for-dev
   5-6-idle-prompt-reclassified-as-transient: review
-  5-7-release-pipeline-end-to-end-verification: ready-for-dev
-  5-8-cookbook-consolidation: backlog
-  5-9-first-time-reader-docs-pass: backlog
-  5-10-crates-io-namespace-and-v0-1-0-tag: backlog
+  5-7-session-cwd-on-the-wire: review                  # Finding 3 (+ ADR 0006); gates v0.1.0
+  5-8-server-side-session-filter: backlog               # Finding 5-filter; gates v0.1.0
+  5-9-daemon-start-on-login: backlog                     # Finding 1 (+ ADR 0007); gates v0.1.0
+  5-10-shim-names-daemon-down-cause: backlog            # Finding 2 (minor); gates v0.1.0
+  5-11-release-pipeline-end-to-end-verification: ready-for-dev
+  5-12-cookbook-consolidation: backlog
+  5-13-first-time-reader-docs-pass: backlog
+  5-14-crates-io-namespace-and-v0-1-0-tag: backlog
   epic-5-retrospective: optional

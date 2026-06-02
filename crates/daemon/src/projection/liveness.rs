@@ -212,6 +212,10 @@ pub async fn probe_once(
             // matching the prior row.
             pid: stored.last_pid,
             notification_type: None,
+            // Story 5.7: the probe knows no cwd; cwd: None lets carry-forward
+            // preserve the session's last-known location (an ended session
+            // keeps its cwd).
+            cwd: None,
         };
         // Story 5.3 review finding #2: gate the synthetic write on the row
         // still matching what we observed. If a real hook event interleaved

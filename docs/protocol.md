@@ -82,13 +82,15 @@ All authenticated routes return `401 Unauthorized` on a missing or malformed bea
       "last_event_kind": "PostToolUse",
       "last_event_at_ms": 1748190001000,
       "updated_at": 1748190001000,
-      "last_pid": 12345
+      "last_pid": 12345,
+      "cwd": "/Users/x/code/myrepo",
+      "started_at": 1748190000000
     }
   ]
   ```
 
 - **Field source.** [`crates/protocol/src/rest.rs:38`](../crates/protocol/src/rest.rs) `SessionListItem`.
-- **Notes.** `current_state` is the read-time projection (stale-`Working` → `Idle` fallback per Story 1.6's `current_state_for_read`), NOT the raw stored value. Sentinel-source sessions (`source = "__daemon__"`) are filtered out. `last_pid` (Story 5.3) is the carry-forwarded PID from the most recent envelope whose `bowerbird_ppid` was set — `null` for sessions ingested before Story 5.3.
+- **Notes.** `current_state` is the read-time projection (stale-`Working` → `Idle` fallback per Story 1.6's `current_state_for_read`), NOT the raw stored value. Sentinel-source sessions (`source = "__daemon__"`) are filtered out. `last_pid` (Story 5.3) is the carry-forwarded PID from the most recent envelope whose `bowerbird_ppid` was set — `null` for sessions ingested before Story 5.3. `cwd` and `started_at` (Story 5.7) carry the session's working directory and start time. `cwd` is `null` for sessions projected before Story 5.7 (and stays `null` until a post-upgrade event reports one). `started_at` is initially `null` for pre-5.7 rows, but the daemon backfills it from the session's first stored event (by `event_id` order) on the row's next projection write — so it does not stay `null` forever. See the `SessionState` narrative below.
 
 ### `GET /sessions/{id}`
 
@@ -104,7 +106,9 @@ All authenticated routes return `401 Unauthorized` on a missing or malformed bea
       "current_state": "Idle",
       "last_event_kind": "PostToolUse",
       "last_event_at_ms": 1748190001000,
-      "last_pid": 12345
+      "last_pid": 12345,
+      "cwd": "/Users/x/code/myrepo",
+      "started_at": 1748190000000
     },
     "updated_at": 1748190001000
   }
@@ -179,7 +183,7 @@ All authenticated routes return `401 Unauthorized` on a missing or malformed bea
   ```
 
 - **Status codes.** `200`, `401`, `413 Payload Too Large` (body exceeded the 1 MiB cap).
-- **Notes.** Replayed events flow through the same `ingest_tx → projection::session::write` path as live shim ingest — they're persisted, projected, and broadcast over WebSocket as `EventFrame` + `StateFrame` pairs. Sentinel kinds (`RecordingStarted`, `RecordingEnded`) are rejected at the replay boundary with a `parse_errors` entry (they're reserved for daemon-lifecycle emission). No rate limiting; the 1 MiB body cap is the only structural limit. Original inter-event timing is NOT preserved — events are forwarded as fast as the bounded `ingest_tx` channel accepts them, and `created_at` reflects replay wall-clock. Story 4.1 introduced the endpoint plus the `bowerbird replay` and `bowerbird export` CLI commands that pair with it. See [`docs/protocol-changelog.md`](protocol-changelog.md) Story 4.1 entry.
+- **Notes.** Replayed events flow through the same `ingest_tx → projection::session::write` path as live shim ingest — they're persisted, projected, and broadcast over WebSocket as `EventFrame` + `StateFrame` pairs. Sentinel kinds (`RecordingStarted`, `RecordingEnded`) are rejected at the replay boundary with a `parse_errors` entry (they're reserved for daemon-lifecycle emission). No rate limiting; the 1 MiB body cap is the only structural limit. Original inter-event timing is NOT preserved — events are forwarded as fast as the bounded `ingest_tx` channel accepts them, and `created_at` reflects replay wall-clock. Consequently a replayed session's `started_at` (set-once from the first event's `created_at`) is the replay wall-clock of the first replayed write, NOT the original exported timestamp; replay carries each event's stored `cwd` forward but does not thread the JSONL `created_at`. Story 4.1 introduced the endpoint plus the `bowerbird replay` and `bowerbird export` CLI commands that pair with it. See [`docs/protocol-changelog.md`](protocol-changelog.md) Story 4.1 entry.
 
 ## WebSocket endpoint and control mechanics
 
@@ -257,10 +261,13 @@ NOT currently emitted by any daemon producer. The validated constructor `SyncFra
     "reaction": "Continue",
     "payload": "{...native JSON payload as a verbatim string...}",
     "created_at": 1748190001000,
-    "pid": 12345
+    "pid": 12345,
+    "cwd": "/Users/x/code/myrepo"
   }
 }
 ```
+
+The `event.cwd` field (Story 5.7) is the session's working directory for this event as the source's hook payload reported it, verbatim — `null` when the source omitted it. (`started_at` is NOT on `Event`; it is a session-state-only field — see the `state` frame below.)
 
 For `SessionEnded` events (Story 5.3 — daemon-observed liveness), `payload` carries the mechanical observation as a JSON object: `{"reason":"no_pid_at_upgrade"|"pid_dead","pid":<number or null>,"observed_at_ms":<epoch_ms>}`. Presenters that want to render "session is dead" subscribe to `state.session.*` and watch for `current_state: "Ended"` — they do NOT need to call `kill(pid, 0)` themselves.
 
@@ -279,7 +286,9 @@ The `event.reaction` field is `null` when the adapter cannot classify the tool �
     "current_state": "Idle",
     "last_event_kind": "PostToolUse",
     "last_event_at_ms": 1748190001000,
-    "last_pid": 12345
+    "last_pid": 12345,
+    "cwd": "/Users/x/code/myrepo",
+    "started_at": 1748190000000
   }
 }
 ```
@@ -289,6 +298,10 @@ Emitted (a) on every `current_state` transition resulting from a projection writ
 `SessionCurrentState` is one of `Idle`, `Working`, `WaitingInput`, `Ended`, `Unknown`. `WaitingInput` means the session is blocked on user input with work queued behind the answer (`permission_prompt` / `elicitation_dialog`, incl. `AskUserQuestion`); as of Story 5.6 / ADR 0005 these are the only two `notification_type` values that *transition a session into* it. `idle_prompt` does NOT transition a session into `WaitingInput` — it is the idle nudge (~60s after a turn ends) and resolves to `Idle`, EXCEPT a session already in `WaitingInput` from a pending block stays `WaitingInput` (the nudge neither creates nor clears a block). Resolving to `Idle` (rather than preserving a prior `Working`) also covers a dropped `Stop`: a finished session whose `Stop` hook was lost still lands on `Idle` on the next idle nudge. The `Ended` variant (Story 5.3) is daemon-observed: the session's `last_pid` is no longer a live OS process. **`Ended` is non-terminal** — a session can transition out on the next hook event since the hook proves the process is alive (e.g. a `UserPromptSubmit` from `claude --resume` returns the session to `Working`). A `Notification` from `Ended` follows the same per-type rules as any other prior state: `permission_prompt` / `elicitation_dialog` transition to `WaitingInput`, while `idle_prompt` and the transient types (`auth_success` / `elicitation_response` / `elicitation_complete` / unknown / missing) resurrect to `Idle`. The `Unknown` variant is the additive-compat catch-all added in Story 4.4 (via `#[serde(other)]`): a future v1.x daemon may introduce new state values (e.g. `Compacting`, `AwaitingApproval`) which v1.0 presenters MUST decode as `Unknown` rather than erroring on the tag. The daemon never *produces* `Unknown` — it's decode-only, same shape as `ServerMessage::Unknown` (Story 2.1). Source: [`crates/protocol/src/state.rs`](../crates/protocol/src/state.rs).
 
 `last_pid` (Story 5.3) is the carry-forward PID — set when an envelope carrying `bowerbird_ppid` projects, preserved across subsequent envelopes that don't carry one. Presenters do NOT need to call `kill(pid, 0)` themselves; the daemon runs a 5-second probe and emits `SessionEnded` for dead-or-no-PID rows, transitioning `current_state` to `Ended`.
+
+`cwd` (Story 5.7) is the session's working directory as the source's hook payload reported it, carry-forwarded across events (overwrite-on-Some, identical to `last_pid`). It is a **mechanical fact**: the daemon stores it verbatim — no path canonicalization, no `~` expansion, no symlink resolution. *repo*, *project name*, and *branch* are presenter derivations from `cwd`, not daemon fields (Axiom 4, ADR 0006). `null` for sessions projected before Story 5.7, for non-Claude sources, or for a producer that omits it. `cwd` also rides each `Event` (above); `started_at` does not.
+
+`started_at` (Story 5.7) is the epoch-ms timestamp of the session's first observed event, daemon-derived and set once (never updated). Presenters render session age from it without a side fetch. Initially `null` for sessions projected before Story 5.7, but the daemon backfills it on the row's next projection write from the session's first stored event (by `event_id ASC` order, **not** `MIN(created_at)` — first-by-`event_id` is what a full rebuild reconstructs, and the two diverge under non-monotonic timestamps). So a pre-5.7 row reads `null` only until its next event lands; no migration rewrites the stored blob.
 
 **V1 PID-only liveness: known limitations.** The probe checks `kill(last_pid, 0)` only — it confirms *some* process holds the PID, not that it's the original Claude Code session. Two scenarios this does not catch:
 
@@ -349,6 +362,7 @@ Rules:
 - **Wire framing.** One `{object}\n` in, one status line out. Newline-delimited JSON (NDJ). The daemon side: [`crates/daemon/src/ingest/listener.rs`](../crates/daemon/src/ingest/listener.rs) (accept loop) plus [`crates/daemon/src/ingest/handler.rs`](../crates/daemon/src/ingest/handler.rs) (per-line parse). The shim side: [`crates/shim/src/socket.rs`](../crates/shim/src/socket.rs). The framing decision is documented in [ADR-0002](decisions/0002-ingest-wire-framing-and-hook-kind.md).
 - **`hook_kind` requirement** (Story 1.8, extended in Story 5.2). Every ingest line MUST carry a `hook_kind` field whose value is one of `PreToolUse`, `PostToolUse`, `Stop`, `Notification`, `UserPromptSubmit`. A missing field returns `400 missing hook_kind\n`. An unknown value returns `400 unknown hook_kind: <value>\n` where `<value>` is sanitized via the daemon's `sanitize_for_wire`. The shim injects `hook_kind` automatically on every payload — no consumer-side concern unless you're writing a custom producer.
 - **`bowerbird_ppid` injection** (Story 5.3). The shim injects `bowerbird_ppid` (an integer equal to `libc::getppid()` at shim-invocation time — i.e. Claude Code's PID) on every payload. The daemon's adapter normalize step extracts it as `EventEnvelope.pid` which then projects through to `SessionState.last_pid`. A custom producer that wants the daemon to track liveness MUST inject `bowerbird_ppid`; without it, the session's `last_pid` stays `None` and the startup probe will emit `SessionEnded` with `reason: "no_pid_at_upgrade"` on the next daemon restart.
+- **`cwd` extraction** (Story 5.7). Unlike `bowerbird_ppid` (shim-injected), `cwd` is a NATIVE Claude Code hook field present at the top level of every payload (alongside `session_id`, `transcript_path`, `hook_event_name`); the shim forwards it verbatim and the `adapter-claude` normalize step reads it as `EventEnvelope.cwd`, which projects to `SessionState.cwd` / `Event.cwd` (carry-forward / overwrite-on-Some). A custom producer that wants location tracking includes a top-level `cwd` string; absent or non-string → `SessionState.cwd` stays `None`. (`started_at` needs no producer cooperation — the daemon derives it from the first event it sees for a session.)
 - **`notification_type` extraction** (Story 5.3; `idle_prompt` reclassified in Story 5.6 / ADR 0005). The adapter (NOT the shim) reads the upstream Claude Code `notification_type` field on `Notification`-kind payloads and uses the typed value to drive the projection transition via three rules: (1) input-required types (`permission_prompt`, `elicitation_dialog`) → `WaitingInput`; (2) `idle_prompt` → `Idle`, EXCEPT a prior `WaitingInput` is preserved — the idle nudge (~60s after a turn ends) signals the turn is over (so it covers a dropped `Stop`) but never clears a real block; (3) transient types (`auth_success`, `elicitation_response`, `elicitation_complete`) and any unknown/future/missing value → preserve prior `current_state`, except a prior `Ended` resurrects to `Idle` (a hook proves the process is alive). The typed value is NOT surfaced on `SessionState` or the wire `StateFrame` — it stays in `events.payload` (verbatim) for presenters that want richer rendering by subscribing to the events stream.
 - **Framing rationale.** NDJ is a deliberate choice for **shim-dependency minimalism**, NOT a latency optimization. The shim is `std`-only with no async runtime; any framing more complex than "write a line, exit" would require pulling in a parser or state machine that violates the p99 ≤5ms budget. This narration is load-bearing — the Epic 1 retrospective (Agreement A3) and Epic 2 retrospective (AI-6) both explicitly mandate that protocol.md describe the choice this way, so a future presenter author building a custom shim understands the constraint hierarchy.
 - **Adapter trait.** `SourceAdapter` is the V1 extension point for new event sources (Codex, OpenCode, etc.). The `adapter-claude` crate is the reference implementation. Source: [`crates/protocol/src/adapter.rs`](../crates/protocol/src/adapter.rs) — `SourceAdapter` trait, `NormalizeResult`, `AdapterMeta`. V2 may move adapters to subprocesses; for V1, in-process is the model.

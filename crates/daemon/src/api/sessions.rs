@@ -94,6 +94,8 @@ pub async fn list(State(state): State<AppState>) -> Response {
             last_event_at_ms: stored.last_event_at_ms,
             updated_at,
             last_pid: stored.last_pid,
+            cwd: stored.cwd,
+            started_at: stored.started_at,
         });
     }
 
@@ -170,6 +172,8 @@ pub async fn detail(State(state): State<AppState>, Path(id): Path<String>) -> Re
         last_event_kind: stored.last_event_kind,
         last_event_at_ms: stored.last_event_at_ms,
         last_pid: stored.last_pid,
+        cwd: stored.cwd,
+        started_at: stored.started_at,
     };
 
     Json(SessionDetail {

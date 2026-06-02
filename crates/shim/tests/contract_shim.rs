@@ -526,6 +526,35 @@ fn shim_preserves_notification_type_field_verbatim() {
     );
 }
 
+// Story 5.7: `cwd` is a NATIVE Claude Code hook field. The shim must NOT strip
+// or rewrite it — it forwards the payload verbatim and the adapter reads `cwd`
+// at normalize. This pins that the native field survives the shim untouched
+// (no shim change was made for Story 5.7; this is the regression guard).
+#[test]
+fn shim_preserves_cwd_field_verbatim() {
+    let tmp = TempDir::new().expect("tempdir");
+    let log_tmp = TempDir::new().expect("log tmpdir");
+    let log = log_tmp.path().join("shim.log");
+    let mock = start_mock_ingest(&tmp, b"200\n");
+
+    let stdin = br#"{"session_id":"sess-c","tool_name":"Bash","cwd":"/Users/x/repo"}"#;
+    let out = run_shim_with_env(&mock.sock_path, &log, "PreToolUse", stdin, None);
+    assert_eq!(out.status.code(), Some(0));
+
+    let captured = wait_for_capture(&mock);
+    let value = parse_captured_payload(&captured);
+    let obj = value.as_object().expect("object");
+    assert_eq!(
+        obj.get("cwd").and_then(|v| v.as_str()),
+        Some("/Users/x/repo"),
+        "native cwd must survive the shim verbatim"
+    );
+    assert_eq!(
+        obj.get("hook_kind").and_then(|v| v.as_str()),
+        Some("PreToolUse")
+    );
+}
+
 #[test]
 fn shim_preserves_existing_hook_event_name_field() {
     let tmp = TempDir::new().expect("tempdir");

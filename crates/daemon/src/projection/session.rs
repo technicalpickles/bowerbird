@@ -5,8 +5,8 @@ use crate::broadcast::{BroadcastEnvelope, BroadcastHub};
 use crate::db::queries::{
     event_kind_as_str, event_kind_from_db_str, reaction_as_db_string, INSERT_EVENT,
     INSERT_RECORDING_SESSION_STARTED, SELECT_DISTINCT_SESSIONS_FROM_EVENTS,
-    SELECT_EVENT_KINDS_FOR_SESSION, SELECT_SESSION_PROJECTION_STATE,
-    UPDATE_RECORDING_SESSION_ENDED, UPSERT_SESSION_PROJECTION,
+    SELECT_EVENT_KINDS_FOR_SESSION, SELECT_FIRST_EVENT_CREATED_AT_FOR_SESSION,
+    SELECT_SESSION_PROJECTION_STATE, UPDATE_RECORDING_SESSION_ENDED, UPSERT_SESSION_PROJECTION,
 };
 use crate::error::{Error, Result};
 use crate::projection::state::{current_state_for_read, transition};
@@ -85,13 +85,23 @@ pub async fn write_if_state_matches(
 
 /// Closure return type from `write_inner`'s `interact` callback. `None`
 /// means the precondition (if any) was not met — the txn dropped without
-/// committing, no broadcast is owed.
+/// committing, no broadcast is owed. The tuple is
+/// `(event_id, new_state, prev_raw_current_state, prev_read_current_state,
+/// prev_started_at)` — the trailing `prev_started_at` is the value the row
+/// held BEFORE any legacy backfill, so the publish path can detect a
+/// started_at correction that left `current_state` unchanged (Story 5.7
+/// review pass 4).
 type WriteInteractResult = Option<(
     i64,
     SessionState,
     Option<SessionCurrentState>,
     Option<SessionCurrentState>,
+    Option<i64>,
 )>;
+
+/// One row read by `rebuild_missing_projections` from
+/// `SELECT_EVENT_KINDS_FOR_SESSION`: `(kind, created_at, pid, cwd, payload)`.
+type RebuildEventRow = (String, i64, Option<u32>, Option<String>, String);
 
 async fn write_inner(
     writer_pool: &deadpool_sqlite::Pool,
@@ -130,6 +140,7 @@ async fn write_inner(
     let payload = envelope.payload;
     let pid = envelope.pid;
     let notification_type = envelope.notification_type;
+    let cwd = envelope.cwd;
 
     // The closure moves its captures, so duplicate the fields the post-commit
     // publish path needs. SessionState is returned out of the closure to avoid
@@ -142,6 +153,7 @@ async fn write_inner(
     let kind_str = event_kind_as_str(&kind);
     let reaction_str = reaction.as_ref().map(reaction_as_db_string);
     let payload_for_closure = payload.clone();
+    let cwd_for_closure = cwd.clone();
 
     let interact_res = conn
         .interact(move |c| -> rusqlite::Result<WriteInteractResult> {
@@ -151,7 +163,7 @@ async fn write_inner(
             // writer cannot interleave between SELECT and UPSERT. Reads do
             // not break the "exactly two writes" invariant from
             // architecture.md:634-641 — the invariant is about *writes*.
-            let prev_state: Option<SessionState> = tx
+            let mut prev_state: Option<SessionState> = tx
                 .query_row(
                     SELECT_SESSION_PROJECTION_STATE,
                     rusqlite::params![&source_for_closure, &session_id_for_closure],
@@ -210,12 +222,49 @@ async fn write_inner(
             let prev_read_current_state = prev_state
                 .as_ref()
                 .map(|s| current_state_for_read(s, now_ms));
+            // The started_at the row held BEFORE the legacy backfill below —
+            // i.e. the value any already-connected subscriber last saw. Used
+            // post-commit to publish a corrected State frame when a legacy
+            // backfill changed started_at without changing current_state
+            // (Story 5.7 review pass 4).
+            let prev_started_at = prev_state.as_ref().and_then(|s| s.started_at);
+
+            // Story 5.7 review (legacy started_at): a pre-5.7 projection blob
+            // deserializes with `started_at: None`. `transition`'s set-once rule
+            // (`prev.started_at.or(Some(now_ms))`) would otherwise stamp THIS
+            // post-upgrade event's clock onto it — a false "started just now"
+            // for a session that began before the upgrade, and a divergence from
+            // what a full rebuild produces. Restore the value the event log
+            // already holds so the live projection equals a rebuild — the
+            // byte-identical rebuild contract, and ADR 0006's "reconstructs
+            // identically on rebuild" guarantee. Rebuild folds events in
+            // `event_id ASC` order and keeps the FIRST event's `created_at`, so
+            // the backfill reads the first event BY EVENT_ID (not the aggregate
+            // MIN) — the two diverge under non-monotonic timestamps (review
+            // pass 2). The current event is not yet INSERTed, so the lookup is
+            // over the prior events (the legacy session always has some); a
+            // session with no prior events falls back to now_ms in transition.
+            // Fires only for legacy rows — post-5.7 sessions carry a non-None
+            // started_at and skip the query entirely.
+            if let Some(s) = prev_state.as_mut() {
+                if s.started_at.is_none() {
+                    s.started_at = tx
+                        .query_row(
+                            SELECT_FIRST_EVENT_CREATED_AT_FOR_SESSION,
+                            rusqlite::params![&source_for_closure, &session_id_for_closure],
+                            |row| row.get::<_, Option<i64>>(0),
+                        )
+                        .optional()?
+                        .flatten();
+                }
+            }
 
             let new_state = transition(
                 prev_state.as_ref(),
                 kind_for_transition,
                 notification_type,
                 pid,
+                cwd_for_closure.clone(),
                 now_ms,
             );
             let state_json = serde_json::to_string(&new_state).map_err(|e| {
@@ -244,6 +293,7 @@ async fn write_inner(
                     payload_for_closure,
                     now_ms,
                     pid,
+                    cwd_for_closure,
                 ],
             )?;
             let id = tx.last_insert_rowid();
@@ -253,12 +303,13 @@ async fn write_inner(
                 new_state,
                 prev_raw_current_state,
                 prev_read_current_state,
+                prev_started_at,
             )))
         })
         .await
         .map_err(|e| Error::Pool(format!("interact failed: {e}")))?;
 
-    let (event_id_raw, new_state, prev_raw_current_state, prev_read_current_state) =
+    let (event_id_raw, new_state, prev_raw_current_state, prev_read_current_state, prev_started_at) =
         match interact_res? {
             Some(t) => t,
             None => {
@@ -285,6 +336,7 @@ async fn write_inner(
         payload,
         created_at: now_ms,
         pid,
+        cwd,
     };
     broadcaster.publish(BroadcastEnvelope::Event(event));
 
@@ -297,8 +349,22 @@ async fn write_inner(
     // - raw catches a delayed `Stop` after stale stored `Working` (Working→Idle)
     // - read-facing catches renewed activity after stale stored `Working`
     //   (Idle-as-read→Working)
+    //
+    // Story 5.7 review pass 4: also publish when a legacy backfill changed
+    // `started_at` without changing `current_state`. `started_at` is set-once,
+    // so it only ever transitions `None → Some` — either the first event for a
+    // session (which already publishes via the `None → Some(current_state)`
+    // transition above) or a one-time legacy backfill on a pre-5.7 row. Without
+    // this term, an already-connected `state.session.*` subscriber that
+    // snapshotted `started_at: null` would miss the correction on a same-state
+    // post-upgrade event (e.g. `Idle → Stop`) until a later transition or
+    // reconnect. Steady-state writes keep `started_at` equal and add no frames;
+    // cwd-only changes stay gated by current_state (Story 5.2 policy unchanged —
+    // cwd rides the `events.*` frame).
+    let started_at_changed = prev_started_at != new_state.started_at;
     let state_changed = prev_raw_current_state != Some(new_state.current_state)
-        || prev_read_current_state != Some(new_state.current_state);
+        || prev_read_current_state != Some(new_state.current_state)
+        || started_at_changed;
     if state_changed {
         broadcaster.publish(BroadcastEnvelope::State {
             source,
@@ -309,6 +375,7 @@ async fn write_inner(
     tracing::debug!(
         event_id = event_id.0,
         state_published = state_changed,
+        started_at_backfilled = started_at_changed,
         "ws: published event envelope; state envelope gated on transition"
     );
 
@@ -358,6 +425,7 @@ pub async fn write_recording_started(
                     payload,
                     now_ms,
                     None::<u32>,
+                    None::<String>,
                 ],
             )?;
             let event_id = tx.last_insert_rowid();
@@ -420,6 +488,7 @@ pub async fn write_recording_ended(
                     payload,
                     now_ms,
                     None::<u32>,
+                    None::<String>,
                 ],
             )?;
             let event_id = tx.last_insert_rowid();
@@ -485,18 +554,23 @@ pub async fn rebuild_missing_projections(writer_pool: &deadpool_sqlite::Pool) ->
                     continue;
                 }
 
-                // Story 5.3: SELECT now returns (kind, created_at, pid, payload)
-                // so rebuild can thread last_pid carry-forward AND parse
-                // notification_type from Notification payloads (the typed
-                // value lives in events.payload, not on the stored Event).
-                let kinds: Vec<(String, i64, Option<u32>, String)> = {
+                // Story 5.3 / 5.7: SELECT returns (kind, created_at, pid, cwd,
+                // payload) so rebuild threads last_pid + cwd carry-forward AND
+                // parses notification_type from Notification payloads (the
+                // typed value lives in events.payload, not on the stored
+                // Event). `started_at` needs no extra column — the set-once
+                // rule in `transition` derives it from each event's stored
+                // `created_at` (passed as `now_ms`), so the first replayed
+                // event sets it and the rest preserve it.
+                let kinds: Vec<RebuildEventRow> = {
                     let mut stmt = tx.prepare(SELECT_EVENT_KINDS_FOR_SESSION)?;
                     let rows = stmt.query_map(rusqlite::params![&source, &session_id], |row| {
                         Ok((
                             row.get::<_, String>(0)?,
                             row.get::<_, i64>(1)?,
                             row.get::<_, Option<u32>>(2)?,
-                            row.get::<_, String>(3)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, String>(4)?,
                         ))
                     })?;
                     rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -505,7 +579,7 @@ pub async fn rebuild_missing_projections(writer_pool: &deadpool_sqlite::Pool) ->
                 let mut state: Option<SessionState> = None;
                 let mut last_created_at: i64 = 0;
                 let mut bad_kind = false;
-                for (kind_str, created_at, pid, payload) in kinds {
+                for (kind_str, created_at, pid, cwd, payload) in kinds {
                     last_created_at = created_at;
                     let kind = match event_kind_from_db_str(&kind_str) {
                         Ok(k) => k,
@@ -552,7 +626,14 @@ pub async fn rebuild_missing_projections(writer_pool: &deadpool_sqlite::Pool) ->
                     // Sentinel kinds should be filtered by the source != '__daemon__' clause
                     // on SELECT_DISTINCT_SESSIONS_FROM_EVENTS, but defend against future shape
                     // changes by routing them through transition's defensive branch anyway.
-                    let next = transition(state.as_ref(), kind, notification_type, pid, created_at);
+                    let next = transition(
+                        state.as_ref(),
+                        kind,
+                        notification_type,
+                        pid,
+                        cwd,
+                        created_at,
+                    );
                     state = Some(next);
                 }
                 if bad_kind {

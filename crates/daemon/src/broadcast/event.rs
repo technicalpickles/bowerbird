@@ -153,6 +153,7 @@ mod tests {
             payload: "{}".to_string(),
             created_at: 0,
             pid: None,
+            cwd: None,
         }
     }
 
@@ -165,6 +166,8 @@ mod tests {
                 last_event_kind: EventKind::PreToolUse,
                 last_event_at_ms: 0,
                 last_pid: None,
+                cwd: None,
+                started_at: None,
             },
         }
     }

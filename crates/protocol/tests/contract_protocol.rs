@@ -235,6 +235,8 @@ fn session_state_round_trips() {
         last_event_kind: EventKind::PreToolUse,
         last_event_at_ms: 1_747_574_400_000,
         last_pid: Some(12345),
+        cwd: None,
+        started_at: None,
     };
     let json = serde_json::to_string(&state).unwrap();
     let parsed: SessionState = serde_json::from_str(&json).unwrap();
@@ -294,6 +296,8 @@ fn session_list_item_round_trips() {
         last_event_at_ms: 1_000_000,
         updated_at: 2_000_000,
         last_pid: Some(42),
+        cwd: None,
+        started_at: None,
     };
     let json = serde_json::to_string(&item).unwrap();
     // Hand-parse back through serde_json::Value so we can also assert specific
@@ -330,6 +334,8 @@ fn session_detail_round_trips_and_accepts_unknown_fields() {
             last_event_kind: EventKind::Notification,
             last_event_at_ms: 42,
             last_pid: Some(7),
+            cwd: None,
+            started_at: None,
         },
         updated_at: 100,
     };
@@ -664,6 +670,21 @@ mod legacy_v1_0_mocks {
         pub state: LegacySessionState,
     }
 
+    /// Pre-5.7 shape of one `GET /sessions` array entry — no `cwd` /
+    /// `started_at`. AC #10/#13: a v1.0 presenter must decode a 5.7+ list
+    /// item carrying both new fields without erroring.
+    #[derive(Debug, Deserialize)]
+    #[allow(dead_code)]
+    pub(super) struct LegacySessionListItem {
+        pub source: String,
+        pub session_id: String,
+        pub current_state: LegacySessionCurrentState,
+        pub last_event_kind: LegacyEventKind,
+        pub last_event_at_ms: i64,
+        pub updated_at: i64,
+        pub last_pid: Option<u32>,
+    }
+
     #[derive(Debug, Deserialize)]
     #[serde(tag = "op", rename_all = "snake_case")]
     #[allow(dead_code)]
@@ -796,4 +817,161 @@ fn additive_compat_state_frame_with_ended_decodes_directly() {
         LegacySessionCurrentState::Unknown
     );
     assert_eq!(parsed.source, "claude");
+}
+
+// Story 5.7 AC #10/#13: the asymmetric outbound-permissive policy means a v1.0
+// presenter compiled before Story 5.7 decodes a 5.7+ daemon's `StateFrame`
+// (carrying `cwd` + `started_at`) and `EventFrame` (carrying `cwd`) without
+// erroring — the unknown fields are silently dropped. Decode through the actual
+// nested WS frame shape (ServerMessage), per Story 5.3 review finding #7.
+#[test]
+fn additive_compat_cwd_and_started_at_ignored_by_v1_consumer() {
+    use legacy_v1_0_mocks::*;
+
+    // StateFrame via ServerMessage: state carries cwd + started_at.
+    let state_wire = r#"{
+        "op": "state",
+        "source": "claude",
+        "session_id": "s1",
+        "state": {
+            "current_state": "Working",
+            "last_event_kind": "PreToolUse",
+            "last_event_at_ms": 42,
+            "last_pid": 12345,
+            "cwd": "/Users/x/repo",
+            "started_at": 1717200000000
+        }
+    }"#;
+    let parsed: LegacyServerMessage =
+        serde_json::from_str(state_wire).expect("legacy ServerMessage decode with cwd/started_at");
+    match parsed {
+        LegacyServerMessage::State(frame) => {
+            assert_eq!(frame.session_id, "s1");
+            assert_eq!(
+                frame.state.current_state,
+                LegacySessionCurrentState::Working
+            );
+            assert_eq!(frame.state.last_event_at_ms, 42);
+        }
+        other => panic!("expected State variant, got {other:?}"),
+    }
+
+    // EventFrame via ServerMessage: event carries cwd.
+    let event_wire = r#"{
+        "op": "event",
+        "event": {
+            "event_id": 9,
+            "source": "claude",
+            "session_id": "s1",
+            "kind": "PreToolUse",
+            "reaction": null,
+            "payload": "{}",
+            "created_at": 0,
+            "pid": 12345,
+            "cwd": "/Users/x/repo"
+        }
+    }"#;
+    let parsed: LegacyServerMessage =
+        serde_json::from_str(event_wire).expect("legacy ServerMessage decode with cwd");
+    match parsed {
+        LegacyServerMessage::Event(frame) => {
+            assert_eq!(frame.event.event_id, 9);
+            assert_eq!(frame.event.kind, LegacyEventKind::PreToolUse);
+        }
+        other => panic!("expected Event variant, got {other:?}"),
+    }
+}
+
+// Story 5.7 review pass 2 (AC #10/#13): a v1.0 presenter decodes one
+// `GET /sessions` list item from a 5.7+ daemon carrying `cwd` + `started_at`
+// without erroring — the unknown fields drop silently and the known fields
+// decode unchanged. The other compat test decodes `StateFrame`/`EventFrame`
+// through `ServerMessage`; the existing list-item round-trip test uses the
+// CURRENT `SessionListItem` type. This pins the LEGACY `SessionListItem` shape
+// (lacking both fields) the REST `/sessions` array consumer sees.
+#[test]
+fn additive_compat_session_list_item_ignores_cwd_and_started_at() {
+    use legacy_v1_0_mocks::*;
+
+    let item_wire = r#"{
+        "source": "claude",
+        "session_id": "s1",
+        "current_state": "Working",
+        "last_event_kind": "PreToolUse",
+        "last_event_at_ms": 42,
+        "updated_at": 99,
+        "last_pid": 12345,
+        "cwd": "/Users/x/repo",
+        "started_at": 1717200000000
+    }"#;
+    let parsed: LegacySessionListItem = serde_json::from_str(item_wire)
+        .expect("legacy SessionListItem decode with cwd/started_at must succeed");
+    assert_eq!(parsed.source, "claude");
+    assert_eq!(parsed.session_id, "s1");
+    assert_eq!(parsed.current_state, LegacySessionCurrentState::Working);
+    assert_eq!(parsed.last_event_kind, LegacyEventKind::PreToolUse);
+    assert_eq!(parsed.last_event_at_ms, 42);
+    assert_eq!(parsed.updated_at, 99);
+    assert_eq!(parsed.last_pid, Some(12345));
+}
+
+// Story 5.7 AC #13 (inverse direction): a CURRENT `SessionState` deserializes a
+// pre-5.7 projection blob that LACKS both `cwd` and `started_at` → both default
+// to `None`, no error. This is the no-migration read path: serde defaults absent
+// `Option` fields (same mechanism `last_pid` relied on in Story 5.3).
+#[test]
+fn pre_5_7_session_state_blob_reads_back_with_none_cwd_and_started_at() {
+    use protocol::SessionState;
+    let pre_5_7 = r#"{
+        "current_state": "Idle",
+        "last_event_kind": "Stop",
+        "last_event_at_ms": 7,
+        "last_pid": null
+    }"#;
+    let parsed: SessionState = serde_json::from_str(pre_5_7).expect("pre-5.7 blob decodes");
+    assert_eq!(parsed.cwd, None);
+    assert_eq!(parsed.started_at, None);
+    assert_eq!(parsed.last_event_at_ms, 7);
+}
+
+// Story 5.7: cwd + started_at round-trip through serialize → deserialize for
+// both Some and None.
+#[test]
+fn session_state_and_event_cwd_started_at_round_trip() {
+    use protocol::{Event, EventId, EventKind, SessionCurrentState, SessionState};
+
+    for (cwd, started_at) in [
+        (
+            Some("/Users/x/repo".to_string()),
+            Some(1_717_200_000_000_i64),
+        ),
+        (None, None),
+    ] {
+        let state = SessionState {
+            current_state: SessionCurrentState::Working,
+            last_event_kind: EventKind::PreToolUse,
+            last_event_at_ms: 1,
+            last_pid: Some(5),
+            cwd: cwd.clone(),
+            started_at,
+        };
+        let back: SessionState =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(back, state);
+
+        // Event carries cwd (not started_at).
+        let event = Event {
+            event_id: EventId(1),
+            source: "claude".to_string(),
+            session_id: "s1".to_string(),
+            kind: EventKind::PreToolUse,
+            reaction: None,
+            payload: "{}".to_string(),
+            created_at: 0,
+            pid: None,
+            cwd: cwd.clone(),
+        };
+        let back: Event = serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+        assert_eq!(back.cwd, cwd);
+    }
 }
