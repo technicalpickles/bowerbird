@@ -5147,9 +5147,10 @@ mod story_2_3_snapshot {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use bowerbird_daemon::db::queries::UPSERT_SESSION_PROJECTION;
     use bowerbird_daemon::state::AppState;
     use futures_util::SinkExt;
-    use protocol::{EventKind, ServerMessage, SessionCurrentState};
+    use protocol::{EventKind, ServerMessage, SessionCurrentState, SessionState};
     use tokio_tungstenite::tungstenite::Message;
 
     use super::story_2_1_ws::{
@@ -5220,6 +5221,128 @@ mod story_2_3_snapshot {
         assert!(
             frame.state.started_at.is_some(),
             "snapshot StateFrame.state.started_at must be set"
+        );
+
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
+    }
+
+    /// Story 5.7 review pass 4: a legacy projection row (pre-5.7 blob with
+    /// `started_at: None`) backed by real events backfills `started_at` on its
+    /// next projection write (`write_inner`, first-event-by-`event_id` order).
+    /// Because `started_at` is state-only and the backfill can fire on a
+    /// SAME-STATE event, the post-commit State publish predicate must treat a
+    /// `started_at` change (`None -> Some`) as publish-worthy — otherwise an
+    /// already-connected `state.session.*` subscriber that snapshotted
+    /// `started_at: null` never sees the correction until a later transition or
+    /// reconnect.
+    ///
+    /// Deterministic, no timeouts: after the same-state backfill event, publish
+    /// a second event that DOES change `current_state`. With the fix the FIRST
+    /// live State frame is the same-state backfill (`current_state` unchanged,
+    /// `started_at` now `Some`); without it the same-state event emits no State
+    /// frame and the first live frame would be the later transition.
+    ///
+    /// The legacy row is seeded as `Idle` (not `Working`) on purpose: the
+    /// read-time stale-`Working` → `Idle` fallback (`current_state_for_read`,
+    /// 5-minute window) would otherwise make an ancient stored `Working` read
+    /// as `Idle` and trip the publish predicate independently of the
+    /// `started_at` term, hiding the regression. `Idle` is not subject to that
+    /// fallback, so the ONLY thing that can publish on the same-state `Stop` is
+    /// the `started_at` change.
+    #[tokio::test(flavor = "current_thread")]
+    async fn legacy_started_at_backfill_publishes_state_frame_on_same_state_event() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 4);
+
+        // Seed one backing pre-upgrade event (event_id 1) so the backfill
+        // query has a first-event `created_at` to read.
+        {
+            let conn = state.db.writer.get().await.expect("writer pool");
+            conn.interact(|c| -> rusqlite::Result<()> {
+                c.execute(
+                    "INSERT INTO events (source, session_id, kind, payload, created_at) \
+                     VALUES ('claude', 'sess-legacy', 'Stop', '{}', 1000)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("interact")
+            .expect("seed event");
+        }
+
+        // Legacy projection blob: Idle, `started_at: None` (pre-5.7 shape).
+        let blob = serde_json::to_string(&SessionState {
+            current_state: SessionCurrentState::Idle,
+            last_event_kind: EventKind::Stop,
+            last_event_at_ms: 1_000,
+            last_pid: None,
+            cwd: None,
+            started_at: None,
+        })
+        .expect("serialize legacy state");
+        {
+            let conn = state.db.writer.get().await.expect("writer pool");
+            conn.interact(move |c| -> rusqlite::Result<()> {
+                c.execute(
+                    UPSERT_SESSION_PROJECTION,
+                    rusqlite::params!["claude", "sess-legacy", blob, 1_000_i64],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("interact")
+            .expect("seed legacy projection");
+        }
+
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+
+        // Snapshot frame: the legacy row, `started_at` still null. Reading it
+        // also serves as the barrier that the subscription is live before we
+        // publish.
+        let snap = parse_state_frame(&read_text_frame_or_close(&mut ws).await);
+        assert_eq!(snap.session_id, "sess-legacy");
+        assert_eq!(snap.state.current_state, SessionCurrentState::Idle);
+        assert_eq!(
+            snap.state.started_at, None,
+            "legacy snapshot must carry started_at: null"
+        );
+
+        // Same-state post-upgrade event (Idle stays Idle) — triggers the legacy
+        // `started_at` backfill but does NOT change `current_state`.
+        publish_via_projection(&state, "claude", "sess-legacy", EventKind::Stop, None, "{}").await;
+        // A genuine transition right after (Idle -> PreToolUse => Working).
+        publish_via_projection(
+            &state,
+            "claude",
+            "sess-legacy",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+
+        // The FIRST live State frame must be the same-state backfill, proving
+        // the predicate published on a started_at-only change.
+        let live = parse_state_frame(&read_text_frame_or_close(&mut ws).await);
+        assert_eq!(
+            live.state.current_state,
+            SessionCurrentState::Idle,
+            "first live State frame must be the same-state Stop backfill event, \
+             not the later PreToolUse transition (without the fix it would be Working)"
+        );
+        assert_eq!(
+            live.state.started_at,
+            Some(1_000),
+            "backfilled started_at (first event by event_id) must reach the live subscriber"
         );
 
         state.shutdown_requested.cancel();
@@ -8238,6 +8361,12 @@ mod story_4_1_replay {
     /// `SessionState` (the `State` frame). Replay reconstructs the envelope
     /// from the JSONL `Event.cwd` (`replay.rs`), a path the other cwd tests
     /// don't touch.
+    ///
+    /// Review pass 4: also pins that the projected `started_at` follows Story
+    /// 4.1's retimestamping contract — it is the replay wall-clock of the first
+    /// replayed write, NOT the JSONL `created_at` placeholder (`1000`). `cwd` is
+    /// threaded from the stored event; `started_at` is daemon-derived and
+    /// re-stamped, so the two diverge by design.
     #[tokio::test(flavor = "current_thread")]
     async fn replay_carries_event_cwd_onto_broadcast_and_projection() {
         let (_tmp, pools) = fresh_pools().await;
@@ -8285,6 +8414,22 @@ mod story_4_1_replay {
             Some(Some("/repo".to_string())),
             "replayed projection State.cwd must carry the stored cwd"
         );
+
+        // Review pass 4: `started_at` does NOT carry the JSONL `created_at`
+        // (1000) — replay re-stamps wall-clock per Story 4.1, and `started_at`
+        // is set-once from the first replayed write's fresh timestamp.
+        let state_started_at = frames.iter().find_map(|f| match f {
+            BroadcastEnvelope::State { state, .. } => Some(state.started_at),
+            _ => None,
+        });
+        match state_started_at {
+            Some(Some(ts)) => assert!(
+                ts > 1_000_000_000_000,
+                "replayed started_at {ts} must be recent replay wall-clock, \
+                 not the JSONL placeholder 1000"
+            ),
+            other => panic!("expected a State frame with started_at: Some; got {other:?}"),
+        }
     }
 
     /// AC #4: events spanning two `(source, session_id)` keys produce

@@ -85,12 +85,18 @@ pub async fn write_if_state_matches(
 
 /// Closure return type from `write_inner`'s `interact` callback. `None`
 /// means the precondition (if any) was not met — the txn dropped without
-/// committing, no broadcast is owed.
+/// committing, no broadcast is owed. The tuple is
+/// `(event_id, new_state, prev_raw_current_state, prev_read_current_state,
+/// prev_started_at)` — the trailing `prev_started_at` is the value the row
+/// held BEFORE any legacy backfill, so the publish path can detect a
+/// started_at correction that left `current_state` unchanged (Story 5.7
+/// review pass 4).
 type WriteInteractResult = Option<(
     i64,
     SessionState,
     Option<SessionCurrentState>,
     Option<SessionCurrentState>,
+    Option<i64>,
 )>;
 
 /// One row read by `rebuild_missing_projections` from
@@ -216,6 +222,12 @@ async fn write_inner(
             let prev_read_current_state = prev_state
                 .as_ref()
                 .map(|s| current_state_for_read(s, now_ms));
+            // The started_at the row held BEFORE the legacy backfill below —
+            // i.e. the value any already-connected subscriber last saw. Used
+            // post-commit to publish a corrected State frame when a legacy
+            // backfill changed started_at without changing current_state
+            // (Story 5.7 review pass 4).
+            let prev_started_at = prev_state.as_ref().and_then(|s| s.started_at);
 
             // Story 5.7 review (legacy started_at): a pre-5.7 projection blob
             // deserializes with `started_at: None`. `transition`'s set-once rule
@@ -291,12 +303,13 @@ async fn write_inner(
                 new_state,
                 prev_raw_current_state,
                 prev_read_current_state,
+                prev_started_at,
             )))
         })
         .await
         .map_err(|e| Error::Pool(format!("interact failed: {e}")))?;
 
-    let (event_id_raw, new_state, prev_raw_current_state, prev_read_current_state) =
+    let (event_id_raw, new_state, prev_raw_current_state, prev_read_current_state, prev_started_at) =
         match interact_res? {
             Some(t) => t,
             None => {
@@ -336,8 +349,22 @@ async fn write_inner(
     // - raw catches a delayed `Stop` after stale stored `Working` (Working→Idle)
     // - read-facing catches renewed activity after stale stored `Working`
     //   (Idle-as-read→Working)
+    //
+    // Story 5.7 review pass 4: also publish when a legacy backfill changed
+    // `started_at` without changing `current_state`. `started_at` is set-once,
+    // so it only ever transitions `None → Some` — either the first event for a
+    // session (which already publishes via the `None → Some(current_state)`
+    // transition above) or a one-time legacy backfill on a pre-5.7 row. Without
+    // this term, an already-connected `state.session.*` subscriber that
+    // snapshotted `started_at: null` would miss the correction on a same-state
+    // post-upgrade event (e.g. `Idle → Stop`) until a later transition or
+    // reconnect. Steady-state writes keep `started_at` equal and add no frames;
+    // cwd-only changes stay gated by current_state (Story 5.2 policy unchanged —
+    // cwd rides the `events.*` frame).
+    let started_at_changed = prev_started_at != new_state.started_at;
     let state_changed = prev_raw_current_state != Some(new_state.current_state)
-        || prev_read_current_state != Some(new_state.current_state);
+        || prev_read_current_state != Some(new_state.current_state)
+        || started_at_changed;
     if state_changed {
         broadcaster.publish(BroadcastEnvelope::State {
             source,
@@ -348,6 +375,7 @@ async fn write_inner(
     tracing::debug!(
         event_id = event_id.0,
         state_published = state_changed,
+        started_at_backfilled = started_at_changed,
         "ws: published event envelope; state envelope gated on transition"
     );
 
