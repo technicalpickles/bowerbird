@@ -209,13 +209,34 @@ fn subscribe_with_states_round_trips() {
     let with_states = r#"{"op":"subscribe","topic":"state.session.*","states":["working","idle"]}"#;
     let parsed: ClientMessage =
         serde_json::from_str(with_states).expect("subscribe with states must deserialize");
-    match parsed {
+    match &parsed {
         ClientMessage::Subscribe { topic, states } => {
             assert_eq!(topic, "state.session.*");
-            assert_eq!(states, vec!["working".to_string(), "idle".to_string()]);
+            assert_eq!(states, &vec!["working".to_string(), "idle".to_string()]);
         }
         other => panic!("expected Subscribe, got {other:?}"),
     }
+    // Actually round-trip: ClientMessage derives Serialize (protocol-crate rule
+    // that every public type round-trips), so re-serializing then re-parsing
+    // must reproduce the value. Compare the parsed values, not raw strings —
+    // serde does not guarantee key/field order in the emitted JSON.
+    let reserialized = serde_json::to_string(&parsed).expect("ClientMessage must serialize");
+    let reparsed: ClientMessage =
+        serde_json::from_str(&reserialized).expect("re-serialized subscribe must re-parse");
+    assert_eq!(parsed, reparsed, "Subscribe with states must round-trip");
+}
+
+#[test]
+fn subscribe_unfiltered_serializes_to_v1_0_wire_shape() {
+    // `skip_serializing_if = "Vec::is_empty"` means an unfiltered Subscribe
+    // serializes to the EXACT pre-5.8 wire bytes (no `states` key), so a Rust
+    // presenter that omits the filter is byte-compatible with a v1.0 daemon.
+    let unfiltered = ClientMessage::Subscribe {
+        topic: "state.session.*".to_string(),
+        states: Vec::new(),
+    };
+    let json = serde_json::to_string(&unfiltered).expect("must serialize");
+    assert_eq!(json, r#"{"op":"subscribe","topic":"state.session.*"}"#);
 }
 
 #[test]

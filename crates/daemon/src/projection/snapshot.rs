@@ -32,7 +32,12 @@ use crate::projection::state::current_state_for_read;
 /// Returns an empty vec when `new_topic` is not a state topic, when the
 /// projection table has no non-sentinel rows, or when every matching
 /// session is already covered by an entry in `pre_existing` (snapshot
-/// dedup against overlapping subscriptions).
+/// dedup against overlapping topics). `pre_existing` is the set of topics
+/// already *unfiltered*-snapshotted on the connection — NOT the raw
+/// subscription set. A filtered subscribe (`state_filter` non-empty) sent
+/// only a subset of its topic's rows, so the caller must keep it out of
+/// `pre_existing` or this dedup would suppress rows the client never got
+/// (Story 5.8 finding).
 ///
 /// `state_filter` (Story 5.8, ADR 0008) scopes the burst by the presenter's
 /// requested `SessionCurrentState` set, keyed on the read-derived

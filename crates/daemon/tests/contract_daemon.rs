@@ -5493,6 +5493,14 @@ mod story_2_3_snapshot {
     /// snapshot burst to the requested read-derived states — the `Ended`
     /// graveyard is excluded — while a live transition INTO `Ended` after
     /// subscribe still arrives (the live stream is never scoped by `states`).
+    ///
+    /// No `sleep`s (deterministic-test discipline): exclusion is proven by the
+    /// frame *after* the active-session snapshot being the live `sess-W`→Ended
+    /// transition, NOT a `sess-E` snapshot frame. That holds regardless of the
+    /// `updated_at` order of the two pre-created rows, so we don't need to
+    /// wall-clock-separate them. The read/publish await sequence (read the
+    /// snapshot frame, THEN publish the live event, THEN read again) is what
+    /// orders snapshot-before-live — not timing.
     #[tokio::test(flavor = "current_thread")]
     async fn snapshot_states_filter_excludes_ended_live_transition_still_arrives() {
         let (_tmp, pools) = fresh_pools().await;
@@ -5500,9 +5508,8 @@ mod story_2_3_snapshot {
         let (addr, _server) = spawn_test_daemon(state.clone()).await;
 
         // sess-W: PreToolUse → Working (active). sess-E: SessionEnded → Ended
-        // (graveyard). sess-E is published LAST so it has the largest
-        // updated_at and would LEAD the snapshot if it weren't filtered out —
-        // making the exclusion assertion meaningful.
+        // (graveyard). With the `["working","waitinginput","idle"]` filter only
+        // sess-W can appear in the snapshot.
         let _ = publish_via_projection(
             &state,
             "claude",
@@ -5512,7 +5519,6 @@ mod story_2_3_snapshot {
             "{}",
         )
         .await;
-        tokio::time::sleep(Duration::from_millis(2)).await;
         let _ = publish_via_projection(
             &state,
             "claude",
@@ -5532,8 +5538,7 @@ mod story_2_3_snapshot {
         .await
         .expect("send subscribe with states filter");
 
-        // Only sess-W is in the snapshot; sess-E (Ended) is filtered out even
-        // though its updated_at is newer (would otherwise lead the burst).
+        // The only snapshot frame is sess-W; sess-E (Ended) is filtered out.
         let first = parse_state_frame(&read_text_frame_or_close(&mut ws).await);
         assert_eq!(
             first.session_id, "sess-W",
@@ -5543,8 +5548,9 @@ mod story_2_3_snapshot {
 
         // A live transition INTO Ended after subscribe still arrives — `states`
         // scopes only the snapshot, never live `state.*` delivery. Flip sess-W
-        // (currently Working) to Ended.
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        // (currently Working) to Ended. Because the snapshot held exactly one
+        // frame (sess-W), this next frame being the live sess-W→Ended (and not
+        // a sess-E snapshot frame) is what proves sess-E was excluded.
         let _ = publish_via_projection(
             &state,
             "claude",
@@ -5555,12 +5561,87 @@ mod story_2_3_snapshot {
         )
         .await;
         let live = parse_state_frame(&read_text_frame_or_close(&mut ws).await);
-        assert_eq!(live.session_id, "sess-W");
+        assert_eq!(
+            live.session_id, "sess-W",
+            "next frame must be the live sess-W transition, not a sess-E snapshot frame"
+        );
         assert_eq!(
             live.state.current_state,
             SessionCurrentState::Ended,
             "a live transition to Ended must arrive even though Ended was filtered from the snapshot"
         );
+
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
+    }
+
+    /// Story 5.8 review (finding #2): a *filtered* subscribe must NOT suppress a
+    /// later snapshot of the same topic for rows the filter excluded. The
+    /// snapshot dedup keys on topics already *unfiltered*-snapshotted, so a
+    /// first `states:["ended"]` subscribe (which only sent the graveyard) does
+    /// not poison a second `states:["working",...]` subscribe to the same topic.
+    ///
+    /// This is exactly the deck's `a`→"show ended" trajectory: connect filtered
+    /// to active sessions, then widen. Pre-fix, the second subscribe saw
+    /// `StateAll` already in the subscription set and short-circuited to an
+    /// empty snapshot — the active rows were never sent.
+    #[tokio::test(flavor = "current_thread")]
+    async fn filtered_subscribe_does_not_suppress_later_wider_snapshot() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 4);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        // sess-W: Working (active). sess-E: Ended (graveyard).
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-W",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-E",
+            EventKind::SessionEnded,
+            None,
+            "{}",
+        )
+        .await;
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+
+        // First subscribe: ended-only. Snapshot is exactly [sess-E].
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.*","states":["ended"]}"#.into(),
+        ))
+        .await
+        .expect("send ended-only subscribe");
+        let ended = parse_state_frame(&read_text_frame_or_close(&mut ws).await);
+        assert_eq!(
+            ended.session_id, "sess-E",
+            "first (ended) snapshot is the graveyard row"
+        );
+        assert_eq!(ended.state.current_state, SessionCurrentState::Ended);
+
+        // Second subscribe: same topic, now the active states. The filtered
+        // first subscribe must NOT have suppressed this — we must receive
+        // sess-W. (Pre-fix this read would time out: the snapshot was empty.)
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.*","states":["working","waitinginput","idle"]}"#
+                .into(),
+        ))
+        .await
+        .expect("send active-states subscribe");
+        let active = parse_state_frame(&read_text_frame_or_close(&mut ws).await);
+        assert_eq!(
+            active.session_id, "sess-W",
+            "a wider re-subscribe after a filtered one must still snapshot the previously-excluded active row"
+        );
+        assert_eq!(active.state.current_state, SessionCurrentState::Working);
 
         state.shutdown_requested.cancel();
         state.ws_close_requested.cancel();
@@ -10018,6 +10099,33 @@ mod story_5_8_session_filter {
         assert!(
             msg.contains("running"),
             "message must name the bad token: {msg}"
+        );
+    }
+
+    // Review finding #5: `SessionsParams` is `#[serde(deny_unknown_fields)]`, so
+    // an unknown query key fails loudly (strict-inbound policy), the same way
+    // `EventsParams` does. Axum surfaces the `Query` rejection as 400. Pins the
+    // behavior so it cannot silently regress.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sessions_unknown_query_key_400() {
+        let (_tmp, pools) = fresh_pools().await;
+        seed(
+            &pools,
+            "claude",
+            "sess-w",
+            &st(SessionCurrentState::Working, FRESH),
+            1_000,
+        )
+        .await;
+        let app = api::router(ready_state(pools));
+        let resp = app
+            .oneshot(auth_get("/sessions?foo=bar"))
+            .await
+            .expect("oneshot");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "an unknown query key must 400 (deny_unknown_fields), not be silently ignored"
         );
     }
 

@@ -48,6 +48,7 @@
 # last_updated: 2026-06-02 (Story 5.8 → in-progress; dev-story session started)
 # last_updated: 2026-06-02 (Story 5.8 → review; dev-story complete — 11 tasks done, 15 ACs satisfied. REST ?state=/?since=/?limit= on GET /sessions + optional Subscribe.states snapshot filter, both default-unfiltered, filtering on read-time current_state (shared api::filter helper); no schema migration. 537 workspace tests + fmt + clippy + changelog gate green; REST smoke validated live against the real 174-session graveyard DB (174→18 active). NOTE: smoke migrated the maintainer's live bower.db v2→v3 (Story 5.7's additive events.cwd column, non-destructive) since the installed daemon predated 5.7; recovered by cargo install of the 5.8 build + restart. WS snapshot/invalid-token covered by e2e contract tests (no wscat installed).)
 # last_updated: 2026-06-02 (Story 5.8 → in-progress; bmad-code-review documented 1 decision-needed item + 7 patch findings in the story. Unresolved items cover since/limit pagination semantics, WS snapshot dedupe with differing states filters, per-element states validation, ClientMessage Serialize/round-trip coverage, unknown query-key test coverage, real-sleep cleanup in the new WS test, validation-record accuracy for the substituted WS smoke, and unrelated doc/status churn in the 5.8 diff.)
+# last_updated: 2026-06-02 (Story 5.8 → review; all 8 code-review findings resolved. #1 since/limit kept as recency-filter+cap (protocol.md de-paginated, deferred-work downgraded to partially-addressed, true cursor pagination deferred); #2 snapshot dedup now keys on fully_snapshotted (unfiltered only) + new test; #3 WS states validated per array element (parse_states_array); #4 ClientMessage derives Serialize/PartialEq + true round-trip + skip_serializing_if; #5 unknown-query-key 400 test; #6 sleeps removed from WS states test; #7 Task 11 WS-smoke record corrected (automated e2e) + AC count 14→15; #8 5.1/5.6/5.7+architecture churn split to its own commit. Full workspace gate + fmt + clippy + changelog gate green.)
 # project: bowerbird
 # project_key: NOKEY
 # tracking_system: file-system
@@ -84,7 +85,7 @@
 
 generated: 2026-05-16
 last_updated: 2026-06-02 (Story 5.1 → done; maintainer moved it straight to done rather than a separate code-review pass — the dogfood-triage stories 5.7–5.10 are the substantive review of what the deck surfaced, and the deck is consumer-only [no crates/ change]; dogfooding-validation-phase stays in-progress until the v0.1.0 tag, Story 5.14)
-last_updated: 2026-06-02 (Story 5.8 → in-progress after bmad-code-review; 1 decision-needed item + 7 patch findings documented in story Review Findings)
+last_updated: 2026-06-02 (Story 5.8 → review; all 8 code-review findings resolved [1 decision + 7 patches] — see the comment block above for the per-finding summary)
 project: bowerbird
 project_key: NOKEY
 tracking_system: file-system
@@ -146,7 +147,7 @@ development_status:
   5-5-bench-gates-load-bearing: ready-for-dev
   5-6-idle-prompt-reclassified-as-transient: done
   5-7-session-cwd-on-the-wire: done                     # Finding 3 (+ ADR 0006); gates v0.1.0
-  5-8-server-side-session-filter: in-progress            # Finding 5-filter; gates v0.1.0
+  5-8-server-side-session-filter: review                 # Finding 5-filter; gates v0.1.0
   5-9-daemon-start-on-login: backlog                     # Finding 1 (+ ADR 0007); gates v0.1.0
   5-10-shim-names-daemon-down-cause: backlog            # Finding 2 (minor); gates v0.1.0
   5-11-release-pipeline-end-to-end-verification: ready-for-dev

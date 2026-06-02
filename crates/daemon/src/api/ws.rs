@@ -42,7 +42,7 @@ use protocol::{
     ServerMessage, StateFrame,
 };
 
-use crate::api::filter::parse_state_filter;
+use crate::api::filter::parse_states_array;
 use crate::broadcast::{BroadcastEnvelope, Topic};
 use crate::db::queries::SELECT_HELLO_DB_FIELDS;
 use crate::state::AppState;
@@ -195,6 +195,14 @@ async fn connection_task(
     }
 
     let mut subscriptions: HashSet<Topic> = HashSet::new();
+    // Story 5.8 (ADR 0008) — topics that received an *unfiltered* snapshot, the
+    // set the snapshot dedup keys on (NOT `subscriptions`). A filtered subscribe
+    // (`states` non-empty) only sent a subset of matching rows, so it must NOT
+    // suppress a later snapshot of the same topic; recording only unfiltered
+    // (full-coverage) snapshots here keeps the dedup sound. A re-subscribe to a
+    // topic already fully snapshotted is still skipped; a wider/different
+    // filtered re-subscribe after a narrow one still gets its rows.
+    let mut fully_snapshotted: HashSet<Topic> = HashSet::new();
     let ping_interval = state.ws_config.ping_interval;
     let pong_timeout = state.ws_config.pong_timeout;
     let mut ping_timer =
@@ -268,6 +276,7 @@ async fn connection_task(
                         if !handle_text_frame(
                             &mut socket,
                             &mut subscriptions,
+                            &mut fully_snapshotted,
                             &mut rx,
                             &state,
                             text.as_str(),
@@ -404,6 +413,7 @@ async fn connection_task(
 async fn handle_text_frame(
     socket: &mut WebSocket,
     subscriptions: &mut HashSet<Topic>,
+    fully_snapshotted: &mut HashSet<Topic>,
     rx: &mut tokio::sync::broadcast::Receiver<BroadcastEnvelope>,
     state: &AppState,
     text: &str,
@@ -426,8 +436,10 @@ async fn handle_text_frame(
         //       subscription set (unchanged from Story 2.1)
         //   [B] read now_ms for the read-time stale-Working fallback
         //   [C] read the projection table to build the snapshot, filtered
-        //       by the NEW topic AND deduped against the pre-existing
-        //       subscription set
+        //       by the NEW topic AND deduped against topics already
+        //       *unfiltered*-snapshotted on this connection (Story 5.8:
+        //       NOT the raw subscription set — a prior filtered subscribe
+        //       didn't fully cover its topic)
         //   [D] insert the new topic into the subscription set so the
         //       main loop dispatches subsequent envelopes under the NEW
         //       set
@@ -450,21 +462,18 @@ async fn handle_text_frame(
             // Story 5.8 (ADR 0008): parse the optional snapshot-scoping
             // `states` filter before anything else. An invalid token closes
             // the connection with `bad message` (same loud-reject as an
-            // invalid topic — strict-inbound policy). Empty/absent `states`
-            // yields an empty filter (unfiltered, the v1.0 default); we skip
-            // `parse_state_filter` entirely in that case because it treats an
-            // empty token as an error. A non-empty `states` is joined into the
-            // same CSV shape the REST `?state=` parser consumes, so both
-            // surfaces share one token table.
-            let state_filter = if states.is_empty() {
-                Vec::new()
-            } else {
-                match parse_state_filter(&states.join(",")) {
-                    Ok(f) => f,
-                    Err(msg) => {
-                        close_with_bad_message(socket, &msg).await;
-                        return false;
-                    }
+            // invalid topic — strict-inbound policy). Each array element is
+            // validated as a SINGLE token (not CSV-joined), so a comma-bearing
+            // element is rejected rather than silently split — one wire value,
+            // one grammar input, the same discipline `topic` follows. An
+            // empty/absent `states` yields an empty filter (unfiltered, the
+            // v1.0 default). The token table is shared with the REST `?state=`
+            // parser via `crate::api::filter`.
+            let state_filter = match parse_states_array(&states) {
+                Ok(f) => f,
+                Err(msg) => {
+                    close_with_bad_message(socket, &msg).await;
+                    return false;
                 }
             };
             match Topic::parse(&topic) {
@@ -515,10 +524,14 @@ async fn handle_text_frame(
                     //     client silently unsubscribed for this topic
                     //     because the protocol has no Subscribe ack/error
                     //     frame in V1 (see protocol-changelog.md).
+                    //     Dedup keys on `fully_snapshotted` (topics that got an
+                    //     UNFILTERED snapshot), NOT `subscriptions`: a prior
+                    //     filtered subscribe only sent a subset, so it must not
+                    //     suppress this snapshot's rows (Story 5.8 finding).
                     let snapshot_frames = match crate::projection::snapshot_for_topic(
                         &state.db.reader,
                         &t,
-                        subscriptions,
+                        fully_snapshotted,
                         now_ms,
                         &state_filter,
                     )
@@ -536,7 +549,13 @@ async fn handle_text_frame(
 
                     // [D] Insert the new topic. Envelopes published between
                     //     [C] and here stay buffered in rx and dispatch under
-                    //     the new set at [F], after snapshot emission.
+                    //     the new set at [F], after snapshot emission. Record
+                    //     the topic as fully snapshotted ONLY when unfiltered —
+                    //     a filtered snapshot didn't cover every matching row,
+                    //     so it must not suppress a later (wider) snapshot.
+                    if state_filter.is_empty() {
+                        fully_snapshotted.insert(t.clone());
+                    }
                     subscriptions.insert(t);
 
                     // [E] Emit snapshot frames. Order is the SQL row order:

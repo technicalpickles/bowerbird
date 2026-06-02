@@ -48,7 +48,13 @@ pub enum ServerMessage {
 /// rule; `ClientMessage` is the documented exception. If a future story
 /// genuinely needs additive inbound ops, the daemon's `bad message: ...`
 /// rejection path is the right place to widen — not this enum.
-#[derive(Debug, Deserialize)]
+///
+/// `Serialize` is derived too (per the protocol-crate rule that every public
+/// type round-trips — project-context.md §Protocol crate stability): the daemon
+/// only deserializes inbound, but a Rust presenter built on this crate
+/// serializes `ClientMessage` to send it. The `deny_unknown_fields` asymmetry
+/// above is about *deserialize* strictness only and is unaffected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClientMessage {
     Subscribe {
@@ -62,10 +68,13 @@ pub enum ClientMessage {
         ///
         /// `#[serde(default)]` keeps it optional for v1.0 presenters (absent →
         /// empty vec → unfiltered) while the enum's `deny_unknown_fields` still
-        /// rejects a typo'd *other* key. `Vec<String>` (not
-        /// `Vec<SessionCurrentState>`) so a typo'd token is loud-rejected
-        /// daemon-side rather than silently mapped to `Unknown`.
-        #[serde(default)]
+        /// rejects a typo'd *other* key. `skip_serializing_if` keeps the
+        /// serialized shape identical to a pre-5.8 `Subscribe` when unfiltered,
+        /// so a Rust presenter that omits the filter emits the exact v1.0 wire
+        /// bytes. `Vec<String>` (not `Vec<SessionCurrentState>`) so a typo'd
+        /// token is loud-rejected daemon-side rather than silently mapped to
+        /// `Unknown`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         states: Vec<String>,
     },
     Unsubscribe {
