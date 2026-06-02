@@ -135,7 +135,8 @@ All authenticated routes return `401 Unauthorized` on a missing or malformed bea
         "reaction": "Continue",
         "payload": "{...native JSON payload as a verbatim string...}",
         "created_at": 1748190000500,
-        "pid": 12345
+        "pid": 12345,
+        "cwd": "/Users/x/code/myrepo"
       }
     ],
     "cursor": 1,
@@ -145,7 +146,7 @@ All authenticated routes return `401 Unauthorized` on a missing or malformed bea
 
 - **Status codes.** `200`, `401`, `404 Not Found` (session-id was never seen).
 - **Field source.** [`crates/protocol/src/rest.rs:18`](../crates/protocol/src/rest.rs) `EventListResponse`, [`crates/protocol/src/event.rs:30`](../crates/protocol/src/event.rs) `Event`.
-- **Notes.** Loop until `cursor === null` to catch up to the tail. Gap-detection: when your starting `since` is below the response's `oldest_available_event_id`, events in `(since, oldest_available)` were truncated. `oldest_available_event_id` is the global minimum across the whole event log (filtered to non-sentinel rows); `EventId(i64::MAX)` if the events table is empty. Per-event truncation gaps are silently skipped — the response continues with whatever is on disk. See [`cookbook/rest-cursor-pagination.md`](cookbook/rest-cursor-pagination.md) for the gap-window-rendering pattern.
+- **Notes.** Loop until `cursor === null` to catch up to the tail. Per-event `cwd` (string-or-null, Story 5.7) is the source's hook-reported working directory for that specific event — the same value carried on WS `EventFrame.event.cwd`. It is `null` for events with no reported cwd (pre-5.7 rows, non-Claude sources, or a producer that omits it). `started_at` is NOT a per-event field — it is state/list-only (see `/sessions` and `/sessions/{id}`). Gap-detection: when your starting `since` is below the response's `oldest_available_event_id`, events in `(since, oldest_available)` were truncated. `oldest_available_event_id` is the global minimum across the whole event log (filtered to non-sentinel rows); `EventId(i64::MAX)` if the events table is empty. Per-event truncation gaps are silently skipped — the response continues with whatever is on disk. See [`cookbook/rest-cursor-pagination.md`](cookbook/rest-cursor-pagination.md) for the gap-window-rendering pattern.
 
 ### `GET /sessions/{id}/stats`
 
@@ -165,7 +166,7 @@ All authenticated routes return `401 Unauthorized` on a missing or malformed bea
 
 - **Status codes.** `200`, `401`, `404 Not Found`.
 - **Field source.** [`crates/protocol/src/rest.rs:25`](../crates/protocol/src/rest.rs) `SessionStats`.
-- **Notes.** `first_event_at` and `last_event_at` are `null` for sessions with no surviving events (e.g. all events truncated).
+- **Notes.** `first_event_at` and `last_event_at` are `null` for sessions with no surviving events (e.g. all events truncated). `first_event_at` is `MIN(created_at)` and `last_event_at` is `MAX(created_at)` over the session's stored events — they are pure timestamp aggregates, NOT the same field as `SessionState.started_at`. `started_at` is the `created_at` of the session's *first event by `event_id ASC` order* (so it matches a full rebuild, which folds events in `event_id` order). With monotonically increasing timestamps the two coincide, but under clock skew, manually injected data, or replay-reordered events they can diverge: `first_event_at` always reports the smallest timestamp, while `started_at` reports whichever timestamp belongs to the lowest `event_id`. Use `started_at` for "when did this session begin"; use `/stats` aggregates for min/max bookkeeping.
 
 ### `POST /replay`
 

@@ -3244,6 +3244,84 @@ mod story_1_7_rest {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    // Story 5.7 review pass-5 finding: `/sessions/{id}/stats` `first_event_at`
+    // is `MIN(created_at)` — a pure timestamp aggregate — which is NOT the same
+    // field as `SessionState.started_at` (the `created_at` of the first event by
+    // `event_id ASC`, matching rebuild). With monotonic timestamps the two
+    // coincide; under clock skew / manually injected / replay-reordered data
+    // they diverge. This pins that documented contract (docs/protocol.md
+    // §`GET /sessions/{id}/stats` Notes) so a silent change to either side
+    // surfaces here. The decision is to keep `/stats` as min/max aggregates and
+    // document the divergence, NOT to switch `/stats` to event_id order.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stats_first_event_at_min_diverges_from_started_at_under_nonmonotonic_created_at() {
+        let (_tmp, pools) = fresh_pools().await;
+
+        // event_id 1 carries a LATER created_at than event_id 2 (clock skew).
+        // started_at follows event_id order (2000); MIN(created_at) is 1000.
+        let conn = pools.writer.get().await.expect("writer pool");
+        conn.interact(|c| -> rusqlite::Result<()> {
+            let rows: &[(&str, i64)] = &[
+                ("PreToolUse", 2_000), // event_id 1, latest-by-id
+                ("Stop", 1_000),       // event_id 2, smaller timestamp
+            ];
+            for (kind, created_at) in rows {
+                c.execute(
+                    "INSERT INTO events (source, session_id, kind, payload, created_at) \
+                     VALUES ('claude', 'sess-skew', ?, '{}', ?)",
+                    rusqlite::params![kind, created_at],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .expect("interact")
+        .expect("insert events");
+        drop(conn);
+
+        projection::session::rebuild_missing_projections(&pools.writer)
+            .await
+            .expect("rebuild");
+
+        let app = api::router(ready_state(pools));
+
+        // started_at (via REST /sessions/{id}) = first event by event_id (2000).
+        let detail: SessionDetail = json_body(
+            app.clone()
+                .oneshot(auth_get("/sessions/sess-skew"))
+                .await
+                .expect("oneshot"),
+        )
+        .await;
+        assert_eq!(
+            detail.state.started_at,
+            Some(2_000),
+            "started_at must be the created_at of the first event by event_id, not MIN"
+        );
+
+        // /stats first_event_at = MIN(created_at) = 1000, deliberately divergent.
+        let resp = app
+            .oneshot(auth_get("/sessions/sess-skew/stats"))
+            .await
+            .expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let stats: SessionStats = json_body(resp).await;
+        assert_eq!(
+            stats.first_event_at,
+            Some(1_000),
+            "/stats first_event_at is MIN(created_at), a pure aggregate"
+        );
+        assert_eq!(
+            stats.last_event_at,
+            Some(2_000),
+            "/stats last_event_at is MAX(created_at)"
+        );
+        assert_ne!(
+            stats.first_event_at, detail.state.started_at,
+            "documented divergence: MIN(created_at) != started_at under non-monotonic timestamps"
+        );
+    }
+
     // ----- /status -----
     #[tokio::test(flavor = "current_thread")]
     async fn status_returns_uptime_and_last_event() {

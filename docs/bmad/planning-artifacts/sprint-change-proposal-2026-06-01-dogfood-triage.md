@@ -40,7 +40,7 @@ Two live dogfooding sessions on 2026-06-01 surfaced five distinct findings (`doc
 |----------|---------|--------|
 | **New ADR 0006** | 3 | Session working directory (`cwd`) as a mechanical fact on the wire |
 | **New ADR 0007** | 1 | Daemon start-on-login supervision via launchd LaunchAgent |
-| `crates/protocol/src/state.rs`, `event.rs` | 3 | `cwd: Option<String>` on `SessionState` (number-or-null wire field) |
+| `crates/protocol/src/state.rs`, `event.rs` | 3 | `cwd: Option<String>` on `SessionState` (string-or-null wire field) |
 | `crates/adapter-claude/src/normalize.rs` | 3 | Extract `cwd` from the Claude Code hook payload |
 | `crates/daemon/src/db/migrations.rs` | 3 | Schema v3: nullable `cwd` column |
 | `crates/daemon/src/projection/session.rs` | 3 | Carry-forward `cwd` (overwrite-on-Some, mirrors `last_pid`) |
@@ -91,7 +91,7 @@ Four new stories. Proposed numbering inserts them as **5.7–5.10** and renumber
 
 **Intent:** add `cwd` as a mechanical fact so presenters can group/filter by location (and build a recognizable label, closing Finding 4).
 
-- `crates/protocol/src/state.rs`: `SessionState` gains `cwd: Option<String>` (permissive outbound, number-or-null on the wire).
+- `crates/protocol/src/state.rs`: `SessionState` gains `cwd: Option<String>` (permissive outbound, string-or-null on the wire). (`started_at` is the number-or-null field.)
 - `crates/protocol/src/event.rs`: `EventEnvelope` carries `cwd: Option<String>` (mirrors `pid`).
 - `crates/adapter-claude/src/normalize.rs`: read `cwd` from the hook payload; absent/non-string → `None`, still normalizes successfully.
 - `crates/daemon/src/db/migrations.rs`: schema **v3**, nullable `cwd` column.
