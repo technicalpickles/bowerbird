@@ -1,6 +1,6 @@
 # Story 5.7: Session working directory and start time on the wire
 
-Status: review
+Status: done
 
 <!-- Story key / filename stays `5-7-session-cwd-on-the-wire` (renaming complicates sprint-status + diff review, per Story 5.3 Task 15). `started_at` was bundled in at create-story time per the proposal §6 option. -->
 

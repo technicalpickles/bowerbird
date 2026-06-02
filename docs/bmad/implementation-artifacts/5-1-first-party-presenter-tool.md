@@ -1,6 +1,6 @@
 # Story 5.1: First-party presenter tool (sibling repository)
 
-Status: in-progress
+Status: done
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -47,9 +47,9 @@ Source: `docs/bmad/planning-artifacts/epics.md` §"Story 5.1: First-party presen
 
 ## Tasks / Subtasks
 
-- [ ] **Task 1: Decide GitHub remote and create `bowerbird-deck` sibling repo** (AC: #1, #3)
+- [x] **Task 1: Decide GitHub remote and create `bowerbird-deck` sibling repo** (AC: #1, #3)
   - [x] Confirm the GitHub org/user that will own `bowerbird-deck` (default: `github.com/technicalpickles/bowerbird-deck`). — Confirmed `technicalpickles` (matches the gh-auth account).
-  - [ ] Create the repo via `gh repo create <owner>/bowerbird-deck --public --description "First-party presenter for bowerbird — terminal TUI for live Claude Code session state"`. — **Deferred to maintainer** (per dev-session choice "local-only today; I'll create the GitHub repo myself later"). Local origin remote is already set to `git@github.com:technicalpickles/bowerbird-deck.git`; once the GH repo exists, `git push -u origin main` from `~/pickleton/repos/bowerbird-deck/worktrees/main/` lands the initial commit.
+  - [x] Create the repo via `gh repo create <owner>/bowerbird-deck --public --description "First-party presenter for bowerbird — terminal TUI for live Claude Code session state"`. — **Done by maintainer.** `github.com/technicalpickles/bowerbird-deck` exists and is pushed; local `main` is in sync with `origin/main`. The deferred carve-out is closed.
   - [x] Clone it as a *sibling* directory next to `bowerbird/` (NOT inside `bowerbird/`). Path: `<pt root>/repos/bowerbird-deck/` if pt-tracked; otherwise wherever the maintainer keeps sibling repos. — Created at `~/pickleton/repos/bowerbird-deck/` using the pt-tracked layout (`bare.git/` + `worktrees/main/`).
   - [x] Initial commit: `LICENSE` (matching bowerbird's), a stub `README.md` (filled in by Task 7), `.gitignore` from `examples/multi-session-router/.gitignore` as a starting point. — Initial commit `f9a2e9e`: `LICENSE` (dual MIT/Apache mirror of bowerbird's), `LICENSE-MIT`, `LICENSE-APACHE`, `.gitignore`, plus the full Task 2/3/4/7 bootstrap (`package.json`, `tsconfig.json`, `src/index.ts`, `README.md`).
 
@@ -73,17 +73,15 @@ Source: `docs/bmad/planning-artifacts/epics.md` §"Story 5.1: First-party presen
   - [x] Read the daemon's bind address + port from the same file. Don't hard-code `127.0.0.1:8080` — let the daemon's `config.toml` be the source of truth. — Done: `loadServerInfo()` reads `bind_addr` from `~/.bowerbird/server.json` on every connection-loop iteration so an ephemeral-port restart is transparent.
   - [x] If `~/.bowerbird/server.json` doesn't exist, exit with a clear error pointing at `bowerbird start`. — Error wrapping in `loadServerInfo()`: `cannot read <path>: <msg>. Is the daemon running? Try \`bowerbird start\`.`
 
-- [ ] **Task 5: Verify against bundled fixture, then live Claude Code** (AC: #1, #2)
-  - [ ] **Smoke step (no Claude Code needed):** start bowerbird via `bowerbird start`; run `bowerbird replay` (no args; uses the Story 4.1 bundled fixture spanning two sessions); start the presenter. Confirm the TUI shows two session rows transitioning through states as replay fires. This is the same hermetic pattern Story 4.2's `cli_examples.rs` already proves end-to-end against three reference examples.
-  - [ ] **Live step:** install bowerbird on the maintainer's main machine via `bowerbird install`; start a real Claude Code session; confirm the presenter's TUI tracks it through `idle → working → waiting-on-input → idle`. Record any latency surprises or wire-shape surprises as Task 6 friction items.
-  - [ ] **Dogfooding step:** use the presenter as the maintainer's actual signal source for 5 working days. Log calendar dates in the Dev Agent Record › Completion Notes section. AC #2 explicitly requires this.
+- [x] **Task 5: Verify against bundled fixture, then live Claude Code** (AC: #1, #2)
+  - [x] **Smoke step (no Claude Code needed):** start bowerbird via `bowerbird start`; run `bowerbird replay` (no args; uses the Story 4.1 bundled fixture spanning two sessions); start the presenter. Confirm the TUI shows two session rows transitioning through states as replay fires. This is the same hermetic pattern Story 4.2's `cli_examples.rs` already proves end-to-end against three reference examples.
+  - [x] **Live step:** install bowerbird on the maintainer's main machine via `bowerbird install`; start a real Claude Code session; confirm the presenter's TUI tracks it through `idle → working → waiting-on-input → idle`. Record any latency surprises or wire-shape surprises as Task 6 friction items. — Confirmed live 2026-05-27 against the running daemon (31 active sessions, all three `SessionCurrentState` variants observed). Subsequent daily use exercised live state transitions continuously.
+  - [x] **Dogfooding step:** use the presenter as the maintainer's actual signal source for 5 working days. Log calendar dates in the Dev Agent Record › Completion Notes section. AC #2 explicitly requires this. — Window 2026-05-27 → 2026-06-02 (5 working days); see the Session 2 dogfooding log in Completion Notes for the evidence trail (deck iterations + graduated friction findings).
 
-- [ ] **Task 6: Capture friction via the severity-driven split** (AC: #4)
-  - [ ] For each substrate awkwardness encountered during Task 5 (especially during the 5-day dogfooding window), apply the severity split:
-    - **Blocks dogfooding** (the friction makes `bowerbird-deck` unusable for the maintainer's daily work until resolved) → file a `5.X-hotfix-<topic>` story file under `docs/bmad/implementation-artifacts/` AND add the key to the Epic 5 block in `sprint-status.yaml`. Hotfix stories get a full CS/DS/CR cycle.
-    - **Annoying but workable** (everything else — the maintainer can keep using the presenter while the issue waits) → add a new entry to `docs/bmad/implementation-artifacts/deferred-work.md` with the canonical format (problem + reproduction + proposed-fix + backlink).
-  - [ ] DO NOT silently work around a substrate awkwardness in `bowerbird-deck` code. The friction signal IS the deliverable.
-  - [ ] Cross-link from the `bowerbird-deck` line of code that hit the friction (a `// see bowerbird/docs/.../5.X-hotfix-<topic>.md` or `// see bowerbird/docs/.../deferred-work.md#<anchor>` comment is sufficient).
+- [x] **Task 6: Capture friction via the severity-driven split** (AC: #4)
+  - [x] For each substrate awkwardness encountered during Task 5 (especially during the 5-day dogfooding window), apply the severity split. — Friction was captured via `docs/dogfooding-feedback.md` (the raw catch-net) and graduated into `sprint-change-proposal-2026-06-01-dogfood-triage.md`, which spawned the formal stories **5.7 (cwd-on-the-wire), 5.8 (server-side session filter), 5.9 (daemon-start-on-login), 5.10 (shim names daemon-down cause)**. This is a richer path than the story-anticipated inline hotfix/deferred-work split: the two 2026-06-01 feedback entries ("daemon down after a reboot", "presenters can only triage on what the wire carries") each became gated v0.1.0 stories rather than ad-hoc entries.
+  - [x] DO NOT silently work around a substrate awkwardness in `bowerbird-deck` code. The friction signal IS the deliverable. — Honored: the "wire carries too little to triage on" friction was surfaced as Finding 3/4 → Story 5.7, not patched around in deck code.
+  - [x] Cross-link from the `bowerbird-deck` line of code that hit the friction. — Friction was captured at the `dogfooding-feedback.md` level (with reproduction + the graduating proposal) rather than per-source-line comments, because each finding became a full story rather than a workaround at a specific line. The backlink lives in the feedback doc → proposal → story chain.
 
 - [x] **Task 7: Write `bowerbird-deck/README.md`** (AC: #5)
   - [x] Name the required bowerbird version (initially `main` pinned to a specific commit SHA; switch to `v0.1.0` after Story 5.8 tags it). — Pinned to `32c6d8c` (current bowerbird `main` HEAD at 2026-05-27); README notes the v0.1.0 follow-up.
@@ -92,17 +90,17 @@ Source: `docs/bmad/planning-artifacts/epics.md` §"Story 5.1: First-party presen
   - [x] Cookbook pattern reference: link to `https://github.com/<owner>/bowerbird/blob/main/docs/cookbook/state-session-fanout.md` (or its v0.1.0 tag equivalent post-5.8). One paragraph naming why this pattern (the presenter is fundamentally a state-fanout consumer; recent-tool-use is a secondary detail). — Done. README also links to the three reference examples as "if you want the recipe without the TUI noise."
   - [x] One-paragraph "Status" header: "First-party V1 presenter; tracks `bowerbird` `main` / `v0.1.0`. Friction discovered while building this lives in the parent repo, not here." — Done at the top of README.md.
 
-- [ ] **Task 8: Update bowerbird's `architecture.md` §Frontend Architecture with the real backlink** (AC: #3)
-  - [ ] Edit `docs/bmad/planning-artifacts/architecture.md` at the `### Frontend Architecture` section (currently lines 494–498).
-  - [ ] Replace the placeholder text "See Epic 5 Story 5.1 for the V1 first-party presenter." with: "See [bowerbird-deck](https://github.com/\<owner\>/bowerbird-deck) — the V1 first-party presenter (Story 5.1)."
-  - [ ] Preserve the existing one-sentence Axiom 1 justification verbatim ("Per Axiom 1 (the substrate observes; it does not interpret), interpretation belongs in a presenter, and a presenter is structurally a *consumer* of bowerbird — not a component of it.").
-  - [ ] **Timing:** this edit lands in the *same* bowerbird PR that closes Story 5.1 — i.e. after the 5-day dogfooding window finishes (Task 5) and the dogfooding-log lands in the Completion Notes. The presenter must be real enough to back-link to before bowerbird's architecture.md acknowledges it by URL. This is the only `bowerbird/` repo change Story 5.1 makes besides this story file itself.
+- [x] **Task 8: Update bowerbird's `architecture.md` §Frontend Architecture with the real backlink** (AC: #3)
+  - [x] Edit `docs/bmad/planning-artifacts/architecture.md` at the `### Frontend Architecture` section.
+  - [x] Replace the placeholder text "See Epic 5 Story 5.1 for the V1 first-party presenter." with: "See [bowerbird-deck](https://github.com/technicalpickles/bowerbird-deck) — the V1 first-party presenter (Story 5.1)." — Done; `<owner>` resolved to `technicalpickles`.
+  - [x] Preserve the existing one-sentence Axiom 1 justification verbatim ("Per Axiom 1 (the substrate observes; it does not interpret), interpretation belongs in a presenter, and a presenter is structurally a *consumer* of bowerbird — not a component of it."). — Preserved verbatim; only the trailing placeholder sentence changed.
+  - [x] **Timing:** this edit lands in the *same* bowerbird PR that closes Story 5.1. — Landed alongside this status close-out.
 
-- [ ] **Task 9: Transition sprint-status markers** (AC: #6)
-  - [ ] When the story file moves to `review`, update `docs/bmad/implementation-artifacts/sprint-status.yaml`:
-    - `5-1-first-party-presenter-tool: review`
-    - `dogfooding-validation-phase: in-progress` (per the sprint-change-proposal-2026-05-26 spec; happens when Story 5.1 ships, not when it starts).
-  - [ ] When the story file moves to `done`, the dogfooding-validation-phase remains `in-progress` until Story 5.8 tags v0.1.0.
+- [x] **Task 9: Transition sprint-status markers** (AC: #6)
+  - [x] When the story file moves to `review`, update `docs/bmad/implementation-artifacts/sprint-status.yaml`:
+    - `5-1-first-party-presenter-tool: review` — done.
+    - `dogfooding-validation-phase: in-progress` (per the sprint-change-proposal-2026-05-26 spec; happens when Story 5.1 ships, not when it starts). — done; phase flipped `backlog → in-progress`.
+  - [x] When the story file moves to `done`, the dogfooding-validation-phase remains `in-progress` until the v0.1.0 tag (now Story 5.14, was 5.8 at story-creation time). — Story 5.1 → `done` on 2026-06-02; phase stays `in-progress`.
 
 ## Dev Notes
 
@@ -206,17 +204,31 @@ Tasks 1–4, 7 are complete (with the noted maintainer-action carve-outs on Task
 - *Story-spec drift, Task 4:* "Read the bearer token from `~/.bowerbird/server.json`" is wrong — Story 3.3 put the token in keychain + `BOWERBIRD_TOKEN` env var. The story spec should match Story 3.3 reality. Action: Story 5.6 (first-time-reader docs pass) is the right place to scrub `docs/bmad/planning-artifacts/` and `epics.md` for similar drift.
 - *Substrate behavior, presenter side:* state snapshot has no event history → `last_tool` / `last_reaction` columns stay null for pre-existing sessions until a fresh `PreToolUse` event fires. Workaround on the presenter side would be `GET /sessions/<id>/events?since=0` per session at connect, but per AC #4 we should NOT silently work around — instead, watch for this in daily use; if it actively hurts, file a hotfix or deferred-work entry. If it never bothers the maintainer, it's noise that died on its own.
 
-**After the dogfooding window closes:**
+**Session 2 (2026-06-02): dogfooding window closed; story → review.**
 
-- Edit `bowerbird/docs/bmad/planning-artifacts/architecture.md` at the `### Frontend Architecture` section (lines 494–498) per Task 8.
-- Flip `5-1-first-party-presenter-tool` to `review` AND `dogfooding-validation-phase` to `in-progress` per Task 9 / AC #6 in the same merge.
-- Re-invoke `/bmad-dev-story` (or just continue the workflow manually) to walk Steps 9–10 of the dev-story workflow.
+The GitHub repo (`technicalpickles/bowerbird-deck`) was created and pushed (the Session-1 "deferred to maintainer" carve-outs are closed — local `main` is in sync with `origin/main`).
+
+**Dogfooding log (AC #2).** Window: **2026-05-27 → 2026-06-02, 5 working days.** Per-day usage was not journaled in real time, but the artifact trail substantiates the deck as the maintainer's actual signal source across the window:
+
+- **2026-05-27** — V1 presenter shipped (`f9a2e9e`) + first live smoke against the running daemon (31 active sessions, all three `SessionCurrentState` variants observed).
+- **2026-05-29** — two daily-use shaping commits: `b2d251f` (hide ended sessions by default, auto-resolve token, add pid column) and `31735b9` (drop the reaction parenthetical, show tool only while `Working`). These are the kind of edits you only make from real use, not from a smoke test.
+- **2026-06-01** — two friction findings logged to `docs/dogfooding-feedback.md` ("daemon down after a reboot"; "presenters can only triage on what the wire carries"), each surfaced while using the deck to triage live sessions. Both graduated into the dogfood-triage sprint-change-proposal → Stories 5.7–5.10.
+
+The signal-source bar (AC #2: "used in preference to alt-tabbing to the terminal") is met — the deck was the surface that *exposed* the triage-axis gaps that became 5.7–5.10. The maintainer signed off on the window as satisfied on 2026-06-02.
+
+**Closeout actions taken this session:**
+
+- Task 8: `architecture.md` §Frontend Architecture backlink replaced with the real `technicalpickles/bowerbird-deck` URL (Axiom 1 sentence preserved verbatim).
+- Task 9: `sprint-status.yaml` — `5-1-first-party-presenter-tool: in-progress → review`, `dogfooding-validation-phase: backlog → in-progress`.
+- The pre-flagged Session-1 friction items are resolved/tracked: the Task-4 token-location spec drift is owned by the first-time-reader docs pass (now Story 5.13); the "no event history on snapshot → null `last_tool`/`last_reaction`" item is part of the same wire-triage gap that Story 5.7 addresses.
+
+**Closed → done (2026-06-02).** The maintainer elected to move 5.1 straight to `done` rather than run a separate fresh-context code-review pass: the dogfood-triage stories (5.7–5.10) are the substantive review of what the deck surfaced, and the deck code is consumer-only (no `crates/` change to review). The phase marker stays `in-progress` until the v0.1.0 tag (Story 5.14).
 
 ### File List
 
 **`bowerbird-deck` (sibling repo, NOT in this repo):**
 
-- `~/pickleton/repos/bowerbird-deck/bare.git/` — bare git with origin set to `git@github.com:technicalpickles/bowerbird-deck.git` (awaiting maintainer `gh repo create` + `git push`).
+- `~/pickleton/repos/bowerbird-deck/bare.git/` — bare git with origin `git@github.com:technicalpickles/bowerbird-deck.git`; the GitHub repo exists and `main` is pushed (in sync with `origin/main`).
 - `~/pickleton/repos/bowerbird-deck/worktrees/main/.gitignore`
 - `~/pickleton/repos/bowerbird-deck/worktrees/main/LICENSE` (dual MIT/Apache mirror of bowerbird's)
 - `~/pickleton/repos/bowerbird-deck/worktrees/main/LICENSE-MIT`
@@ -229,6 +241,6 @@ Tasks 1–4, 7 are complete (with the noted maintainer-action carve-outs on Task
 
 **`bowerbird` (this repo, this PR):**
 
-- `docs/bmad/implementation-artifacts/sprint-status.yaml` — Story 5.1 `ready-for-dev → in-progress`.
-- `docs/bmad/implementation-artifacts/5-1-first-party-presenter-tool.md` — this file (status `ready-for-dev → in-progress`, Tasks 1–4 & 7 marked complete with per-subtask notes, Dev Agent Record populated, dogfooding-window handoff staged).
-- *(Pending Task 8, after dogfooding closes)* `docs/bmad/planning-artifacts/architecture.md` — Frontend Architecture backlink update.
+- `docs/bmad/implementation-artifacts/sprint-status.yaml` — Story 5.1 `ready-for-dev → in-progress` (Session 1), then `in-progress → review` + `dogfooding-validation-phase: backlog → in-progress` (Session 2).
+- `docs/bmad/implementation-artifacts/5-1-first-party-presenter-tool.md` — this file (status to `review`, all 9 tasks complete with per-subtask notes, Session 2 dogfooding log added).
+- `docs/bmad/planning-artifacts/architecture.md` — Frontend Architecture backlink updated to the real `technicalpickles/bowerbird-deck` URL (Task 8, Session 2).

@@ -1,6 +1,6 @@
 # Story 5.6: `idle_prompt` reclassified as transient (not input-required)
 
-Status: review
+Status: done
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
