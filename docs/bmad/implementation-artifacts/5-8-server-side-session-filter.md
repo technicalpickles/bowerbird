@@ -1,0 +1,255 @@
+# Story 5.8: Server-side session filter
+
+Status: ready-for-dev
+
+<!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
+
+## Story
+
+As a presenter author,
+I want `GET /sessions` to accept `?state=`/`?since=`/`?limit=` query filters AND the WS snapshot-on-subscribe burst to stop blasting me with the full `Ended` graveyard,
+so that a new presenter can fetch (and a reconnecting presenter can be handed) just the sessions it cares about — active ones — instead of re-implementing hide-ended client-side and paying the cost of every dead session the daemon has ever seen.
+
+**Closes dogfooding Finding 5 (filter half)** from `docs/dogfooding-feedback.md` (2026-06-01, "presenters can only triage on what the wire carries"). Building the pickletown web `/sessions` triage radar against `bowerbird-deck` surfaced that `Ended` is non-terminal by design (ADR 0004: `claude --resume` revives it), so the daemon cannot delete-on-death, and `SELECT_NON_SENTINEL_SESSIONS` returns the **entire** session history — dumped on every presenter both via the REST `GET /sessions` response AND via the snapshot-on-subscribe burst (Story 2.3). Concrete signal: a "134 ended hidden" footer in the deck, and two independent presenters (deck + web) each re-implementing the same hide-ended filter client-side. This story moves that filter server-side.
+
+**Operationalizes ADR 0008** (`docs/decisions/0008-server-side-session-filter.md` — authored 2026-06-02, Status Accepted). Read it first. The decision: filter on **both** surfaces by a **presenter-supplied predicate** (the read-time `current_state`), defaulting to unfiltered so v1.0 behavior is preserved everywhere. REST gets `?state=`/`?since=`/`?limit=` query params; the WS snapshot-on-subscribe burst is scoped by an optional `states` field on `ClientMessage::Subscribe`. The daemon never decides on its own what is "worth" sending — the presenter expresses intent and the daemon filters by a mechanical fact, the same way `topic` already scopes by session id. This keeps the substrate a pure fact-filter (Axiom 1).
+
+Source proposal: `docs/bmad/planning-artifacts/sprint-change-proposal-2026-06-01-dogfood-triage.md` §4.2 (the change list — note: §4.2 said "no ADR" assuming REST-only query parsing; the maintainer's choice to scope the WS snapshot by a presenter-supplied predicate modifies the wire protocol, which ADR 0008 records) and §3 (rationale: why filter-only, not a retention sweep). **Second of four dogfood-triage stories (5.7–5.10)**; all four gate the v0.1.0 tag (now Story 5.14). Story 5.7 (session cwd + started_at on the wire) is **done** and is the immediate predecessor — it touched almost every file this story touches.
+
+**This is filter-only, NOT a retention sweep.** The `Ended` graveyard never *evicts* (managed truncation = the no-list "no `bowerbird gc`" cut). This story makes the graveyard *filterable* and lets presenters opt the snapshot burst out of it; it does NOT delete projection rows. Tracked as bean `gt-3cnt` — this story **partially resolves** it (filter half); the retention sweep stays open on the bean as a post-V1 deferral (`deferred-work.md`).
+
+**This story modifies the wire protocol** (`ClientMessage::Subscribe` gains an optional `states` field). Consequences the dev must handle: the protocol-changelog gate fires (a `type: schema` entry satisfies it), ADR 0008's `Affects context.md sections` requires a same-PR `project-context.md` touch, and the additive-compat policy applies (the field is `#[serde(default)]` so old presenters omitting it are unaffected). The REST `?state=`/`?since=`/`?limit=` filters are query params parsed by an axum `Query` extractor (NOT new `protocol` types) — they ride the same changelog entry as additive behavior. **No schema migration** — `events`/`session_projections` are unchanged; this is a query/transport-shape story.
+
+## Acceptance Criteria
+
+1. **Given** `GET /sessions` with no query params **When** the daemon serializes the response **Then** the behavior is byte-for-byte identical to pre-5.8 (the full non-sentinel session list, `ORDER BY updated_at DESC, source ASC, session_id ASC`, each row carrying `cwd`/`started_at`/`last_pid` from Story 5.7) — the default is unfiltered and preserves current behavior exactly.
+
+2. **Given** `GET /sessions?state=<csv>` where `<csv>` is a comma-separated list of one or more session-state tokens (case-insensitive; accepted tokens are the `SessionCurrentState` wire variants `idle`, `working`, `waitinginput`, `ended`, `unknown`) **When** the daemon builds the response **Then** only sessions whose **read-time-derived** `current_state` (the value the response actually carries, after `current_state_for_read`'s stale-`Working`→`Idle` fallback — Story 1.6) is in the requested set are returned; the filter matches the rendered `current_state`, never a divergent stored value.
+
+3. **Given** `GET /sessions?state=working,waitinginput,idle,unknown` (i.e. every non-`Ended` state) **When** the daemon responds **Then** the `Ended` graveyard is excluded — this is the canonical "drop the dead sessions" call a triage presenter makes. **Given** `GET /sessions?state=ended` **Then** only `Ended` sessions are returned (the inverse — a history/audit view). Because `current_state_for_read` never produces or consumes `Ended` (it only maps stale `Working`→`Idle`), the `Ended`/non-`Ended` partition is exact regardless of the read-time fallback.
+
+4. **Given** `GET /sessions?state=<token>` with an unrecognized token (e.g. `?state=running`, `?state=foo`) **When** the daemon parses the query **Then** it returns `400 Bad Request` with body `{"error": "..."}` naming the invalid token and the accepted set — NOT a silent empty list, NOT a 500. (Strict-inbound policy, project-context §"Wire format": typos fail loudly.)
+
+5. **Given** `GET /sessions?since=<updated_at_ms>` where `<updated_at_ms>` is an epoch-ms integer **When** the daemon queries **Then** only sessions with `updated_at > <updated_at_ms>` are returned (exclusive lower bound on the `updated_at` column — the same `updated_at` carried in each `SessionListItem`), filtered at the SQL layer; `?since=0` or an absent `since` imposes no lower bound (current behavior); a non-integer `since` yields `400`.
+
+6. **Given** `GET /sessions?limit=<n>` where `<n>` is a positive integer **When** the daemon queries **Then** at most `<n>` rows are read from `session_projections` via a SQL `LIMIT` applied to the ordered (`updated_at DESC, source ASC, session_id ASC`), `since`-filtered query; an absent `limit` imposes no cap (current behavior); `limit=0` or a negative/non-integer `limit` yields `400`.
+
+7. **Given** `GET /sessions?state=<csv>&limit=<n>` (state-filter combined with limit) **When** the daemon responds **Then** the SQL `LIMIT <n>` is applied to the pre-state-filter ordered row set, then the read-time `?state=` filter is applied in Rust — so the returned array MAY contain fewer than `<n>` items when some of the `<n>` fetched rows are filtered out by state. This interaction is documented (`docs/protocol.md`); a presenter needing exactly-N active sessions paginates via `?since=`. `?state=`, `?since=`, and `?limit=` are independently optional and compose.
+
+8. **Given** any combination of `?state=`/`?since=`/`?limit=` **When** the response is built **Then** each returned `SessionListItem` is identical in shape and field values to what the unfiltered endpoint would have returned for that same row (the filters select *which* rows, never *how* a row is rendered); the `__daemon__` sentinel filter (`source != '__daemon__'`) is always applied underneath the new filters; corrupt-JSON rows are still skipped-with-log, not 500'd (mirrors pre-5.8 `list` discipline).
+
+9. **Given** the protocol crate **When** Story 5.8 lands **Then** `crates/protocol/src/ws.rs` `ClientMessage::Subscribe` gains `#[serde(default)] states: Vec<String>` (an empty vec — the default when the field is absent — means unfiltered, preserving v1.0 behavior); `ClientMessage` keeps `deny_unknown_fields` (the new field is known, so old clients omitting it parse fine and a typo'd *other* key still 1008-closes); the `states` values are dumb strings parsed daemon-side (mirroring how `topic: String` is parsed by `Topic::parse`), NOT a typed `Vec<SessionCurrentState>` (which would silently map a typo to `Unknown` per its `#[serde(other)]`).
+
+10. **Given** a WS client sends `Subscribe { topic: "state.session.*", states: ["working","waitinginput","idle"] }` **When** the daemon builds the snapshot-on-subscribe burst (`snapshot_for_topic`, Story 2.3) **Then** only sessions whose read-time-derived `current_state` is in `states` appear in the snapshot frames (here: the `Ended` graveyard is excluded); an empty/absent `states` yields the full current behavior (every matching session). The token parse is the SAME `parse_state_filter` the REST `?state=` uses (case-insensitive); an invalid token closes the connection with a `bad message` reason via the existing invalid-topic path (NOT a silent empty snapshot). The **live** event/state stream after subscription is **unchanged** — `states` scopes only the initial unsolicited snapshot burst; a session that later transitions to/from `Ended` still produces live `state.*` frames per Story 5.2's transitions-only gating.
+
+11. **Given** the snapshot scoping in AC #10 **When** a presenter needs the full session history including `Ended` **Then** it simply omits `states` (or uses REST `GET /sessions?state=ended` for the graveyard alone) — the snapshot stays presenter-controlled and the REST surface stays the complete query (consistent with the Story 2.3 doc: "Event history is fetched via REST; the live event stream picks up at subscribe-time"). The default on both surfaces is unfiltered; nothing is filtered unless the presenter asks.
+
+12. **Given** the documentation surface **When** Story 5.8 lands **Then** `docs/protocol.md` documents the `GET /sessions` `?state=`/`?since=`/`?limit=` params (accepted values, default-unfiltered, the `limit`+`state` interaction from AC #7, the `since`=`updated_at`-recency semantics) AND the `Subscribe.states` snapshot filter (accepted tokens, default-unfiltered, snapshot-only scope); `docs/protocol-changelog.md` gains ONE `type: schema` entry under `## v1.0 → v1.1` `(Resolves: 5.8)` covering the `ClientMessage::Subscribe.states` field (additive, `#[serde(default)]`, old presenters unaffected) AND the additive REST query params; `docs/presenter-authoring.md` gains a short note that triage presenters request `GET /sessions?state=working,waitinginput,idle` and `Subscribe` with the matching `states` rather than filtering client-side. `docs/bmad/project-context.md` is updated in the SAME PR per ADR 0008's `Affects context.md sections: Wire format, HTTP surface`.
+
+13. **Given** a v1.0 / pre-5.8 presenter **When** it connects to a Story-5.8+ daemon and sends `Subscribe { topic }` WITHOUT `states` **Then** the daemon deserializes it (the `#[serde(default)]` fills `states` empty) and returns the full unfiltered snapshot — no decode error, no behavior change. An additive-compat test in `crates/protocol/tests/contract_protocol.rs` asserts a `Subscribe` JSON without `states` deserializes (and one with `states` round-trips). Note: `ClientMessage` is inbound/strict, so this is the deserialize-with-and-without-the-field shape, not the permissive-outbound shape the Story 5.3/5.7 tests use for `SessionState`.
+
+14. **Given** the planning artifacts **When** Story 5.8 lands **Then** the `epics.md` §"Story 5.8" stub is replaced with the real ACs derived from this story (noting ADR 0008); `sprint-status.yaml` `5-8-server-side-session-filter` transitions `backlog → ready-for-dev` (at create-story time) with a `last_updated` breadcrumb; `deferred-work.md` line ~53 ("No pagination on `GET /sessions`") is marked resolved-by-5.8 (strike-through + note, matching the file's resolved-entry style); bean `gt-3cnt` is updated noting the filter half is resolved here and the retention sweep stays open.
+
+15. **Given** the full workspace test suite **When** Story 5.8 lands **Then** `cargo test --workspace -- --test-threads=1`, `cargo fmt --check`, and `cargo clippy --all-targets --workspace -- -D warnings` are all green; the protocol-changelog gate (`BOWERBIRD_CHANGELOG_GATE_BASE=origin/main`) passes (the `type: schema` entry satisfies the `crates/protocol/src/ws.rs` touch); new contract tests cover: `?state=` single + multi + invalid-token-400; `?since=` lower-bound + invalid-400; `?limit=` cap + invalid-400; the `?state=`+`?limit=` fewer-than-limit interaction; unfiltered-response-unchanged regression; the `Subscribe.states` snapshot filter (a subscriber against a DB with mixed `Ended`/active rows receives snapshot frames for only the requested states, while a live transition to `Ended` post-subscribe still arrives); an invalid `states` token closes with bad-message; and the `Subscribe`-without-`states` additive-compat round-trip.
+
+## Tasks / Subtasks
+
+> **Approach decided: presenter-controlled filtering on both surfaces (ADR 0008).** REST gets `?state=`/`?since=`/`?limit=` query params; the WS snapshot is scoped by an optional `states` field on `ClientMessage::Subscribe`. This **modifies the wire protocol** — the protocol-changelog gate fires (Task 9 / a `type: schema` entry covers it), ADR 0008's `Affects context.md sections` requires a same-PR `project-context.md` touch (Task 7), and the additive-compat policy applies (Task 4 makes the field `#[serde(default)]`). Read the Dev Note "Why presenter-controlled (approach A), and what was rejected" before starting.
+
+- [ ] **Task 1: Shared state-filter parse + match helper** (AC: #2, #3, #4, #10)
+  - [ ] Add a small helper module/fn the REST handler AND the WS snapshot both call, so the `?state=` semantics are defined once. Suggested home: `crates/daemon/src/api/sessions.rs` (or a new `crate::api::filter` module if it reads cleaner). Two functions:
+    - `parse_state_filter(raw: &str) -> Result<Vec<SessionCurrentState>, String>` — split `raw` on `,`, trim each token, lowercase, map to `SessionCurrentState` (`"idle"`→`Idle`, `"working"`→`Working`, `"waitinginput"`→`WaitingInput`, `"ended"`→`Ended`, `"unknown"`→`Unknown`). An empty/whitespace token or an unrecognized token returns `Err(<message naming the bad token + accepted set>)`. An empty overall string is the caller's concern (treat absent param as "no filter", not as a call to this fn).
+    - `state_matches(filter: &[SessionCurrentState], derived: SessionCurrentState) -> bool` — `filter.is_empty() || filter.contains(&derived)`. **Operates on the read-derived `current_state`, never the stored one.**
+  - [ ] Do NOT reuse `event_kind_from_db_str`-style JSON round-tripping — that parses PascalCase wire strings; here we want case-insensitive presenter-friendly tokens. Keep the token table explicit and small (5 variants). Add a unit test for the parser (valid single, valid multi mixed-case, invalid token → Err, empty token in a list → Err).
+
+- [ ] **Task 2: `GET /sessions` query params — `?state=`/`?since=`/`?limit=`** (AC: #1, #2, #3, #4, #5, #6, #7, #8)
+  - [ ] Edit `crates/daemon/src/api/sessions.rs::list`. Add an axum `Query` extractor, mirroring `crates/daemon/src/api/events.rs::EventsParams` exactly (`#[derive(Debug, Deserialize)]` + `#[serde(deny_unknown_fields)]`):
+    ```rust
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct SessionsParams {
+        #[serde(default)]
+        pub state: Option<String>,   // CSV of state tokens; None = unfiltered
+        #[serde(default)]
+        pub since: i64,              // updated_at exclusive lower bound; 0 = no bound
+        #[serde(default)]
+        pub limit: Option<i64>,      // SQL LIMIT; None = no cap
+    }
+    ```
+    Change the handler signature to `pub async fn list(State(state): State<AppState>, Query(params): Query<SessionsParams>) -> Response`. (`deny_unknown_fields` means an unknown query key 400s — consistent with the strict-inbound policy and with `EventsParams`. Verify axum returns 400, not 422, for the Query rejection; if it surfaces as 422 mirror whatever `EventsParams` already does and document it.)
+  - [ ] **Parse + validate up front, return 400 on bad input** (AC #4, #5, #6):
+    - If `params.state` is `Some(raw)`, call `parse_state_filter(raw)`; on `Err(msg)` return `400` with `Json(json!({"error": msg}))`. On `Ok(v)` keep the `Vec<SessionCurrentState>`. `None` → empty vec (no filter).
+    - If `params.limit` is `Some(n)` and `n <= 0` → `400` (`"limit must be a positive integer"`). `since < 0` → `400` (or clamp to 0 — pick 400 for consistency with limit; document).
+  - [ ] **SQL: add `since`/`limit` to the query** (AC #5, #6, #7). The current `SELECT_NON_SENTINEL_SESSIONS` is a `&'static str` with no params. Add filtered variants in `crates/daemon/src/db/queries.rs` (Task 3) and bind params. Push `since` (`AND updated_at > ?`) and `limit` (`LIMIT ?`) to SQL. Do **NOT** push `?state=` to SQL — it is applied in Rust on the read-derived state (see the design note). Keep the `WHERE source != '__daemon__'` sentinel filter and the `ORDER BY updated_at DESC, source ASC, session_id ASC` ordering in every variant.
+  - [ ] **Rust: apply `?state=` after `current_state_for_read`** (AC #2, #3, #7, #8). Inside the existing per-row loop (after `let current_state = current_state_for_read(&stored, now_ms);`), `if !state_matches(&state_filter, current_state) { continue; }` BEFORE pushing the `SessionListItem`. Everything else about the `SessionListItem` construction is unchanged (Story 5.7 fields `cwd`/`started_at` ride through).
+  - [ ] Confirm the unfiltered path (no params) produces the identical SQL + identical output as pre-5.8 (AC #1) — the simplest way is: when `since == 0 && limit.is_none()`, the query string equals (or is semantically identical to) the original `SELECT_NON_SENTINEL_SESSIONS`. A regression test pins this.
+
+- [ ] **Task 3: Filtered query variants in `queries.rs`** (AC: #5, #6, #7)
+  - [ ] Edit `crates/daemon/src/db/queries.rs`. Keep `SELECT_NON_SENTINEL_SESSIONS` (used by the unfiltered path AND by `snapshot_for_topic`). Add the `since`/`limit` clauses. Two clean options — pick one and comment it:
+    - (a) Build the SQL string dynamically in `list` (base + optional `AND updated_at > ?` + optional `LIMIT ?`), binding params positionally. Keep it readable; this is a read path, not the hot ingest path.
+    - (b) Add a couple of `const` variants (e.g. `SELECT_NON_SENTINEL_SESSIONS_SINCE`, `..._SINCE_LIMIT`). More constants but each is a fixed string.
+    - **Recommendation: (a)** — three independent optional clauses (`since`, `limit`) combinatorially explode into too many constants; a small dynamic builder with bound params (NEVER string-interpolated values — use `?` placeholders to avoid injection) is clearer. Mirror the `params!`/positional-bind style already in the file.
+  - [ ] The SQL `LIMIT ?` binds an `i64`; `since` binds an `i64`. Use placeholders, bind via the `interact` closure's `query_map` params (the current call passes `[]` — it will now pass the bound params). Watch the closure's `move`/borrow of `since`/`limit`.
+
+- [ ] **Task 4: Protocol — `Subscribe.states` field + additive-compat test** (AC: #9, #13)
+  - [ ] Edit `crates/protocol/src/ws.rs`. Change `ClientMessage::Subscribe { topic: String }` to `Subscribe { topic: String, #[serde(default)] states: Vec<String> }`. Keep `#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]` on the enum unchanged — `#[serde(default)]` makes the field optional for old clients (absent → empty vec → unfiltered), while `deny_unknown_fields` still rejects a typo'd *other* key. Add a doc comment: "`states` (Story 5.8, ADR 0008): optional snapshot-scoping filter. When non-empty, the snapshot-on-subscribe burst includes only sessions whose read-time `current_state` is in this set (tokens are `SessionCurrentState` wire values, case-insensitive, parsed daemon-side like `topic`). Empty/absent = unfiltered. Scopes ONLY the snapshot; the live stream is unaffected."
+  - [ ] `Vec<String>` (dumb strings), NOT `Vec<SessionCurrentState>` — a typed field would silently map a typo to `Unknown` (its `#[serde(other)]`), losing the loud-reject the strict-inbound policy wants. The daemon parses the strings via `parse_state_filter` (Task 1) at the `Subscribe` arm and closes with `bad message` on an invalid token (Task 5).
+  - [ ] `cargo build -p protocol`. No new deps. The changelog gate WILL fire on this `protocol/src/ws.rs` touch — Task 7's `type: schema` entry satisfies it (verify in Task 9).
+  - [ ] **Additive-compat test** (AC #13). Edit `crates/protocol/tests/contract_protocol.rs`. Add `subscribe_without_states_deserializes_to_empty`: `{"op":"subscribe","topic":"state.session.*"}` deserializes to `ClientMessage::Subscribe` with `states == []` (the pre-5.8 wire shape still parses — `#[serde(default)]`). Add `subscribe_with_states_round_trips`: `{"op":"subscribe","topic":"...","states":["working","idle"]}` deserializes with `states == ["working","idle"]`. **Note** this is the INBOUND/strict shape (deserialize-with-and-without-the-field), NOT the permissive-outbound `SessionState` shape the Story 5.3/5.7 `additive_compat_*` tests use — `ClientMessage` carries `deny_unknown_fields`, so don't try to deserialize it with an *unknown* extra key (that SHOULD error).
+
+- [ ] **Task 5: WS — thread `states` into the snapshot path** (AC: #10, #11)
+  - [ ] Edit `crates/daemon/src/projection/snapshot.rs::snapshot_for_topic`. Add a `state_filter: &[SessionCurrentState]` parameter (after `now_ms`). In the per-row loop, after `let derived_current = current_state_for_read(&stored, now_ms);` (line ~131), add `if !state_matches(state_filter, derived_current) { continue; }` BEFORE pushing the `StateFrame`. Empty filter = match all (current behavior). Import `SessionCurrentState` at module scope (the `#[cfg(test)]` block already imports it; production code needs it now). Update the existing `snapshot_for_topic` callers in its own `#[cfg(test)]` tests to pass `&[]`.
+  - [ ] Edit `crates/daemon/src/api/ws.rs` `ClientMessage::Subscribe` arm (~line 448). Destructure the new field: `ClientMessage::Subscribe { topic, states }`. Parse `states` via `parse_state_filter` — on `Err(msg)`, `close_with_bad_message(socket, &msg).await; return false;` (mirror the existing `Topic::parse` `Err(())` → `close_with_bad_message` path at ~line 540). On `Ok(filter)`, thread `&filter` into the `snapshot_for_topic(&state.db.reader, &t, subscriptions, now_ms, &filter)` call (step [C], ~line 496). An empty `states` parses to an empty filter → unfiltered snapshot, identical to today.
+  - [ ] **Live-stream invariant:** do NOT touch the broadcast/dispatch path (`rx.recv()` loop, `Topic::matches`). `states` scopes only the snapshot built at step [C]; a session transitioning to/from `Ended` after subscribe still delivers its live `state.*` frame (Story 5.2 emits a `State` broadcast on the genuine transition the liveness probe sets). AC #10's last sentence tests this invariant.
+  - [ ] Check the `Unsubscribe` arm — it does NOT gain `states` (it has no snapshot); leave `ClientMessage::Unsubscribe { topic }` as-is. Only `Subscribe` carries the snapshot filter.
+
+- [ ] **Task 6: REST contract tests** (AC: #1–#8, #15)
+  - [ ] Edit `crates/daemon/tests/contract_daemon.rs`. Add a `story_5_8_session_filter` test module (mirror the `story_5_4_*` module style). Use the existing harness that spins a daemon + reader pool against a tempfile DB and seeds `session_projections` rows via `UPSERT_SESSION_PROJECTION` (see `snapshot.rs` tests and existing `contract_daemon.rs` session tests for the seed helper). Cover:
+    - `sessions_unfiltered_unchanged` — seed mixed states; `GET /sessions` returns all non-sentinel rows in the documented order, every field intact (AC #1, #8).
+    - `sessions_state_filter_single` — `?state=working` returns only `Working` (read-derived) rows (AC #2).
+    - `sessions_state_filter_multi_drops_ended` — `?state=working,waitinginput,idle` excludes `Ended` rows (AC #3).
+    - `sessions_state_filter_ended_only` — `?state=ended` returns only `Ended` (AC #3).
+    - `sessions_state_filter_invalid_token_400` — `?state=running` → 400 with the bad token named (AC #4).
+    - `sessions_since_lower_bound` — seed rows with known `updated_at`; `?since=<mid>` returns only rows with `updated_at > mid` (AC #5); `?since=notanint` → 400.
+    - `sessions_limit_caps_rows` — `?limit=2` returns at most 2 rows in order (AC #6); `?limit=0` and `?limit=-1` → 400.
+    - `sessions_limit_plus_state_may_return_fewer` — seed e.g. `[Ended, Ended, Working]` in `updated_at DESC` order; `?state=working&limit=2` fetches the 2 newest (both `Ended`), state-filters to 0 → empty array (proves the documented AC #7 interaction, not a bug).
+    - **Read-derived correctness** — seed a stale `Working` row (stored `Working`, `last_event_at_ms` old enough that `current_state_for_read` renders `Idle`); assert `?state=idle` INCLUDES it and `?state=working` EXCLUDES it (proves the filter matches rendered state, not stored — AC #2). Reuse whatever staleness threshold `current_state_for_read` uses; check `projection::state` for the constant.
+  - [ ] `unwrap()` is fine in tests; tempfile DBs (not `:memory:`) for anything exercising the reader pool / WAL.
+
+- [ ] **Task 7: WS snapshot filter test** (AC: #10, #11, #15)
+  - [ ] Edit `crates/daemon/src/projection/snapshot.rs` `#[cfg(test)] mod tests` (it already has `fresh_db` + seed helpers and tests like `snapshot_for_topic(&reader, &Topic::StateAll, &HashSet::new(), now_ms)` — these now pass `&[]` as the new last arg, unfiltered). Add `snapshot_states_filter_excludes_unmatched`: seed a DB with active (`Working`/`WaitingInput`/`Idle`) AND `Ended` sessions; call `snapshot_for_topic(.., &[Working, WaitingInput, Idle])`; assert the frames cover only the active sessions, none `Ended`.
+  - [ ] Add `snapshot_empty_filter_returns_all`: same seed, `&[]` filter → all sessions (proves default-unfiltered, AC #11).
+  - [ ] Add `snapshot_states_filter_matches_read_derived`: a stale-`Working` row (renders `Idle`, NOT `Ended`) is INCLUDED by `&[Idle]` and EXCLUDED by `&[Working]` — proves the filter keys on the read-derived `current_state`, consistent with REST.
+  - [ ] The end-to-end "invalid `states` token closes with bad-message" and "live transition to `Ended` post-subscribe still arrives" halves are WS-handler behavior — cover the invalid-token close in a `contract_daemon.rs` WS test if the harness supports it (mirror however invalid-topic close is tested); if expensive, unit-test `parse_state_filter` rejection (Task 1) + assert the `Subscribe` arm routes `Err` to `close_with_bad_message`, and note the live-delivery invariant is covered by Story 2.2/5.2 tests this story does not regress.
+
+- [ ] **Task 8: Documentation** (AC: #12)
+  - [ ] Edit `docs/protocol.md` §`GET /sessions`: document the three query params — `?state=<csv>` (accepted tokens `idle,working,waitinginput,ended,unknown`, case-insensitive, default unfiltered, filters on the read-time `current_state`), `?since=<updated_at_ms>` (exclusive lower bound on `updated_at`; recency filter, not an opaque cursor), `?limit=<n>` (positive; SQL cap on the ordered pre-state-filter set). Document the `?state=`+`?limit=` interaction (a page may return fewer than `limit` after state filtering — paginate via `?since=` for exact-N). State that invalid values 400.
+  - [ ] Edit `docs/protocol.md` WS / `Subscribe` + snapshot section (the Story 2.3 snapshot-on-subscribe area): document the optional `states` field on the `subscribe` op (accepted tokens, case-insensitive, default-absent = unfiltered, scopes ONLY the snapshot burst — the live stream is unaffected); note an invalid token closes the connection (`bad message`); note full history including `Ended` is available via REST `GET /sessions` (`?state=ended` for the graveyard alone).
+  - [ ] Edit `docs/protocol-changelog.md`: ONE `type: schema` entry under `## v1.0 → v1.1` (after the Story 5.7 entry), `(Resolves: 5.8)`. Cover: (1) `ClientMessage::Subscribe` gains optional `states: Vec<String>` (`#[serde(default)]`; a v1.0 presenter omitting it is unaffected; scopes the snapshot-on-subscribe burst by read-time `current_state`); (2) additive `GET /sessions` `?state=`/`?since=`/`?limit=` query params (default-unfiltered preserves v1.0 behavior). Reference ADR 0008. Match the prose density of the Story 5.3/5.7 `type: schema` entries.
+  - [ ] Edit `docs/presenter-authoring.md`: short note — a multi-session triage presenter should request `GET /sessions?state=working,waitinginput,idle` and `Subscribe` with the matching `states`, instead of fetching everything and hiding `Ended` client-side (which deck + web both did before 5.8). Mention `Ended` is non-terminal (a filtered-out session can revive and reappear on the live stream / next unfiltered fetch).
+  - [ ] **`project-context.md` (ADR 0008 same-PR protocol) — REQUIRED in this PR.** This task changes the wire protocol (`ClientMessage::Subscribe`) + the HTTP surface (`/sessions` filters), triggering ADR 0008's `Affects context.md sections: Wire format, HTTP surface`. In the same PR, edit `docs/bmad/project-context.md`: §"Wire format" — note the additive inbound `Subscribe.states` field (the asymmetric `deny_unknown_fields` policy already covers inbound-strict; `states` is an additive optional inbound field); §"HTTP surface" — add the `/sessions` `?state=`/`?since=`/`?limit=` filter params where the data endpoints are listed. One line each. The CI doc-touch gate on `crates/protocol/src/*.rs` fires for the `ws.rs` change — the `protocol-changelog.md` entry satisfies it mechanically, but ADR 0008 additionally requires these context.md sections be updated, not just touched.
+
+- [ ] **Task 9: Planning-artifact bookkeeping** (AC: #14)
+  - [ ] Edit `docs/bmad/planning-artifacts/epics.md` §"Story 5.8: Server-side session filter" — replace the stub paragraph with the real ACs (summarize ACs #1–#12 above; note ADR 0008; keep the breadcrumb pointing at `sprint-change-proposal-2026-06-01-dogfood-triage.md` §4.2). **Do NOT renumber anything** — Story 5.7 already inserted all four stubs (5.7–5.10) and renumbered the release tail (old 5.7–5.10 → 5.11–5.14). The slot exists; only its ACs change.
+  - [ ] Edit `docs/bmad/implementation-artifacts/sprint-status.yaml`: `5-8-server-side-session-filter` is `backlog`; transition `backlog → ready-for-dev` at create-story time, then `→ in-progress` at dev-story start, `→ review` post dev-story, `→ done` post code-review. Add a `last_updated` comment line per transition.
+  - [ ] Edit `docs/bmad/implementation-artifacts/deferred-work.md`: mark the "No pagination on `GET /sessions`" entry (line ~53) resolved-by-5.8 (strike-through + note). **Leave** the "No page-size limit on `GET /sessions/{id}/events`" entry (line ~52) OPEN — that is a different endpoint (`api/events.rs`) and is NOT in this story's scope (see Scope fence).
+  - [ ] Update bean `gt-3cnt` (`pt beans update 3cnt -d -` via stdin, preserving existing body): note the server-side filter half is resolved by Story 5.8; the `Ended` retention sweep (managed truncation) stays open as a post-V1 no-list (`no gc`) deferral.
+
+- [ ] **Task 10: Full workspace gate** (AC: #15)
+  - [ ] `cargo test --workspace -- --test-threads=1` (serialized per Epic 2 retro AI-3).
+  - [ ] `cargo fmt --check` and `cargo clippy --all-targets --workspace -- -D warnings`.
+  - [ ] **The protocol-changelog gate FIRES** (this story touches `crates/protocol/src/ws.rs`). Verify with `BOWERBIRD_CHANGELOG_GATE_BASE=origin/main cargo test --workspace -- protocol_changelog_gate --test-threads=1`; the Task 8 `type: schema` entry satisfies it. (If it fails, the changelog entry is missing or malformed — fix Task 8, not the gate.)
+
+- [ ] **Task 11: Manual smoke against the running daemon** (AC: #2, #3, #5, #6, #10)
+  - [ ] Build release, restart the daemon (it already migrated to v3 in Story 5.7 — no new migration here). With live + ended sessions present:
+    - `curl -s -H "Authorization: Bearer $(jq -r .token ~/.bowerbird/server.json)" 'http://127.0.0.1:<port>/sessions?state=working,waitinginput,idle' | jq 'length'` vs unfiltered `length` — confirm the ended count drops out.
+    - `?state=ended` returns only the graveyard; `?state=bogus` returns 400; `?limit=3` caps; `?since=<recent-ms>` narrows to recent.
+    - `wscat` to `state.session.*` WITH `states` in the subscribe (`{"op":"subscribe","topic":"state.session.*","states":["working","waitinginput","idle"]}`) against a daemon with a fat `Ended` graveyard; confirm the snapshot burst excludes the dead sessions. Repeat WITHOUT `states` and confirm the full graveyard still bursts (default-unfiltered preserved). Send a bogus token (`"states":["nope"]`) and confirm the connection closes with `bad message`. Confirm a live session that ends still pushes a `state` frame post-subscribe. Dogfooding success criterion: the deck/web subscribe with `states` and the connect is no longer a graveyard dump.
+  - [ ] **Out of scope** (do NOT touch): daemon supervision / start-on-login (Story 5.9), shim names-the-cause-on-daemon-down (Story 5.10), the `Ended` retention sweep (`gt-3cnt`, post-V1), `/sessions/{id}/events` page-size limit (separate deferred-work entry).
+
+## Dev Notes
+
+### Why presenter-controlled (approach A), and what was rejected
+
+The design decision is recorded in **ADR 0008** — read it. The short version: filter on **both** surfaces by a **presenter-supplied predicate** (the read-time `current_state`), defaulting to unfiltered so v1.0 behavior is preserved everywhere. REST: `?state=`/`?since=`/`?limit=` query params. WS: an optional `states` field on `ClientMessage::Subscribe` that scopes the snapshot burst. The daemon never decides on its own what is "worth" sending — `states` scopes the snapshot the same way `topic` scopes which sessions you get live. That keeps the substrate a pure fact-filter (Axiom 1) and keeps both surfaces' defaults identical ("nothing filters unless you ask").
+
+**Cost of this choice (handle it, don't be surprised by it):** it modifies the wire protocol (`ClientMessage::Subscribe`), so the changelog gate fires (Task 10), ADR 0008's `Affects context.md sections` requires a same-PR `project-context.md` touch (Task 8), and there's a forward-compat edge — a *newer* presenter sending `states` to an *older* daemon is rejected (`deny_unknown_fields`, WS close 1008). That's the unusual "client ahead of daemon" direction and is acceptable.
+
+**The rejected alternative (approach B):** a fixed daemon-side default where `snapshot_for_topic` always drops `Ended`, no protocol change, no ADR. It was close — lighter, matches the proposal's stated file footprint, and both current presenters would be happy with it. Rejected because it has the daemon *decide* relevance (a mild Axiom-1 smell), *silently changes* the WS snapshot default (breaking the "nothing filters unless asked" symmetry the REST half keeps), and removes a presenter's ability to get the graveyard on the snapshot at all. The maintainer chose the axiom-cleanliness and symmetry of A and accepted the wire-change + ADR cost for a protocol-stability release. ADR 0008 §Alternatives records the full reasoning. **Do not implement B.**
+
+ADR numbering note: this story takes **ADR 0008** (0007 is reserved for Story 5.9 supervision and authored later; re-assigning it is higher churn). Cookbook Story 5.12, previously told "next free," takes 0009.
+
+### Why `?state=` filters in Rust on the read-derived state, not in SQL
+
+The `SessionListItem.current_state` contract (`crates/protocol/src/rest.rs`) is explicit: it is the **read-time** value, after `current_state_for_read`'s stale-`Working`→`Idle` fallback (Story 1.6), NOT the raw stored value. If `?state=` filtered the stored JSON in SQL (`json_extract(state,'$.current_state')`), a stale-`Working` row would match `?state=working` while the response renders its `current_state` as `Idle` — the filter would contradict the rendered field. That is a confusing lie. Filtering in Rust, right after `current_state_for_read` is computed (it already is, in both `list` and `snapshot_for_topic`), guarantees the filter matches exactly what the presenter sees.
+
+Cost: `?state=` can't reduce the DB row count, so it doesn't shrink the SQL scan — only `?since=`/`?limit=` do (those are pushed to SQL). At v0.1.0 scale (hundreds of sessions, ~1 MB max — see project-context "Projection growth is slow, one row per session, ~1MB over months") this is fine; the actual dogfooding pain was the unbounded *response* and the connect-time *burst*, both of which Rust-side filtering fixes (smaller response array; scoped snapshot). The `?state=`+`?limit=` interaction (AC #7: limit caps pre-filter, so a page may return < limit) is the one wart, and it's documented. `Ended` (the real use case) is exact either way because `current_state_for_read` never produces or consumes `Ended` — it only maps stale `Working`→`Idle`.
+
+### `?since=` is a recency filter on `updated_at`, not an event cursor
+
+Unlike `/sessions/{id}/events?since=<event_id>` (a monotonic event-id cursor, ASC order), sessions have no per-session monotonic cursor. `?since=` here is an **exclusive lower bound on the `updated_at` column** (`WHERE updated_at > ?`), the same `updated_at` each `SessionListItem` carries. Semantics: "sessions touched since this epoch-ms." With the existing `ORDER BY updated_at DESC` a presenter polling "what changed since my last poll" passes the max `updated_at` it has seen. Default `0` = no bound (all real rows have `updated_at > 0`). This satisfies the deferred-work "No pagination on `GET /sessions`" intent (line ~53) without inventing an opaque token.
+
+### This is the sibling of Story 5.7 — same files, lighter touch
+
+Story 5.7 (done) is the immediate predecessor and touched nearly every file you will: `api/sessions.rs` (it added `cwd`/`started_at` to the `SessionListItem` push and `SessionDetail.state` — see lines ~89–99 and ~170–177), `db/queries.rs` (it extended `INSERT_EVENT` and the per-event SELECTs), `projection/snapshot.rs` (it threaded `cwd`/`started_at` into the `StateFrame` push, line ~135–142). Read 5.7 (`5-7-session-cwd-on-the-wire.md`) for the established patterns and its Dev Agent Record. Key 5.7 lessons that apply:
+- **`api/events.rs::EventsParams`** (`#[serde(deny_unknown_fields)]` + `#[serde(default)]`, used via `Query(params)`) is the exact pattern to mirror for `SessionsParams`. Story 5.7 did not add query params, but the events endpoint already proves the shape.
+- **The list/snapshot pair share `SELECT_NON_SENTINEL_SESSIONS` and the corrupt-JSON-skip discipline** — keep them in lockstep. `snapshot.rs` line ~104 comment explicitly says "mirrors `api/sessions.rs::list` discipline."
+- **Manual `params!`/SQL sites are not compiler-enforced** — 5.7's Dev Agent Record records a sentinel-writer regression (`INSERT_EVENT` got an 8th column but a hand-built `params!` site wasn't updated, crashing at smoke). You're adding `?` placeholders + bound params to a `query_map` that currently passes `[]`; double-check the bind count matches the placeholder count, and smoke it (Task 10).
+- **clippy `type_complexity`** bit 5.7 on a wide row tuple — if you build a dynamic SQL string with a `Vec<Box<dyn ToSql>>` params vector, keep it clippy-clean.
+
+### Files this story touches
+
+**Source (4–5 files):** `crates/protocol/src/ws.rs` (`Subscribe.states` field), `crates/daemon/src/api/sessions.rs` (`SessionsParams` + `list` filtering + the shared `parse_state_filter`/`state_matches` helper, or a small new `api/filter.rs`), `crates/daemon/src/db/queries.rs` (since/limit query variants or dynamic builder), `crates/daemon/src/projection/snapshot.rs` (`state_filter` param), `crates/daemon/src/api/ws.rs` (`Subscribe` arm parses `states` + threads into `snapshot_for_topic`). **No `crates/shim/**`, no `crates/adapter-claude/**`, no migration** (the `events`/`session_projections` schema is unchanged — this is a query/transport-shape story, not a data-shape story).
+
+**Tests (2 files):** `crates/daemon/tests/contract_daemon.rs` (`story_5_8_session_filter` module — REST + WS invalid-token close), `crates/daemon/src/projection/snapshot.rs` `#[cfg(test)]` (snapshot `states` filter), `crates/protocol/tests/contract_protocol.rs` (`Subscribe` additive-compat).
+
+**Docs (4 files):** `docs/protocol.md`, `docs/protocol-changelog.md` (`type: schema`), `docs/presenter-authoring.md`, `docs/bmad/project-context.md` (ADR 0008 `Affects context.md sections` touch).
+
+**Decisions (1 file, authored at create-story time):** `docs/decisions/0008-server-side-session-filter.md` (Accepted 2026-06-02).
+
+**Planning artifacts (3 files):** `epics.md` (replace §5.8 stub ACs — NO renumber), `sprint-status.yaml` (status transitions), `deferred-work.md` (mark the `/sessions` pagination entry resolved). Plus bean `gt-3cnt`.
+
+**Files explicitly NOT touched:** `crates/daemon/src/db/migrations.rs` (no schema change), `crates/daemon/src/api/events.rs` (`/events` page-size limit stays deferred), `crates/shim/**`, `crates/adapter-claude/**`, the `current_state` arms of `projection/state.rs` (filtering reads `current_state`, never changes the state machine).
+
+### Project Structure Notes
+
+- `crates/daemon/src/api/sessions.rs` — UPDATE — add `SessionsParams` (`Query` extractor mirroring `EventsParams`), validate→400, push `since`/`limit` to SQL, apply `?state=` in Rust after `current_state_for_read`.
+- `crates/daemon/src/db/queries.rs` — UPDATE — `since`/`limit` clauses (dynamic builder recommended; keep `SELECT_NON_SENTINEL_SESSIONS` for the unfiltered + snapshot paths).
+- `crates/protocol/src/ws.rs` — UPDATE — `ClientMessage::Subscribe` gains `#[serde(default)] states: Vec<String>`.
+- `crates/daemon/src/projection/snapshot.rs` — UPDATE — `snapshot_for_topic` gains a `state_filter: &[SessionCurrentState]` param; `state_matches` skip in the per-row loop; bring `SessionCurrentState` into module scope.
+- `crates/daemon/src/api/ws.rs` — UPDATE — `Subscribe` arm destructures `states`, parses via `parse_state_filter` (bad token → `close_with_bad_message`), threads `&filter` into `snapshot_for_topic`.
+- `crates/daemon/src/api/sessions.rs` (or new `api/filter.rs`) — `parse_state_filter` + `state_matches` shared helpers.
+- `crates/daemon/tests/contract_daemon.rs` — UPDATE — `story_5_8_session_filter` module.
+- `crates/protocol/tests/contract_protocol.rs` — UPDATE — `Subscribe` additive-compat (with/without `states`).
+- `docs/protocol.md`, `docs/protocol-changelog.md` (`type: schema`), `docs/presenter-authoring.md`, `docs/bmad/project-context.md` (ADR 0008 Affects-sections) — UPDATE.
+- `docs/decisions/0008-server-side-session-filter.md` — DONE (authored 2026-06-02; Status Accepted).
+- `docs/bmad/planning-artifacts/epics.md` — UPDATE — replace §5.8 stub ACs (no renumber).
+- `docs/bmad/implementation-artifacts/sprint-status.yaml`, `deferred-work.md` — UPDATE.
+
+### Testing Standards
+
+Per `docs/bmad/project-context.md` §"Required contract tests" + §"Deterministic test discipline":
+- Tempfile DBs (not `:memory:`) for reader-pool/WAL paths; `unwrap()` is fine in tests.
+- No real `sleep()` for synchronization — the stale-`Working`→`Idle` test seeds an old `last_event_at_ms` directly rather than sleeping.
+- The unfiltered-response-unchanged test (AC #1) is the regression canary that the filters are additive.
+- `--test-threads=1` for the full workspace run (Epic 2 retro AI-3).
+
+### What is explicitly NOT in this story (scope fence)
+
+- **The `Ended` retention sweep / row eviction** — managed truncation, no-list "no `bowerbird gc`" cut, post-V1, `gt-3cnt`. This story makes `Ended` filterable, never deleted.
+- **`/sessions/{id}/events` page-size limit** — a DIFFERENT endpoint (`api/events.rs`), its own deferred-work entry (line ~52); stays deferred. Only `GET /sessions` (the list) gets pagination here.
+- **Daemon supervision / start-on-login** (Story 5.9, +ADR 0007), **shim names the daemon-down cause** (Story 5.10) — separate dogfood-triage stories.
+- **A `?source=` filter / multi-source disambiguation** — separate deferred-work item; V1 has one source (`claude`).
+- **Pushing `?state=` to SQL via `json_extract`** — rejected (see Dev Note / ADR 0008: would contradict the read-time `current_state` contract).
+- **A fixed daemon-side snapshot default (approach B)** — rejected in favor of the presenter-supplied `states` filter (see Dev Note + ADR 0008 §Alternatives). Do not implement B.
+- **Scoping the *live* stream by `states`** — `states` scopes only the snapshot burst; live `state.*`/`events.*` delivery is unchanged. Live-stream filtering is an explicit ADR 0008 "revisit when" item, not this story.
+
+### References
+
+- `docs/decisions/0008-server-side-session-filter.md` — **the decision record** (Accepted 2026-06-02). Why presenter-controlled filtering on both surfaces; the rejected approach-B and json_extract alternatives; the `Vec<String>`-not-`Vec<SessionCurrentState>` choice; the `gt-3cnt` retention split; the ADR-numbering note. Read first.
+- `docs/bmad/planning-artifacts/sprint-change-proposal-2026-06-01-dogfood-triage.md` — the originating spec. §4.2 (the change list: `?state=`/`?since=`/`?limit=` on `api/sessions.rs::list`, filtered `SELECT_NON_SENTINEL_SESSIONS` variants, `api/ws.rs` snapshot scoping, folds the `/sessions` pagination deferred item, partially resolves `gt-3cnt`), §3 (rationale: why filter-only not a retention sweep), §6 (the retention sweep stays deferred). NOTE §4.2 said "no ADR" assuming REST-only; the maintainer's presenter-controlled WS choice modifies the wire protocol, hence ADR 0008.
+- `docs/dogfooding-feedback.md` — 2026-06-01 "presenters can only triage on what the wire carries" (Finding 5: `Ended` never evicts, the full history dumped via REST and the snapshot burst). The trigger.
+- `docs/bmad/implementation-artifacts/5-7-session-cwd-on-the-wire.md` — **the immediate predecessor (done)**; same files, the `SessionListItem`/`SessionDetail`/`snapshot` patterns, and the Dev Agent Record sentinel-writer + clippy lessons.
+- `docs/decisions/0004-daemon-observed-session-liveness.md` — `Ended` is daemon-observed and **non-terminal** (`claude --resume` revives it); why the daemon can't delete-on-death (the reason a *filter*, not eviction, is the fix).
+- `docs/bmad/project-context.md` — Axiom 1 (substrate observes, does not interpret — `Ended` is a mechanical fact; "active" is the presenter's word, which is why `?state=` takes literal state tokens), §"HTTP surface" (the `/sessions` data endpoints), §"Wire format" (strict-inbound `deny_unknown_fields` — typo'd params 400; gets a same-PR touch per ADR 0008), §"ADR triggers" (the `Subscribe.states` wire-protocol change is what triggered ADR 0008).
+- `crates/daemon/src/api/sessions.rs:24–103` — `list`; the per-row loop where `current_state_for_read` is computed and `SessionListItem` is pushed (where `?state=` filtering slots in).
+- `crates/daemon/src/api/events.rs:23–35` — `EventsParams` + `Query(params)` — the exact extractor pattern to mirror for `SessionsParams`.
+- `crates/daemon/src/db/queries.rs:40–43` — `SELECT_NON_SENTINEL_SESSIONS` (the base query; `since`/`limit` clauses attach here; keep it for the unfiltered + snapshot paths).
+- `crates/daemon/src/projection/snapshot.rs:39–146` — `snapshot_for_topic` signature (gains `state_filter`) + per-row loop; `current_state_for_read` at ~131, `StateFrame` push at ~132 (where the `state_matches` skip slots in). Its `#[cfg(test)]` callers pass `&[]`.
+- `crates/daemon/src/api/ws.rs:448–544` — the `ClientMessage::Subscribe { topic }` arm: destructure `states`, parse via `parse_state_filter`, route `Err` to `close_with_bad_message` (mirror the `Topic::parse` `Err(())` path at ~540), thread `&filter` into the `snapshot_for_topic(.., now_ms, &filter)` call at ~496.
+- `crates/protocol/src/state.rs:17–47` — `SessionCurrentState` (`Idle`/`Working`/`WaitingInput`/`Ended`/`Unknown`) — the `?state=`/`states` token set; `SessionState`.
+- `crates/protocol/src/rest.rs:34–55` — `SessionListItem`, with the explicit "`current_state` is the **read-time** projection" contract that mandates Rust-side `?state=` filtering.
+- `crates/protocol/src/ws.rs:51–56` — `ClientMessage` (`#[serde(tag="op", rename_all="snake_case", deny_unknown_fields)]`); `Subscribe { topic }` gains `#[serde(default)] states: Vec<String>`. The doc-comment block at lines 35–50 explains the strict-inbound policy — the additive optional field is consistent with it.
+- `crates/protocol/tests/contract_protocol.rs` — the `additive_compat_*` family (Story 5.3/5.7, permissive-outbound `SessionState`); the new `Subscribe` test is the inbound/strict mirror (deserialize with/without `states`).
+- `crates/daemon/src/projection/state.rs::current_state_for_read` — the stale-`Working`→`Idle` read fallback + its staleness threshold constant (seed the threshold in the read-derived-correctness test).
+- `docs/bmad/implementation-artifacts/deferred-work.md:52–53` — the two pagination entries: line 53 (`/sessions`) is folded/resolved here; line 52 (`/sessions/{id}/events`) stays deferred.
+
+## Dev Agent Record
+
+### Agent Model Used
+
+### Debug Log References
+
+### Completion Notes List
+
+### File List
