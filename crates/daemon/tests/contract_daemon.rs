@@ -3812,6 +3812,67 @@ mod story_2_1_ws {
         state.ws_close_requested.cancel();
     }
 
+    /// Story 5.8 pass-3 (ADR 0008): a non-empty `states` filter is only valid
+    /// on a `state.session.*` family topic — those are the only topics with a
+    /// snapshot for it to scope. A `states` filter on an event topic has nothing
+    /// to scope, so accepting it would silently discard presenter intent; the
+    /// strict-inbound axiom fails loud (1008) instead. (An EMPTY `states` stays
+    /// valid on any topic — that's an ordinary subscribe, covered below.)
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_states_on_event_topic_closes_with_policy_violation() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = make_test_state_with_ws(
+            pools,
+            Arc::new(AtomicBool::new(true)),
+            4,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        );
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _hello = read_text_frame_or_close(&mut ws).await;
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"events.*","states":["working"]}"#.into(),
+        ))
+        .await
+        .expect("send event subscribe with a states filter");
+        assert_closes_with_1008(&mut ws).await;
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
+    }
+
+    /// Story 5.8 pass-3: the reject above is gated on a NON-empty filter — an
+    /// event subscribe with no `states` (the v1.0 shape) still works and goes
+    /// live, proving the new check does not regress ordinary event subscribes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_empty_states_on_event_topic_is_ordinary_subscribe() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = make_test_state_with_ws(
+            pools,
+            Arc::new(AtomicBool::new(true)),
+            4,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+        );
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"events.*","states":[]}"#.into(),
+        ))
+        .await
+        .expect("send event subscribe with empty states");
+        // Goes live (no close): a published event probe arrives on the wire.
+        crate::story_2_2_publish::wait_subscribe_live(
+            &mut ws,
+            &state,
+            crate::story_2_2_publish::ProbeKind::Event { source: "claude" },
+        )
+        .await;
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn ws_401_when_no_auth() {
         let (_tmp, pools) = fresh_pools().await;
@@ -5863,6 +5924,229 @@ mod story_2_3_snapshot {
             SessionCurrentState::Ended,
             "the fresh snapshot must carry the state that drifted while unsubscribed"
         );
+
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
+    }
+
+    /// Story 5.8 review pass-3: a State frame delivered LIVE (not via the
+    /// snapshot burst) must still update this connection's snapshot coverage,
+    /// so an identical re-subscribe does not re-snapshot a row the live stream
+    /// already carried (the `docs/protocol.md` no-double-delivery promise).
+    /// Pre-fix, `snapshotted_keys` was written only while emitting snapshot
+    /// frames, so a live row stayed "uncovered" and the re-subscribe duplicated
+    /// it. Repro: empty daemon → subscribe (empty snapshot) → publish a new
+    /// session (delivered live) → identical re-subscribe must emit nothing new.
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_state_frame_recorded_in_coverage_no_duplicate_on_resubscribe() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 4);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+
+        // Subscribe to an EMPTY daemon → empty snapshot. Confirm live before
+        // publishing so the next real frame is unambiguously the live one.
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+        wait_subscribe_live(
+            &mut ws,
+            &state,
+            ProbeKind::State {
+                session_id: "__live__",
+            },
+        )
+        .await;
+
+        // A new session arrives → delivered LIVE (not via the snapshot burst).
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-L",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+        let live = parse_state_frame(&read_text_frame_or_close(&mut ws).await);
+        assert_eq!(live.session_id, "sess-L");
+        assert_eq!(live.state.current_state, SessionCurrentState::Working);
+
+        // Identical re-subscribe: sess-L's key was recorded by the LIVE
+        // delivery, so zero new snapshot frames. A duplicate sess-L snapshot
+        // would be a non-probe frame and make this readiness drain panic.
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.*"}"#.into(),
+        ))
+        .await
+        .expect("send identical re-subscribe");
+        wait_subscribe_live(
+            &mut ws,
+            &state,
+            ProbeKind::State {
+                session_id: "__after__",
+            },
+        )
+        .await;
+
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
+    }
+
+    /// Story 5.8 review pass-3: coverage for a session lapses only when NO
+    /// remaining active state subscription covers it. With overlapping
+    /// subscriptions (`state.session.*` + `state.session.<id>`), unsubscribing
+    /// only the wildcard must NOT lapse coverage for the id the specific
+    /// subscription still tracks — its live state keeps flowing, and a wildcard
+    /// re-subscribe does not re-snapshot it. Guards against an over-broad
+    /// "clear all coverage on unsubscribe" reading of the protocol docs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn overlapping_subscription_unsubscribe_does_not_lapse_covered_session() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 4);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        // sess-A starts Working.
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-A",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+
+        // Subscribe wildcard → snapshot [sess-A]. Then ALSO subscribe the
+        // specific id (overlapping). The specific subscribe sends no new
+        // snapshot frame — sess-A is already covered (per-key dedup).
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.*"}"#.into(),
+        ))
+        .await
+        .expect("send wildcard subscribe");
+        let snap = parse_state_frame(&read_text_frame_or_close(&mut ws).await);
+        assert_eq!(snap.session_id, "sess-A");
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.sess-A"}"#.into(),
+        ))
+        .await
+        .expect("send specific-id subscribe");
+
+        // Barrier: an event subscription whose probe confirms in-order
+        // processing of everything sent before it (both state subs).
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"events.barrier.*"}"#.into(),
+        ))
+        .await
+        .expect("send barrier subscribe");
+        wait_subscribe_live(&mut ws, &state, ProbeKind::Event { source: "barrier" }).await;
+
+        // Unsubscribe ONLY the wildcard. The specific `state.session.sess-A`
+        // still covers sess-A, so its key must survive the unsubscribe prune.
+        ws.send(Message::Text(
+            r#"{"op":"unsubscribe","topic":"state.session.*"}"#.into(),
+        ))
+        .await
+        .expect("send wildcard unsubscribe");
+        // Fresh barrier probe, published AFTER the unsubscribe → its arrival
+        // proves the unsubscribe is fully processed (in-order handling).
+        wait_subscribe_live(&mut ws, &state, ProbeKind::Event { source: "barrier" }).await;
+
+        // Mutate sess-A → Ended. The specific subscription still delivers its
+        // live state (coverage did NOT lapse for delivery).
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-A",
+            EventKind::SessionEnded,
+            None,
+            "{}",
+        )
+        .await;
+        let live = parse_state_frame(&read_text_frame_or_close(&mut ws).await);
+        assert_eq!(live.session_id, "sess-A");
+        assert_eq!(
+            live.state.current_state,
+            SessionCurrentState::Ended,
+            "the still-active specific subscription must deliver the live transition"
+        );
+
+        // Re-subscribe the wildcard. sess-A is still covered (the specific sub
+        // kept it current), so NO re-snapshot. A duplicate would be a non-probe
+        // frame and make this readiness drain panic.
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.*"}"#.into(),
+        ))
+        .await
+        .expect("send wildcard re-subscribe");
+        wait_subscribe_live(&mut ws, &state, ProbeKind::Event { source: "barrier" }).await;
+
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
+    }
+
+    /// Story 5.8 review pass-3: the `states` snapshot filter applies to specific
+    /// `state.session.<id>` topics too, not only the wildcard. A matching filter
+    /// yields the snapshot row; a non-matching filter yields none. Two
+    /// connections so the negative case has its own fresh coverage set.
+    #[tokio::test(flavor = "current_thread")]
+    async fn states_filter_on_specific_session_topic() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 4);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        // sess-A is Working.
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-A",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+
+        // Matching filter: state.session.sess-A + states:["working"] → snapshot.
+        let (mut ws_match, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws_match).await);
+        ws_match
+            .send(Message::Text(
+                r#"{"op":"subscribe","topic":"state.session.sess-A","states":["working"]}"#.into(),
+            ))
+            .await
+            .expect("send matching-filter specific subscribe");
+        let matched = parse_state_frame(&read_text_frame_or_close(&mut ws_match).await);
+        assert_eq!(matched.session_id, "sess-A");
+        assert_eq!(matched.state.current_state, SessionCurrentState::Working);
+
+        // Non-matching filter: state.session.sess-A + states:["ended"] → no
+        // snapshot (sess-A renders Working). A wrongly-sent snapshot frame would
+        // be a non-probe frame and make this readiness drain panic. The State
+        // probe matches the specific subscription (keyed on session_id "sess-A").
+        let (mut ws_miss, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws_miss).await);
+        ws_miss
+            .send(Message::Text(
+                r#"{"op":"subscribe","topic":"state.session.sess-A","states":["ended"]}"#.into(),
+            ))
+            .await
+            .expect("send non-matching-filter specific subscribe");
+        wait_subscribe_live(
+            &mut ws_miss,
+            &state,
+            ProbeKind::State {
+                session_id: "sess-A",
+            },
+        )
+        .await;
 
         state.shutdown_requested.cancel();
         state.ws_close_requested.cancel();
@@ -10323,6 +10607,58 @@ mod story_5_8_session_filter {
         );
     }
 
+    // Pass-3 finding: `filter.rs` unit-tests empty/trailing tokens, but the HTTP
+    // surface only pinned `state=running`. A present-but-empty `?state=` and a
+    // trailing-comma `?state=working,` are malformed (an empty token is not "no
+    // filter" — absent is) and must 400 with an error body, the same loud-reject
+    // an unknown token gets. Pins the handler-level behavior end to end.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sessions_state_filter_empty_and_trailing_token_400() {
+        let (_tmp, pools) = fresh_pools().await;
+        seed(
+            &pools,
+            "claude",
+            "sess-w",
+            &st(SessionCurrentState::Working, FRESH),
+            1_000,
+        )
+        .await;
+        let app = api::router(ready_state(pools));
+
+        // Present-but-empty `?state=` → empty token → 400 with an error body.
+        let empty = app
+            .clone()
+            .oneshot(auth_get("/sessions?state="))
+            .await
+            .expect("oneshot");
+        assert_eq!(
+            empty.status(),
+            StatusCode::BAD_REQUEST,
+            "a present-but-empty ?state= is malformed, not 'no filter'"
+        );
+        let empty_body: serde_json::Value = json_body(empty).await;
+        assert!(
+            empty_body["error"].is_string(),
+            "empty ?state= must return an {{error}} body"
+        );
+
+        // Trailing comma → empty trailing token → 400 with an error body.
+        let trailing = app
+            .oneshot(auth_get("/sessions?state=working,"))
+            .await
+            .expect("oneshot");
+        assert_eq!(
+            trailing.status(),
+            StatusCode::BAD_REQUEST,
+            "a trailing-comma ?state= yields an empty token and must 400"
+        );
+        let trailing_body: serde_json::Value = json_body(trailing).await;
+        assert!(
+            trailing_body["error"].is_string(),
+            "trailing-comma ?state= must return an {{error}} body"
+        );
+    }
+
     // Review finding #5: `SessionsParams` is `#[serde(deny_unknown_fields)]`, so
     // an unknown query key fails loudly (strict-inbound policy), the same way
     // `EventsParams` does. Axum surfaces the `Query` rejection as 400. Pins the
@@ -10433,10 +10769,20 @@ mod story_5_8_session_filter {
         assert_eq!(zero.status(), StatusCode::BAD_REQUEST);
 
         let neg = app
+            .clone()
             .oneshot(auth_get("/sessions?limit=-1"))
             .await
             .expect("oneshot");
         assert_eq!(neg.status(), StatusCode::BAD_REQUEST);
+
+        // Pass-3 finding: a non-integer limit is an axum Query rejection → 400,
+        // the same loud-reject `?since=notanint` gets (AC #6 says non-integer
+        // limit → 400; only 0/-1 were pinned before).
+        let nan = app
+            .oneshot(auth_get("/sessions?limit=notanint"))
+            .await
+            .expect("oneshot");
+        assert_eq!(nan.status(), StatusCode::BAD_REQUEST);
     }
 
     // AC #7: limit caps the PRE-state-filter set, then state filters in Rust —

@@ -256,6 +256,7 @@ async fn connection_task(
                 close_for_daemon_shutdown(
                     &mut socket,
                     &subscriptions,
+                    &mut snapshotted_keys,
                     &mut rx,
                     &mut last_delivered_event_id,
                     &mut last_dropped_at,
@@ -330,11 +331,24 @@ async fn connection_task(
                         // doc for why this gate matters for state-only and
                         // narrow-topic subscribers.
                         match dispatch_envelope(&mut socket, &subscriptions, &env).await {
-                            DispatchOutcome::Sent => {
-                                if let BroadcastEnvelope::Event(ref ev) = env {
+                            DispatchOutcome::Sent => match &env {
+                                BroadcastEnvelope::Event(ev) => {
                                     last_delivered_event_id = Some(ev.event_id);
                                 }
-                            }
+                                // Story 5.8 pass-3: a live-delivered State frame
+                                // keeps the row current on this connection, so
+                                // record its `(source, session_id)` key in the
+                                // snapshot-coverage set. An identical re-subscribe
+                                // must not re-snapshot a session the live stream
+                                // already carried (no-double-delivery, protocol.md).
+                                BroadcastEnvelope::State {
+                                    source,
+                                    session_id,
+                                    ..
+                                } => {
+                                    snapshotted_keys.insert((source.clone(), session_id.clone()));
+                                }
+                            },
                             DispatchOutcome::Filtered => {}
                             DispatchOutcome::Closed => return,
                         }
@@ -480,11 +494,31 @@ async fn handle_text_frame(
             };
             match Topic::parse(&topic) {
                 Ok(t) => {
+                    // Story 5.8 pass-3 (ADR 0008): `states` scopes the
+                    // snapshot-on-subscribe burst, and only `state.session.*`
+                    // family topics have one. A non-empty `states` on an event
+                    // topic has nothing to scope, so accepting it would silently
+                    // discard the presenter's intent — the strict-inbound axiom
+                    // (project-context §"Wire format") fails loud instead, the
+                    // same loud-reject an invalid token or topic gets. An empty
+                    // `states` stays valid on any topic (an ordinary subscribe).
+                    if !state_filter.is_empty() && !t.is_state_session_family() {
+                        close_with_bad_message(
+                            socket,
+                            &format!(
+                                "states filter is only valid on state.session.* topics, not {topic:?}"
+                            ),
+                        )
+                        .await;
+                        return false;
+                    }
+
                     // [A] Drain pre-existing in-flight envelopes under the
                     //     OLD subscription set.
                     if !drain_backlog_under_state(
                         socket,
                         subscriptions,
+                        snapshotted_keys,
                         rx,
                         last_delivered_event_id,
                         last_dropped_at,
@@ -594,6 +628,7 @@ async fn handle_text_frame(
                 if !drain_backlog_under_state(
                     socket,
                     subscriptions,
+                    snapshotted_keys,
                     rx,
                     last_delivered_event_id,
                     last_dropped_at,
@@ -640,6 +675,7 @@ async fn handle_text_frame(
 async fn drain_backlog_under_state(
     socket: &mut WebSocket,
     subscriptions: &HashSet<Topic>,
+    snapshotted_keys: &mut HashSet<(String, String)>,
     rx: &mut tokio::sync::broadcast::Receiver<BroadcastEnvelope>,
     last_delivered_event_id: &mut Option<EventId>,
     last_dropped_at: &mut Option<tokio::time::Instant>,
@@ -655,11 +691,21 @@ async fn drain_backlog_under_state(
                 // — see DispatchOutcome doc and the code-review finding
                 // for Story 2.4.
                 match dispatch_envelope(socket, subscriptions, &env).await {
-                    DispatchOutcome::Sent => {
-                        if let BroadcastEnvelope::Event(ref ev) = env {
+                    DispatchOutcome::Sent => match &env {
+                        BroadcastEnvelope::Event(ev) => {
                             *last_delivered_event_id = Some(ev.event_id);
                         }
-                    }
+                        // Story 5.8 pass-3: same per-key coverage recording as
+                        // the main `rx.recv()` arm — a State frame drained under
+                        // the OLD subscription set (before a Subscribe inserts
+                        // the new topic) keeps that row current, so the snapshot
+                        // built next must dedup against it.
+                        BroadcastEnvelope::State {
+                            source, session_id, ..
+                        } => {
+                            snapshotted_keys.insert((source.clone(), session_id.clone()));
+                        }
+                    },
                     DispatchOutcome::Filtered => {}
                     DispatchOutcome::Closed => return false,
                 }
@@ -956,6 +1002,7 @@ async fn dispatch_envelope(
 async fn close_for_daemon_shutdown(
     socket: &mut WebSocket,
     subscriptions: &HashSet<Topic>,
+    snapshotted_keys: &mut HashSet<(String, String)>,
     rx: &mut tokio::sync::broadcast::Receiver<BroadcastEnvelope>,
     last_delivered_event_id: &mut Option<EventId>,
     last_dropped_at: &mut Option<tokio::time::Instant>,
@@ -966,6 +1013,7 @@ async fn close_for_daemon_shutdown(
     if !drain_backlog_under_state(
         socket,
         subscriptions,
+        snapshotted_keys,
         rx,
         last_delivered_event_id,
         last_dropped_at,

@@ -152,6 +152,22 @@ impl Topic {
             _ => false,
         }
     }
+
+    /// True if this is a `state.session.*` family topic — the only family
+    /// that has a snapshot-on-subscribe burst.
+    ///
+    /// Two callers: [`crate::projection::snapshot_for_topic`] gates the
+    /// snapshot read on it (an event topic has no snapshot), and the WS
+    /// `Subscribe` arm uses it to reject a non-empty `states` filter on a
+    /// non-state topic (Story 5.8, ADR 0008): `states` scopes the snapshot,
+    /// so a filter on an event topic has nothing to scope and would silently
+    /// discard presenter intent — the strict-inbound axiom fails loud instead.
+    pub fn is_state_session_family(&self) -> bool {
+        matches!(
+            self,
+            Topic::StateAll | Topic::StateSession(_) | Topic::StateSessionCurrent(_)
+        )
+    }
 }
 
 #[cfg(test)]

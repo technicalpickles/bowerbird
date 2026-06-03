@@ -59,10 +59,7 @@ pub async fn snapshot_for_topic(
     now_ms: i64,
     state_filter: &[SessionCurrentState],
 ) -> Result<Vec<StateFrame>> {
-    if !matches!(
-        new_topic,
-        Topic::StateAll | Topic::StateSession(_) | Topic::StateSessionCurrent(_)
-    ) {
+    if !new_topic.is_state_session_family() {
         return Ok(Vec::new());
     }
 
