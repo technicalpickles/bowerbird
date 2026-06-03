@@ -208,3 +208,99 @@ Run `cargo test -p bowerbird-daemon` (no `--test-threads=1`) on a multi-core run
 - The `release_pipeline_docs.rs::ci_workflow_runs_workspace_tests_single_threaded` test asserts the *string* `--test-threads=1` is present in `ci.yml`. It locks in the flag (and its folklore comment) — it must be updated in the same PR that removes the flag, or it will fail the build. (Confirmed: `tests/release_pipeline_docs.rs`.)
 - `init_tracing` (`crates/daemon/src/lib.rs:160-198`) uses non-panicking `try_init()` and is not called by any test — so even repeated subscriber init is a no-op, not a serialization hazard.
 - The historical SQLite-teardown deadlock fix (explicit `drop(reader) → drop(pools) → drop(tmp)` with `yield_now()`) lives at `contract_daemon.rs:2359-2363` as defense-in-depth; worth keeping regardless of the flag decision.
+
+---
+
+## Follow-up: 2026-06-03
+
+New scope, two distinct symptoms surfaced during Story 5.8 pass-4 (the broadcast-lag snapshot-coverage fix in `crates/daemon/src/api/ws.rs`). Case prep already existed at `docs/research/test-isolation-bowerbird-findings.md` (captured 2026-06-03); this block root-causes both. The first concluded section above answered a *different* question (why the workspace-wide `--test-threads=1` flag exists); these two symptoms are new and are NOT the `story_3_3_auth` env/keyring cause.
+
+**Naming reconciliation:** the intake brief called Symptom B "the F1 e2e," but `F1` is the Story 5.8 *pass-2* finding (`widening_filter_resends_only_uncovered_rows`, `contract_daemon.rs:5717`). The test that actually flakes under `--workspace` is the Story 5.8 *pass-4* test `story_2_4_dropped::lag_invalidates_snapshot_coverage_resubscribe_resnapshots` (matches the brief's "3/3, 9s→14s, daemon emits frame, client misses deadline" exactly). Subject of Symptom B below = the pass-4 lag test.
+
+### Hand-off Brief (follow-up)
+
+1. **Symptom A — the intermittent hang is a SQLite connection-close teardown deadlock, not signal handlers or a daemon spawn.** `story_1_7_rest::status_returns_none_last_event_when_only_sentinels` (`contract_daemon.rs:3377-3391`) is a pure in-process `app.oneshot("/status")` test — no WS, no signal handlers, no child daemon. It writes via the writer pool and reads via the reader pool, then drops `app`/`pools`/`_tmp` at scope exit **without** the explicit `drop → yield_now` ordering that the codebase already uses elsewhere to avoid the documented `sqlite3_close → pthread_mutex_wait` teardown deadlock (`contract_daemon.rs:2194-2209`). Race-y (~1-in-5), process-local, deterministic mechanism. Confidence: Medium-High (documentary; one live backtrace would seal it).
+2. **Symptom B — the e2e flake is wall-clock fragility under host load, not a logic bug.** `lag_invalidates_snapshot_coverage_resubscribe_resnapshots` asserts on observing a single WS snapshot frame over a real localhost TCP socket within a 5s deadline, in a connection deliberately stressed into broadcast-lag. The daemon provably emits the frame (file-trace confirmed in the research doc); `cargo test --workspace` runs other crates' test binaries concurrently with `contract_daemon` (cargo parallelizes *across* test binaries — `--test-threads=1` only serializes *within* one), raising the daemon binary's wall time ~9s→~14s and pushing frame delivery past the deadline. Confidence: High that it's load/timing.
+3. **What's needed next.** A: apply the existing `drop(reader)/drop(writer) → drop(pools) → drop(tmp)` + `yield_now()` teardown to the status test (and audit sibling in-process pool tests lacking it); optionally capture one hung backtrace to upgrade to High. B: add a testability seam around `connection_task`/`snapshotted_keys` so the re-snapshot is observed deterministically instead of racing a real-socket deadline; nextest serialized test-group is the cheaper interim that reduces (not eliminates) the contention.
+
+### Evidence Inventory (follow-up)
+
+| Source | Status | Notes |
+| ------ | ------ | ----- |
+| `docs/research/test-isolation-bowerbird-findings.md` | Available | Stronghold/case-prep. Repro commands for A and B; established B's daemon-emits-frame fact and that flavor/read-strategy are not the cause. |
+| `crates/daemon/tests/contract_daemon.rs:3377-3391` | Available | Symptom A test. In-process `oneshot("/status")`; writer-pool write + reader-pool read; **no teardown drop/yield ordering**. |
+| `crates/daemon/tests/contract_daemon.rs:2194-2209` | Available | Documents the exact deadlock: `sqlite3_close → sqlite3_mutex_enter → pthread_mutex_wait` in TempDir teardown; fix = explicit `drop(reader)→drop(pools)→drop(tmp)` + `yield_now()` (Story 4.4 AC#3a, Epic 3 retro AI-2). |
+| `crates/daemon/tests/contract_daemon.rs:216, 2478-2481, 8261, 8313` | Available | The teardown-ordering fix is applied here — pattern exists in-tree, just not on the status test. |
+| `crates/daemon/src/db/pool.rs:21-71` | Available | `init_pools`: writer `max_size=1`, reader `max_size=4`, `Runtime::Tokio1`, 5s pool-wait, post_create/post_recycle PRAGMA hooks via `interact`. Confirms 5s-bounded waits → a >60s hang is a true deadlock, not a timeout. |
+| `crates/daemon/src/api/status.rs:16-49` | Available | `/status`: `reader.get().await` then `interact()` (deadpool-sync spawn-blocking). The DB work that creates the reader-pool connection whose close races teardown. |
+| `crates/daemon/src/api/events.rs` (deny_unknown_fields 400 path) | Partial | Why `events_endpoint_rejects_unknown_query_param` (sibling at 3393) does NOT hang: the 400 is raised at the extractor before any pool checkout, so no deadpool connection is created → no close-mutex teardown race. (Deduced; worth a 1-line confirm.) |
+| deadpool-sqlite 0.13.0 / deadpool-sync 0.2.0 / deadpool 0.13.0 (`Cargo.lock`) | Available | Pinned versions whose `interact`/close-on-background-thread behavior is the deadlock substrate. |
+
+### Confirmed Findings (follow-up)
+
+#### Finding A1: The status hang's documented siblings prove the mechanism; the status test simply lacks the guard
+
+**Evidence:** `contract_daemon.rs:2194-2209` names the deadlock (`sqlite3_close → pthread_mutex_wait` in TempDir teardown) and its fix; the fix is present at lines 216 / 2478-2481 / 8261 / 8313 but absent at the status test (3377-3391). `db/pool.rs:19,40-44` caps every pool wait at 5s, so the observed >60s hang (research doc repro: `timeout 60 … → 1 of 5 times out`) cannot be a pool/busy timeout — it is an unbounded wait, i.e. a mutex deadlock, consistent with the documented `pthread_mutex_wait`.
+
+#### Finding A2: Symptom A is independent of WS / Story 5.8 and of the first investigation's cause
+
+**Evidence:** the status test imports no WS/broadcast types, spawns no child (`oneshot` against an in-process `api::router`), and registers no signal handler (those are binary-only, `main.rs`, per H1 refutation in the concluded section). It also touches no `std::env`/keyring (the `story_3_3_auth` cause). So A is orthogonal to both Story 5.8 and the `--test-threads=1` rationale — it is purely a per-test teardown defect.
+
+#### Finding B1: cargo parallelizes across test binaries; `--test-threads=1` does not prevent it
+
+**Evidence:** research doc §"Symptom B" measures contract_daemon at ~9s alone vs ~14s under `cargo test --workspace -- --test-threads=1`. `--test-threads=1` is a libtest (within-binary) flag; cargo still schedules each crate's test binary concurrently. The wall-time delta is the other crates' binaries (protocol/shim/adapter/cli) competing for CPU. This is the "extra system load" the research doc hypothesized — confirmed by the flag's semantics.
+
+#### Finding B2: The B failure is in the assertion's timing model, not the daemon
+
+**Evidence:** research doc: file-trace of `api/ws.rs` shows the daemon clears `snapshotted_keys`, re-snapshots `sess-A`, and calls `socket.send` on the post-lag re-subscribe; "the failure is purely that the client side never observes the frame within the deadline." Flavor-invariant and read-strategy-invariant (both tried). So the regression test encodes a wall-clock race against real-socket delivery; under added load the 5s deadline loses.
+
+### Hypotheses (follow-up)
+
+#### HA (Symptom A): in-process SQLite connection-close teardown deadlock
+
+**Status: Confirmed (Medium-High).** Mechanism documented in-tree (2194-2209), guard demonstrably present on siblings and absent here, timeout math rules out a bounded wait. **To refute/seal:** capture one hung backtrace via `sample`/`lldb` during the research-doc repro and confirm a `sqlite3_close`/`pthread_mutex` frame on a deadpool background thread → upgrades to High. **Refutation attempt:** considered "pool-wait timeout" and "busy_timeout" — both refuted by the 5s caps in `pool.rs` vs the >60s observed hang.
+
+#### HA-alt (refuted): signal-handler registration / daemon-spawn-that-doesn't-come-up
+
+**Status: Refuted.** The research doc lead #4 guessed these. The status test neither spawns the daemon binary nor calls `main()` (signal handlers are binary-only), and uses `oneshot` (no TCP listener to fail to bind). Neither guess can apply.
+
+#### HB (Symptom B): wall-clock-deadline assertion over a real socket, perturbed by cross-binary CPU contention
+
+**Status: Confirmed (High).** Findings B1+B2. **Note:** nextest serialized groups / `--jobs`-capped runs *reduce* contention but do not remove the wall-clock fragility — only decoupling the assertion from real-socket delivery does (the durable fix).
+
+### Source Code Trace (follow-up)
+
+| Element | Symptom A | Symptom B |
+| --- | --- | --- |
+| Defect site | `contract_daemon.rs:3377-3391` (missing teardown ordering) | `lag_invalidates_snapshot_coverage_resubscribe_resnapshots` (5s real-socket deadline after a forced lag burst) |
+| Mechanism | `sqlite3_close → sqlite3_mutex_enter → pthread_mutex_wait` race between deadpool connection close and TempDir/runtime teardown | host-load-perturbed WS frame delivery missing a wall-clock deadline |
+| Trigger | scope-exit drop with both pools' connections live, no `yield_now` tick | `cargo test --workspace` running sibling test binaries concurrently (~9s→~14s) |
+| Why intermittent | timing race on the close mutex (~1/5) | depends on how much concurrent load the box carries during the deadline window |
+| Not the cause | signal handlers (binary-only), daemon spawn (none), env/keyring (`story_3_3_auth` only) | runtime flavor, read strategy (both eliminated by experiment); the daemon logic (frame is emitted) |
+
+### Fix Direction (follow-up)
+
+**Symptom A (small, deterministic).** Give the status test the same teardown the codebase already uses: bind the pools to a local, then at end-of-body `drop(reader_conn if any); drop(state/app); drop(pools); yield_now().await; drop(tmp); yield_now().await;` (mirror lines 2478-2481). Then audit the other in-process `fresh_pools`+`oneshot` tests for the same missing guard. Higher-value than B because it intermittently hangs the whole serialized CI run. A systemic option worth a follow-up: a teardown helper or an `init_pools`/Drop-side fix so individual tests can't forget the ordering.
+
+**Symptom B (testability seam).** Add a deterministic observation point around `connection_task` so the post-lag re-snapshot can be asserted on the per-connection coverage set (`snapshotted_keys`) via a test hook, rather than racing a real-socket 5s deadline. Interim, load-reducing-only step: move the heavyweight WS/daemon contract tests into a cargo-nextest serialized test-group (`max-threads = 1`) — this is the same nextest direction the concluded section already recommended for the `story_3_3_auth` class, so both threads converge on adopting nextest.
+
+### Diagnostic / Reproduction (follow-up)
+
+- **A (seal to High):** loop the research-doc repro (`contract_daemon.rs` built; in-process test spawns no children, so no zombie-daemon risk), and on a hang, `sample <pid>` / `lldb -p <pid> -o 'thread backtrace all'` to capture the `sqlite3_close`/`pthread_mutex` frame. Expected: a deadpool background thread parked in `pthread_mutex_wait` inside SQLite close, and the runtime drop blocked on it.
+- **B (confirm load hypothesis cheaply):** run `cargo nextest run -p bowerbird-daemon` alone vs a `--workspace` nextest run with the WS contract tests in a `max-threads=1` group; expect the flake to shrink as concurrency drops, while only the seam fix makes it disappear.
+
+### Status (follow-up): Active — A diagnosed (Medium-High, backtrace pending), B diagnosed (High); both with concrete fix directions. No code changed this pass (investigation scope).
+
+## Follow-up: 2026-06-03 #2 — Symptom A reproduction attempt (during the quick-dev fix)
+
+Attempting to *fix* Symptom A (the teardown guard, spec `spec-status-test-teardown-deadlock.md`) surfaced evidence that **revises the Symptom A diagnosis**:
+
+- **Could not reproduce the hang on a quiet machine.** The original *unfixed* racy drop (replicated exactly: `fresh_pools` → write sentinel → `ready_state(pools)` → `oneshot("/status")`, no teardown) ran **50/50 clean** — 30× direct test-binary + 20× `cargo test --exact`. Zero hangs.
+- **The hang correlates with concurrent worktree load, not pure in-isolation timing.** Every observation of the hang (the original "~1-in-5", and the one cargo-level stall seen during this session) coincided with *another* session concurrently running full `contract_daemon`/`--workspace` suites in the same worktree (confirmed: a second `CLAUDE_SESSION_ID` + a background full-suite run + a spawned daemon, contending for CPU and the cargo lock). When that load was absent, neither the fixed nor the unfixed test hung.
+- **Implication:** Symptom A is likely the **same trigger profile as Symptom B** (load-/scheduler-sensitive), not a distinct in-isolation deadlock. The research-doc "~1/5 in isolation" was captured *during* Story 5.8 pass-4 work, which plausibly carried its own background load. This does **not** refute the documented `sqlite3_close → pthread_mutex_wait` mechanism (it is real, and the canonical fix at `contract_daemon.rs:2471` exists) — it reclassifies it as a **rare, load-amplified** race rather than a ~20%-in-isolation one.
+
+**Correction to the prior follow-up's confidence:** the "65/65 clean after the fix" figure recorded informally during the fix is **not** evidence the fix works — the unfixed control also passes on a quiet machine. Symptom A's fix is therefore *unproven* (bug not reproducible on demand), shipped only as defense-in-depth consistent with the canonical pattern.
+
+**Corrected scope of the at-risk set (reliable parser-based audit):** the deadlock class is **not** "in-process oneshot tests" — it is **every test that calls `fresh_pools()`** (each opens a migration writer connection). That is **79 in-process** `fresh_pools` tests (the quick-dev guarded 21) **+ 63 real-server** `fresh_pools` tests. Per-test enumeration proved unreliable (helper indirection: `seed()`, `list_ids()`); the only robust identification is "calls `fresh_pools`".
+
+**Open diagnostic to settle it:** reproduce Symptom A *under controlled load* (status test in a loop while a `--workspace` build/test or CPU stressor runs). If the unfixed control hangs under load and the leak/teardown variants don't, that both confirms the mechanism and validates a fix. Until then, A and B should likely be treated as one load-sensitivity problem with a shared fix (nextest binary-concurrency control / testability seam), per the §"Leads" in `docs/research/test-isolation-bowerbird-findings.md`.

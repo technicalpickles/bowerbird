@@ -28,6 +28,21 @@ async fn fresh_pools() -> (TempDir, DbPools) {
     (tmp, pools)
 }
 
+/// Ordered teardown for in-process pool tests. Drops the pools so SQLite's
+/// connection-close runs, yields so those finalizers complete, THEN drops the
+/// `TempDir` that removes `bower.db`. Prevents the intermittent
+/// `sqlite3_close → sqlite3_mutex_enter → pthread_mutex_wait` deadlock — the
+/// same fix the inline block in `state_plus_event_atomicity_under_sigkill...`
+/// applies (see its doc-comment for the mechanism). In-process `oneshot` REST
+/// tests that check out a connection must call this at end-of-body instead of
+/// relying on implicit scope-exit drop order.
+async fn teardown_pools(pools: DbPools, tmp: TempDir) {
+    drop(pools);
+    tokio::task::yield_now().await;
+    drop(tmp);
+    tokio::task::yield_now().await;
+}
+
 const TEST_BEARER: &str = "test-bearer-token-1.7";
 
 fn make_test_state(pools: DbPools, migrations_complete: Arc<AtomicBool>) -> AppState {
@@ -579,9 +594,9 @@ async fn readyz_returns_503_before_migrations_complete() {
     use axum::http::Request;
     use tower::ServiceExt;
 
-    let (_tmp, pools) = fresh_pools().await;
+    let (tmp, pools) = fresh_pools().await;
     let migrations_complete = Arc::new(AtomicBool::new(false));
-    let state = make_test_state(pools, migrations_complete.clone());
+    let state = make_test_state(pools.clone(), migrations_complete.clone());
     let app = api::router(state);
 
     let resp = app
@@ -607,6 +622,8 @@ async fn readyz_returns_503_before_migrations_complete() {
         .await
         .expect("oneshot");
     assert_eq!(resp2.status(), axum::http::StatusCode::OK);
+
+    teardown_pools(pools, tmp).await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2647,7 +2664,7 @@ mod story_1_7_rest {
     // ----- Task 13 -----
     #[tokio::test(flavor = "current_thread")]
     async fn sessions_list_returns_known_sessions_with_read_time_state() {
-        let (_tmp, pools) = fresh_pools().await;
+        let (tmp, pools) = fresh_pools().await;
         // Sentinel — must be filtered out of /sessions.
         projection::session::write_recording_started(&pools.writer)
             .await
@@ -2705,7 +2722,7 @@ mod story_1_7_rest {
         .await
         .expect("write sess-b Stop");
 
-        let app = api::router(ready_state(pools));
+        let app = api::router(ready_state(pools.clone()));
         let resp = app.oneshot(auth_get("/sessions")).await.expect("oneshot");
         assert_eq!(resp.status(), StatusCode::OK);
         let items: Vec<SessionListItem> = json_body(resp).await;
@@ -2727,11 +2744,13 @@ mod story_1_7_rest {
             "Stop surfaces as Idle"
         );
         assert_eq!(by_id["sess-b"].last_event_kind, EventKind::Stop);
+
+        super::teardown_pools(pools, tmp).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn sessions_list_applies_stale_working_fallback() {
-        let (_tmp, pools) = fresh_pools().await;
+        let (tmp, pools) = fresh_pools().await;
         projection::session::write(
             &pools.writer,
             &BroadcastHub::new(16),
@@ -2769,7 +2788,7 @@ mod story_1_7_rest {
             .expect("update");
         drop(writer);
 
-        let app = api::router(ready_state(pools));
+        let app = api::router(ready_state(pools.clone()));
         let resp = app.oneshot(auth_get("/sessions")).await.expect("oneshot");
         let items: Vec<SessionListItem> = json_body(resp).await;
         let it = items
@@ -2781,12 +2800,14 @@ mod story_1_7_rest {
             SessionCurrentState::Idle,
             "Working older than STALE_WORKING_MS must surface as Idle at read time"
         );
+
+        super::teardown_pools(pools, tmp).await;
     }
 
     // ----- Task 14 -----
     #[tokio::test(flavor = "current_thread")]
     async fn sessions_detail_returns_projection_state() {
-        let (_tmp, pools) = fresh_pools().await;
+        let (tmp, pools) = fresh_pools().await;
         projection::session::write(
             &pools.writer,
             &BroadcastHub::new(16),
@@ -2804,7 +2825,7 @@ mod story_1_7_rest {
         .await
         .expect("write sess-x");
 
-        let app = api::router(ready_state(pools));
+        let app = api::router(ready_state(pools.clone()));
         let resp = app
             .oneshot(auth_get("/sessions/sess-x"))
             .await
@@ -2815,13 +2836,15 @@ mod story_1_7_rest {
         assert_eq!(detail.session_id, "sess-x");
         assert_eq!(detail.state.current_state, SessionCurrentState::Working);
         assert_eq!(detail.state.last_event_kind, EventKind::PreToolUse);
+
+        super::teardown_pools(pools, tmp).await;
     }
 
     // Story 5.7 AC #8: GET /sessions and /sessions/{id} carry cwd + started_at;
     // the read-time stale-Working → Idle fallback does NOT alter them.
     #[tokio::test(flavor = "current_thread")]
     async fn sessions_rest_surfaces_cwd_and_started_at() {
-        let (_tmp, pools) = fresh_pools().await;
+        let (tmp, pools) = fresh_pools().await;
         projection::session::write(
             &pools.writer,
             &BroadcastHub::new(16),
@@ -2839,7 +2862,7 @@ mod story_1_7_rest {
         .await
         .expect("write sess-cwd");
 
-        let app = api::router(ready_state(pools));
+        let app = api::router(ready_state(pools.clone()));
 
         // Detail.
         let resp = app
@@ -2868,6 +2891,8 @@ mod story_1_7_rest {
             .expect("sess-cwd in list");
         assert_eq!(item.cwd, Some("/Users/x/repo".to_string()));
         assert!(item.started_at.is_some());
+
+        super::teardown_pools(pools, tmp).await;
     }
 
     // Story 5.7 review pass 2 (AC #9): GET /sessions/{id}/events carries
@@ -2876,7 +2901,7 @@ mod story_1_7_rest {
     // `cwd` through a separate column-index path (`SELECT_EVENTS_FOR_SESSION_SINCE`).
     #[tokio::test(flavor = "current_thread")]
     async fn events_rest_surfaces_event_cwd() {
-        let (_tmp, pools) = fresh_pools().await;
+        let (tmp, pools) = fresh_pools().await;
         projection::session::write(
             &pools.writer,
             &BroadcastHub::new(16),
@@ -2894,7 +2919,7 @@ mod story_1_7_rest {
         .await
         .expect("write sess-ev-cwd");
 
-        let app = api::router(ready_state(pools));
+        let app = api::router(ready_state(pools.clone()));
         let resp = app
             .oneshot(auth_get("/sessions/sess-ev-cwd/events?since=0"))
             .await
@@ -2907,12 +2932,14 @@ mod story_1_7_rest {
             Some("/repo".to_string()),
             "GET /sessions/{{id}}/events must carry Event.cwd"
         );
+
+        super::teardown_pools(pools, tmp).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn sessions_detail_returns_404_when_unknown() {
-        let (_tmp, pools) = fresh_pools().await;
-        let app = api::router(ready_state(pools));
+        let (tmp, pools) = fresh_pools().await;
+        let app = api::router(ready_state(pools.clone()));
         let resp = app
             .oneshot(auth_get("/sessions/does-not-exist"))
             .await
@@ -2920,12 +2947,14 @@ mod story_1_7_rest {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         let body: serde_json::Value = json_body(resp).await;
         assert_eq!(body, serde_json::json!({ "error": "session not found" }));
+
+        super::teardown_pools(pools, tmp).await;
     }
 
     // ----- Task 15 -----
     #[tokio::test(flavor = "current_thread")]
     async fn events_list_returns_all_in_ascending_order() {
-        let (_tmp, pools) = fresh_pools().await;
+        let (tmp, pools) = fresh_pools().await;
         for _ in 0..5 {
             projection::session::write(
                 &pools.writer,
@@ -2944,7 +2973,7 @@ mod story_1_7_rest {
             .await
             .expect("write");
         }
-        let app = api::router(ready_state(pools));
+        let app = api::router(ready_state(pools.clone()));
         let resp = app
             .oneshot(auth_get("/sessions/sess-y/events?since=0"))
             .await
@@ -2966,6 +2995,8 @@ mod story_1_7_rest {
             body.oldest_available_event_id, body.events[0].event_id,
             "oldest_available_event_id should match earliest stored row"
         );
+
+        super::teardown_pools(pools, tmp).await;
     }
 
     // Story 5.4 AC #5: requesting `/events` for a session_id that has never
@@ -2975,9 +3006,9 @@ mod story_1_7_rest {
     // (in `story_5_4_events_404` below) tests.
     #[tokio::test(flavor = "current_thread")]
     async fn events_list_returns_404_for_unknown_session() {
-        let (_tmp, pools) = fresh_pools().await;
+        let (tmp, pools) = fresh_pools().await;
         // Do not write any non-sentinel events; the session simply doesn't exist.
-        let app = api::router(ready_state(pools));
+        let app = api::router(ready_state(pools.clone()));
         let resp = app
             .oneshot(auth_get("/sessions/no-such/events?since=0"))
             .await
@@ -2985,11 +3016,13 @@ mod story_1_7_rest {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         let body: serde_json::Value = json_body(resp).await;
         assert_eq!(body, serde_json::json!({ "error": "session not found" }));
+
+        super::teardown_pools(pools, tmp).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn events_list_respects_since_cursor() {
-        let (_tmp, pools) = fresh_pools().await;
+        let (tmp, pools) = fresh_pools().await;
         let mut written_ids: Vec<i64> = Vec::new();
         for _ in 0..10 {
             let id = projection::session::write(
@@ -3012,7 +3045,7 @@ mod story_1_7_rest {
         }
         let cutoff = written_ids[4]; // strictly > cutoff means last 5 returned.
 
-        let app = api::router(ready_state(pools));
+        let app = api::router(ready_state(pools.clone()));
         let resp = app
             .oneshot(auth_get(&format!("/sessions/sess-y/events?since={cutoff}")))
             .await
@@ -3026,12 +3059,14 @@ mod story_1_7_rest {
                 ev.event_id
             );
         }
+
+        super::teardown_pools(pools, tmp).await;
     }
 
     // ----- Task 16 -----
     #[tokio::test(flavor = "current_thread")]
     async fn events_list_oldest_available_after_purge() {
-        let (_tmp, pools) = fresh_pools().await;
+        let (tmp, pools) = fresh_pools().await;
         let mut written: Vec<i64> = Vec::new();
         for _ in 0..5 {
             let id = projection::session::write(
@@ -3067,7 +3102,7 @@ mod story_1_7_rest {
         drop(writer);
         let surviving_min = written[3];
 
-        let app = api::router(ready_state(pools));
+        let app = api::router(ready_state(pools.clone()));
         let resp = app
             .oneshot(auth_get("/sessions/sess-y/events?since=0"))
             .await
@@ -3084,6 +3119,8 @@ mod story_1_7_rest {
             since < body.oldest_available_event_id.0,
             "presenter can infer a gap from since < oldest_available_event_id"
         );
+
+        super::teardown_pools(pools, tmp).await;
     }
 
     // ----- Task 17 -----
@@ -3200,7 +3237,7 @@ mod story_1_7_rest {
     // ----- /stats happy path + 404 -----
     #[tokio::test(flavor = "current_thread")]
     async fn sessions_stats_returns_stats_for_known_session() {
-        let (_tmp, pools) = fresh_pools().await;
+        let (tmp, pools) = fresh_pools().await;
         for _ in 0..3 {
             projection::session::write(
                 &pools.writer,
@@ -3219,7 +3256,7 @@ mod story_1_7_rest {
             .await
             .expect("write");
         }
-        let app = api::router(ready_state(pools));
+        let app = api::router(ready_state(pools.clone()));
         let resp = app
             .oneshot(auth_get("/sessions/sess-s/stats"))
             .await
@@ -3231,17 +3268,21 @@ mod story_1_7_rest {
         assert_eq!(stats.event_count, 3);
         assert!(stats.first_event_at.is_some());
         assert!(stats.last_event_at.is_some());
+
+        super::teardown_pools(pools, tmp).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn sessions_stats_returns_404_when_unknown() {
-        let (_tmp, pools) = fresh_pools().await;
-        let app = api::router(ready_state(pools));
+        let (tmp, pools) = fresh_pools().await;
+        let app = api::router(ready_state(pools.clone()));
         let resp = app
             .oneshot(auth_get("/sessions/missing/stats"))
             .await
             .expect("oneshot");
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        super::teardown_pools(pools, tmp).await;
     }
 
     // Story 5.7 review pass-5 finding: `/sessions/{id}/stats` `first_event_at`
@@ -3255,7 +3296,7 @@ mod story_1_7_rest {
     // document the divergence, NOT to switch `/stats` to event_id order.
     #[tokio::test(flavor = "current_thread")]
     async fn stats_first_event_at_min_diverges_from_started_at_under_nonmonotonic_created_at() {
-        let (_tmp, pools) = fresh_pools().await;
+        let (tmp, pools) = fresh_pools().await;
 
         // event_id 1 carries a LATER created_at than event_id 2 (clock skew).
         // started_at follows event_id order (2000); MIN(created_at) is 1000.
@@ -3283,7 +3324,7 @@ mod story_1_7_rest {
             .await
             .expect("rebuild");
 
-        let app = api::router(ready_state(pools));
+        let app = api::router(ready_state(pools.clone()));
 
         // started_at (via REST /sessions/{id}) = first event by event_id (2000).
         let detail: SessionDetail = json_body(
@@ -3320,12 +3361,14 @@ mod story_1_7_rest {
             stats.first_event_at, detail.state.started_at,
             "documented divergence: MIN(created_at) != started_at under non-monotonic timestamps"
         );
+
+        super::teardown_pools(pools, tmp).await;
     }
 
     // ----- /status -----
     #[tokio::test(flavor = "current_thread")]
     async fn status_returns_uptime_and_last_event() {
-        let (_tmp, pools) = fresh_pools().await;
+        let (tmp, pools) = fresh_pools().await;
         projection::session::write(
             &pools.writer,
             &BroadcastHub::new(16),
@@ -3347,7 +3390,7 @@ mod story_1_7_rest {
         let mc = Arc::new(AtomicBool::new(true));
         let (ingest_tx, _ingest_rx) = tokio::sync::mpsc::channel::<protocol::EventEnvelope>(1);
         let state = AppState {
-            db: pools,
+            db: pools.clone(),
             migrations_complete: mc,
             shutdown_requested: CancellationToken::new(),
             ws_close_requested: CancellationToken::new(),
@@ -3372,15 +3415,17 @@ mod story_1_7_rest {
         assert!(body.uptime_ms >= 0);
         assert!(body.last_event_id.is_some());
         assert!(body.last_event_at_ms.is_some());
+
+        super::teardown_pools(pools, tmp).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn status_returns_none_last_event_when_only_sentinels() {
-        let (_tmp, pools) = fresh_pools().await;
+        let (tmp, pools) = fresh_pools().await;
         projection::session::write_recording_started(&pools.writer)
             .await
             .expect("sentinel");
-        let app = api::router(ready_state(pools));
+        let app = api::router(ready_state(pools.clone()));
         let resp = app.oneshot(auth_get("/status")).await.expect("oneshot");
         let body: DaemonStatus = json_body(resp).await;
         assert!(
@@ -3388,6 +3433,8 @@ mod story_1_7_rest {
             "sentinel rows should not surface as last_event_id"
         );
         assert!(body.last_event_at_ms.is_none());
+
+        super::teardown_pools(pools, tmp).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -10291,8 +10338,8 @@ mod story_5_4_events_404 {
     /// any id including typos.
     #[tokio::test(flavor = "current_thread")]
     async fn events_404_for_unknown_session() {
-        let (_tmp, pools) = fresh_pools().await;
-        let app = api::router(ready_state(pools));
+        let (tmp, pools) = fresh_pools().await;
+        let app = api::router(ready_state(pools.clone()));
         let resp = app
             .oneshot(auth_get("/sessions/never-existed/events?since=0"))
             .await
@@ -10300,6 +10347,8 @@ mod story_5_4_events_404 {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         let body: serde_json::Value = json_body(resp).await;
         assert_eq!(body, serde_json::json!({ "error": "session not found" }));
+
+        super::teardown_pools(pools, tmp).await;
     }
 
     /// Story 5.4 AC #5: the new 404 gate must not break the legitimate
@@ -10307,7 +10356,7 @@ mod story_5_4_events_404 {
     /// with an empty `events` array and `cursor: None`.
     #[tokio::test(flavor = "current_thread")]
     async fn events_200_for_existing_session_with_no_new_events() {
-        let (_tmp, pools) = fresh_pools().await;
+        let (tmp, pools) = fresh_pools().await;
         let hub = BroadcastHub::new(16);
         let last_id = projection::session::write(
             &pools.writer,
@@ -10326,7 +10375,7 @@ mod story_5_4_events_404 {
         .await
         .expect("write");
 
-        let app = api::router(ready_state(pools));
+        let app = api::router(ready_state(pools.clone()));
         let resp = app
             .oneshot(auth_get(&format!(
                 "/sessions/sess-tail/events?since={}",
@@ -10342,6 +10391,8 @@ mod story_5_4_events_404 {
         let body: EventListResponse = json_body(resp).await;
         assert!(body.events.is_empty(), "no new events past cursor");
         assert_eq!(body.cursor, None);
+
+        super::teardown_pools(pools, tmp).await;
     }
 }
 
@@ -10630,7 +10681,7 @@ mod story_5_8_session_filter {
     // every field intact. The unfiltered regression canary.
     #[tokio::test(flavor = "current_thread")]
     async fn sessions_unfiltered_unchanged() {
-        let (_tmp, pools) = fresh_pools().await;
+        let (tmp, pools) = fresh_pools().await;
         seed(
             &pools,
             "__daemon__",
@@ -10664,7 +10715,7 @@ mod story_5_8_session_filter {
         )
         .await;
 
-        let app = api::router(ready_state(pools));
+        let app = api::router(ready_state(pools.clone()));
         let resp = app.oneshot(auth_get("/sessions")).await.expect("oneshot");
         assert_eq!(resp.status(), StatusCode::OK);
         let items: Vec<SessionListItem> = json_body(resp).await;
@@ -10676,6 +10727,8 @@ mod story_5_8_session_filter {
         assert_eq!(a.current_state, SessionCurrentState::Working);
         assert_eq!(a.started_at, Some(1));
         assert_eq!(a.updated_at, 3_000);
+
+        super::teardown_pools(pools, tmp).await;
     }
 
     // AC #2: ?state=<single> filters on the read-derived current_state.
@@ -10879,7 +10932,7 @@ mod story_5_8_session_filter {
     // AC #5: ?since=<updated_at_ms> exclusive lower bound; non-integer → 400.
     #[tokio::test(flavor = "current_thread")]
     async fn sessions_since_lower_bound() {
-        let (_tmp, pools) = fresh_pools().await;
+        let (tmp, pools) = fresh_pools().await;
         seed(
             &pools,
             "claude",
@@ -10904,7 +10957,7 @@ mod story_5_8_session_filter {
             3_000,
         )
         .await;
-        let app = api::router(ready_state(pools));
+        let app = api::router(ready_state(pools.clone()));
 
         let ids = list_ids(app.clone(), "/sessions?since=1500").await;
         // updated_at > 1500 → 2000, 3000 (DESC order).
@@ -10916,12 +10969,14 @@ mod story_5_8_session_filter {
             .await
             .expect("oneshot");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        super::teardown_pools(pools, tmp).await;
     }
 
     // AC #6: ?limit=<n> caps rows in order; limit=0 / negative → 400.
     #[tokio::test(flavor = "current_thread")]
     async fn sessions_limit_caps_rows() {
-        let (_tmp, pools) = fresh_pools().await;
+        let (tmp, pools) = fresh_pools().await;
         seed(
             &pools,
             "claude",
@@ -10946,7 +11001,7 @@ mod story_5_8_session_filter {
             1_000,
         )
         .await;
-        let app = api::router(ready_state(pools));
+        let app = api::router(ready_state(pools.clone()));
 
         let ids = list_ids(app.clone(), "/sessions?limit=2").await;
         assert_eq!(ids, vec!["sess-a", "sess-b"]);
@@ -10973,6 +11028,8 @@ mod story_5_8_session_filter {
             .await
             .expect("oneshot");
         assert_eq!(nan.status(), StatusCode::BAD_REQUEST);
+
+        super::teardown_pools(pools, tmp).await;
     }
 
     // AC #7: limit caps the PRE-state-filter set, then state filters in Rust —
