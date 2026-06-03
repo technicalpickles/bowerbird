@@ -213,7 +213,15 @@ The two inbound shapes — tool → daemon. Both are strict-`deny_unknown_fields
 { "op": "subscribe", "topic": "state.session.*", "states": ["working", "waitinginput", "idle"] }
 ```
 
-Subscribes the current connection to one topic (see [§Topic grammar](#topic-grammar) for the supported set). Subscribing to the same topic twice on one connection is idempotent (no double-delivery). Subscribing to a wildcard then a specific sub-topic deduplicates snapshots — `state.session.*` followed by `state.session.<id>` emits zero additional snapshot frames for that id.
+Subscribes the current connection to one topic (see [§Topic grammar](#topic-grammar) for the supported set).
+
+**Snapshot dedup is per session, not per topic.** The daemon tracks the `(source, session_id)` rows it has already snapshot-delivered on this connection and never re-sends one. Three consequences follow (all "no double-delivery"):
+
+- Subscribing to the **same topic twice** is idempotent — the second subscribe emits zero snapshot frames. This holds whether or not a `states` filter is set: an identical filtered re-subscribe (e.g. `states:["ended"]` twice) emits nothing the second time.
+- Subscribing to a **wildcard then a specific** sub-topic deduplicates — `state.session.*` followed by `state.session.<id>` emits zero additional snapshot frames for that id.
+- **Widening** a filter re-sends only the newly-uncovered rows. After `states:["working"]`, the same topic unfiltered snapshots the sessions the narrow burst skipped (the `Ended` graveyard, etc.) and **not** the `Working` rows already sent.
+
+Coverage **lapses on unsubscribe**: once you unsubscribe a topic, the live stream that kept its snapshot current stops, so a later re-subscribe re-snapshots that session (carrying any state that drifted while you were unsubscribed). Snapshot coverage is per-connection — a fresh connection always gets a full snapshot.
 
 **`states` (optional, Story 5.8).** A list of `SessionCurrentState` tokens (case-insensitive: `idle`, `working`, `waitinginput`, `ended`, `unknown`) that scopes the **snapshot-on-subscribe burst** to sessions whose read-time `current_state` is in the set — keyed identically to the REST `GET /sessions?state=`. Absent or empty = unfiltered (the v1.0 default; every matching session is bursted). A triage presenter passes `["working","waitinginput","idle"]` to drop the `Ended` graveyard from the connect burst. The filter scopes **only** the initial snapshot — the live `state.*`/`events.*` stream is unaffected, so a session that transitions to/from `Ended` after subscribe still delivers a live `state` frame, and the full history (including `Ended`) is always available via REST `GET /sessions` (`?state=ended` for the graveyard alone). An invalid token closes the connection with `bad message` (close code 1008), the same way an invalid topic does. `states` is additive: a v1.0 presenter omitting it is unaffected (`#[serde(default)]`).
 

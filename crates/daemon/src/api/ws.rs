@@ -195,14 +195,16 @@ async fn connection_task(
     }
 
     let mut subscriptions: HashSet<Topic> = HashSet::new();
-    // Story 5.8 (ADR 0008) — topics that received an *unfiltered* snapshot, the
-    // set the snapshot dedup keys on (NOT `subscriptions`). A filtered subscribe
-    // (`states` non-empty) only sent a subset of matching rows, so it must NOT
-    // suppress a later snapshot of the same topic; recording only unfiltered
-    // (full-coverage) snapshots here keeps the dedup sound. A re-subscribe to a
-    // topic already fully snapshotted is still skipped; a wider/different
-    // filtered re-subscribe after a narrow one still gets its rows.
-    let mut fully_snapshotted: HashSet<Topic> = HashSet::new();
+    // Story 5.8 (ADR 0008) — the `(source, session_id)` natural keys this
+    // connection has already emitted a snapshot frame for. The snapshot dedup
+    // keys on delivered rows, NOT on subscribed topics: a topic set cannot
+    // express a filtered subscribe's partial coverage. Recording the actual
+    // delivered keys makes every snapshot contract fall out of one model —
+    // identical re-subscribes are idempotent, a wider re-subscribe re-sends
+    // only the keys a narrower one never covered, and (via the prune on
+    // `Unsubscribe` below) coverage lapses when no active subscription tracks
+    // the session, so a re-subscribe re-snapshots the drift.
+    let mut snapshotted_keys: HashSet<(String, String)> = HashSet::new();
     let ping_interval = state.ws_config.ping_interval;
     let pong_timeout = state.ws_config.pong_timeout;
     let mut ping_timer =
@@ -276,7 +278,7 @@ async fn connection_task(
                         if !handle_text_frame(
                             &mut socket,
                             &mut subscriptions,
-                            &mut fully_snapshotted,
+                            &mut snapshotted_keys,
                             &mut rx,
                             &state,
                             text.as_str(),
@@ -413,7 +415,7 @@ async fn connection_task(
 async fn handle_text_frame(
     socket: &mut WebSocket,
     subscriptions: &mut HashSet<Topic>,
-    fully_snapshotted: &mut HashSet<Topic>,
+    snapshotted_keys: &mut HashSet<(String, String)>,
     rx: &mut tokio::sync::broadcast::Receiver<BroadcastEnvelope>,
     state: &AppState,
     text: &str,
@@ -436,13 +438,13 @@ async fn handle_text_frame(
         //       subscription set (unchanged from Story 2.1)
         //   [B] read now_ms for the read-time stale-Working fallback
         //   [C] read the projection table to build the snapshot, filtered
-        //       by the NEW topic AND deduped against topics already
-        //       *unfiltered*-snapshotted on this connection (Story 5.8:
-        //       NOT the raw subscription set — a prior filtered subscribe
-        //       didn't fully cover its topic)
+        //       by the NEW topic AND deduped against the `(source,
+        //       session_id)` keys already snapshot-delivered on this
+        //       connection (Story 5.8: per-key, NOT per-topic — a topic set
+        //       can't express a filtered subscribe's partial coverage)
         //   [D] insert the new topic into the subscription set so the
         //       main loop dispatches subsequent envelopes under the NEW
-        //       set
+        //       set; record each delivered key at [E]
         //   [E] emit each snapshot StateFrame on this connection's socket
         //   [F] (main loop resumes) `rx.recv()` dispatches buffered live
         //       envelopes under the NEW set, AFTER snapshot emission
@@ -519,19 +521,22 @@ async fn handle_text_frame(
                     //     primary contract. If the snapshot is essential,
                     //     the client reconnects (which is the canonical WS
                     //     retry mechanism and the only path that gets a
-                    //     fresh `pre_existing` set). Returning early
+                    //     fresh, empty `snapshotted_keys` set). Returning early
                     //     without inserting the topic would leave the
                     //     client silently unsubscribed for this topic
                     //     because the protocol has no Subscribe ack/error
                     //     frame in V1 (see protocol-changelog.md).
-                    //     Dedup keys on `fully_snapshotted` (topics that got an
-                    //     UNFILTERED snapshot), NOT `subscriptions`: a prior
-                    //     filtered subscribe only sent a subset, so it must not
-                    //     suppress this snapshot's rows (Story 5.8 finding).
+                    //     Dedup keys on `snapshotted_keys` (the `(source,
+                    //     session_id)` rows this connection already sent a
+                    //     snapshot frame for), NOT on subscribed topics: a
+                    //     prior filtered subscribe only covered a subset of
+                    //     its topic, so a topic-level dedup would either
+                    //     suppress rows the client never got or re-send rows
+                    //     it already has (Story 5.8 finding).
                     let snapshot_frames = match crate::projection::snapshot_for_topic(
                         &state.db.reader,
                         &t,
-                        fully_snapshotted,
+                        snapshotted_keys,
                         now_ms,
                         &state_filter,
                     )
@@ -549,18 +554,16 @@ async fn handle_text_frame(
 
                     // [D] Insert the new topic. Envelopes published between
                     //     [C] and here stay buffered in rx and dispatch under
-                    //     the new set at [F], after snapshot emission. Record
-                    //     the topic as fully snapshotted ONLY when unfiltered —
-                    //     a filtered snapshot didn't cover every matching row,
-                    //     so it must not suppress a later (wider) snapshot.
-                    if state_filter.is_empty() {
-                        fully_snapshotted.insert(t.clone());
-                    }
+                    //     the new set at [F], after snapshot emission.
                     subscriptions.insert(t);
 
-                    // [E] Emit snapshot frames. Order is the SQL row order:
+                    // [E] Emit snapshot frames and record each delivered
+                    //     `(source, session_id)` key so a later subscribe on
+                    //     this connection won't re-send it (the dedup model
+                    //     above). Order is the SQL row order:
                     //     `updated_at DESC, source ASC, session_id ASC`.
                     for frame in snapshot_frames {
+                        snapshotted_keys.insert((frame.source.clone(), frame.session_id.clone()));
                         let json = match serde_json::to_string(&ServerMessage::State(frame)) {
                             Ok(s) => s,
                             Err(e) => {
@@ -603,6 +606,16 @@ async fn handle_text_frame(
                     return false;
                 }
                 subscriptions.remove(&t);
+                // Story 5.8: snapshot coverage lapses when no active
+                // subscription still tracks the session. Drop keys no longer
+                // covered so a later re-subscribe re-snapshots the drift that
+                // accumulated while unsubscribed — the snapshot is a catch-up,
+                // and unsubscribing stops the live updates that kept it
+                // current (the `state.session.<id>.current_state` sibling is
+                // handled by `covers_state_session`, which keys on the id).
+                snapshotted_keys.retain(|(_source, sid)| {
+                    subscriptions.iter().any(|s| s.covers_state_session(sid))
+                });
                 true
             }
             Err(()) => {

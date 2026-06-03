@@ -136,6 +136,22 @@ impl Topic {
             _ => false,
         }
     }
+
+    /// True if this is a *state* topic whose coverage includes `session_id`.
+    ///
+    /// Mirrors the State arms of [`Topic::matches`] but keys on the session
+    /// id alone (state topics carry no source). Used to prune a WS
+    /// connection's per-key snapshot coverage on `Unsubscribe` (Story 5.8):
+    /// a snapshotted session stays "covered" only while some active
+    /// subscription still tracks it, so its catch-up snapshot is not
+    /// re-sent. Event topics never cover state and return `false`.
+    pub fn covers_state_session(&self, session_id: &str) -> bool {
+        match self {
+            Topic::StateAll => true,
+            Topic::StateSession(want) | Topic::StateSessionCurrent(want) => want == session_id,
+            _ => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -329,5 +345,32 @@ mod tests {
     fn matches_state_does_not_match_event_envelope() {
         let t = Topic::StateAll;
         assert!(!t.matches(&BroadcastEnvelope::Event(make_event("claude", "sess-1"))));
+    }
+
+    // Story 5.8: `covers_state_session` backs the unsubscribe-time prune of a
+    // connection's per-key snapshot coverage. It mirrors the State arms of
+    // `matches` (keyed on session id) and is false for every event topic.
+    #[test]
+    fn covers_state_session_wildcard_covers_any_session() {
+        assert!(Topic::StateAll.covers_state_session("sess-1"));
+        assert!(Topic::StateAll.covers_state_session("sess-2"));
+    }
+
+    #[test]
+    fn covers_state_session_specific_and_current_key_on_id() {
+        assert!(Topic::StateSession("sess-1".to_string()).covers_state_session("sess-1"));
+        assert!(!Topic::StateSession("sess-1".to_string()).covers_state_session("sess-2"));
+        assert!(Topic::StateSessionCurrent("sess-1".to_string()).covers_state_session("sess-1"));
+        assert!(!Topic::StateSessionCurrent("sess-1".to_string()).covers_state_session("sess-2"));
+    }
+
+    #[test]
+    fn covers_state_session_event_topics_never_cover() {
+        assert!(!Topic::EventsAll.covers_state_session("sess-1"));
+        assert!(!Topic::EventsBySource("claude".to_string()).covers_state_session("sess-1"));
+        assert!(
+            !Topic::EventsBySourceSession("claude".to_string(), "sess-1".to_string())
+                .covers_state_session("sess-1")
+        );
     }
 }

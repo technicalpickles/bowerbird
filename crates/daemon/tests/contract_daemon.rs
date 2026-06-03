@@ -5576,8 +5576,8 @@ mod story_2_3_snapshot {
     }
 
     /// Story 5.8 review (finding #2): a *filtered* subscribe must NOT suppress a
-    /// later snapshot of the same topic for rows the filter excluded. The
-    /// snapshot dedup keys on topics already *unfiltered*-snapshotted, so a
+    /// later snapshot of the same topic for rows the filter excluded. Snapshot
+    /// dedup keys on the `(source, session_id)` rows already delivered, so a
     /// first `states:["ended"]` subscribe (which only sent the graveyard) does
     /// not poison a second `states:["working",...]` subscribe to the same topic.
     ///
@@ -5642,6 +5642,227 @@ mod story_2_3_snapshot {
             "a wider re-subscribe after a filtered one must still snapshot the previously-excluded active row"
         );
         assert_eq!(active.state.current_state, SessionCurrentState::Working);
+
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
+    }
+
+    /// Story 5.8 review pass-2 finding F1: widening a filter on the same topic
+    /// re-sends ONLY the keys the narrower burst never covered — the overlap is
+    /// not double-delivered (the `docs/protocol.md` no-double-delivery promise).
+    /// The reviewer's exact case: subscribe `states:["working"]`, then the same
+    /// topic unfiltered — the Working row already delivered must NOT repeat, and
+    /// only the previously-excluded Ended row arrives.
+    #[tokio::test(flavor = "current_thread")]
+    async fn widening_filter_resends_only_uncovered_rows() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 4);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        // sess-W: Working (active). sess-E: Ended (graveyard).
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-W",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-E",
+            EventKind::SessionEnded,
+            None,
+            "{}",
+        )
+        .await;
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+
+        // Narrow subscribe: working-only. Snapshot is exactly [sess-W].
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.*","states":["working"]}"#.into(),
+        ))
+        .await
+        .expect("send working-only subscribe");
+        let working = parse_state_frame(&read_text_frame_or_close(&mut ws).await);
+        assert_eq!(working.session_id, "sess-W");
+        assert_eq!(working.state.current_state, SessionCurrentState::Working);
+
+        // Wider subscribe: same topic, unfiltered. sess-W was already
+        // delivered, so the ONLY new snapshot frame is sess-E.
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.*"}"#.into(),
+        ))
+        .await
+        .expect("send unfiltered subscribe");
+        let widened = parse_state_frame(&read_text_frame_or_close(&mut ws).await);
+        assert_eq!(
+            widened.session_id, "sess-E",
+            "widening must deliver only the previously-uncovered Ended row"
+        );
+
+        // No further snapshot frame: a duplicate sess-W would be a non-probe
+        // frame and make this readiness drain panic.
+        wait_subscribe_live(
+            &mut ws,
+            &state,
+            ProbeKind::State {
+                session_id: "__w__",
+            },
+        )
+        .await;
+
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
+    }
+
+    /// Story 5.8 review pass-2 finding F3: an identical filtered re-subscribe on
+    /// one connection is idempotent (no duplicate snapshot frame) — the
+    /// `docs/protocol.md` "subscribing to the same topic twice ... is idempotent"
+    /// promise, now honored for filtered subscribes by the per-key dedup.
+    #[tokio::test(flavor = "current_thread")]
+    async fn identical_filtered_resubscribe_is_idempotent() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 4);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-E",
+            EventKind::SessionEnded,
+            None,
+            "{}",
+        )
+        .await;
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+
+        // First ended-only subscribe: snapshot is exactly [sess-E].
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.*","states":["ended"]}"#.into(),
+        ))
+        .await
+        .expect("send ended-only subscribe");
+        let first = parse_state_frame(&read_text_frame_or_close(&mut ws).await);
+        assert_eq!(first.session_id, "sess-E");
+
+        // Identical re-subscribe: sess-E's key is already recorded, so zero new
+        // snapshot frames. A duplicate would be caught as a non-probe frame by
+        // the readiness drain below.
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.*","states":["ended"]}"#.into(),
+        ))
+        .await
+        .expect("send identical re-subscribe");
+        wait_subscribe_live(
+            &mut ws,
+            &state,
+            ProbeKind::State {
+                session_id: "__i__",
+            },
+        )
+        .await;
+
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
+    }
+
+    /// Story 5.8 review pass-2 finding F2: snapshot coverage lapses on
+    /// unsubscribe. After unsubscribing, the live updates that kept the snapshot
+    /// current stop, so a re-subscribe must re-snapshot the drift that
+    /// accumulated while unsubscribed. Repro: subscribe unfiltered, unsubscribe,
+    /// change a session while unsubscribed, re-subscribe → fresh snapshot
+    /// carrying the NEW state. Pre-fix, `fully_snapshotted` still held the topic
+    /// and the re-subscribe short-circuited to an empty snapshot.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unsubscribe_lapses_coverage_resubscribe_resnapshots() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = default_state(pools, 4);
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        // sess-A starts Working.
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-A",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+
+        // Subscribe unfiltered → snapshot [sess-A Working]; confirm live.
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+        let snap = parse_state_frame(&read_text_frame_or_close(&mut ws).await);
+        assert_eq!(snap.session_id, "sess-A");
+        assert_eq!(snap.state.current_state, SessionCurrentState::Working);
+        wait_subscribe_live(
+            &mut ws,
+            &state,
+            ProbeKind::State {
+                session_id: "__a__",
+            },
+        )
+        .await;
+
+        // Unsubscribe, then subscribe a non-matching event barrier. Once that
+        // Event probe is live, the unsubscribe is guaranteed processed
+        // (in-order frame handling), so the next publish delivers nothing live
+        // (state is unsubscribed; the barrier topic only matches source
+        // "barrier", not the "claude" change below).
+        ws.send(Message::Text(
+            r#"{"op":"unsubscribe","topic":"state.session.*"}"#.into(),
+        ))
+        .await
+        .expect("send unsubscribe");
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"events.barrier.*"}"#.into(),
+        ))
+        .await
+        .expect("send barrier subscribe");
+        wait_subscribe_live(&mut ws, &state, ProbeKind::Event { source: "barrier" }).await;
+
+        // Drift while unsubscribed: sess-A → Ended. No live frame reaches the
+        // client (state unsubscribed; barrier topic excludes claude events).
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-A",
+            EventKind::SessionEnded,
+            None,
+            "{}",
+        )
+        .await;
+
+        // Re-subscribe → fresh snapshot reflecting the drift (sess-A now Ended).
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.*"}"#.into(),
+        ))
+        .await
+        .expect("send re-subscribe");
+        let resnap = parse_state_frame(&read_text_frame_or_close(&mut ws).await);
+        assert_eq!(
+            resnap.session_id, "sess-A",
+            "re-subscribe after unsubscribe must re-snapshot the session"
+        );
+        assert_eq!(
+            resnap.state.current_state,
+            SessionCurrentState::Ended,
+            "the fresh snapshot must carry the state that drifted while unsubscribed"
+        );
 
         state.shutdown_requested.cancel();
         state.ws_close_requested.cancel();

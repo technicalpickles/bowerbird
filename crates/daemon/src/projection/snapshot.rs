@@ -31,13 +31,18 @@ use crate::projection::state::current_state_for_read;
 ///
 /// Returns an empty vec when `new_topic` is not a state topic, when the
 /// projection table has no non-sentinel rows, or when every matching
-/// session is already covered by an entry in `pre_existing` (snapshot
-/// dedup against overlapping topics). `pre_existing` is the set of topics
-/// already *unfiltered*-snapshotted on the connection — NOT the raw
-/// subscription set. A filtered subscribe (`state_filter` non-empty) sent
-/// only a subset of its topic's rows, so the caller must keep it out of
-/// `pre_existing` or this dedup would suppress rows the client never got
-/// (Story 5.8 finding).
+/// session was already snapshot-delivered on this connection.
+/// `already_snapshotted` is the set of `(source, session_id)` natural keys
+/// (project-context "Substrate-not-actor invariants") this connection has
+/// already emitted a snapshot frame for; a row whose key is in the set is
+/// skipped so the connection never double-delivers a snapshot
+/// (`docs/protocol.md` idempotence promise). Keying on the delivered key
+/// rather than on the subscribed topic is what lets a filtered subscribe
+/// (`state_filter` non-empty, which sent only a subset of its topic's rows)
+/// coexist with a later wider subscribe: the wider burst re-sends only the
+/// keys the narrow one never covered (Story 5.8, ADR 0008 finding). The
+/// caller prunes this set on `Unsubscribe`, so coverage lapses when no
+/// active subscription tracks the session and a re-subscribe re-snapshots.
 ///
 /// `state_filter` (Story 5.8, ADR 0008) scopes the burst by the presenter's
 /// requested `SessionCurrentState` set, keyed on the read-derived
@@ -50,7 +55,7 @@ use crate::projection::state::current_state_for_read;
 pub async fn snapshot_for_topic(
     reader_pool: &deadpool_sqlite::Pool,
     new_topic: &Topic,
-    pre_existing: &HashSet<Topic>,
+    already_snapshotted: &HashSet<(String, String)>,
     now_ms: i64,
     state_filter: &[SessionCurrentState],
 ) -> Result<Vec<StateFrame>> {
@@ -61,29 +66,13 @@ pub async fn snapshot_for_topic(
         return Ok(Vec::new());
     }
 
-    // Cheap pre-query coverage check. Skip the SQL read entirely when
-    // `pre_existing` already covers every envelope the new topic could
-    // match — every row would be deduped away inside the per-row loop
-    // anyway, so the DB and JSON work would be wasted. Covers:
-    //   - `StateAll` in pre_existing (covers every State envelope)
-    //   - exact `new_topic` already in pre_existing (idempotent re-sub)
-    //   - either of `StateSession(id)` / `StateSessionCurrent(id)` in
-    //     pre_existing when the new topic targets the same id (the two
-    //     variants match identical State envelopes — see
-    //     `Topic::matches` in `crates/daemon/src/broadcast/event.rs`).
-    if pre_existing.contains(&Topic::StateAll) || pre_existing.contains(new_topic) {
-        return Ok(Vec::new());
-    }
-    if let Some(want_sid) = match new_topic {
-        Topic::StateSession(sid) | Topic::StateSessionCurrent(sid) => Some(sid),
-        _ => None,
-    } {
-        let sibling_a = Topic::StateSession(want_sid.clone());
-        let sibling_b = Topic::StateSessionCurrent(want_sid.clone());
-        if pre_existing.contains(&sibling_a) || pre_existing.contains(&sibling_b) {
-            return Ok(Vec::new());
-        }
-    }
+    // No topic-based pre-query short-circuit: snapshot coverage is tracked
+    // per `(source, session_id)` key, not per topic (a topic set cannot
+    // express a filtered subscribe's partial coverage). An idempotent or
+    // already-covered re-subscribe still reads the rows and dedups them in
+    // Rust below — at projection scale (one row per session, ~1MB) that
+    // cold read is immaterial, the same tradeoff ADR 0008 accepted for
+    // Rust-side `?state=` filtering.
 
     let conn = reader_pool
         .get()
@@ -111,6 +100,16 @@ pub async fn snapshot_for_topic(
 
     let mut out = Vec::with_capacity(rows.len());
     for (source, session_id, state_json) in rows {
+        // Per-key snapshot dedup: a session already snapshot-delivered on
+        // this connection (under any prior subscribe, filtered or not) is
+        // not re-sent — the no-double-delivery contract (protocol.md),
+        // keyed on the `(source, session_id)` natural key the StateFrame
+        // carries. Checked before the JSON parse so a covered row costs
+        // nothing.
+        if already_snapshotted.contains(&(source.clone(), session_id.clone())) {
+            continue;
+        }
+
         // Skip rows with corrupt JSON rather than 500-ing the whole
         // snapshot — mirrors `api/sessions.rs::list` discipline.
         let stored: SessionState = match serde_json::from_str(&state_json) {
@@ -133,9 +132,6 @@ pub async fn snapshot_for_topic(
         };
 
         if !new_topic.matches(&synth) {
-            continue;
-        }
-        if pre_existing.iter().any(|t| t.matches(&synth)) {
             continue;
         }
 
@@ -443,10 +439,13 @@ mod tests {
         assert_ne!(frames[0].source, "__daemon__");
     }
 
+    // Story 5.8: snapshot dedup keys on the `(source, session_id)` rows the
+    // connection has already snapshot-delivered, NOT on subscribed topics.
+    // A session already in `already_snapshotted` is not re-sent.
     #[tokio::test(flavor = "current_thread")]
-    async fn pre_existing_subscription_dedupes_overlap() {
-        // AC #7: subscribing to state.session.* after already holding
-        // state.session.sess-A must not re-snapshot sess-A.
+    async fn already_snapshotted_key_dedupes_overlap() {
+        // sess-A was already delivered (e.g. a prior `state.session.sess-A`
+        // subscribe); a later `state.session.*` must not re-snapshot it.
         let tmp = TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("snap.db");
         let pools = init_pools(&db_path).await.expect("init_pools");
@@ -469,21 +468,20 @@ mod tests {
         )
         .await;
 
-        let mut pre = HashSet::new();
-        pre.insert(Topic::StateSession("sess-A".to_string()));
+        let already = HashSet::from([("claude".to_string(), "sess-A".to_string())]);
 
-        let frames = snapshot_for_topic(&pools.reader, &Topic::StateAll, &pre, 3_000, &[])
+        let frames = snapshot_for_topic(&pools.reader, &Topic::StateAll, &already, 3_000, &[])
             .await
             .expect("snapshot ok");
-        // sess-B is new, sess-A is dedup'd.
+        // sess-B is new, sess-A is dedup'd by key.
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].session_id, "sess-B");
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn pre_existing_wildcard_dedupes_everything() {
-        // Wildcard already covers every state envelope, so any second
-        // subscribe to a state topic emits zero new snapshot frames.
+    async fn all_keys_snapshotted_returns_empty() {
+        // Every matching session already delivered → zero new frames, the
+        // per-key analogue of the documented wildcard-then-specific dedup.
         let tmp = TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("snap.db");
         let pools = init_pools(&db_path).await.expect("init_pools");
@@ -506,13 +504,15 @@ mod tests {
         )
         .await;
 
-        let mut pre = HashSet::new();
-        pre.insert(Topic::StateAll);
+        let already = HashSet::from([
+            ("claude".to_string(), "sess-A".to_string()),
+            ("claude".to_string(), "sess-B".to_string()),
+        ]);
 
         let frames = snapshot_for_topic(
             &pools.reader,
             &Topic::StateSession("sess-A".to_string()),
-            &pre,
+            &already,
             3_000,
             &[],
         )
@@ -522,69 +522,133 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn sibling_state_topic_short_circuits_without_db_read() {
-        // `StateSession("sess-A")` and `StateSessionCurrent("sess-A")`
-        // match identical State envelopes — they're functionally
-        // equivalent. If one is already in `pre_existing`, subscribing
-        // to the other yields zero new frames AND must short-circuit
-        // before the DB read. To prove the short-circuit fires, we
-        // deliberately point the helper at a CLOSED reader pool; a
-        // path that touches SQLite would surface a pool error, while
-        // the short-circuit returns `Ok(vec![])` without ever calling
-        // the pool.
+    async fn sibling_state_topic_dedupes_by_key() {
+        // `StateSession("sess-A")` and `StateSessionCurrent("sess-A")` cover
+        // the same session. Once sess-A's key is recorded (delivered under
+        // one), subscribing to the other re-snapshots nothing — the dedup is
+        // by delivered key, so the two siblings are equivalent without any
+        // topic-set bookkeeping.
         let tmp = TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("snap.db");
         let pools = init_pools(&db_path).await.expect("init_pools");
         run_migrations(&pools.writer).await.expect("migrate");
-        pools.reader.close();
 
-        let mut pre = HashSet::new();
-        pre.insert(Topic::StateSession("sess-A".to_string()));
+        upsert_session(
+            &pools.writer,
+            "claude",
+            "sess-A",
+            &working_state(1_000),
+            1_000,
+        )
+        .await;
+
+        let already = HashSet::from([("claude".to_string(), "sess-A".to_string())]);
 
         let frames = snapshot_for_topic(
             &pools.reader,
             &Topic::StateSessionCurrent("sess-A".to_string()),
-            &pre,
+            &already,
             1_000,
             &[],
         )
         .await
-        .expect("sibling short-circuit must not touch the (closed) reader pool");
+        .expect("snapshot ok");
         assert!(frames.is_empty());
 
         // Symmetric direction.
-        let mut pre2 = HashSet::new();
-        pre2.insert(Topic::StateSessionCurrent("sess-A".to_string()));
         let frames2 = snapshot_for_topic(
             &pools.reader,
             &Topic::StateSession("sess-A".to_string()),
-            &pre2,
+            &already,
             1_000,
             &[],
         )
         .await
-        .expect("symmetric sibling short-circuit must not touch the (closed) reader pool");
+        .expect("snapshot ok");
         assert!(frames2.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn idempotent_re_subscribe_short_circuits_without_db_read() {
-        // Re-subscribing to a topic the connection already holds must
-        // not perform a fresh DB read. Same closed-pool trick as
-        // `sibling_state_topic_short_circuits_without_db_read`.
+    async fn idempotent_re_subscribe_dedupes_by_key() {
+        // Re-subscribing to a topic whose rows were already delivered emits
+        // zero new frames — the no-double-delivery contract, honored by the
+        // per-key set rather than a topic short-circuit.
         let tmp = TempDir::new().expect("tempdir");
         let db_path = tmp.path().join("snap.db");
         let pools = init_pools(&db_path).await.expect("init_pools");
         run_migrations(&pools.writer).await.expect("migrate");
-        pools.reader.close();
 
-        let mut pre = HashSet::new();
-        pre.insert(Topic::StateAll);
+        upsert_session(
+            &pools.writer,
+            "claude",
+            "sess-A",
+            &working_state(1_000),
+            1_000,
+        )
+        .await;
 
-        let frames = snapshot_for_topic(&pools.reader, &Topic::StateAll, &pre, 1_000, &[])
+        let already = HashSet::from([("claude".to_string(), "sess-A".to_string())]);
+
+        let frames = snapshot_for_topic(&pools.reader, &Topic::StateAll, &already, 1_000, &[])
             .await
-            .expect("idempotent re-sub must not touch the (closed) reader pool");
+            .expect("snapshot ok");
         assert!(frames.is_empty());
+    }
+
+    // Story 5.8 finding F1: widening a filter re-sends ONLY the keys the
+    // narrower burst never covered. After a `states:["working"]` subscribe
+    // recorded the Working key, an unfiltered re-subscribe delivers the rest
+    // (here: the Ended row) and NOT the already-sent Working row.
+    #[tokio::test(flavor = "current_thread")]
+    async fn widening_after_filtered_resends_only_uncovered() {
+        let tmp = TempDir::new().expect("tempdir");
+        let pools = init_pools(&tmp.path().join("snap.db"))
+            .await
+            .expect("init_pools");
+        run_migrations(&pools.writer).await.expect("migrate");
+
+        let now = 10_000;
+        upsert_session(
+            &pools.writer,
+            "claude",
+            "sess-working",
+            &state_with(SessionCurrentState::Working, now),
+            2_000,
+        )
+        .await;
+        upsert_session(
+            &pools.writer,
+            "claude",
+            "sess-ended",
+            &state_with(SessionCurrentState::Ended, now),
+            1_000,
+        )
+        .await;
+
+        // Narrow burst: only Working. Caller records the delivered key.
+        let narrow = snapshot_for_topic(
+            &pools.reader,
+            &Topic::StateAll,
+            &HashSet::new(),
+            now,
+            &[SessionCurrentState::Working],
+        )
+        .await
+        .expect("snapshot ok");
+        assert_eq!(narrow.len(), 1);
+        assert_eq!(narrow[0].session_id, "sess-working");
+
+        let already: HashSet<(String, String)> = narrow
+            .iter()
+            .map(|f| (f.source.clone(), f.session_id.clone()))
+            .collect();
+
+        // Wider (unfiltered) re-subscribe: only the uncovered Ended row.
+        let wide = snapshot_for_topic(&pools.reader, &Topic::StateAll, &already, now, &[])
+            .await
+            .expect("snapshot ok");
+        assert_eq!(wide.len(), 1, "Working already delivered must not repeat");
+        assert_eq!(wide[0].session_id, "sess-ended");
     }
 
     #[tokio::test(flavor = "current_thread")]
