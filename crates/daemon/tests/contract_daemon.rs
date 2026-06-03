@@ -6636,7 +6636,10 @@ mod story_2_4_dropped {
     use bowerbird_daemon::db::DbPools;
     use bowerbird_daemon::state::{AppState, WsConfig};
     use futures_util::{SinkExt, StreamExt};
-    use protocol::{Event, EventId, EventKind, EventListResponse, ServerMessage};
+    use protocol::{
+        Event, EventId, EventKind, EventListResponse, ServerMessage, SessionCurrentState,
+        SessionState,
+    };
     use tokio_tungstenite::tungstenite::Message;
     use tokio_util::sync::CancellationToken;
     use tower::ServiceExt;
@@ -6645,7 +6648,7 @@ mod story_2_4_dropped {
         connect_authed, parse_hello, read_text_frame_or_close, spawn_test_daemon,
     };
     use super::story_2_2_publish::{
-        publish_via_projection, wait_subscribe_live, ProbeKind, WsStream,
+        parse_state_frame, publish_via_projection, wait_subscribe_live, ProbeKind, WsStream,
     };
     use super::{fresh_pools, TEST_BEARER};
 
@@ -7760,6 +7763,193 @@ mod story_2_4_dropped {
              EventId(0) sentinel (no prior Event delivery). Got {first:?} \
              — likely cursor advanced on unrelated Events, regression of \
              Story 2.4 code-review finding #1."
+        );
+
+        state.shutdown_requested.cancel();
+        state.ws_close_requested.cancel();
+    }
+
+    /// Story 5.8 review pass-4 — broadcast lag must INVALIDATE snapshot
+    /// coverage so a state-only subscriber can recover via re-subscribe.
+    ///
+    /// `snapshotted_keys` suppresses re-snapshots for `(source, session_id)`
+    /// rows the connection already has current (no double-delivery). But a
+    /// broadcast `Lagged(n)` reports only a count, never the identities of
+    /// the evicted envelopes — any of them could have been a `State` frame
+    /// for a covered session. If coverage is NOT invalidated, the row stays
+    /// in `snapshotted_keys`, so a re-subscribe skips it and the subscriber
+    /// is permanently stale (a state-only subscriber can't replay missed
+    /// state via `/sessions/{id}/events?since=`).
+    ///
+    /// Scenario:
+    ///   1. Seed sess-A; subscribe `state.session.*` → snapshot covers sess-A
+    ///      (its key is recorded).
+    ///   2. Flood synthetic events to force `RecvError::Lagged` while the
+    ///      state subscription is active → the connection receives `Dropped`.
+    ///   3. Re-subscribe `state.session.*`.
+    /// Post-fix: lag cleared `snapshotted_keys`, so sess-A re-snapshots →
+    /// a fresh `StateFrame` for sess-A arrives. Pre-fix: no re-snapshot, and
+    /// the observation loop never sees sess-A and the assertion fails.
+    ///
+    /// Observation note: after the flood the connection task is busy draining
+    /// residual envelopes, so the re-subscribe's snapshot frame (which the
+    /// daemon *does* emit — verified by tracing) can be starved from flushing.
+    /// We drive the runtime like `wait_subscribe_live` — republish a live
+    /// `state` probe and drain every iteration; each probe is a
+    /// `state.session.*` frame the daemon sends, flushing everything pending
+    /// including the sess-A re-snapshot.
+    ///
+    /// KNOWN FLAKE under `cargo test --workspace` (passes reliably when the
+    /// `contract_daemon` binary runs alone): see
+    /// `docs/research/test-isolation-parallelism-research-results.md` and the
+    /// Story 5.8 pass-4 Debug Log. The fix itself is verified independently
+    /// (tracing + the binary-alone runs + the without-fix negative check).
+    #[tokio::test(flavor = "current_thread")]
+    async fn lag_invalidates_snapshot_coverage_resubscribe_resnapshots() {
+        let (_tmp, pools) = fresh_pools().await;
+        let state = state_with_caps(pools, 16, Duration::from_secs(1));
+        let (addr, _server) = spawn_test_daemon(state.clone()).await;
+
+        // Seed sess-A in the projection table BEFORE connecting (the
+        // broadcast envelopes are discarded — no client yet).
+        let _ = publish_via_projection(
+            &state,
+            "claude",
+            "sess-A",
+            EventKind::PreToolUse,
+            None,
+            "{}",
+        )
+        .await;
+
+        let (mut ws, _) = connect_authed(addr, TEST_BEARER).await;
+        let _ = parse_hello(&read_text_frame_or_close(&mut ws).await);
+
+        // Subscribe → snapshot delivers sess-A; its key is recorded in
+        // `snapshotted_keys`. Drain the snapshot frame so the readiness
+        // gate below sees only probe frames.
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.*"}"#.into(),
+        ))
+        .await
+        .expect("send subscribe");
+        let snap = parse_state_frame(&read_text_frame_or_close(&mut ws).await);
+        assert_eq!(
+            snap.session_id, "sess-A",
+            "first subscribe must snapshot sess-A"
+        );
+
+        // Confirm the per-connection task has fully processed the subscribe
+        // (key recorded) and is live before we force lag.
+        wait_subscribe_live(
+            &mut ws,
+            &state,
+            ProbeKind::State {
+                session_id: "__probe__",
+            },
+        )
+        .await;
+
+        // Force lag: flood synthetic EVENT envelopes (Filtered by the
+        // state-only subscription, but they still lap the shared channel,
+        // so the per-connection task observes `RecvError::Lagged`).
+        for i in 0..256 {
+            state
+                .broadcaster
+                .publish(synthetic_event(i + 1, "sess-flood"));
+        }
+        tokio::task::yield_now().await;
+
+        // The subscriber must still receive a `Dropped` frame (socket stays
+        // open) — and, with the fix, the lag has cleared snapshot coverage.
+        let outcome = read_until_dropped(&mut ws, 400)
+            .await
+            .expect("active state subscriber must receive Dropped on lag");
+        assert!(outcome.0 >= 1, "Dropped count must be positive");
+
+        // Drain the flood residue and confirm the connection task has caught
+        // up / gone idle BEFORE re-subscribing. `wait_subscribe_live` is the
+        // proven drive-the-runtime helper: it republishes a probe and reads
+        // until the probe arrives, which only happens once the task has
+        // dispatched everything ahead of it (the residual flood events are
+        // Filtered by the state-only subscription, so they produce no wire
+        // frames). With the socket idle, the re-subscribe's snapshot flushes
+        // promptly — the same clean-socket condition the non-lag re-snapshot
+        // tests rely on. The probe session ("__caughtup__") has no projection
+        // row, so it is never itself snapshotted; sess-A's coverage stays
+        // cleared by the lag (no live sess-A frame re-recorded it).
+        wait_subscribe_live(
+            &mut ws,
+            &state,
+            ProbeKind::State {
+                session_id: "__caughtup__",
+            },
+        )
+        .await;
+
+        // Re-subscribe. Post-fix the lag invalidated sess-A's coverage, so the
+        // subscribe handler re-snapshots it.
+        ws.send(Message::Text(
+            r#"{"op":"subscribe","topic":"state.session.*"}"#.into(),
+        ))
+        .await
+        .expect("send re-subscribe");
+
+        // Observe the re-snapshot by driving the runtime (the `wait_subscribe_live`
+        // discipline): each iteration publish a fresh live `state` probe for a
+        // throwaway session and drain everything queued. The probe is a
+        // `state.session.*` frame the daemon sends, and that send flushes the
+        // queued sess-A snapshot too. Without the fix sess-A is never
+        // re-snapshotted, so it never appears and the 5s deadline fails the test.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut saw_sess_a = false;
+        let mut pump = 0u64;
+        while !saw_sess_a && std::time::Instant::now() < deadline {
+            state.broadcaster.publish(BroadcastEnvelope::State {
+                source: format!("__pump-{pump}__"),
+                session_id: "__pump__".to_string(),
+                state: SessionState {
+                    current_state: SessionCurrentState::Idle,
+                    last_event_kind: EventKind::PreToolUse,
+                    last_event_at_ms: 0,
+                    last_pid: None,
+                    cwd: None,
+                    started_at: None,
+                },
+            });
+            pump += 1;
+            loop {
+                let msg = match tokio::time::timeout(Duration::from_millis(50), ws.next()).await {
+                    Ok(Some(Ok(m))) => m,
+                    Ok(None) => break,
+                    Ok(Some(Err(e))) => panic!("ws recv error during re-subscribe: {e:?}"),
+                    Err(_) => break, // queue drained for now — republish to keep pumping
+                };
+                let text = match msg {
+                    Message::Text(t) => t,
+                    Message::Close(_) => panic!("socket must stay open"),
+                    _ => continue,
+                };
+                let server: ServerMessage =
+                    serde_json::from_str(text.as_str()).expect("parse ServerMessage");
+                match server {
+                    ServerMessage::State(f) if f.session_id == "sess-A" => {
+                        saw_sess_a = true;
+                        break;
+                    }
+                    // Pump probes (session "__pump__"), residual Dropped — keep hunting.
+                    ServerMessage::State(_) | ServerMessage::Dropped(_) => {}
+                    ServerMessage::Event(_) => {
+                        panic!("Event frame leaked through state.session.* topic filter")
+                    }
+                    other => panic!("unexpected ServerMessage during re-subscribe: {other:?}"),
+                }
+            }
+        }
+        assert!(
+            saw_sess_a,
+            "re-subscribe after lag MUST re-snapshot sess-A (lag should have \
+             invalidated snapshot coverage); never saw a fresh sess-A StateFrame"
         );
 
         state.shutdown_requested.cancel();

@@ -370,6 +370,20 @@ async fn connection_task(
                             );
                             continue;
                         }
+                        // Story 5.8 pass-4: broadcast `Lagged(n)` reports only a
+                        // count of evicted envelopes, never their identities, so
+                        // we cannot know whether a `State` frame for a covered
+                        // session was in the gap. Any key in `snapshotted_keys`
+                        // may now be stale on this connection, and the
+                        // no-double-delivery dedup would otherwise make a
+                        // re-subscribe SKIP it — leaving a state-only subscriber
+                        // permanently stale (it can't replay missed state via
+                        // `/sessions/{id}/events?since=`). Conservatively
+                        // invalidate ALL snapshot coverage so the next
+                        // re-subscribe re-snapshots the drift (the snapshot is
+                        // the catch-up mechanism). An extra re-send of an
+                        // unaffected row is idempotent; a missed update is not.
+                        snapshotted_keys.clear();
                         if !emit_dropped_or_coalesce(
                             &mut socket,
                             &mut last_dropped_at,
@@ -725,6 +739,13 @@ async fn drain_backlog_under_state(
                     );
                     continue;
                 }
+                // Story 5.8 pass-4: same opaque-gap invalidation as the main
+                // `rx.recv()` arm — a dropped batch may have carried a `State`
+                // frame for a covered session, so clear snapshot coverage. This
+                // drain runs immediately before a Subscribe/Unsubscribe applies,
+                // so the snapshot that subscribe builds next re-snapshots the
+                // drift instead of skipping it as already-covered.
+                snapshotted_keys.clear();
                 if !emit_dropped_or_coalesce(
                     socket,
                     last_dropped_at,
