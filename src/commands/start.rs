@@ -46,8 +46,7 @@ fn start_daemon(bowerbird_dir: &std::path::Path) -> anyhow::Result<()> {
     // win for the launchd-spawned process and may differ from the current CLI
     // env. Probing/waiting against the CLI env would time out while the daemon
     // comes up where launchd actually put it, so resolve the data dir + ingest
-    // socket from the *registered* plist env (Story 5.9 review pass-3 F2),
-    // falling back to the CLI's resolution only when the plist carries no env.
+    // socket from the *registered* plist env (Story 5.9 review pass-3 F2).
     let registered = launch_agent::registered_plist_env(&plist_path);
     let reg = |k: &str| {
         registered
@@ -55,23 +54,34 @@ fn start_daemon(bowerbird_dir: &std::path::Path) -> anyhow::Result<()> {
             .find(|(rk, _)| rk == k)
             .map(|(_, v)| v.clone())
     };
-    let effective_dir = reg("BOWERBIRD_DATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| bowerbird_dir.to_path_buf());
+    // When the plist carries no `BOWERBIRD_DATA_DIR` (a legacy / malformed /
+    // no-env registration), launchd does NOT inherit the current shell env, so
+    // it starts the daemon in launchd's own default — `$HOME/.bowerbird`, the
+    // daemon's own fallback — NOT the current CLI data dir. Falling back to the
+    // CLI dir here would make the probe/readiness wait look in a directory the
+    // launchd daemon never uses, producing a false readiness timeout (Story 5.9
+    // review pass-4 #2). Use the launchd default explicitly; never the current
+    // CLI env for a launchd-managed process.
+    let effective_dir = match reg("BOWERBIRD_DATA_DIR") {
+        Some(d) => PathBuf::from(d),
+        None => super::home_dir()?.join(".bowerbird"),
+    };
     // The launchd daemon uses the plist's `BOWERBIRD_INGEST_SOCK` when present,
     // else `<effective_dir>/ingest.sock` — NOT the current CLI env (which the
     // launchd process never sees).
     let ingest_sock = reg("BOWERBIRD_INGEST_SOCK")
         .map(PathBuf::from)
         .unwrap_or_else(|| effective_dir.join("ingest.sock"));
-    let loaded = launch_agent::launch_agent_loaded()?;
 
-    // If a daemon is already accepting on the socket, do NOT bootstrap/kickstart
-    // over it: a manual daemon can satisfy the socket probe while the loaded
-    // agent is down/stale, and bootstrapping a competing process would fail the
-    // singleton lock and crash-loop under KeepAlive. We also can't prove launchd
-    // owns this PID, so the message stays neutral rather than claiming launchd
-    // ownership (pass-2 F2).
+    // Probe the registered socket BEFORE asking launchd anything (Story 5.9
+    // review pass-4 #1). If a daemon is already accepting, no launchd action is
+    // needed — and an unverifiable `launchctl print` (which `launch_agent_loaded`
+    // surfaces as `Err`, pass-3 F1) must NOT make `bowerbird start` fail when the
+    // daemon is already up and no launchd query is even required. A manual daemon
+    // can satisfy the socket probe while the loaded agent is down/stale, and
+    // bootstrapping a competing process would fail the singleton lock and
+    // crash-loop under KeepAlive; we also can't prove launchd owns this PID, so
+    // the message stays neutral rather than claiming launchd ownership (pass-2 F2).
     if super::daemon_is_up(&ingest_sock) {
         let pid = daemon::read_pid(&effective_dir.join("bowerbird.pid"))
             .ok()
@@ -83,11 +93,13 @@ fn start_daemon(bowerbird_dir: &std::path::Path) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Socket is down, so no daemon is competing for the singleton lock. Drive
-    // launchd: kickstart a loaded-but-down agent (a clean `bowerbird stop`
-    // leaves it down under KeepAlive={SuccessfulExit=false}), or bootstrap one
-    // that is merely registered.
-    if loaded {
+    // Socket is down, so no daemon is competing for the singleton lock. Now —
+    // and only now — query launchd to decide how to start it: kickstart a
+    // loaded-but-down agent (a clean `bowerbird stop` leaves it down under
+    // KeepAlive={SuccessfulExit=false}), or bootstrap one that is merely
+    // registered. Deferring the launchd query to here is what lets an
+    // unverifiable `print` no longer block the already-up path above.
+    if launch_agent::launch_agent_loaded()? {
         launch_agent::kickstart_launch_agent().context("kickstart the registered launch agent")?;
     } else {
         launch_agent::bootstrap_launch_agent(&plist_path)

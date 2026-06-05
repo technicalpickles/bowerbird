@@ -121,13 +121,33 @@ fn supervise_or_start(no_start: bool) -> anyhow::Result<()> {
     // probe a different socket than the launchd daemon and shim use (Story 5.9
     // review pass-3 F4). Refuse to persist a non-absolute socket into launchd.
     if let Some(sock) = &ingest_sock_env {
-        if !std::path::Path::new(sock).is_absolute() {
+        let sock_path = std::path::Path::new(sock);
+        if !sock_path.is_absolute() {
             anyhow::bail!(
                 "BOWERBIRD_INGEST_SOCK is set to a non-absolute path ({sock}); launchd, the \
                  shim, and later `bowerbird` commands resolve it against differing working \
                  directories, so they would not agree on the ingest socket — set an absolute \
                  path before installing"
             );
+        }
+        // The daemon's bind path (`crates/daemon/src/ingest/listener.rs`) does
+        // NOT create the socket's parent directory — it only `remove_file`s a
+        // stale socket then `UnixListener::bind`s. An absolute custom socket
+        // under a *missing* parent would let bootstrap "succeed" while the daemon
+        // immediately exits non-zero on bind and launchd restarts it forever
+        // under KeepAlive={SuccessfulExit=false} (Story 5.9 review pass-4 #5).
+        // Create the parent now (or fail loudly before writing any registration),
+        // for BOTH the bootstrap and `--no-start` paths — the plist is a future
+        // launch registration either way.
+        if let Some(parent) = sock_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).with_context(|| {
+                    format!(
+                        "create parent directory {} for BOWERBIRD_INGEST_SOCK {sock}",
+                        parent.display()
+                    )
+                })?;
+            }
         }
     }
 
@@ -193,18 +213,26 @@ fn supervise_or_start(no_start: bool) -> anyhow::Result<()> {
     let ingest_sock = super::effective_ingest_sock(&data_dir_abs);
     if super::daemon_is_up(&ingest_sock) {
         println!("stopping the running unsupervised daemon so launchd can take over");
-        let outcome = daemon::stop_daemon_via_pid_file(&data_dir).map_err(|e| {
+        daemon::stop_daemon_via_pid_file(&data_dir).map_err(|e| {
             anyhow::anyhow!(
                 "could not stop the running daemon before handing off to launchd ({e:#}); \
                  refusing to bootstrap (a launchd start would fail the singleton lock and \
                  crash-loop) — run `bowerbird stop` and re-run install"
             )
         })?;
-        if outcome == daemon::StopOutcome::NotRunning && super::daemon_is_up(&ingest_sock) {
+        // Re-probe after ANY stop outcome (Story 5.9 review pass-4 #4). The
+        // previous check only bailed on `StopOutcome::NotRunning` + a live
+        // socket, but a stale/wrong PID file, PID reuse, or a concurrent restart
+        // can make the stop report `Stopped`/`Escalated` (it killed *something*)
+        // while the real daemon is still accepting — and bootstrapping launchd
+        // over it would fail the singleton lock and crash-loop under KeepAlive. If
+        // the socket is still live whatever the outcome, refuse rather than
+        // bootstrap a daemon launchd cannot manage.
+        if super::daemon_is_up(&ingest_sock) {
             anyhow::bail!(
-                "a daemon is accepting on {} but no bowerbird PID file points at a stoppable \
-                 process; refusing to bootstrap launchd over a daemon it cannot manage \
-                 (stop that daemon, then re-run install)",
+                "a daemon is still accepting on {} after attempting to stop it; refusing to \
+                 bootstrap launchd over a daemon it cannot manage (stop that daemon, then \
+                 re-run install)",
                 ingest_sock.display()
             );
         }

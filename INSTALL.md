@@ -108,10 +108,14 @@ is deferred). Pass `--no-start` to write the LaunchAgent plist (macOS) without
 bootstrapping it, or to skip the spawn (Linux) — useful for scripted setups.
 
 **(f) Uninstall.** `bowerbird uninstall` reverses (a). On **macOS** it boots
-the LaunchAgent out (`launchctl bootout`, which stops the daemon), also stops a
-manually-started daemon via its PID file as a fallback (so nothing survives
-uninstall), and removes the plist; on **Linux** it stops the daemon (SIGTERM
-with 10s graceful drain, SIGKILL fallback). It does NOT delete `~/.bowerbird/`. Your event history is
+the LaunchAgent out (`launchctl bootout`, which stops the daemon) and removes
+the plist; as a fallback it also attempts to stop a manually-started / pre-5.9
+daemon via its PID file. If a manual daemon is still accepting on the ingest
+socket after that (for example because no PID file points at it), uninstall
+prints a non-fatal warning so you can stop that process yourself — the
+LaunchAgent registration is still removed either way. On **Linux** it stops the
+daemon (SIGTERM with 10s graceful drain, SIGKILL fallback). It does NOT delete
+`~/.bowerbird/`. Your event history is
 your data; re-installing should not lose it. To wipe history, `rm -rf
 ~/.bowerbird/` is a deliberate manual step.
 

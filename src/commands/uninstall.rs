@@ -61,46 +61,61 @@ pub fn run(args: UninstallArgs) -> anyhow::Result<()> {
 #[cfg(target_os = "macos")]
 fn teardown_supervision(no_stop: bool) -> anyhow::Result<()> {
     use super::launch_agent;
+    use std::path::PathBuf;
 
     let plist_path = launch_agent::plist_path()?;
 
     if !no_stop {
+        // Resolve the data dir + ingest socket from the LaunchAgent's REGISTERED
+        // env (read now, while the plist still exists — it is removed below), not
+        // the current CLI env (Story 5.9 review pass-4 #3). If install registered
+        // `BOWERBIRD_DATA_DIR=/A` or `BOWERBIRD_INGEST_SOCK=/A/custom.sock`, a
+        // later uninstall run without those env vars would otherwise check the
+        // wrong PID file / socket and miss a surviving manual / pre-5.9 daemon.
+        // Fall back to the CLI env only when the plist carries no such entry.
+        let registered = launch_agent::registered_plist_env(&plist_path);
+        let reg = |k: &str| {
+            registered
+                .iter()
+                .find(|(rk, _)| rk == k)
+                .map(|(_, v)| v.clone())
+        };
+        let data_dir = match reg("BOWERBIRD_DATA_DIR") {
+            Some(d) => PathBuf::from(d),
+            None => super::resolve_bowerbird_dir()?,
+        };
+        let ingest_sock = reg("BOWERBIRD_INGEST_SOCK")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| super::effective_ingest_sock(&data_dir));
+
         // Boot the launchd-owned daemon out — fatal on a real/unverifiable
-        // failure so we never claim success while the agent lingers (F3).
+        // failure so we never claim success while the agent lingers (F3 pass-2).
         launch_agent::bootout_launch_agent(&plist_path)
             .context("boot the bowerbird LaunchAgent out of launchd")?;
         // Also catch a manually-started / pre-5.9 PID-file daemon launchd never
         // owned, so uninstall actually leaves no daemon running. Non-fatal: this
         // mirrors the historical daemon-stop posture and a leftover manual daemon
         // is not a launchd-registration residue.
-        let data_dir = super::resolve_bowerbird_dir()?;
-        let stop_outcome = match daemon::stop_daemon_via_pid_file(&data_dir) {
-            Ok(outcome) => Some(outcome),
-            Err(e) => {
-                eprintln!("warning: {e:#}");
-                None
-            }
-        };
+        if let Err(e) = daemon::stop_daemon_via_pid_file(&data_dir) {
+            eprintln!("warning: {e:#}");
+        }
 
-        // `StopOutcome::NotRunning` covers a missing/stale/invalid PID file — but
-        // a manual daemon can still be accepting on the ingest socket with no
-        // bowerbird PID file pointing at it. Previously the outcome was ignored
-        // and uninstall printed success while that daemon kept running (Story 5.9
-        // review pass-3 F5). Probe the effective socket after the stop attempt
-        // and warn clearly if a daemon survived; non-fatal, matching the manual-
-        // daemon stop posture (settings.json is already un-merged).
-        if stop_outcome != Some(daemon::StopOutcome::Stopped)
-            && stop_outcome != Some(daemon::StopOutcome::Escalated)
-        {
-            let ingest_sock = super::effective_ingest_sock(&data_dir);
-            if super::daemon_is_up(&ingest_sock) {
-                eprintln!(
-                    "warning: a daemon is still accepting on {} after uninstall; the LaunchAgent \
-                     registration was removed but a manual / pre-5.9 daemon is still running and \
-                     no bowerbird PID file could stop it — stop that process manually",
-                    ingest_sock.display()
-                );
-            }
+        // Re-probe the effective socket after ANY stop outcome (Story 5.9 review
+        // pass-4 #4). A stale/wrong PID file, PID reuse, or a concurrent restart
+        // can make `stop_daemon_via_pid_file` report `Stopped`/`Escalated` (it
+        // killed *something*) while the daemon socket is still accepting — the
+        // previous code only probed when the outcome was NOT `Stopped`/`Escalated`
+        // (pass-3 F5), so it could still claim clean removal while a manual daemon
+        // kept running. The probe is cheap and only warns when a daemon is
+        // actually still live; non-fatal, matching the manual-daemon stop posture
+        // (settings.json is already un-merged).
+        if super::daemon_is_up(&ingest_sock) {
+            eprintln!(
+                "warning: a daemon is still accepting on {} after uninstall; the LaunchAgent \
+                 registration was removed but a manual / pre-5.9 daemon is still running and \
+                 no bowerbird PID file could stop it — stop that process manually",
+                ingest_sock.display()
+            );
         }
     }
 
