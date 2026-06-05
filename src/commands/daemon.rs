@@ -66,16 +66,28 @@ pub fn start_daemon_detached(bowerbird_dir: &Path) -> anyhow::Result<StartOutcom
 /// graceful shutdown sequence (Story 2.5), then escalating to SIGKILL with a
 /// 1s post-signal drain to absorb kernel reap latency.
 pub fn stop_daemon_via_pid_file(bowerbird_dir: &Path) -> anyhow::Result<StopOutcome> {
-    let pid_path = bowerbird_dir.join("bowerbird.pid");
-
-    let pid = match read_pid(&pid_path)? {
-        Some(p) => p,
-        None => return Ok(StopOutcome::NotRunning),
+    // The daemon's singleton is the BSD flock held on `bowerbird.pid`, NOT the
+    // pid *content* (`crates/daemon/src/singleton.rs`: the FD-held flock is the
+    // lock primitive, "the PID file content is informational only"). Probe the
+    // lock first so a STALE pid file (lock free, content left from a crashed/old
+    // daemon — possibly a pid now reused by an unrelated process) never makes us
+    // SIGTERM the wrong process (Story 5.9 review pass-6 F4).
+    let pid = match singleton_state(bowerbird_dir) {
+        // No one holds the singleton: any pid file present is stale. Do NOT
+        // signal it.
+        SingletonState::Free => return Ok(StopOutcome::NotRunning),
+        SingletonState::Held(pid) => pid,
+        // A daemon holds the singleton but `bowerbird.pid` does not name a live
+        // process (empty/corrupt/dead pid, or the daemon is between flock and
+        // pid-write). We cannot identify which process to SIGTERM, and signaling
+        // a guessed pid is exactly the bug F4 guards against — fail clearly.
+        SingletonState::HeldUnknownPid => anyhow::bail!(
+            "a bowerbird daemon holds the singleton for {} but its `bowerbird.pid` does not name \
+             a live process (empty/corrupt/dead pid); refusing to signal a guessed pid — stop \
+             that process manually",
+            bowerbird_dir.display()
+        ),
     };
-
-    if !pid_alive(pid) {
-        return Ok(StopOutcome::NotRunning);
-    }
 
     println!("sending SIGTERM to bowerbird-daemon (pid {pid})");
     send_signal(pid, libc::SIGTERM).context("send SIGTERM")?;
@@ -142,20 +154,85 @@ pub fn pid_alive(pid: i32) -> bool {
     errno == libc::EPERM
 }
 
-/// Is a live process recorded in the data dir's singleton PID file? This is
-/// distinct from [`super::daemon_is_up`] (a socket probe): the daemon acquires
-/// its singleton (flock + `bowerbird.pid`) BEFORE it binds the ingest socket
-/// (`crates/daemon/src/singleton.rs`, taken in `main` before any socket work),
-/// so a holder can be alive while the socket is still down — wedged before bind,
-/// or still bound to a previous socket path after the registered socket changed.
-/// The macOS launchd handoff uses this so it does not bootstrap/kickstart over a
-/// singleton holder the socket probe cannot see, which would fail the launchd
-/// daemon's singleton acquisition and crash-loop it under
-/// `KeepAlive={SuccessfulExit=false}` (Story 5.9 review pass-5 F2).
-pub fn pid_holder_alive(bowerbird_dir: &Path) -> bool {
+/// Whether — and by whom — the data dir's daemon singleton is held.
+///
+/// The daemon's singleton is a BSD `flock(LOCK_EX)` on `<data_dir>/bowerbird.pid`
+/// held for the process lifetime (`crates/daemon/src/singleton.rs`); the kernel
+/// releases it when the holding FD closes (clean exit, panic, OOM, SIGKILL all
+/// self-clean). The pid file *content* is informational. So liveness must be
+/// probed by the lock, not by `kill(pid, 0)` on the recorded pid — a stale pid
+/// file (lock free) can name a reused, unrelated process, and a real holder can
+/// have an empty/corrupt pid file (Story 5.9 review pass-6 F4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SingletonState {
+    /// The nonblocking flock was acquirable: no daemon holds the singleton. Any
+    /// pid file present is stale and must NOT be signaled.
+    Free,
+    /// A daemon holds the singleton and `bowerbird.pid` names a live process.
+    Held(i32),
+    /// A daemon holds the singleton but the pid file is missing/empty/corrupt or
+    /// names a dead process — the holder cannot be identified. Callers must not
+    /// signal a guessed pid, and must not bootstrap launchd over it.
+    HeldUnknownPid,
+}
+
+/// Probe the singleton with a NONBLOCKING BSD `flock` on `bowerbird.pid` — the
+/// same primitive the daemon holds. This is distinct from [`super::daemon_is_up`]
+/// (a socket probe): the daemon takes the singleton BEFORE it binds the ingest
+/// socket, so a holder can own the lock while the socket is still down (wedged
+/// before bind, or bound to a previous socket path after the registered socket
+/// changed). The macOS launchd handoff uses this so it does not bootstrap/kickstart
+/// over a singleton holder the socket probe cannot see, which would fail the
+/// launchd daemon's singleton acquisition and crash-loop it under
+/// `KeepAlive={SuccessfulExit=false}` (Story 5.9 review pass-5 F2 / pass-6 F4).
+#[cfg(unix)]
+pub fn singleton_state(bowerbird_dir: &Path) -> SingletonState {
+    use std::os::unix::io::AsRawFd;
+
+    let pid_path = bowerbird_dir.join("bowerbird.pid");
+    // Open read-only WITHOUT creating: a holder always creates this file before
+    // locking, so a missing file means no daemon ever locked here. (flock works
+    // on an O_RDONLY fd — the lock is independent of the open mode.)
+    let file = match std::fs::OpenOptions::new().read(true).open(&pid_path) {
+        Ok(f) => f,
+        Err(_) => return SingletonState::Free,
+    };
+    let fd = file.as_raw_fd();
+    // Retry only on EINTR; LOCK_NB means we never block.
+    let acquired = loop {
+        let r = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+        if r == 0 {
+            break true;
+        }
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        if errno == libc::EINTR {
+            continue;
+        }
+        // EWOULDBLOCK (== EAGAIN) means held; any other error means we could not
+        // prove the lock free, so treat it as held too (conservative — never
+        // bootstrap/signal on an unprovable-free lock).
+        break false;
+    };
+    if acquired {
+        // Release immediately (dropping the File would too; be explicit). We were
+        // only probing — we must not hold the singleton ourselves.
+        unsafe { libc::flock(fd, libc::LOCK_UN) };
+        return SingletonState::Free;
+    }
+    match read_pid(&pid_path) {
+        Ok(Some(pid)) if pid_alive(pid) => SingletonState::Held(pid),
+        _ => SingletonState::HeldUnknownPid,
+    }
+}
+
+/// Non-unix fallback: no flock, degrade to pid-file liveness. The daemon and the
+/// launchd supervision this guards are unix-only, so this path is effectively
+/// unreachable in practice.
+#[cfg(not(unix))]
+pub fn singleton_state(bowerbird_dir: &Path) -> SingletonState {
     match read_pid(&bowerbird_dir.join("bowerbird.pid")) {
-        Ok(Some(pid)) => pid_alive(pid),
-        _ => false,
+        Ok(Some(pid)) if pid_alive(pid) => SingletonState::Held(pid),
+        _ => SingletonState::Free,
     }
 }
 

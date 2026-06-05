@@ -561,6 +561,49 @@ fn with_fake_launchctl(cmd: &mut Command, fake_bin_dir: &std::path::Path, log: &
     cmd.env("FAKE_LAUNCHCTL_LOG", log);
 }
 
+/// Spawn a REAL BSD-flock holder on `<...>/bowerbird.pid`, mirroring the daemon's
+/// singleton (`crates/daemon/src/singleton.rs`: a `flock(LOCK_EX)` held for the
+/// process lifetime, the daemon's pid written into the file). The pre-pass-6
+/// tests modeled a "singleton holder" with a plain `sleep` + a hand-written pid
+/// file, which proved PID liveness, not lock ownership — the CLI's flock probe
+/// (pass-6 F4) correctly ignores such a file as stale. macOS ships perl, whose
+/// `flock` is `flock(2)` (the same primitive nix/libc use), so the spawned
+/// `bowerbird` subprocess sees the lock held. Returns the child so the test can
+/// reap it after `bowerbird` SIGTERMs it (or kill it directly when `bowerbird` is
+/// expected to refuse). Blocks until the holder has acquired the lock and written
+/// its pid.
+#[cfg(target_os = "macos")]
+fn spawn_flock_holder(pid_path: &std::path::Path) -> std::process::Child {
+    // +>> = read/write + create (no truncate-on-open, avoiding a truncate-before-
+    // lock race); flock LOCK_EX (2); then clear + write our own pid and sleep,
+    // releasing the lock only when the fd closes (SIGTERM/SIGKILL), exactly like
+    // the daemon.
+    const HOLD: &str = r#"
+        open(my $f, "+>>", $ARGV[0]) or die "open: $!";
+        flock($f, 2) or die "flock: $!";
+        seek($f, 0, 0); truncate($f, 0);
+        my $old = select($f); $| = 1; select($old);
+        print $f "$$\n";
+        $SIG{TERM} = sub { exit 0 };
+        sleep 600;
+    "#;
+    let child = std::process::Command::new("perl")
+        .arg("-e")
+        .arg(HOLD)
+        .arg(pid_path)
+        .spawn()
+        .expect("spawn perl flock holder");
+    for _ in 0..500 {
+        if let Ok(s) = fs::read_to_string(pid_path) {
+            if s.trim().parse::<i32>().is_ok() {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    child
+}
+
 /// Story 5.9 review F2/F3: a reinstall over an already-loaded agent must boot the
 /// old agent out (so the freshly-written plist's ProgramArguments/env take
 /// effect) and then re-bootstrap — never bootstrap on top of the stale loaded
@@ -887,12 +930,14 @@ fn uninstall_no_stop_warns_in_session_supervision_survives_on_macos() {
 /// Story 5.9 review pass-3 F2: `bowerbird start` must look for the daemon where
 /// launchd will actually run it — the data dir registered in the plist's
 /// `EnvironmentVariables` — not the data dir in the *current* CLI env. We
-/// install with data dir A (so the plist embeds A), drop a `server.json` into A
-/// pointing at an unreachable health port, then run `start` from a *different*
-/// CLI data dir B. If `start` reads A's env it finds A's `server.json` and times
-/// out on the unreachable healthz ("failed to become healthy"); if it had used B
-/// it would instead time out waiting for a `server.json` that does not exist
-/// ("did not appear"). The error message distinguishes the two.
+/// install with data dir A (so the plist embeds A), drop a STALE `server.json`
+/// into A, then run `start` from a *different* CLI data dir B. `start` (pass-6 F5)
+/// removes the EFFECTIVE data dir's stale `server.json` before handing to launchd.
+/// If `start` resolved the effective dir from the plist env (A) rather than the
+/// CLI env (B), it is A's `server.json` that gets removed — proving F2 (reads the
+/// registered env) and F5 (clears the stale hint) at once. (Pre-pass-6 this test
+/// proved F2 via "start finds A's stale server.json", but F5 now deliberately
+/// removes that stale file, so the proof flips to "A's server.json was cleared".)
 #[cfg(target_os = "macos")]
 #[test]
 fn start_uses_registered_plist_data_dir_not_cli_env_on_macos() {
@@ -906,6 +951,9 @@ fn start_uses_registered_plist_data_dir_not_cli_env_on_macos() {
     fs::create_dir_all(&dir_b).expect("data-b");
     fs::create_dir_all(&bin_dir).expect("bin dir");
     write_executable(&bin_dir.join("launchctl"), FAKE_LAUNCHCTL);
+    // A real executable daemon so start's F6 launchable revalidation passes.
+    let daemon = bin_dir.join("bowerbird-daemon");
+    write_executable(&daemon, "#!/bin/sh\nexit 0\n");
 
     // Install with data dir A (--no-start: writes the plist, no real launchctl).
     bowerbird_bin()
@@ -916,18 +964,18 @@ fn start_uses_registered_plist_data_dir_not_cli_env_on_macos() {
         .env("HOME", dir.path())
         .env("BOWERBIRD_LAUNCH_AGENTS_DIR", &la_dir)
         .env("BOWERBIRD_DATA_DIR", &dir_a)
-        .env("BOWERBIRD_DAEMON_BIN", "/usr/local/bin/bowerbird-daemon")
+        .env("BOWERBIRD_DAEMON_BIN", &daemon)
         .assert()
         .success();
 
-    // install canonicalizes the data dir before embedding it; write server.json
-    // where the plist actually points.
+    // install canonicalizes the data dir before embedding it; write the stale
+    // server.json where the plist actually points.
     let dir_a_canon = fs::canonicalize(&dir_a).expect("canonicalize data-a");
     fs::write(
         dir_a_canon.join("server.json"),
         r#"{"bind_addr":"127.0.0.1:1","token":"x"}"#,
     )
-    .expect("write server.json into A");
+    .expect("write stale server.json into A");
 
     // start from a DIFFERENT CLI data dir (B). If F2 is honored it reads A's env.
     let log = dir.path().join("launchctl.log");
@@ -939,22 +987,24 @@ fn start_uses_registered_plist_data_dir_not_cli_env_on_macos() {
         .env("FAKE_LAUNCHCTL_PRINT_EXIT", "1") // not loaded -> bootstrap
         .env("FAKE_LAUNCHCTL_BOOTSTRAP_EXIT", "0");
     with_fake_launchctl(&mut cmd, &bin_dir, &log);
-    let assertion = cmd.assert().failure();
+    // Readiness times out (the fake daemon writes no fresh server.json).
+    cmd.assert().failure();
 
-    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).into_owned();
+    // F2 + F5: start operated on A (the plist env), so it cleared A's stale
+    // server.json. If it had used CLI dir B, A's file would still be present.
     assert!(
-        stderr.contains("failed to become healthy"),
-        "start must find A's server.json (proving it read the plist's data dir, not the CLI \
-         env); stderr={stderr}"
-    );
-    assert!(
-        !stderr.contains("did not appear"),
-        "start must NOT wait against the CLI env data dir B (where no server.json exists); \
-         stderr={stderr}"
+        !dir_a_canon.join("server.json").exists(),
+        "start must resolve the effective dir from the plist env (A) and clear A's stale \
+         server.json (F2 + F5)"
     );
     assert!(
         !dir_b.join("server.json").exists(),
         "the test must not have created server.json in B"
+    );
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        calls.contains("bootstrap"),
+        "start must bootstrap the not-loaded agent; calls=\n{calls}"
     );
 }
 
@@ -1083,17 +1133,17 @@ fn uninstall_warns_when_live_daemon_survives_missing_pid_on_macos() {
     );
 }
 
-/// Story 5.9 review pass-4 #1: `bowerbird start` must probe the registered ingest
-/// socket BEFORE querying launchd. If a daemon is already accepting, an
-/// unverifiable `launchctl print` (a non-zero exit whose stderr is not an
-/// absent-service signal — which `launch_agent_loaded` surfaces as `Err`) must
-/// NOT make `start` fail: no launchd action is needed at all. We bind a live
-/// listener on the registered socket and configure `print` to be unverifiable;
-/// `start` must still exit 0 with the neutral "daemon already running" and never
-/// invoke launchctl.
+/// Story 5.9 review pass-4 #1 + pass-6 F3: when a daemon is already accepting on
+/// the registered socket and `launchctl print` is UNVERIFIABLE (a non-zero exit
+/// whose stderr is not an absent-service signal — `Err` / `LoadState::Unknown`),
+/// `bowerbird start` must NOT fail and must NOT kill the working daemon to migrate
+/// it on a guess: it leaves the daemon running, warns that launchd supervision
+/// could not be confirmed, and exits 0. (pass-6 F3 lets `start` consult `print` to
+/// decide supervision, so — unlike the pass-4 wording — a `print` call is now
+/// expected; what must NOT happen is any launchd ACTION: bootstrap/kickstart/bootout.)
 #[cfg(target_os = "macos")]
 #[test]
-fn start_succeeds_on_live_socket_even_when_launchctl_print_unverifiable_on_macos() {
+fn start_keeps_live_daemon_when_launchctl_print_unverifiable_on_macos() {
     use std::os::unix::net::UnixListener;
 
     let dir = TempDir::new().expect("tempdir");
@@ -1116,8 +1166,7 @@ fn start_succeeds_on_live_socket_even_when_launchctl_print_unverifiable_on_macos
     cmd.arg("start")
         .env("HOME", dir.path())
         .env("BOWERBIRD_LAUNCH_AGENTS_DIR", &la_dir)
-        // print is unverifiable (non-zero exit, non-absent stderr); it must never
-        // be reached because the live-socket probe short-circuits first.
+        // print is unverifiable (non-zero exit, non-absent stderr) => Unknown.
         .env("FAKE_LAUNCHCTL_PRINT_EXIT", "1")
         .env("FAKE_LAUNCHCTL_PRINT_STDERR", "Operation not permitted");
     with_fake_launchctl(&mut cmd, &bin_dir, &log);
@@ -1128,10 +1177,17 @@ fn start_succeeds_on_live_socket_even_when_launchctl_print_unverifiable_on_macos
         stdout.contains("daemon already running"),
         "start must report the already-live daemon neutrally; stdout={stdout}"
     );
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("could not be verified"),
+        "start must warn that launchd supervision is unverifiable; stderr={stderr}"
+    );
     let calls = fs::read_to_string(&log).unwrap_or_default();
     assert!(
-        calls.trim().is_empty(),
-        "start must not invoke launchctl when the socket is already live; calls=\n{calls}"
+        !calls.contains("bootstrap")
+            && !calls.contains("kickstart")
+            && !calls.contains("bootout"),
+        "start must take NO launchd action over a live daemon on an unverifiable print; calls=\n{calls}"
     );
 }
 
@@ -1139,12 +1195,13 @@ fn start_succeeds_on_live_socket_even_when_launchctl_print_unverifiable_on_macos
 /// (a legacy / no-env registration) must make `bowerbird start` look where
 /// launchd actually runs the daemon — launchd's default `$HOME/.bowerbird` — NOT
 /// the current CLI data dir (which the launchd process never sees). We register a
-/// no-env plist, drop a `server.json` into `$HOME/.bowerbird` pointing at an
-/// unreachable health port, and run `start` from a *different* CLI data dir B. If
-/// start honors the launchd default it finds `$HOME/.bowerbird`'s server.json and
-/// times out on healthz ("failed to become healthy"); if it wrongly used B it
-/// would time out waiting for a server.json that does not exist ("did not
-/// appear").
+/// no-env plist, drop a STALE `server.json` into `$HOME/.bowerbird`, and run
+/// `start` from a *different* CLI data dir B. `start` (pass-6 F5) clears the
+/// EFFECTIVE dir's stale `server.json` before handing to launchd; if it honored
+/// the launchd default it is `$HOME/.bowerbird`'s file that gets removed (not B's),
+/// proving it ignored the CLI env. (Pre-pass-6 the proof was "start finds the
+/// launchd-default server.json"; F5 now removes it, so the proof flips to "the
+/// launchd-default server.json was cleared".)
 #[cfg(target_os = "macos")]
 #[test]
 fn start_uses_launchd_default_dir_for_no_env_plist_on_macos() {
@@ -1159,14 +1216,15 @@ fn start_uses_launchd_default_dir_for_no_env_plist_on_macos() {
     fs::create_dir_all(&bin_dir).expect("bin dir");
     fs::create_dir_all(&launchd_default).expect("launchd default dir");
     write_executable(&bin_dir.join("launchctl"), FAKE_LAUNCHCTL);
-    // No-env plist stub (no EnvironmentVariables block).
+    // No-env plist stub (no EnvironmentVariables block; also no ProgramArguments,
+    // so start's F6 launchable check is skipped).
     fs::write(&plist, "<plist/>\n").expect("write plist stub");
-    // server.json in launchd's default dir, pointing at an unreachable port.
+    // Stale server.json in launchd's default dir.
     fs::write(
         launchd_default.join("server.json"),
         r#"{"bind_addr":"127.0.0.1:1","token":"x"}"#,
     )
-    .expect("write server.json into launchd default");
+    .expect("write stale server.json into launchd default");
 
     let log = dir.path().join("launchctl.log");
     let mut cmd = bowerbird_bin();
@@ -1177,17 +1235,15 @@ fn start_uses_launchd_default_dir_for_no_env_plist_on_macos() {
         .env("FAKE_LAUNCHCTL_PRINT_EXIT", "1") // not loaded -> bootstrap
         .env("FAKE_LAUNCHCTL_BOOTSTRAP_EXIT", "0");
     with_fake_launchctl(&mut cmd, &bin_dir, &log);
-    let assertion = cmd.assert().failure();
+    // Readiness times out (the fake daemon writes no fresh server.json).
+    cmd.assert().failure();
 
-    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).into_owned();
+    // F2 + F5: start resolved the effective dir to the launchd default and cleared
+    // its stale server.json; the CLI env dir B was never touched.
     assert!(
-        stderr.contains("failed to become healthy"),
-        "start must find the launchd-default server.json (proving it ignored the CLI env dir B); \
-         stderr={stderr}"
-    );
-    assert!(
-        !stderr.contains("did not appear"),
-        "start must NOT wait against the CLI env data dir B; stderr={stderr}"
+        !launchd_default.join("server.json").exists(),
+        "start must resolve the effective dir to launchd's default $HOME/.bowerbird and clear its \
+         stale server.json (ignoring the CLI env dir B)"
     );
     assert!(
         !dir_b.join("server.json").exists(),
@@ -1286,15 +1342,11 @@ fn install_fails_when_socket_live_after_clean_stop_on_macos() {
     let sock = data_dir_canon.join("ingest.sock");
     let _listener = UnixListener::bind(&sock).expect("bind live socket");
 
-    // A killable process the PID file points at; a helper thread reaps it so the
-    // stop sees a clean `Stopped` (bowerbird is not the process's parent and
-    // could not otherwise reap the zombie).
-    let mut child = std::process::Command::new("sleep")
-        .arg("30")
-        .spawn()
-        .expect("spawn sleep");
-    let pid = child.id();
-    fs::write(data_dir_canon.join("bowerbird.pid"), pid.to_string()).expect("write pid file");
+    // A REAL singleton holder (flock) the stop SIGTERMs to a clean `Stopped`; a
+    // helper thread reaps it. The flock probe (pass-6 F4) ignores a plain
+    // sleep+pid-file as stale, so we must hold an actual flock — and the separate
+    // live listener above keeps the socket up after the holder is stopped.
+    let mut child = spawn_flock_holder(&data_dir_canon.join("bowerbird.pid"));
     let reaper = std::thread::spawn(move || {
         let _ = child.wait();
     });
@@ -1349,14 +1401,11 @@ fn install_stops_singleton_holder_when_socket_down_on_macos() {
     write_executable(&daemon, "#!/bin/sh\nexit 0\n");
     let log = dir.path().join("launchctl.log");
 
-    // NO socket listener: the ingest socket is DOWN. But a live PID holder.
+    // NO socket listener: the ingest socket is DOWN. But a REAL singleton holder
+    // (flock on bowerbird.pid). A plain sleep + hand-written pid file would be
+    // ignored as stale by the flock probe (pass-6 F4).
     let data_dir_canon = fs::canonicalize(&data_dir).expect("canonicalize data dir");
-    let mut child = std::process::Command::new("sleep")
-        .arg("30")
-        .spawn()
-        .expect("spawn sleep");
-    let pid = child.id();
-    fs::write(data_dir_canon.join("bowerbird.pid"), pid.to_string()).expect("write pid file");
+    let mut child = spawn_flock_holder(&data_dir_canon.join("bowerbird.pid"));
     let reaper = std::thread::spawn(move || {
         let _ = child.wait();
     });
@@ -1409,13 +1458,10 @@ fn start_stops_singleton_holder_when_socket_down_on_macos() {
     fs::write(&plist, "<plist/>\n").expect("write plist stub");
     let log = la_parent.path().join("launchctl.log");
 
-    // Socket down (no listener); a live PID holder in the launchd-default dir.
-    let mut child = std::process::Command::new("sleep")
-        .arg("30")
-        .spawn()
-        .expect("spawn sleep");
-    let pid = child.id();
-    fs::write(bowerbird_home.join("bowerbird.pid"), pid.to_string()).expect("write pid file");
+    // Socket down (no listener); a REAL singleton holder (flock) in the
+    // launchd-default dir. A plain sleep + pid file would be ignored as stale by
+    // the flock probe (pass-6 F4).
+    let mut child = spawn_flock_holder(&bowerbird_home.join("bowerbird.pid"));
     let reaper = std::thread::spawn(move || {
         let _ = child.wait();
     });
@@ -1479,12 +1525,11 @@ fn uninstall_warns_when_socket_live_after_clean_stop_on_macos() {
     let sock = data_dir_canon.join("ingest.sock");
     let _listener = UnixListener::bind(&sock).expect("bind live socket");
 
-    let mut child = std::process::Command::new("sleep")
-        .arg("30")
-        .spawn()
-        .expect("spawn sleep");
-    let pid = child.id();
-    fs::write(data_dir_canon.join("bowerbird.pid"), pid.to_string()).expect("write pid file");
+    // A REAL singleton holder (flock) the manual-daemon fallback SIGTERMs to a
+    // clean `Stopped`; the separate live listener above keeps the socket up
+    // afterward so uninstall must still warn. The flock probe (pass-6 F4) ignores
+    // a plain sleep+pid-file as stale.
+    let mut child = spawn_flock_holder(&data_dir_canon.join("bowerbird.pid"));
     let reaper = std::thread::spawn(move || {
         let _ = child.wait();
     });
@@ -1563,5 +1608,399 @@ fn help_lists_install_and_uninstall_subcommands() {
     assert!(
         stdout.contains("uninstall"),
         "help missing `uninstall`:\n{stdout}"
+    );
+}
+
+// --- Story 5.9 review pass-6 -----------------------------------------------
+
+/// Pass-6 F1: `bowerbird stop` must stop a launchd-supervised daemon by booting
+/// the agent OUT, not by PID-file SIGTERM/SIGKILL. A SIGKILL-escalated stop is a
+/// non-zero exit, which `KeepAlive={SuccessfulExit=false}` reads as a crash and
+/// restarts — so a forced stop would bounce right back. Bootout removes the job
+/// from the domain, so there is nothing for KeepAlive to restart.
+#[cfg(target_os = "macos")]
+#[test]
+fn stop_boots_out_loaded_launch_agent_on_macos() {
+    let dir = TempDir::new().expect("tempdir");
+    let la_dir = dir.path().join("LaunchAgents");
+    let plist = la_dir.join("com.technicalpickles.bowerbird.daemon.plist");
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&la_dir).expect("la dir");
+    fs::create_dir_all(&bin_dir).expect("bin dir");
+    write_executable(&bin_dir.join("launchctl"), FAKE_LAUNCHCTL);
+    fs::write(&plist, "<plist/>\n").expect("write plist stub");
+    let log = dir.path().join("launchctl.log");
+
+    let mut cmd = bowerbird_bin();
+    cmd.arg("stop")
+        .env("HOME", dir.path())
+        .env("BOWERBIRD_LAUNCH_AGENTS_DIR", &la_dir)
+        .env("FAKE_LAUNCHCTL_PRINT_EXIT", "0") // agent loaded
+        .env("FAKE_LAUNCHCTL_BOOTOUT_EXIT", "0");
+    with_fake_launchctl(&mut cmd, &bin_dir, &log);
+    let assertion = cmd.assert().success();
+
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("daemon stopped") && stdout.contains("supervision paused"),
+        "stop must report a launchd-owned stop; stdout={stdout}"
+    );
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        calls.contains("bootout"),
+        "stop must boot the loaded agent out (not SIGKILL it into a KeepAlive respawn); calls=\n{calls}"
+    );
+}
+
+/// Pass-6 F1 (fallback side): when a plist exists but the agent is NOT loaded,
+/// `bowerbird stop` falls back to the PID-file path and never boots anything out.
+#[cfg(target_os = "macos")]
+#[test]
+fn stop_falls_back_to_pid_file_when_agent_not_loaded_on_macos() {
+    let dir = TempDir::new().expect("tempdir");
+    let la_dir = dir.path().join("LaunchAgents");
+    let plist = la_dir.join("com.technicalpickles.bowerbird.daemon.plist");
+    let bin_dir = dir.path().join("bin");
+    let data_dir = dir.path().join(".bowerbird");
+    fs::create_dir_all(&la_dir).expect("la dir");
+    fs::create_dir_all(&bin_dir).expect("bin dir");
+    fs::create_dir_all(&data_dir).expect("data dir");
+    write_executable(&bin_dir.join("launchctl"), FAKE_LAUNCHCTL);
+    fs::write(&plist, "<plist/>\n").expect("write plist stub");
+    let log = dir.path().join("launchctl.log");
+
+    let mut cmd = bowerbird_bin();
+    cmd.arg("stop")
+        .env("HOME", dir.path())
+        .env("BOWERBIRD_LAUNCH_AGENTS_DIR", &la_dir)
+        .env("FAKE_LAUNCHCTL_PRINT_EXIT", "1"); // agent not loaded -> PID-file path
+    with_fake_launchctl(&mut cmd, &bin_dir, &log);
+    let assertion = cmd.assert().success();
+
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("daemon not running"),
+        "stop must take the PID-file path (no daemon to stop here); stdout={stdout}"
+    );
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !calls.contains("bootout"),
+        "stop must NOT bootout when the agent is not loaded; calls=\n{calls}"
+    );
+}
+
+/// Pass-6 F2 (install side): when modern `bootstrap` AND `launchctl print` are
+/// unsupported/unverifiable but legacy `load -w` works, install must still reach
+/// the legacy fallback rather than bailing at the `launch_agent_load_state()`
+/// preflight. The preflight is now tri-state, so an unverifiable `print` becomes
+/// `Unknown` and the launch helpers attempt modern-then-legacy.
+#[cfg(target_os = "macos")]
+#[test]
+fn install_uses_legacy_load_when_bootstrap_and_print_unsupported_on_macos() {
+    let dir = TempDir::new().expect("tempdir");
+    let settings = settings_path(&dir);
+    let la_dir = dir.path().join("LaunchAgents");
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("bin dir");
+    write_executable(&bin_dir.join("launchctl"), FAKE_LAUNCHCTL);
+    let daemon = bin_dir.join("bowerbird-daemon");
+    write_executable(&daemon, "#!/bin/sh\nexit 0\n");
+    let log = dir.path().join("launchctl.log");
+
+    let mut cmd = bowerbird_bin();
+    cmd.arg("install")
+        .arg("--settings")
+        .arg(&settings)
+        .env("HOME", dir.path())
+        .env("BOWERBIRD_LAUNCH_AGENTS_DIR", &la_dir)
+        .env("BOWERBIRD_DAEMON_BIN", &daemon)
+        // print unverifiable => Unknown; modern bootstrap/bootout fail; legacy works.
+        .env("FAKE_LAUNCHCTL_PRINT_EXIT", "1")
+        .env("FAKE_LAUNCHCTL_PRINT_STDERR", "Operation not permitted")
+        .env("FAKE_LAUNCHCTL_BOOTOUT_EXIT", "1")
+        .env("FAKE_LAUNCHCTL_UNLOAD_EXIT", "0")
+        .env("FAKE_LAUNCHCTL_BOOTSTRAP_EXIT", "1")
+        .env("FAKE_LAUNCHCTL_LOAD_EXIT", "0");
+    with_fake_launchctl(&mut cmd, &bin_dir, &log);
+    cmd.assert().success();
+
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        calls.contains("load -w"),
+        "install must fall back to legacy `load -w` when bootstrap+print are unsupported; calls=\n{calls}"
+    );
+}
+
+/// Pass-6 F2 (start side): same legacy-fallback path for `bowerbird start` — an
+/// unverifiable `print` must not bail before the modern-then-legacy launch helper.
+#[cfg(target_os = "macos")]
+#[test]
+fn start_uses_legacy_load_when_bootstrap_and_print_unsupported_on_macos() {
+    let dir = TempDir::new().expect("tempdir");
+    let la_dir = dir.path().join("LaunchAgents");
+    let plist = la_dir.join("com.technicalpickles.bowerbird.daemon.plist");
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&la_dir).expect("la dir");
+    fs::create_dir_all(&bin_dir).expect("bin dir");
+    write_executable(&bin_dir.join("launchctl"), FAKE_LAUNCHCTL);
+    fs::write(&plist, "<plist/>\n").expect("write plist stub"); // no ProgramArguments => F6 skipped
+    let log = dir.path().join("launchctl.log");
+
+    let mut cmd = bowerbird_bin();
+    cmd.arg("start")
+        .env("HOME", dir.path())
+        .env("BOWERBIRD_LAUNCH_AGENTS_DIR", &la_dir)
+        .env("FAKE_LAUNCHCTL_PRINT_EXIT", "1")
+        .env("FAKE_LAUNCHCTL_PRINT_STDERR", "Operation not permitted") // Unknown
+        .env("FAKE_LAUNCHCTL_BOOTSTRAP_EXIT", "1")
+        .env("FAKE_LAUNCHCTL_LOAD_EXIT", "0");
+    with_fake_launchctl(&mut cmd, &bin_dir, &log);
+    // Readiness times out (no real daemon), but the legacy load must have run.
+    cmd.assert().failure();
+
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        calls.contains("bootstrap") && calls.contains("load -w"),
+        "start must attempt modern bootstrap then legacy `load -w` on Unknown; calls=\n{calls}"
+    );
+}
+
+/// Pass-6 F3 (loaded side): a live socket whose LaunchAgent is positively loaded
+/// is truly already running AND supervised — `start` reports it and takes no
+/// launchd action.
+#[cfg(target_os = "macos")]
+#[test]
+fn start_reports_supervised_when_loaded_and_socket_live_on_macos() {
+    use std::os::unix::net::UnixListener;
+
+    let dir = TempDir::new().expect("tempdir");
+    let la_dir = dir.path().join("LaunchAgents");
+    let plist = la_dir.join("com.technicalpickles.bowerbird.daemon.plist");
+    let bin_dir = dir.path().join("bin");
+    let data_dir = dir.path().join(".bowerbird");
+    fs::create_dir_all(&la_dir).expect("la dir");
+    fs::create_dir_all(&bin_dir).expect("bin dir");
+    fs::create_dir_all(&data_dir).expect("data dir");
+    write_executable(&bin_dir.join("launchctl"), FAKE_LAUNCHCTL);
+    fs::write(&plist, "<plist/>\n").expect("write plist stub");
+    let _listener = UnixListener::bind(data_dir.join("ingest.sock")).expect("bind socket");
+    let log = dir.path().join("launchctl.log");
+
+    let mut cmd = bowerbird_bin();
+    cmd.arg("start")
+        .env("HOME", dir.path())
+        .env("BOWERBIRD_LAUNCH_AGENTS_DIR", &la_dir)
+        .env("FAKE_LAUNCHCTL_PRINT_EXIT", "0"); // loaded
+    with_fake_launchctl(&mut cmd, &bin_dir, &log);
+    let assertion = cmd.assert().success();
+
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("already running under launchd"),
+        "start must report a supervised live daemon as launchd-owned; stdout={stdout}"
+    );
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !calls.contains("bootstrap") && !calls.contains("kickstart"),
+        "start must take no launchd action for an already-supervised daemon; calls=\n{calls}"
+    );
+}
+
+/// Pass-6 F3 (unsupervised side): a live socket whose LaunchAgent is positively
+/// NOT loaded is a manual / pre-5.9 daemon. `start` must NOT silently accept it as
+/// "already running" (the pre-pass-6 bug that left a registered install
+/// unsupervised); it must attempt to migrate it into launchd ownership and fail
+/// clearly when it cannot stop the manual daemon.
+#[cfg(target_os = "macos")]
+#[test]
+fn start_does_not_silently_accept_unsupervised_manual_daemon_on_macos() {
+    use std::os::unix::net::UnixListener;
+
+    let dir = TempDir::new().expect("tempdir");
+    let la_dir = dir.path().join("LaunchAgents");
+    let plist = la_dir.join("com.technicalpickles.bowerbird.daemon.plist");
+    let bin_dir = dir.path().join("bin");
+    let data_dir = dir.path().join(".bowerbird");
+    fs::create_dir_all(&la_dir).expect("la dir");
+    fs::create_dir_all(&bin_dir).expect("bin dir");
+    fs::create_dir_all(&data_dir).expect("data dir");
+    write_executable(&bin_dir.join("launchctl"), FAKE_LAUNCHCTL);
+    fs::write(&plist, "<plist/>\n").expect("write plist stub");
+    // A live socket the test holds (so it survives any stop attempt), and NO flock
+    // holder — so the singleton is Free and start cannot stop the socket owner.
+    let _listener = UnixListener::bind(data_dir.join("ingest.sock")).expect("bind socket");
+    let log = dir.path().join("launchctl.log");
+
+    let mut cmd = bowerbird_bin();
+    cmd.arg("start")
+        .env("HOME", dir.path())
+        .env("BOWERBIRD_LAUNCH_AGENTS_DIR", &la_dir)
+        .env("FAKE_LAUNCHCTL_PRINT_EXIT", "1"); // not loaded -> NotLoaded -> migrate
+    with_fake_launchctl(&mut cmd, &bin_dir, &log);
+    let assertion = cmd.assert().failure();
+
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).into_owned();
+    assert!(
+        stdout.contains("migrating it to launchd supervision"),
+        "start must attempt to migrate an unsupervised manual daemon; stdout={stdout}"
+    );
+    assert!(
+        stderr.contains("still accepting"),
+        "start must fail clearly when it cannot stop the manual daemon; stderr={stderr}"
+    );
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !calls.contains("bootstrap"),
+        "start must NOT bootstrap launchd over a daemon it could not stop; calls=\n{calls}"
+    );
+}
+
+/// Pass-6 F4 (stale-pid-reuse safety): a `bowerbird.pid` that names a LIVE but
+/// unrelated process, with NO flock held, is stale. `bowerbird stop` must treat it
+/// as "not running" and must NOT SIGTERM the reused pid.
+#[cfg(target_os = "macos")]
+#[test]
+fn stop_ignores_stale_pid_file_without_flock_on_macos() {
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+
+    let dir = TempDir::new().expect("tempdir");
+    let data_dir = dir.path().join("data");
+    fs::create_dir_all(&data_dir).expect("data dir");
+    // No plist under HOME => stop uses the PID-file path directly.
+
+    // A live, unrelated process whose pid we plant as a stale pid file (no flock).
+    let mut victim = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn victim");
+    let victim_pid = victim.id() as i32;
+    fs::write(data_dir.join("bowerbird.pid"), victim_pid.to_string()).expect("write stale pid");
+
+    let mut cmd = bowerbird_bin();
+    cmd.arg("stop")
+        .env("HOME", dir.path())
+        .env("BOWERBIRD_DATA_DIR", &data_dir);
+    let assertion = cmd.assert().success();
+
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("daemon not running"),
+        "stop must treat a lock-free pid file as stale; stdout={stdout}"
+    );
+    // The unrelated process must NOT have been signaled.
+    assert!(
+        kill(Pid::from_raw(victim_pid), None).is_ok(),
+        "stop must NOT SIGTERM a reused pid from a stale (lock-free) pid file"
+    );
+
+    victim.kill().ok();
+    victim.wait().ok();
+}
+
+/// Pass-6 F4 (real holder, unusable pid): when a daemon genuinely HOLDS the
+/// singleton flock but `bowerbird.pid` is corrupt (no usable pid), install must
+/// refuse to bootstrap launchd over it (it cannot identify a process to stop), not
+/// silently proceed into the singleton crash-loop.
+#[cfg(target_os = "macos")]
+#[test]
+fn install_fails_when_singleton_held_with_unusable_pid_on_macos() {
+    let dir = TempDir::new().expect("tempdir");
+    let settings = settings_path(&dir);
+    let la_dir = dir.path().join("LaunchAgents");
+    let data_dir = dir.path().join("data");
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&data_dir).expect("data dir");
+    fs::create_dir_all(&bin_dir).expect("bin dir");
+    write_executable(&bin_dir.join("launchctl"), FAKE_LAUNCHCTL);
+    let daemon = bin_dir.join("bowerbird-daemon");
+    write_executable(&daemon, "#!/bin/sh\nexit 0\n");
+    let log = dir.path().join("launchctl.log");
+
+    // A REAL flock holder; then corrupt the pid file content (the flock is
+    // advisory, so a separate write does not disturb it) => HeldUnknownPid.
+    let data_dir_canon = fs::canonicalize(&data_dir).expect("canonicalize data dir");
+    let mut holder = spawn_flock_holder(&data_dir_canon.join("bowerbird.pid"));
+    fs::write(data_dir_canon.join("bowerbird.pid"), "not-a-pid").expect("corrupt pid file");
+
+    let mut cmd = bowerbird_bin();
+    cmd.arg("install")
+        .arg("--settings")
+        .arg(&settings)
+        .env("HOME", dir.path())
+        .env("BOWERBIRD_DATA_DIR", &data_dir)
+        .env("BOWERBIRD_LAUNCH_AGENTS_DIR", &la_dir)
+        .env("BOWERBIRD_DAEMON_BIN", &daemon)
+        .env("FAKE_LAUNCHCTL_PRINT_EXIT", "1") // not loaded
+        .env("FAKE_LAUNCHCTL_BOOTSTRAP_EXIT", "0");
+    with_fake_launchctl(&mut cmd, &bin_dir, &log);
+    let assertion = cmd.assert().failure();
+
+    holder.kill().ok();
+    holder.wait().ok();
+
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("refusing to bootstrap"),
+        "install must refuse to bootstrap over a singleton holder it cannot stop; stderr={stderr}"
+    );
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !calls.contains("bootstrap"),
+        "install must NOT bootstrap over an unidentifiable singleton holder; calls=\n{calls}"
+    );
+}
+
+/// Pass-6 F6: `install --no-start` may register a plist before the daemon binary
+/// is in place; a later `bowerbird start` must revalidate the registered
+/// ProgramArguments and fail clearly (before touching launchctl) if it is not
+/// launchable, instead of handing launchd a dead job that it retries behind a bare
+/// readiness timeout.
+#[cfg(target_os = "macos")]
+#[test]
+fn start_fails_when_registered_daemon_not_executable_on_macos() {
+    let dir = TempDir::new().expect("tempdir");
+    let settings = settings_path(&dir);
+    let la_dir = dir.path().join("LaunchAgents");
+    let plist = la_dir.join("com.technicalpickles.bowerbird.daemon.plist");
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("bin dir");
+    write_executable(&bin_dir.join("launchctl"), FAKE_LAUNCHCTL);
+    // A NON-executable "daemon" (regular file, no +x), absolute path.
+    let fake_daemon = dir.path().join("bowerbird-daemon-not-exec");
+    fs::write(&fake_daemon, b"#!/bin/sh\n").expect("write non-exec daemon");
+
+    // install --no-start registers the plist (the documented pre-registration
+    // exception skips the launchable check at install time).
+    bowerbird_bin()
+        .arg("install")
+        .arg("--settings")
+        .arg(&settings)
+        .arg("--no-start")
+        .env("HOME", dir.path())
+        .env("BOWERBIRD_LAUNCH_AGENTS_DIR", &la_dir)
+        .env("BOWERBIRD_DAEMON_BIN", &fake_daemon)
+        .assert()
+        .success();
+    assert!(plist.exists(), "plist registered");
+
+    let log = dir.path().join("launchctl.log");
+    let mut cmd = bowerbird_bin();
+    cmd.arg("start")
+        .env("HOME", dir.path())
+        .env("BOWERBIRD_LAUNCH_AGENTS_DIR", &la_dir);
+    with_fake_launchctl(&mut cmd, &bin_dir, &log);
+    let assertion = cmd.assert().failure();
+
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("not an executable file") || stderr.contains("not launchable"),
+        "start must reject a non-executable registered daemon; stderr={stderr}"
+    );
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !calls.contains("bootstrap") && !calls.contains("kickstart"),
+        "start must fail before invoking launchctl; calls=\n{calls}"
     );
 }

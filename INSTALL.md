@@ -92,8 +92,10 @@ present.
 `~/Library/LaunchAgents/com.technicalpickles.bowerbird.daemon.plist` and
 bootstraps it. The agent uses `RunAtLoad` (so the daemon comes back after a
 reboot or login — no more silently-dropped events until a manual restart)
-and `KeepAlive = { SuccessfulExit = false }` (so a crash restarts the daemon,
-but a clean `bowerbird stop` stays down). launchd owns the lifecycle, so
+and `KeepAlive = { SuccessfulExit = false }` (so a crash restarts the daemon).
+`bowerbird stop` stops a launchd-supervised daemon by booting the LaunchAgent
+out, so it stays down for the session (a later login restarts it via
+`RunAtLoad`; run `bowerbird uninstall` to remove supervision entirely). launchd owns the lifecycle, so
 install does not separately spawn the daemon. If a daemon is already running
 when you re-run install (a manual `bowerbird start`, or a pre-5.9 install),
 install hands it to launchd cleanly — it reloads the agent or stops the

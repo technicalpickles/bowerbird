@@ -448,6 +448,19 @@ pub fn registered_plist_env(plist_path: &Path) -> Vec<(String, String)> {
     }
 }
 
+/// Read the daemon executable path (first `ProgramArguments` entry) the
+/// LaunchAgent is registered with (Story 5.9 review pass-6 F6). `None` when the
+/// plist cannot be read or has no parseable `ProgramArguments`. `bowerbird start`
+/// uses this to revalidate the registered daemon is launchable before handing the
+/// agent to launchd — `install --no-start` may register a plist before the binary
+/// exists, so `start` must re-check rather than trust the registration and let
+/// launchd retry a dead job behind a bare readiness timeout.
+#[cfg(target_os = "macos")]
+pub fn registered_plist_program(plist_path: &Path) -> Option<PathBuf> {
+    let xml = std::fs::read_to_string(plist_path).ok()?;
+    parse_plist_program(&xml).map(PathBuf::from)
+}
+
 /// Is the LaunchAgent currently loaded in the user's GUI domain? Positive check
 /// via `launchctl print gui/<uid>/<label>` (exit 0 = present). This is the
 /// authoritative idempotency signal (F3) and the lifecycle discriminator
@@ -458,9 +471,31 @@ pub fn registered_plist_env(plist_path: &Path) -> Vec<(String, String)> {
 /// could not even run `launchctl` (spawn/permission failure) — i.e. "cannot
 /// verify." Collapsing "cannot verify" into "not loaded" is exactly what let
 /// `bootout` claim success while an agent was still supervising the session.
+/// Tri-state load probe (Story 5.9 review pass-6 F2). `launch_agent_loaded()`
+/// returns `Err` for "cannot verify" — the right signal for `uninstall`'s final
+/// bootout verification, but the WRONG gate for `install`/`start`. Those preflight
+/// the load state before calling [`bootstrap_launch_agent`] (which itself attempts
+/// modern `bootstrap` THEN the legacy `load -w` fallback). Gating that preflight
+/// on `launch_agent_loaded()?` makes an unverifiable `launchctl print` bail BEFORE
+/// the legacy fallback ever runs — so on an old/unsupported launchctl where
+/// `print`+`bootstrap` are unavailable but `load -w` works, install/start fail
+/// needlessly. Collapsing the `Err` to `Unknown` here lets the caller fall through
+/// into the launch helper instead.
 #[cfg(target_os = "macos")]
-pub fn launch_agent_loaded() -> anyhow::Result<bool> {
-    agent_loaded(current_uid())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadState {
+    Loaded,
+    NotLoaded,
+    Unknown,
+}
+
+#[cfg(target_os = "macos")]
+pub fn launch_agent_load_state() -> LoadState {
+    match agent_loaded(current_uid()) {
+        Ok(true) => LoadState::Loaded,
+        Ok(false) => LoadState::NotLoaded,
+        Err(_) => LoadState::Unknown,
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -646,6 +681,29 @@ pub fn parse_plist_environment(xml: &str) -> Vec<(String, String)> {
     out
 }
 
+/// Parse the first `ProgramArguments` entry (the daemon executable path) out of a
+/// rendered LaunchAgent plist. Pure / cross-platform (unit-tests on Linux too),
+/// mirroring [`parse_plist_environment`]'s deliberately small format-specific scan
+/// over the fixed shape we render (`<key>ProgramArguments</key>` then an `<array>`
+/// whose first `<string>` is the daemon path). `None` when the plist has no
+/// parseable `ProgramArguments` (e.g. a `<plist/>` stub). Used by `bowerbird start`
+/// to revalidate the registered daemon is launchable (Story 5.9 review pass-6 F6).
+#[cfg(any(target_os = "macos", test))]
+pub fn parse_plist_program(xml: &str) -> Option<String> {
+    let key_at = xml.find("<key>ProgramArguments</key>")?;
+    let rest = &xml[key_at..];
+    let arr_start = rest.find("<array>")?;
+    let arr_end = rest.find("</array>")?;
+    if arr_end < arr_start {
+        return None;
+    }
+    let body = &rest[arr_start + "<array>".len()..arr_end];
+    let s0 = body.find("<string>")?;
+    let sstart = s0 + "<string>".len();
+    let s1 = body[sstart..].find("</string>")?;
+    Some(xml_unescape(&body[sstart..sstart + s1]))
+}
+
 /// Inverse of [`xml_escape`] for the entity set we emit. Used when reading back
 /// the plist we rendered (F2).
 #[cfg(any(target_os = "macos", test))]
@@ -661,6 +719,14 @@ fn xml_unescape(s: &str) -> String {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// Serializes the tests that mutate the process-global `BOWERBIRD_DAEMON_BIN`
+    /// env var (Story 5.9 review pass-6 F7). Rust runs unit tests in parallel by
+    /// default; without this lock a targeted `cargo test -p bowerbird
+    /// launch_agent::tests` (no `--test-threads=1`) can interleave the two
+    /// resolver tests and corrupt each other's set/remove + restore, instead of
+    /// relying on the workspace-wide single-thread convention.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn plist_is_well_formed_and_carries_required_keys() {
@@ -754,6 +820,8 @@ mod tests {
 
     #[test]
     fn daemon_bin_resolver_prefers_absolute_env_override() {
+        // Serialize against the other BOWERBIRD_DAEMON_BIN-mutating test (F7).
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Save/restore the env var so the test is order-independent.
         let prev = std::env::var_os("BOWERBIRD_DAEMON_BIN");
         std::env::set_var("BOWERBIRD_DAEMON_BIN", "/custom/abs/bowerbird-daemon");
@@ -780,6 +848,8 @@ mod tests {
         // target/debug; a sibling `bowerbird-daemon` may or may not exist there,
         // so we only assert the resolver does not panic and returns an absolute
         // path when it succeeds.
+        // Serialize against the other BOWERBIRD_DAEMON_BIN-mutating test (F7).
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var_os("BOWERBIRD_DAEMON_BIN");
         std::env::remove_var("BOWERBIRD_DAEMON_BIN");
         if let Ok(p) = resolve_daemon_bin_absolute() {
@@ -943,6 +1013,35 @@ mod tests {
             env,
             vec![("BOWERBIRD_DATA_DIR".to_string(), "/a&b/<x>".to_string())]
         );
+    }
+
+    #[test]
+    fn parse_plist_program_extracts_daemon_path() {
+        // F6: `start` reads back the registered ProgramArguments to revalidate the
+        // daemon is launchable before handing the agent to launchd.
+        let xml = render_launch_agent_plist(
+            LAUNCH_AGENT_LABEL,
+            Path::new("/opt/bin/bowerbird-daemon"),
+            Path::new("/data/dir"),
+            &[("BOWERBIRD_DATA_DIR", "/data/dir")],
+        );
+        assert_eq!(
+            parse_plist_program(&xml),
+            Some("/opt/bin/bowerbird-daemon".to_string())
+        );
+        // A metachar-bearing path round-trips through the unescape.
+        let xml = render_launch_agent_plist(
+            LAUNCH_AGENT_LABEL,
+            Path::new("/opt/a&b/bowerbird-daemon"),
+            Path::new("/data/dir"),
+            &[],
+        );
+        assert_eq!(
+            parse_plist_program(&xml),
+            Some("/opt/a&b/bowerbird-daemon".to_string())
+        );
+        // A stub plist with no ProgramArguments yields None (start skips the check).
+        assert_eq!(parse_plist_program("<plist/>\n"), None);
     }
 
     #[test]

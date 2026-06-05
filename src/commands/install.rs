@@ -196,10 +196,20 @@ fn supervise_or_start(no_start: bool) -> anyhow::Result<()> {
     //
     // (a) An already-loaded agent (reinstall) is booted out so the new plist's
     //     ProgramArguments/EnvironmentVariables take effect on re-bootstrap
-    //     (this also closes the F3 stale-plist gap).
-    if launch_agent::launch_agent_loaded()? {
-        launch_agent::bootout_launch_agent(&plist_path)
-            .context("bootout previously-loaded launch agent before re-bootstrap")?;
+    //     (this also closes the F3 stale-plist gap). Use the TRI-STATE probe
+    //     (pass-6 F2): gating this on `launch_agent_loaded()?` made an unverifiable
+    //     `launchctl print` bail BEFORE `bootstrap_launch_agent`'s own modern-then-
+    //     legacy `load -w` fallback could run, so install failed on old/unsupported
+    //     launchctl where `load -w` would have worked. On Loaded OR Unknown we
+    //     bootout (it self-normalizes an already-unloaded agent to success and, on
+    //     an old launchctl, attempts the legacy `unload`); only a positively-
+    //     verified NotLoaded skips it.
+    match launch_agent::launch_agent_load_state() {
+        launch_agent::LoadState::Loaded | launch_agent::LoadState::Unknown => {
+            launch_agent::bootout_launch_agent(&plist_path)
+                .context("bootout previously-loaded launch agent before re-bootstrap")?;
+        }
+        launch_agent::LoadState::NotLoaded => {}
     }
 
     // (b) A manual / pre-5.9 daemon may still own the singleton lock — and it
@@ -211,17 +221,24 @@ fn supervise_or_start(no_start: bool) -> anyhow::Result<()> {
     //     can't stop it, refuse rather than bootstrap into an unmanageable
     //     crash-loop.
     let ingest_sock = super::effective_ingest_sock(&data_dir_abs);
-    // The daemon acquires its singleton (flock + PID file) BEFORE it binds the
-    // ingest socket, so a "socket down" probe does NOT prove there is no
+    // The daemon acquires its singleton (a BSD flock on `bowerbird.pid`) BEFORE it
+    // binds the ingest socket, so a "socket down" probe does NOT prove there is no
     // competitor: a daemon wedged before bind, or one still bound to a previous
     // socket path after the registered socket changed, can hold the singleton
     // while the registered socket is unconnectable. Bootstrapping launchd over
     // such a holder fails the singleton acquisition and crash-loops it under
-    // KeepAlive={SuccessfulExit=false}. So disarm a competitor detected by EITHER
-    // the live socket OR a live PID-file holder, not the socket alone (Story 5.9
-    // review pass-5 F2).
-    if super::daemon_is_up(&ingest_sock) || daemon::pid_holder_alive(&data_dir) {
+    // KeepAlive={SuccessfulExit=false}. Detect the competitor by the FLOCK, not by
+    // pid-file content: a stale pid file (lock free) must not trigger a handoff
+    // that SIGTERMs a reused pid, and a real holder with an empty/corrupt pid file
+    // must still block the bootstrap (Story 5.9 review pass-5 F2 / pass-6 F4).
+    if super::daemon_is_up(&ingest_sock)
+        || daemon::singleton_state(&data_dir) != daemon::SingletonState::Free
+    {
         println!("stopping the running unsupervised daemon so launchd can take over");
+        // `stop_daemon_via_pid_file` SIGTERMs the flock holder when it has a live
+        // pid, and FAILS clearly when the singleton is held but the pid is not
+        // identifiable — so a held-but-unknown-pid holder surfaces here as a fatal
+        // "refusing to bootstrap" rather than a silent crash-loop (pass-6 F4).
         daemon::stop_daemon_via_pid_file(&data_dir).map_err(|e| {
             anyhow::anyhow!(
                 "could not stop the running daemon before handing off to launchd ({e:#}); \
@@ -243,7 +260,7 @@ fn supervise_or_start(no_start: bool) -> anyhow::Result<()> {
                 ingest_sock.display()
             );
         }
-        if daemon::pid_holder_alive(&data_dir) {
+        if daemon::singleton_state(&data_dir) != daemon::SingletonState::Free {
             anyhow::bail!(
                 "a daemon is still holding the singleton for {} after attempting to stop it \
                  (its ingest socket is down, so it is wedged before bind or bound to a previous \

@@ -73,39 +73,69 @@ fn start_daemon(bowerbird_dir: &std::path::Path) -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| effective_dir.join("ingest.sock"));
 
-    // Probe the registered socket BEFORE asking launchd anything (Story 5.9
-    // review pass-4 #1). If a daemon is already accepting, no launchd action is
-    // needed — and an unverifiable `launchctl print` (which `launch_agent_loaded`
-    // surfaces as `Err`, pass-3 F1) must NOT make `bowerbird start` fail when the
-    // daemon is already up and no launchd query is even required. A manual daemon
-    // can satisfy the socket probe while the loaded agent is down/stale, and
-    // bootstrapping a competing process would fail the singleton lock and
-    // crash-loop under KeepAlive; we also can't prove launchd owns this PID, so
-    // the message stays neutral rather than claiming launchd ownership (pass-2 F2).
+    // Probe the registered socket BEFORE asking launchd to take any ACTION
+    // (Story 5.9 review pass-4 #1): an unverifiable `launchctl print` must never
+    // fail `start` when the daemon is already up. But a live socket alone does NOT
+    // mean the daemon is *supervised* — a manual / pre-5.9 daemon can accept on the
+    // socket while launchd has no agent loaded, leaving the install unsupervised
+    // even though AC 5 says `start` replaces the manual spawn when a LaunchAgent is
+    // registered. So when the socket is live, decide by launchd's load state
+    // (pass-6 F3):
     if super::daemon_is_up(&ingest_sock) {
-        let pid = daemon::read_pid(&effective_dir.join("bowerbird.pid"))
-            .ok()
-            .flatten();
-        match pid {
-            Some(p) => println!("daemon already running (pid {p})"),
-            None => println!("daemon already running"),
+        match launch_agent::launch_agent_load_state() {
+            // launchd owns the running daemon — truly already up AND supervised.
+            launch_agent::LoadState::Loaded => {
+                let pid = daemon::read_pid(&effective_dir.join("bowerbird.pid"))
+                    .ok()
+                    .flatten();
+                match pid {
+                    Some(p) => println!("daemon already running under launchd (pid {p})"),
+                    None => println!("daemon already running under launchd"),
+                }
+                return Ok(());
+            }
+            // Can't prove launchd's state (unverifiable `launchctl print`). Do NOT
+            // kill a working daemon to migrate it on a guess; leave it running and
+            // warn that supervision could not be confirmed (pass-6 F3 keeps the
+            // pass-4 #1 success path for the unverifiable case).
+            launch_agent::LoadState::Unknown => {
+                eprintln!(
+                    "warning: a daemon is already accepting on {} but launchd's state for the \
+                     registered LaunchAgent could not be verified; leaving the running daemon in \
+                     place — it may not be under launchd supervision (check `launchctl print \
+                     gui/$(id -u)/{}`)",
+                    ingest_sock.display(),
+                    launch_agent::LAUNCH_AGENT_LABEL
+                );
+                println!("daemon already running");
+                return Ok(());
+            }
+            // A manual daemon is accepting but launchd does NOT supervise it.
+            // Migrate it into launchd ownership: fall through to stop it, then
+            // bootstrap (AC 5).
+            launch_agent::LoadState::NotLoaded => {
+                println!(
+                    "a daemon is running but not under launchd; migrating it to launchd supervision"
+                );
+            }
         }
-        return Ok(());
     }
 
-    // The socket is down — but that does NOT prove no daemon competes for the
-    // singleton lock. The daemon takes the singleton (flock + PID file) BEFORE it
-    // binds the socket, so a manual / pre-5.9 daemon wedged before bind, or one
-    // bound to a previous socket path, can hold the singleton while the registered
-    // socket is unconnectable. launchd starting (or `kickstart -k` restarting)
-    // over such a holder would fail the singleton acquisition and crash-loop under
-    // KeepAlive={SuccessfulExit=false}. Stop a live PID-file holder first, and
-    // fail clearly if it survives, so the launchd start has a free singleton
-    // (Story 5.9 review pass-5 F2).
-    if daemon::pid_holder_alive(&effective_dir) {
+    // The socket is down OR a manual daemon must be migrated. Either way a FREE
+    // singleton is required before the launchd start. The daemon takes the
+    // singleton (a flock on `bowerbird.pid`) BEFORE it binds the socket, so a
+    // holder can own the lock with the socket down (wedged before bind, or bound to
+    // a previous socket path). launchd starting (or `kickstart -k` restarting) over
+    // such a holder would fail the singleton acquisition and crash-loop under
+    // KeepAlive={SuccessfulExit=false}. Detect the holder by the FLOCK, not pid-file
+    // content (pass-6 F4): `stop_daemon_via_pid_file` SIGTERMs a live holder and
+    // FAILS clearly when the singleton is held but the pid is unidentifiable, so we
+    // never signal a reused pid nor bootstrap over an unmanageable holder
+    // (Story 5.9 review pass-5 F2 / pass-6 F4).
+    if daemon::singleton_state(&effective_dir) != daemon::SingletonState::Free {
         daemon::stop_daemon_via_pid_file(&effective_dir)
             .context("stop the unsupervised daemon holding the singleton before launchd start")?;
-        if daemon::pid_holder_alive(&effective_dir) {
+        if daemon::singleton_state(&effective_dir) != daemon::SingletonState::Free {
             anyhow::bail!(
                 "a daemon is still holding the singleton for {} after attempting to stop it; \
                  launchd cannot start over it (it would fail the singleton lock and crash-loop) \
@@ -114,17 +144,52 @@ fn start_daemon(bowerbird_dir: &std::path::Path) -> anyhow::Result<()> {
             );
         }
     }
+    // A migrated manual daemon (socket was live, no stoppable singleton holder)
+    // could still be accepting; bootstrapping launchd over it would crash-loop, so
+    // fail clearly if the socket survived the stop (pass-6 F3).
+    if super::daemon_is_up(&ingest_sock) {
+        anyhow::bail!(
+            "a daemon is still accepting on {} but no bowerbird singleton holder could be stopped; \
+             refusing to start launchd over a daemon it cannot manage — stop that daemon, then \
+             re-run `bowerbird start`",
+            ingest_sock.display()
+        );
+    }
+
+    // Revalidate the registered daemon executable before handing the agent to
+    // launchd (pass-6 F6): `install --no-start` may register a plist before the
+    // binary exists, and launchd would otherwise retry a missing/non-executable
+    // job forever behind a bare readiness timeout. Surface the same clear error
+    // `install` uses on the bootstrap path. A stub plist with no parseable
+    // ProgramArguments (None) skips the check.
+    if let Some(program) = launch_agent::registered_plist_program(&plist_path) {
+        launch_agent::ensure_daemon_launchable(&program)
+            .context("the registered LaunchAgent daemon binary is not launchable")?;
+    }
+
+    // `server.json` is only a hint and can be stale after an unclean exit
+    // (`crates/daemon/src/server_file.rs`) — the singleton + ingest-socket probe is
+    // the real liveness proof. Remove any stale copy before starting so the
+    // readiness wait below binds to the freshly-started daemon's file, not an old
+    // port (which could falsely time out, or report readiness against an unrelated
+    // service) (pass-6 F5).
+    let _ = std::fs::remove_file(daemon::server_json_path(&effective_dir));
 
     // Now — and only now — query launchd to decide how to start it: kickstart a
     // loaded-but-down agent (a clean `bowerbird stop` leaves it down under
     // KeepAlive={SuccessfulExit=false}), or bootstrap one that is merely
-    // registered. Deferring the launchd query to here is what lets an
-    // unverifiable `print` no longer block the already-up path above.
-    if launch_agent::launch_agent_loaded()? {
-        launch_agent::kickstart_launch_agent().context("kickstart the registered launch agent")?;
-    } else {
-        launch_agent::bootstrap_launch_agent(&plist_path)
-            .context("bootstrap the registered launch agent")?;
+    // registered. TRI-STATE (pass-6 F2): an unverifiable `print` must NOT bail
+    // before `bootstrap_launch_agent`'s own modern-then-legacy `load -w` fallback,
+    // so Unknown bootstraps (which on an old launchctl falls back to `load -w`).
+    match launch_agent::launch_agent_load_state() {
+        launch_agent::LoadState::Loaded => {
+            launch_agent::kickstart_launch_agent()
+                .context("kickstart the registered launch agent")?;
+        }
+        launch_agent::LoadState::NotLoaded | launch_agent::LoadState::Unknown => {
+            launch_agent::bootstrap_launch_agent(&plist_path)
+                .context("bootstrap the registered launch agent")?;
+        }
     }
     println!("started bowerbird-daemon via launchd");
     wait_for_ready(&effective_dir, "daemon started via launchd")
