@@ -29,22 +29,41 @@ pub fn run(_args: StartArgs) -> anyhow::Result<()> {
 
 /// macOS: when a LaunchAgent is registered (Story 5.9), `bowerbird start` drives
 /// it through launchd instead of spawning an unsupervised `setsid` daemon that
-/// would fight launchd's lifecycle (Story 5.9 review F2). If no plist exists
-/// (dev box, or `install` was never run) we fall back to the detached spawn so
-/// `bowerbird start` still works standalone.
+/// would fight launchd's lifecycle (Story 5.9 review pass-2 F2). If no plist
+/// exists (dev box, or `install` was never run) we fall back to the detached
+/// spawn so `bowerbird start` still works standalone.
 #[cfg(target_os = "macos")]
 fn start_daemon(bowerbird_dir: &std::path::Path) -> anyhow::Result<()> {
     use super::launch_agent;
+    use std::path::PathBuf;
 
     let plist_path = launch_agent::plist_path()?;
     if !plist_path.exists() {
         return start_detached(bowerbird_dir);
     }
 
-    // Probe the *effective* socket (honoring BOWERBIRD_INGEST_SOCK, matching the
-    // path install embeds in the plist) so a daemon on a custom socket is not
-    // missed (F2).
-    let ingest_sock = super::effective_ingest_sock(bowerbird_dir);
+    // launchd starts the daemon with the plist's `EnvironmentVariables`, which
+    // win for the launchd-spawned process and may differ from the current CLI
+    // env. Probing/waiting against the CLI env would time out while the daemon
+    // comes up where launchd actually put it, so resolve the data dir + ingest
+    // socket from the *registered* plist env (Story 5.9 review pass-3 F2),
+    // falling back to the CLI's resolution only when the plist carries no env.
+    let registered = launch_agent::registered_plist_env(&plist_path);
+    let reg = |k: &str| {
+        registered
+            .iter()
+            .find(|(rk, _)| rk == k)
+            .map(|(_, v)| v.clone())
+    };
+    let effective_dir = reg("BOWERBIRD_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| bowerbird_dir.to_path_buf());
+    // The launchd daemon uses the plist's `BOWERBIRD_INGEST_SOCK` when present,
+    // else `<effective_dir>/ingest.sock` — NOT the current CLI env (which the
+    // launchd process never sees).
+    let ingest_sock = reg("BOWERBIRD_INGEST_SOCK")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| effective_dir.join("ingest.sock"));
     let loaded = launch_agent::launch_agent_loaded()?;
 
     // If a daemon is already accepting on the socket, do NOT bootstrap/kickstart
@@ -52,9 +71,9 @@ fn start_daemon(bowerbird_dir: &std::path::Path) -> anyhow::Result<()> {
     // agent is down/stale, and bootstrapping a competing process would fail the
     // singleton lock and crash-loop under KeepAlive. We also can't prove launchd
     // owns this PID, so the message stays neutral rather than claiming launchd
-    // ownership (F2).
+    // ownership (pass-2 F2).
     if super::daemon_is_up(&ingest_sock) {
-        let pid = daemon::read_pid(&bowerbird_dir.join("bowerbird.pid"))
+        let pid = daemon::read_pid(&effective_dir.join("bowerbird.pid"))
             .ok()
             .flatten();
         match pid {
@@ -75,7 +94,7 @@ fn start_daemon(bowerbird_dir: &std::path::Path) -> anyhow::Result<()> {
             .context("bootstrap the registered launch agent")?;
     }
     println!("started bowerbird-daemon via launchd");
-    wait_for_ready(bowerbird_dir, "daemon started via launchd")
+    wait_for_ready(&effective_dir, "daemon started via launchd")
 }
 
 #[cfg(not(target_os = "macos"))]

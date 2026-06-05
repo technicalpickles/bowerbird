@@ -396,16 +396,23 @@ pub fn bootout_launch_agent(plist_path: &Path) -> anyhow::Result<()> {
     )
 }
 
-/// Start an already-loaded agent's job (`launchctl kickstart gui/<uid>/<label>`).
-/// Used by `bowerbird start` when the LaunchAgent is registered but its daemon
-/// is down (e.g. after a clean `bowerbird stop`, which `KeepAlive=SuccessfulExit`
-/// leaves down). Without `-k`, a running job is left alone. Best-effort: a
-/// non-success exit is returned as `Err` for the caller to surface.
+/// Start an already-loaded agent's job (`launchctl kickstart -k gui/<uid>/<label>`).
+/// Used by `bowerbird start` when the LaunchAgent is registered but its ingest
+/// socket is down (e.g. after a clean `bowerbird stop`, which
+/// `KeepAlive=SuccessfulExit=false` leaves down).
+///
+/// `-k` (kill-then-restart) is load-bearing (Story 5.9 review pass-3 F3): a job
+/// can be "running" yet wedged *before* it binds the ingest socket, and a plain
+/// `kickstart` leaves a running job alone — so `bowerbird start` could never
+/// repair the wedged daemon and would just time out. `-k` kills any running
+/// instance first, then (re)starts it, which is correct for both the
+/// loaded-but-down and loaded-but-wedged cases. Best-effort: a non-success exit
+/// is returned as `Err` for the caller to surface.
 #[cfg(target_os = "macos")]
 pub fn kickstart_launch_agent() -> anyhow::Result<()> {
     let uid = current_uid();
     let target = format!("gui/{uid}/{LAUNCH_AGENT_LABEL}");
-    let out = run_launchctl(&["kickstart", &target])?;
+    let out = run_launchctl(&["kickstart", "-k", &target])?;
     if out.success {
         return Ok(());
     }
@@ -414,6 +421,17 @@ pub fn kickstart_launch_agent() -> anyhow::Result<()> {
         out.code_display(),
         out.stderr_trimmed()
     )
+}
+
+/// Read the `EnvironmentVariables` the LaunchAgent is registered with (F2).
+/// Empty when the plist has no env block or cannot be read — callers fall back
+/// to their own resolution in that case.
+#[cfg(target_os = "macos")]
+pub fn registered_plist_env(plist_path: &Path) -> Vec<(String, String)> {
+    match std::fs::read_to_string(plist_path) {
+        Ok(xml) => parse_plist_environment(&xml),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// Is the LaunchAgent currently loaded in the user's GUI domain? Positive check
@@ -434,10 +452,26 @@ pub fn launch_agent_loaded() -> anyhow::Result<bool> {
 #[cfg(target_os = "macos")]
 fn agent_loaded(uid: u32) -> anyhow::Result<bool> {
     let target = format!("gui/{uid}/{LAUNCH_AGENT_LABEL}");
-    // A spawn failure propagates as Err ("cannot verify"); a non-zero launchctl
-    // exit for an absent job is a normal Ok(false), not an error.
+    // A spawn failure propagates as Err ("cannot verify"). Exit 0 = loaded.
     let out = run_launchctl(&["print", &target])?;
-    Ok(out.success)
+    if out.success {
+        return Ok(true);
+    }
+    // A *non-zero* `print` is only "not loaded" when launchctl explicitly says
+    // the service is absent (exit 113 / "Could not find ..."). Any other
+    // non-zero exit — permission, domain-unavailable, transient I/O — is "cannot
+    // verify" and must propagate as Err, NOT collapse to Ok(false) (Story 5.9
+    // review pass-3 F1). Collapsing it is exactly what let `bootout_launch_agent`
+    // accept `!agent_loaded()?` as a clean already-unloaded state and `uninstall`
+    // remove the plist while the agent was actually still loaded.
+    if print_signals_absent(out.code, &out.stderr) {
+        return Ok(false);
+    }
+    anyhow::bail!(
+        "could not verify launchd state for {target}: `launchctl print` exited [{}] {}",
+        out.code_display(),
+        out.stderr_trimmed()
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -527,6 +561,86 @@ fn signals_already_unloaded(code: Option<i32>, stderr: &str) -> bool {
         || s.contains("could not find")
         || s.contains("not find")
         || s.contains("not loaded")
+}
+
+/// Does a non-zero `launchctl print` mean the service is genuinely *absent*
+/// (vs. an unverifiable error)? `launchctl print gui/<uid>/<label>` exits 113
+/// ("Could not find specified service") with a "Could not find service … in
+/// domain" message for an unregistered label. Anything else (permission,
+/// domain-not-available-for-uid, transient I/O) is "cannot verify" and must NOT
+/// be read as "not loaded" (Story 5.9 review pass-3 F1).
+#[cfg(any(target_os = "macos", test))]
+fn print_signals_absent(code: Option<i32>, stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    code == Some(113)
+        || s.contains("could not find")
+        || s.contains("no such")
+        || s.contains("not find")
+        || s.contains("not loaded")
+}
+
+/// Parse the `EnvironmentVariables` dict out of a rendered LaunchAgent plist,
+/// returning the `(key, value)` pairs. Pure / cross-platform so it unit-tests on
+/// Linux CI too.
+///
+/// This is a deliberately small, format-specific scan rather than a general
+/// plist parser: we render the plist ourselves in `render_launch_agent_plist`,
+/// so the shape is fixed (`<key>EnvironmentVariables</key>` then a `<dict>` of
+/// `<key>..</key><string>..</string>` pairs, with no nested dict). `bowerbird
+/// start` reads it so the launchd-managed start probes the socket / waits for
+/// `server.json` where launchd will actually run the daemon — the plist env
+/// wins for the launchd-spawned process, so the current CLI env may differ
+/// (Story 5.9 review pass-3 F2).
+#[cfg(any(target_os = "macos", test))]
+pub fn parse_plist_environment(xml: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let Some(env_at) = xml.find("<key>EnvironmentVariables</key>") else {
+        return out;
+    };
+    let rest = &xml[env_at..];
+    let Some(dict_start) = rest.find("<dict>") else {
+        return out;
+    };
+    let Some(dict_end) = rest.find("</dict>") else {
+        return out;
+    };
+    if dict_end < dict_start {
+        return out;
+    }
+    let body = &rest[dict_start + "<dict>".len()..dict_end];
+
+    // Walk `<key>..</key>` then the next `<string>..</string>`.
+    let mut idx = 0;
+    while let Some(k0) = body[idx..].find("<key>") {
+        let kstart = idx + k0 + "<key>".len();
+        let Some(k1) = body[kstart..].find("</key>") else {
+            break;
+        };
+        let key = xml_unescape(&body[kstart..kstart + k1]);
+        let after_key = kstart + k1 + "</key>".len();
+        let Some(s0) = body[after_key..].find("<string>") else {
+            break;
+        };
+        let sstart = after_key + s0 + "<string>".len();
+        let Some(s1) = body[sstart..].find("</string>") else {
+            break;
+        };
+        let val = xml_unescape(&body[sstart..sstart + s1]);
+        out.push((key, val));
+        idx = sstart + s1 + "</string>".len();
+    }
+    out
+}
+
+/// Inverse of [`xml_escape`] for the entity set we emit. Used when reading back
+/// the plist we rendered (F2).
+#[cfg(any(target_os = "macos", test))]
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
 }
 
 #[cfg(test)]
@@ -738,6 +852,83 @@ mod tests {
             );
             assert!(name.ends_with(".tmp"), "temp name ends with .tmp: {name}");
         }
+    }
+
+    #[test]
+    fn print_absent_only_for_explicit_absent_signals() {
+        // F1: an explicit "could not find" / 113 / "no such" => genuinely absent.
+        assert!(print_signals_absent(
+            Some(113),
+            "Could not find service \"com.example\" in domain for gui"
+        ));
+        assert!(print_signals_absent(Some(1), "No such process"));
+        assert!(print_signals_absent(None, "could not find service"));
+
+        // An unrelated non-zero error must NOT read as absent — `agent_loaded`
+        // must surface it as "cannot verify" (Err), not "not loaded".
+        assert!(
+            !print_signals_absent(Some(1), "Operation not permitted"),
+            "a permission error is unverifiable, not absent"
+        );
+        assert!(
+            !print_signals_absent(Some(5), "Bootstrap failed: 5: Input/output error"),
+            "a transient I/O error is unverifiable, not absent"
+        );
+    }
+
+    #[test]
+    fn parse_plist_environment_round_trips_rendered_env() {
+        // F2: the env we render must read back exactly (the start-time probe and
+        // readiness wait depend on it).
+        let xml = render_launch_agent_plist(
+            LAUNCH_AGENT_LABEL,
+            Path::new("/usr/local/bin/bowerbird-daemon"),
+            Path::new("/data/dir"),
+            &[
+                ("BOWERBIRD_DATA_DIR", "/data/dir"),
+                ("BOWERBIRD_INGEST_SOCK", "/data/dir/ingest.sock"),
+            ],
+        );
+        let env = parse_plist_environment(&xml);
+        assert_eq!(
+            env,
+            vec![
+                ("BOWERBIRD_DATA_DIR".to_string(), "/data/dir".to_string()),
+                (
+                    "BOWERBIRD_INGEST_SOCK".to_string(),
+                    "/data/dir/ingest.sock".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_plist_environment_empty_when_no_env_block() {
+        // No env block (the empty-overrides render) => no pairs, and a daemon-only
+        // plist (the start test's `<plist/>` stub) is also handled gracefully.
+        let xml = render_launch_agent_plist(
+            LAUNCH_AGENT_LABEL,
+            Path::new("/usr/local/bin/bowerbird-daemon"),
+            Path::new("/data/dir"),
+            &[],
+        );
+        assert!(parse_plist_environment(&xml).is_empty());
+        assert!(parse_plist_environment("<plist/>\n").is_empty());
+    }
+
+    #[test]
+    fn parse_plist_environment_unescapes_metacharacters() {
+        let xml = render_launch_agent_plist(
+            LAUNCH_AGENT_LABEL,
+            Path::new("/usr/local/bin/bowerbird-daemon"),
+            Path::new("/a&b"),
+            &[("BOWERBIRD_DATA_DIR", "/a&b/<x>")],
+        );
+        let env = parse_plist_environment(&xml);
+        assert_eq!(
+            env,
+            vec![("BOWERBIRD_DATA_DIR".to_string(), "/a&b/<x>".to_string())]
+        );
     }
 
     #[test]

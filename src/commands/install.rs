@@ -114,6 +114,23 @@ fn supervise_or_start(no_start: bool) -> anyhow::Result<()> {
     let ingest_sock_env = std::env::var("BOWERBIRD_INGEST_SOCK")
         .ok()
         .filter(|s| !s.is_empty());
+
+    // A relative `BOWERBIRD_INGEST_SOCK` would be resolved against whatever
+    // working directory launchd, the shim, and a later CLI command each happen
+    // to run under — so they would not agree on one socket, and install could
+    // probe a different socket than the launchd daemon and shim use (Story 5.9
+    // review pass-3 F4). Refuse to persist a non-absolute socket into launchd.
+    if let Some(sock) = &ingest_sock_env {
+        if !std::path::Path::new(sock).is_absolute() {
+            anyhow::bail!(
+                "BOWERBIRD_INGEST_SOCK is set to a non-absolute path ({sock}); launchd, the \
+                 shim, and later `bowerbird` commands resolve it against differing working \
+                 directories, so they would not agree on the ingest socket — set an absolute \
+                 path before installing"
+            );
+        }
+    }
+
     let mut env: Vec<(&str, &str)> = vec![("BOWERBIRD_DATA_DIR", &data_dir_env)];
     if let Some(sock) = &ingest_sock_env {
         env.push(("BOWERBIRD_INGEST_SOCK", sock));

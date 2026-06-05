@@ -518,11 +518,21 @@ fn install_bootstrap_path_rejects_unlaunchable_daemon_on_macos() {
 // touched, so this is CI-safe on the macOS runner.
 
 /// Fake `launchctl` script body (POSIX sh). `$1` is the subcommand.
+///
+/// `print` models the real `launchctl print` for an absent service: a non-zero
+/// exit carries a "Could not find …" stderr by default so the CLI classifies it
+/// as genuinely-absent (Ok(false)). `FAKE_LAUNCHCTL_PRINT_STDERR` overrides the
+/// message so a test can simulate an *unverifiable* failure (non-absent stderr),
+/// which the CLI must surface as "cannot verify" rather than "not loaded"
+/// (Story 5.9 review pass-3 F1).
 #[cfg(target_os = "macos")]
 const FAKE_LAUNCHCTL: &str = r#"#!/bin/sh
 echo "$@" >> "$FAKE_LAUNCHCTL_LOG"
 case "$1" in
-  print)     exit "${FAKE_LAUNCHCTL_PRINT_EXIT:-1}" ;;
+  print)
+     code="${FAKE_LAUNCHCTL_PRINT_EXIT:-1}"
+     [ "$code" -ne 0 ] && echo "${FAKE_LAUNCHCTL_PRINT_STDERR:-Could not find service in domain for gui}" >&2
+     exit "$code" ;;
   bootstrap) exit "${FAKE_LAUNCHCTL_BOOTSTRAP_EXIT:-0}" ;;
   bootout)
      code="${FAKE_LAUNCHCTL_BOOTOUT_EXIT:-0}"
@@ -693,9 +703,269 @@ fn start_kickstarts_loaded_but_down_agent_on_macos() {
         calls.contains("kickstart"),
         "a loaded-but-down agent must be kickstarted, not respawned; calls=\n{calls}"
     );
+    // F3: the kickstart must use `-k` (kill-then-restart) so a daemon wedged
+    // before binding the socket is repaired rather than left running.
+    assert!(
+        calls.lines().any(|l| l.starts_with("kickstart -k ")),
+        "kickstart must pass -k (force-restart) for loaded-but-down recovery; calls=\n{calls}"
+    );
     assert!(
         !calls.contains("bootstrap"),
         "an already-loaded agent must not be re-bootstrapped by start; calls=\n{calls}"
+    );
+}
+
+/// Story 5.9 review pass-3 F1: a `bootout` that fails with an *unverifiable*
+/// `launchctl print` (a non-zero exit whose stderr is NOT an explicit
+/// absent-service signal) must fail `uninstall` loudly — the CLI must not
+/// collapse "cannot verify" into "not loaded", silently remove the plist, and
+/// claim success while the agent may still be supervising the session.
+#[cfg(target_os = "macos")]
+#[test]
+fn uninstall_fails_when_launchctl_print_is_unverifiable_on_macos() {
+    let dir = TempDir::new().expect("tempdir");
+    let settings = settings_path(&dir);
+    let la_dir = dir.path().join("LaunchAgents");
+    let plist = la_dir.join("com.technicalpickles.bowerbird.daemon.plist");
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("bin dir");
+    write_executable(&bin_dir.join("launchctl"), FAKE_LAUNCHCTL);
+    let log = dir.path().join("launchctl.log");
+
+    // Register the plist first (launchctl-free via --no-start).
+    bowerbird_bin()
+        .arg("install")
+        .arg("--settings")
+        .arg(&settings)
+        .arg("--no-start")
+        .env("HOME", dir.path())
+        .env("BOWERBIRD_LAUNCH_AGENTS_DIR", &la_dir)
+        .assert()
+        .success();
+    assert!(plist.exists(), "plist registered");
+
+    // bootout fails, and `print` returns a NON-absent error (permission), so the
+    // loaded state is unverifiable — uninstall must error, not claim success.
+    let mut cmd = bowerbird_bin();
+    cmd.arg("uninstall")
+        .arg("--settings")
+        .arg(&settings)
+        .env("HOME", dir.path())
+        .env("BOWERBIRD_LAUNCH_AGENTS_DIR", &la_dir)
+        .env("FAKE_LAUNCHCTL_BOOTOUT_EXIT", "1")
+        .env("FAKE_LAUNCHCTL_UNLOAD_EXIT", "1")
+        .env("FAKE_LAUNCHCTL_PRINT_EXIT", "1")
+        .env("FAKE_LAUNCHCTL_PRINT_STDERR", "Operation not permitted");
+    with_fake_launchctl(&mut cmd, &bin_dir, &log);
+    let assertion = cmd.assert().failure();
+
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("could not verify launchd state"),
+        "uninstall must surface the unverifiable launchd state; stderr={stderr}"
+    );
+    assert!(
+        plist.exists(),
+        "an unverifiable bootout must NOT remove the plist (retry must still find it)"
+    );
+}
+
+/// Story 5.9 review pass-3 F2: `bowerbird start` must look for the daemon where
+/// launchd will actually run it — the data dir registered in the plist's
+/// `EnvironmentVariables` — not the data dir in the *current* CLI env. We
+/// install with data dir A (so the plist embeds A), drop a `server.json` into A
+/// pointing at an unreachable health port, then run `start` from a *different*
+/// CLI data dir B. If `start` reads A's env it finds A's `server.json` and times
+/// out on the unreachable healthz ("failed to become healthy"); if it had used B
+/// it would instead time out waiting for a `server.json` that does not exist
+/// ("did not appear"). The error message distinguishes the two.
+#[cfg(target_os = "macos")]
+#[test]
+fn start_uses_registered_plist_data_dir_not_cli_env_on_macos() {
+    let dir = TempDir::new().expect("tempdir");
+    let settings = settings_path(&dir);
+    let la_dir = dir.path().join("LaunchAgents");
+    let dir_a = dir.path().join("data-a");
+    let dir_b = dir.path().join("data-b");
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&dir_a).expect("data-a");
+    fs::create_dir_all(&dir_b).expect("data-b");
+    fs::create_dir_all(&bin_dir).expect("bin dir");
+    write_executable(&bin_dir.join("launchctl"), FAKE_LAUNCHCTL);
+
+    // Install with data dir A (--no-start: writes the plist, no real launchctl).
+    bowerbird_bin()
+        .arg("install")
+        .arg("--settings")
+        .arg(&settings)
+        .arg("--no-start")
+        .env("HOME", dir.path())
+        .env("BOWERBIRD_LAUNCH_AGENTS_DIR", &la_dir)
+        .env("BOWERBIRD_DATA_DIR", &dir_a)
+        .env("BOWERBIRD_DAEMON_BIN", "/usr/local/bin/bowerbird-daemon")
+        .assert()
+        .success();
+
+    // install canonicalizes the data dir before embedding it; write server.json
+    // where the plist actually points.
+    let dir_a_canon = fs::canonicalize(&dir_a).expect("canonicalize data-a");
+    fs::write(
+        dir_a_canon.join("server.json"),
+        r#"{"bind_addr":"127.0.0.1:1","token":"x"}"#,
+    )
+    .expect("write server.json into A");
+
+    // start from a DIFFERENT CLI data dir (B). If F2 is honored it reads A's env.
+    let log = dir.path().join("launchctl.log");
+    let mut cmd = bowerbird_bin();
+    cmd.arg("start")
+        .env("HOME", dir.path())
+        .env("BOWERBIRD_DATA_DIR", &dir_b)
+        .env("BOWERBIRD_LAUNCH_AGENTS_DIR", &la_dir)
+        .env("FAKE_LAUNCHCTL_PRINT_EXIT", "1") // not loaded -> bootstrap
+        .env("FAKE_LAUNCHCTL_BOOTSTRAP_EXIT", "0");
+    with_fake_launchctl(&mut cmd, &bin_dir, &log);
+    let assertion = cmd.assert().failure();
+
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("failed to become healthy"),
+        "start must find A's server.json (proving it read the plist's data dir, not the CLI \
+         env); stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("did not appear"),
+        "start must NOT wait against the CLI env data dir B (where no server.json exists); \
+         stderr={stderr}"
+    );
+    assert!(
+        !dir_b.join("server.json").exists(),
+        "the test must not have created server.json in B"
+    );
+}
+
+/// Story 5.9 review pass-3 F4: install refuses to persist a *relative*
+/// `BOWERBIRD_INGEST_SOCK` into launchd (launchd/shim/CLI would resolve it
+/// against differing working directories). Even with `--no-start`, the plist
+/// must not be written with a non-absolute socket.
+#[cfg(target_os = "macos")]
+#[test]
+fn install_rejects_relative_ingest_sock_on_macos() {
+    let dir = TempDir::new().expect("tempdir");
+    let settings = settings_path(&dir);
+    let la_dir = dir.path().join("LaunchAgents");
+    let plist = la_dir.join("com.technicalpickles.bowerbird.daemon.plist");
+
+    let assertion = bowerbird_bin()
+        .arg("install")
+        .arg("--settings")
+        .arg(&settings)
+        .arg("--no-start")
+        .env("HOME", dir.path())
+        .env("BOWERBIRD_LAUNCH_AGENTS_DIR", &la_dir)
+        .env("BOWERBIRD_DAEMON_BIN", "/usr/local/bin/bowerbird-daemon")
+        .env("BOWERBIRD_INGEST_SOCK", "relative/ingest.sock")
+        .assert()
+        .failure();
+
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("non-absolute") && stderr.contains("BOWERBIRD_INGEST_SOCK"),
+        "install must explain the relative socket is rejected; stderr={stderr}"
+    );
+    assert!(
+        !plist.exists(),
+        "no plist may be written when the ingest socket is non-absolute"
+    );
+}
+
+/// Story 5.9 review pass-3 F4 (the accepted side): an *absolute*
+/// `BOWERBIRD_INGEST_SOCK` is embedded verbatim into the plist's
+/// `EnvironmentVariables`.
+#[cfg(target_os = "macos")]
+#[test]
+fn install_embeds_absolute_ingest_sock_in_plist_on_macos() {
+    let dir = TempDir::new().expect("tempdir");
+    let settings = settings_path(&dir);
+    let la_dir = dir.path().join("LaunchAgents");
+    let plist = la_dir.join("com.technicalpickles.bowerbird.daemon.plist");
+    let sock = dir.path().join("custom-ingest.sock");
+
+    bowerbird_bin()
+        .arg("install")
+        .arg("--settings")
+        .arg(&settings)
+        .arg("--no-start")
+        .env("HOME", dir.path())
+        .env("BOWERBIRD_LAUNCH_AGENTS_DIR", &la_dir)
+        .env("BOWERBIRD_DAEMON_BIN", "/usr/local/bin/bowerbird-daemon")
+        .env("BOWERBIRD_INGEST_SOCK", &sock)
+        .assert()
+        .success();
+
+    let xml = fs::read_to_string(&plist).expect("read plist");
+    assert!(
+        xml.contains("<key>BOWERBIRD_INGEST_SOCK</key>"),
+        "an absolute ingest sock must be embedded in EnvironmentVariables; xml={xml}"
+    );
+    assert!(
+        xml.contains(&format!("<string>{}</string>", sock.display())),
+        "the embedded socket must be the absolute path; xml={xml}"
+    );
+}
+
+/// Story 5.9 review pass-3 F5: when `uninstall` (without `--no-stop`) boots the
+/// agent out but a manual / pre-5.9 daemon is still accepting on the ingest
+/// socket with no PID file to stop it, uninstall must warn clearly instead of
+/// silently claiming success. We bind a real listener on the effective socket
+/// (no PID file present) and assert the warning.
+#[cfg(target_os = "macos")]
+#[test]
+fn uninstall_warns_when_live_daemon_survives_missing_pid_on_macos() {
+    use std::os::unix::net::UnixListener;
+
+    let dir = TempDir::new().expect("tempdir");
+    let settings = settings_path(&dir);
+    let la_dir = dir.path().join("LaunchAgents");
+    let data_dir = dir.path().join("data");
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&data_dir).expect("data dir");
+    fs::create_dir_all(&bin_dir).expect("bin dir");
+    write_executable(&bin_dir.join("launchctl"), FAKE_LAUNCHCTL);
+    let log = dir.path().join("launchctl.log");
+
+    // Register the plist (launchctl-free).
+    bowerbird_bin()
+        .arg("install")
+        .arg("--settings")
+        .arg(&settings)
+        .arg("--no-start")
+        .env("HOME", dir.path())
+        .env("BOWERBIRD_LAUNCH_AGENTS_DIR", &la_dir)
+        .env("BOWERBIRD_DATA_DIR", &data_dir)
+        .assert()
+        .success();
+
+    // A live daemon on the effective socket, but NO bowerbird.pid file.
+    let sock = data_dir.join("ingest.sock");
+    let _listener = UnixListener::bind(&sock).expect("bind fake daemon socket");
+
+    let mut cmd = bowerbird_bin();
+    cmd.arg("uninstall")
+        .arg("--settings")
+        .arg(&settings)
+        .env("HOME", dir.path())
+        .env("BOWERBIRD_DATA_DIR", &data_dir)
+        .env("BOWERBIRD_LAUNCH_AGENTS_DIR", &la_dir)
+        .env("FAKE_LAUNCHCTL_BOOTOUT_EXIT", "0"); // bootout succeeds
+    with_fake_launchctl(&mut cmd, &bin_dir, &log);
+    // Non-fatal: settings are already un-merged, so uninstall still exits 0.
+    let assertion = cmd.assert().success();
+
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("still accepting on"),
+        "uninstall must warn that a live daemon survived the missing PID file; stderr={stderr}"
     );
 }
 
