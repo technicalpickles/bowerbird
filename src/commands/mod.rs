@@ -2,6 +2,13 @@ pub mod auth;
 pub mod daemon;
 pub mod export;
 pub mod install;
+// launchd supervision is macOS-only (Story 5.9); every caller is behind
+// `#[cfg(target_os = "macos")]`, so on other targets the module has no users.
+// Gate it to macOS-or-test so a non-macOS bin build doesn't flag its helpers as
+// dead code, while the cross-platform unit tests (plist render, resolvers,
+// launchctl-output classifiers) still run on Linux CI.
+#[cfg(any(target_os = "macos", test))]
+pub mod launch_agent;
 pub mod replay;
 pub mod start;
 pub mod status;
@@ -66,4 +73,20 @@ pub(crate) fn resolve_daemon_bin() -> PathBuf {
 pub(crate) fn daemon_is_up(ingest_sock: &Path) -> bool {
     use std::os::unix::net::UnixStream;
     UnixStream::connect(ingest_sock).is_ok()
+}
+
+/// The ingest socket path the daemon actually binds: `BOWERBIRD_INGEST_SOCK`
+/// when set (matching what `install` embeds in the launchd plist), else
+/// `<data_dir>/ingest.sock`. The macOS launchd handoff (Story 5.9 review F1/F2)
+/// probes this so a daemon listening on a custom socket is not invisible to the
+/// liveness check, which would otherwise bootstrap launchd on top of a live
+/// daemon and crash-loop against the singleton lock.
+#[cfg(target_os = "macos")]
+pub(crate) fn effective_ingest_sock(data_dir: &Path) -> PathBuf {
+    if let Some(s) = std::env::var_os("BOWERBIRD_INGEST_SOCK") {
+        if !s.is_empty() {
+            return PathBuf::from(s);
+        }
+    }
+    data_dir.join("ingest.sock")
 }

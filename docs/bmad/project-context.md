@@ -297,6 +297,7 @@ What happens when things go wrong:
 - **Settings.json corruption (bowerbird's own config).** Read → validate → atomic-swap (write `.tmp`, rename). Reject and fall back to last-good if validation fails.
 - **Claude's settings.json mid-edit (during `bowerbird install`).** Must be atomic-replacement. Fuzz the partial-read case.
 - **Hook delivery is not reliable** (Claude can drop hooks if the shim is slow or killed). The protocol's gap-detection signal (Open question above) is what makes this visible to presenters.
+- **Daemon down after a reboot drops every event until restart** (dogfood Finding 1, 2026-06-01). On **macOS** the daemon is supervised by a launchd LaunchAgent (`com.technicalpickles.bowerbird.daemon`) installed by `bowerbird install`: `RunAtLoad=true` brings it back on login/reboot and `KeepAlive={SuccessfulExit=false}` restarts it on crash (non-zero exit) while leaving a clean `bowerbird stop` (graceful exit 0) down. Per ADR 0007. On **Linux**, supervision stays manual for V1 (systemd deferred); the shim still never blocks Claude, so a down daemon costs events, not the coding session.
 
 ### Health-check endpoint — Proposed
 

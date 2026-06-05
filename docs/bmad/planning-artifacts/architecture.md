@@ -363,7 +363,7 @@ verify all crate version pins compile, and get `cargo check --workspace` green.
 - SQLite schema (events, session_projections, recording_sessions)
 - Auth model split: Unix socket 0600 ingest / UUID4 bearer TCP
 - EventId(i64) AUTOINCREMENT cursor semantics
-- Process supervision: backgrounded process via `setsid` (macOS + Linux V1); launchd / systemd integration deferred post-V1. CLI surfaces lifecycle: `bowerbird install` spawns the daemon detached, `bowerbird stop` sends SIGTERM with SIGKILL escalation after 10s.
+- Process supervision: on macOS, a launchd LaunchAgent (`RunAtLoad` + `KeepAlive={SuccessfulExit=false}`) starts the daemon on login and restarts it on crash (V1, Story 5.9 / ADR 0007); on Linux, a backgrounded process via `setsid` (V1), with systemd integration still deferred post-V1. CLI surfaces lifecycle: `bowerbird install` registers the LaunchAgent (macOS) or spawns the daemon detached (Linux), `bowerbird stop` sends SIGTERM with SIGKILL escalation after 10s.
 
 **Important Decisions (Shape Architecture):**
 - deadpool-sqlite writer(max=1) + readers(max=4) pool split
@@ -373,7 +373,7 @@ verify all crate version pins compile, and get `cargo check --workspace` green.
 - Keyring crate: `keyring` v3
 
 **Deferred Decisions (Post-MVP):**
-- Linux systemd service integration
+- Linux systemd service integration (macOS launchd start-on-login is now V1 — Story 5.9 / ADR 0007; Linux supervision stays deferred)
 - Event-log truncation (`bowerbird gc`)
 - V2 adapter contract (subprocess vs. in-process)
 - Rate limiting
@@ -500,9 +500,9 @@ Not applicable in this repository. bowerbird has no UI; presenters are external 
 ### Infrastructure & Deployment
 
 **Process supervision (V1):**
-- `bowerbird install` writes the hook entries into `~/.claude/settings.json` (atomic: read → parse → merge → write `.tmp` → fsync → rename) and spawns the daemon detached via `setsid`. The daemon survives the install process's exit and is owned by the user's session.
-- `bowerbird uninstall` reverses the settings.json merge and sends SIGTERM to the daemon (10s drain budget, then SIGKILL escalation). The data directory at `~/.bowerbird/` is intentionally NOT removed — your event history is your data.
-- launchd (macOS) and systemd (Linux) integration are deferred post-V1.
+- `bowerbird install` writes the hook entries into `~/.claude/settings.json` (atomic: read → parse → merge → write `.tmp` → fsync → rename). On **macOS** it then registers a launchd LaunchAgent at `~/Library/LaunchAgents/com.technicalpickles.bowerbird.daemon.plist` (`RunAtLoad=true` for start-on-login, `KeepAlive={SuccessfulExit=false}` for crash-restart) and bootstraps it (`launchctl bootstrap gui/<uid>`) — launchd owns the lifecycle, so install does NOT also `setsid`-spawn. On **Linux** it spawns the daemon detached via `setsid`; the daemon survives the install process's exit and is owned by the user's session. `--no-start` writes the plist (macOS) but skips the bootstrap/spawn.
+- `bowerbird uninstall` reverses the settings.json merge. On **macOS** it boots the LaunchAgent out (`launchctl bootout`, which terminates the daemon) and removes the plist; `--no-stop` removes the plist but skips the bootout. On **Linux** it sends SIGTERM to the daemon (10s drain budget, then SIGKILL escalation). The data directory at `~/.bowerbird/` is intentionally NOT removed — your event history is your data.
+- macOS launchd start-on-login + crash-restart is **V1** (Story 5.9 / ADR 0007, reversing the earlier "deferred post-V1"). Linux systemd integration stays deferred post-V1; `KeepAlive={SuccessfulExit=false}` (not `true`) is what lets a clean `bowerbird stop` (graceful exit 0, Story 2.5) stay down without launchd fighting it.
 
 **CLI framework: clap 4.x with derive macro**
 - Subcommands (top-level, alphabetical): `auth token`, `export`, `install`, `replay`, `start`, `status`, `stop`, `uninstall`. `version` is provided by clap's built-in `--version` flag.

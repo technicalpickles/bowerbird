@@ -87,16 +87,33 @@ pins this.
 user-created `config.toml` (mode `0600` recommended) is honored if
 present.
 
-**(e) Daemon auto-start.** `bowerbird install` spawns `bowerbird-daemon`
-detached. The spawn is idempotent: if a daemon is already running per the
-singleton PID-lock, install skips the spawn. Pass `--no-start` to skip the
-daemon spawn entirely (useful for scripted setups).
+**(e) Daemon start-on-login (macOS) / auto-start (Linux).** On **macOS**,
+`bowerbird install` registers a launchd LaunchAgent at
+`~/Library/LaunchAgents/com.technicalpickles.bowerbird.daemon.plist` and
+bootstraps it. The agent uses `RunAtLoad` (so the daemon comes back after a
+reboot or login — no more silently-dropped events until a manual restart)
+and `KeepAlive = { SuccessfulExit = false }` (so a crash restarts the daemon,
+but a clean `bowerbird stop` stays down). launchd owns the lifecycle, so
+install does not separately spawn the daemon. If a daemon is already running
+when you re-run install (a manual `bowerbird start`, or a pre-5.9 install),
+install hands it to launchd cleanly — it reloads the agent or stops the
+unsupervised daemon before bootstrapping, so you never end up with two daemons
+or a crash-restart loop. Once the agent is registered, `bowerbird start` drives
+launchd (it starts or kickstarts the LaunchAgent) rather than spawning its own
+process. On **Linux**, install spawns
+`bowerbird-daemon` detached via `setsid` (the spawn is idempotent: if a daemon
+is already running per the singleton PID-lock, install skips it), and prints a
+note that start-on-login supervision is macOS-only for V1 (systemd integration
+is deferred). Pass `--no-start` to write the LaunchAgent plist (macOS) without
+bootstrapping it, or to skip the spawn (Linux) — useful for scripted setups.
 
-**(f) Uninstall.** `bowerbird uninstall` reverses (a) and stops the
-daemon (SIGTERM with 10s graceful drain, SIGKILL fallback). It does NOT
-delete `~/.bowerbird/`. Your event history is your data; re-installing
-should not lose it. To wipe history, `rm -rf ~/.bowerbird/` is a
-deliberate manual step.
+**(f) Uninstall.** `bowerbird uninstall` reverses (a). On **macOS** it boots
+the LaunchAgent out (`launchctl bootout`, which stops the daemon), also stops a
+manually-started daemon via its PID file as a fallback (so nothing survives
+uninstall), and removes the plist; on **Linux** it stops the daemon (SIGTERM
+with 10s graceful drain, SIGKILL fallback). It does NOT delete `~/.bowerbird/`. Your event history is
+your data; re-installing should not lose it. To wipe history, `rm -rf
+~/.bowerbird/` is a deliberate manual step.
 
 **(g) Keychain entry.** First daemon start creates a Keychain entry
 (macOS: Keychain Access; Linux: Secret Service) with
@@ -149,7 +166,13 @@ This:
 
 1. Reverses the merge into `~/.claude/settings.json` (atomically; an
    interrupted uninstall leaves the file intact).
-2. Stops the daemon (SIGTERM with 10s graceful drain, SIGKILL fallback).
+2. Stops the daemon. On **macOS**, boots the LaunchAgent out (`launchctl
+   bootout`, which terminates the daemon and ends start-on-login supervision)
+   and removes
+   `~/Library/LaunchAgents/com.technicalpickles.bowerbird.daemon.plist`. On
+   **Linux**, sends SIGTERM with a 10s graceful drain and SIGKILL fallback.
+   (`--no-stop` keeps the daemon running — on macOS it still removes the
+   plist so the registration is gone.)
 3. Leaves `~/.bowerbird/` in place. Your event history survives uninstall.
 
 To remove the binaries themselves:

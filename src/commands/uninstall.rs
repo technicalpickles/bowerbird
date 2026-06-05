@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use anyhow::Context;
 use clap::Args;
 
-use super::daemon::{self, StopOutcome};
+use super::daemon;
+#[cfg(not(target_os = "macos"))]
+use super::daemon::StopOutcome;
 
 #[derive(Args)]
 pub struct UninstallArgs {
@@ -40,7 +42,57 @@ pub fn run(args: UninstallArgs) -> anyhow::Result<()> {
         );
     }
 
-    if args.no_stop {
+    teardown_supervision(args.no_stop)?;
+    Ok(())
+}
+
+/// macOS (Story 5.9 / ADR 0007): boot the LaunchAgent out (launchd terminates
+/// the daemon) and remove the plist. `--no-stop` skips the bootout but still
+/// removes the plist (AC 7), mirroring install's `--no-start`.
+///
+/// A `bootout` failure is now FATAL (review pass 2, F3): `bootout_launch_agent`
+/// already normalizes the already-unloaded case to success, so a remaining error
+/// is a *real* failure (or an unverifiable launchd state) that would leave a
+/// loaded agent supervising the current session. Downgrading it to a warning and
+/// then printing "removed login registration" was a lie — we propagate instead,
+/// and we do NOT remove the plist (so a retry still has the registration to act
+/// on). The manual-daemon PID-file fallback stays non-fatal (it mirrors the
+/// daemon-stop posture and is not about launchd ownership).
+#[cfg(target_os = "macos")]
+fn teardown_supervision(no_stop: bool) -> anyhow::Result<()> {
+    use super::launch_agent;
+
+    let plist_path = launch_agent::plist_path()?;
+
+    if !no_stop {
+        // Boot the launchd-owned daemon out — fatal on a real/unverifiable
+        // failure so we never claim success while the agent lingers (F3).
+        launch_agent::bootout_launch_agent(&plist_path)
+            .context("boot the bowerbird LaunchAgent out of launchd")?;
+        // Also catch a manually-started / pre-5.9 PID-file daemon launchd never
+        // owned, so uninstall actually leaves no daemon running. Non-fatal: this
+        // mirrors the historical daemon-stop posture and a leftover manual daemon
+        // is not a launchd-registration residue.
+        let data_dir = super::resolve_bowerbird_dir()?;
+        if let Err(e) = daemon::stop_daemon_via_pid_file(&data_dir) {
+            eprintln!("warning: {e:#}");
+        }
+    }
+
+    launch_agent::remove_launch_agent_plist(&plist_path)
+        .with_context(|| format!("remove launch agent plist {}", plist_path.display()))?;
+    println!(
+        "removed bowerbird-daemon login registration ({})",
+        plist_path.display()
+    );
+    Ok(())
+}
+
+/// Non-macOS: keep today's PID-file SIGTERM stop. `--no-stop` leaves the daemon
+/// running.
+#[cfg(not(target_os = "macos"))]
+fn teardown_supervision(no_stop: bool) -> anyhow::Result<()> {
+    if no_stop {
         return Ok(());
     }
 
@@ -53,6 +105,7 @@ pub fn run(args: UninstallArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "macos"))]
 fn stop_daemon_if_running() -> anyhow::Result<()> {
     let bowerbird_dir = super::resolve_bowerbird_dir()?;
     match daemon::stop_daemon_via_pid_file(&bowerbird_dir)? {

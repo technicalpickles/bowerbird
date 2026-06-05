@@ -1207,13 +1207,18 @@ Inserted by `sprint-change-proposal-2026-06-01-dogfood-triage.md` (§4.2, Findin
 
 Partially addresses the deferred-work "no pagination on `GET /sessions`" item — the filters + row cap kill the unbounded response, but true cursor pagination stays deferred (the sibling `/sessions/{id}/events` page-size limit also stays deferred — different endpoint). **Partially resolves `gt-3cnt`** (filter half; the retention sweep stays open on the bean, a no-list "no `gc`" deferral).
 
-### Story 5.9: Daemon start-on-login supervision (stub — refine at create-story) + ADR 0007
+### Story 5.9: Daemon start-on-login supervision (+ ADR 0007)
 
 As the bowerbird maintainer,
-I want `bowerbird install` to register the daemon to start on login with crash-restart,
+I want `bowerbird install` to register the daemon to start on login with crash-restart (and `bowerbird uninstall` to remove that registration symmetrically),
 So that a reboot doesn't silently drop every event until I manually restart the daemon.
 
-Inserted by `sprint-change-proposal-2026-06-01-dogfood-triage.md` (§4.3, Finding 1). Gates v0.1.0 (Story 5.14). **Stub** — ACs to be derived from proposal §4.3 at `bmad-create-story` time; **ADR 0007** (`docs/decisions/0007-daemon-start-on-login.md`) pending authoring (launchd-vs-lazy-spawn decision + shim-stays-thin rationale; `Affects context.md sections: Durability and chaos`). Scope: `bowerbird install` writes a `~/Library/LaunchAgents/<label>.plist` (start-on-login + `KeepAlive` crash-restart); `bowerbird uninstall` removes it (symmetry tested); macOS-only (matches the no-list Windows/Linux-packaging posture). The shim is explicitly **NOT** changed (no lazy-spawn — that would put a subprocess fork on the hot path, violating the shim discipline).
+Inserted by `sprint-change-proposal-2026-06-01-dogfood-triage.md` (§4.3, Finding 1); operationalized by **ADR 0007** (`docs/decisions/0007-daemon-start-on-login.md`, authored as the story's Task 1 — `Affects context.md sections: Durability and chaos`). Gates v0.1.0 (Story 5.14). ACs (see `implementation-artifacts/5-9-daemon-start-on-login.md` for the full set):
+
+- **macOS `bowerbird install`** writes `~/Library/LaunchAgents/com.technicalpickles.bowerbird.daemon.plist` (atomic `.tmp`→rename, mode 0644) with `ProgramArguments` = the **absolute** daemon path (launchd's minimal PATH lacks `/usr/local/bin`, so the PATH-relative `bowerbird-daemon` will not exec), `RunAtLoad=true`, and `KeepAlive={SuccessfulExit=false}` (crash-restart without fighting `bowerbird stop`'s graceful exit-0). Install bootstraps the agent (`launchctl bootstrap gui/<uid>`) INSTEAD of the `setsid` spawn; `--no-start` writes the plist but skips the bootstrap (launchctl-free CI path).
+- **macOS `bowerbird uninstall`** boots the agent out (`launchctl bootout gui/<uid>/<label>`) and removes the plist; `--no-stop` removes the plist but skips the bootout; round-trip leaves no residue. `~/.bowerbird/` is never deleted (unchanged).
+- **Linux is unchanged** (`setsid` spawn / PID-file stop); install prints one stderr note that supervision is macOS-only for V1 (systemd deferred). Idempotency: bootstrapping a loaded agent / booting out an unloaded one is treated as success.
+- **No wire-protocol change** (no `crates/protocol/src` touch → no `protocol-changelog.md` entry; the changelog gate stays green precisely because protocol is untouched). The CLI-stays-light invariant holds (`launchctl` via `std::process::Command`, plist hand-rendered — no `tokio`/`axum`). Docs: architecture.md "deferred post-V1" lines reversed for macOS, `project-context.md` §Durability and chaos + `INSTALL.md` §3/§5 updated.
 
 ### Story 5.10: Shim names the cause on daemon-down (stub — refine at create-story)
 
