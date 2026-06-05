@@ -211,7 +211,16 @@ fn supervise_or_start(no_start: bool) -> anyhow::Result<()> {
     //     can't stop it, refuse rather than bootstrap into an unmanageable
     //     crash-loop.
     let ingest_sock = super::effective_ingest_sock(&data_dir_abs);
-    if super::daemon_is_up(&ingest_sock) {
+    // The daemon acquires its singleton (flock + PID file) BEFORE it binds the
+    // ingest socket, so a "socket down" probe does NOT prove there is no
+    // competitor: a daemon wedged before bind, or one still bound to a previous
+    // socket path after the registered socket changed, can hold the singleton
+    // while the registered socket is unconnectable. Bootstrapping launchd over
+    // such a holder fails the singleton acquisition and crash-loops it under
+    // KeepAlive={SuccessfulExit=false}. So disarm a competitor detected by EITHER
+    // the live socket OR a live PID-file holder, not the socket alone (Story 5.9
+    // review pass-5 F2).
+    if super::daemon_is_up(&ingest_sock) || daemon::pid_holder_alive(&data_dir) {
         println!("stopping the running unsupervised daemon so launchd can take over");
         daemon::stop_daemon_via_pid_file(&data_dir).map_err(|e| {
             anyhow::anyhow!(
@@ -220,20 +229,27 @@ fn supervise_or_start(no_start: bool) -> anyhow::Result<()> {
                  crash-loop) — run `bowerbird stop` and re-run install"
             )
         })?;
-        // Re-probe after ANY stop outcome (Story 5.9 review pass-4 #4). The
-        // previous check only bailed on `StopOutcome::NotRunning` + a live
-        // socket, but a stale/wrong PID file, PID reuse, or a concurrent restart
-        // can make the stop report `Stopped`/`Escalated` (it killed *something*)
-        // while the real daemon is still accepting — and bootstrapping launchd
-        // over it would fail the singleton lock and crash-loop under KeepAlive. If
-        // the socket is still live whatever the outcome, refuse rather than
-        // bootstrap a daemon launchd cannot manage.
+        // Re-verify after ANY stop outcome (Story 5.9 review pass-4 #4 + pass-5
+        // F2). A stale/wrong PID file, PID reuse, or a concurrent restart can make
+        // the stop report `Stopped`/`Escalated` (it killed *something*) while the
+        // real daemon is still accepting on the socket OR still holds the
+        // singleton. Bootstrapping launchd over either would fail the singleton
+        // lock and crash-loop, so refuse if EITHER survives the stop.
         if super::daemon_is_up(&ingest_sock) {
             anyhow::bail!(
                 "a daemon is still accepting on {} after attempting to stop it; refusing to \
                  bootstrap launchd over a daemon it cannot manage (stop that daemon, then \
                  re-run install)",
                 ingest_sock.display()
+            );
+        }
+        if daemon::pid_holder_alive(&data_dir) {
+            anyhow::bail!(
+                "a daemon is still holding the singleton for {} after attempting to stop it \
+                 (its ingest socket is down, so it is wedged before bind or bound to a previous \
+                 socket); refusing to bootstrap launchd over a daemon it cannot manage (stop \
+                 that daemon, then re-run install)",
+                data_dir.display()
             );
         }
     }

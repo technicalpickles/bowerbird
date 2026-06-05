@@ -339,14 +339,21 @@ pub fn bootstrap_launch_agent(plist_path: &Path) -> anyhow::Result<()> {
     if modern.success {
         return Ok(());
     }
-    // Already-loaded fast path (explicit stderr), else verify positively. A
-    // verification failure (`?`) surfaces as a real error rather than a guess.
-    if already_loaded(&modern) || agent_loaded(uid)? {
+    // Already-loaded fast path (explicit stderr). Then try a positive
+    // verification — but an UNVERIFIABLE `print` here must NOT short-circuit the
+    // legacy fallback (Story 5.9 review pass-5 F5): an old/unsupported
+    // environment can fail BOTH `bootstrap` AND `launchctl print` while
+    // `load -w` still works, and `agent_loaded(uid)?` would return its "cannot
+    // verify" error before we ever try the fallback. So treat "cannot verify" as
+    // "keep going" here (`unwrap_or(false)`).
+    if already_loaded(&modern) || agent_loaded(uid).unwrap_or(false) {
         return Ok(());
     }
 
     // Legacy fallback for environments where `bootstrap` is unavailable.
     let legacy = run_launchctl(&["load", "-w", &plist])?;
+    // Final verification: both modern and legacy have now been attempted, so an
+    // unverifiable `print` IS a real failure — `?` propagates "cannot verify".
     if legacy.success || already_loaded(&legacy) || agent_loaded(uid)? {
         return Ok(());
     }
@@ -373,16 +380,23 @@ pub fn bootout_launch_agent(plist_path: &Path) -> anyhow::Result<()> {
     if modern.success {
         return Ok(());
     }
-    // `already_unloaded` is the explicit-stderr fast path. Otherwise confirm via
-    // a fallible `launchctl print`: only a positively-verified "not loaded"
-    // (`Ok(false)`) counts as a clean no-op; a verification failure (`?`)
-    // propagates so we never silently report success while the agent lingers.
-    if already_unloaded(&modern) || !agent_loaded(uid)? {
+    // `already_unloaded` is the explicit-stderr fast path. Otherwise try a
+    // positive "not loaded" check — but an UNVERIFIABLE `print` here must NOT
+    // short-circuit the legacy fallback (Story 5.9 review pass-5 F5): an
+    // old/unsupported environment can fail BOTH `bootout` AND `launchctl print`
+    // while `unload` still works, and `!agent_loaded(uid)?` would return its
+    // "cannot verify" error before we try the fallback. Treat "cannot verify" as
+    // "keep going" (`unwrap_or(true)` = assume still loaded, so we proceed to
+    // the legacy unload rather than bailing).
+    if already_unloaded(&modern) || !agent_loaded(uid).unwrap_or(true) {
         return Ok(());
     }
 
     let plist = plist_path.to_string_lossy().into_owned();
     let legacy = run_launchctl(&["unload", "-w", &plist])?;
+    // Final verification: both modern and legacy have now been attempted. Only a
+    // positively-verified "not loaded" is a clean no-op; an unverifiable `print`
+    // (`?`) propagates so we never claim success while the agent may still linger.
     if legacy.success || already_unloaded(&legacy) || !agent_loaded(uid)? {
         return Ok(());
     }

@@ -117,6 +117,20 @@ fn teardown_supervision(no_stop: bool) -> anyhow::Result<()> {
                 ingest_sock.display()
             );
         }
+    } else {
+        // --no-stop skips the bootout. Removing the plist below stops FUTURE
+        // logins from reloading the agent, but it does NOT unload a job already
+        // bootstrapped in the current GUI session: launchd keeps supervising
+        // (and restarting under KeepAlive) that daemon until logout or an
+        // explicit bootout. Say so rather than implying the registration is fully
+        // gone — plist removal alone does not end in-session supervision (Story
+        // 5.9 review pass-5 F6).
+        eprintln!(
+            "note: --no-stop removed the plist without booting the LaunchAgent out; if it was \
+             already loaded this login session, launchd keeps supervising the daemon until you \
+             log out or run `launchctl bootout gui/$(id -u)/{}`",
+            launch_agent::LAUNCH_AGENT_LABEL
+        );
     }
 
     launch_agent::remove_launch_agent_plist(&plist_path)

@@ -770,6 +770,120 @@ fn uninstall_fails_when_launchctl_print_is_unverifiable_on_macos() {
     );
 }
 
+/// Story 5.9 review pass-5 F5: when the modern `bootout` fails as
+/// unsupported AND `launchctl print` is unverifiable, the legacy `unload -w`
+/// fallback must still run — and if it succeeds, uninstall succeeds and removes
+/// the plist. The previous code called `!agent_loaded(uid)?` between `bootout`
+/// and the legacy `unload`, so an unverifiable `print` returned early ("cannot
+/// verify") and the fallback never ran, failing uninstall on environments where
+/// `unload` would have worked.
+#[cfg(target_os = "macos")]
+#[test]
+fn uninstall_legacy_unload_runs_when_bootout_and_print_unsupported_on_macos() {
+    let dir = TempDir::new().expect("tempdir");
+    let settings = settings_path(&dir);
+    let la_dir = dir.path().join("LaunchAgents");
+    let plist = la_dir.join("com.technicalpickles.bowerbird.daemon.plist");
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("bin dir");
+    write_executable(&bin_dir.join("launchctl"), FAKE_LAUNCHCTL);
+    let log = dir.path().join("launchctl.log");
+
+    // Register the plist first (launchctl-free via --no-start).
+    bowerbird_bin()
+        .arg("install")
+        .arg("--settings")
+        .arg(&settings)
+        .arg("--no-start")
+        .env("HOME", dir.path())
+        .env("BOWERBIRD_LAUNCH_AGENTS_DIR", &la_dir)
+        .assert()
+        .success();
+    assert!(plist.exists(), "plist registered");
+
+    // Modern `bootout` fails (unsupported), `print` is unverifiable (non-absent
+    // stderr), but the legacy `unload -w` succeeds. Uninstall must fall through
+    // to the legacy path and succeed.
+    let mut cmd = bowerbird_bin();
+    cmd.arg("uninstall")
+        .arg("--settings")
+        .arg(&settings)
+        .env("HOME", dir.path())
+        .env("BOWERBIRD_LAUNCH_AGENTS_DIR", &la_dir)
+        .env("FAKE_LAUNCHCTL_BOOTOUT_EXIT", "1") // modern unsupported
+        .env("FAKE_LAUNCHCTL_PRINT_EXIT", "1")
+        .env("FAKE_LAUNCHCTL_PRINT_STDERR", "Operation not permitted") // unverifiable
+        .env("FAKE_LAUNCHCTL_UNLOAD_EXIT", "0"); // legacy fallback works
+    with_fake_launchctl(&mut cmd, &bin_dir, &log);
+    cmd.assert().success();
+
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        calls.lines().any(|l| l.starts_with("unload ")),
+        "the legacy `unload` fallback must run when bootout+print are unsupported; calls=\n{calls}"
+    );
+    assert!(
+        !plist.exists(),
+        "a successful legacy unload must let uninstall remove the plist"
+    );
+}
+
+/// Story 5.9 review pass-5 F6: `uninstall --no-stop` on macOS removes the plist
+/// without booting the agent out, so it must NOT imply the registration is fully
+/// gone — a job already loaded this login session keeps being supervised by
+/// launchd until logout/manual bootout. Assert uninstall says so (and that it
+/// did not call bootout). Guards the docs/message from regressing to "the
+/// registration is gone".
+#[cfg(target_os = "macos")]
+#[test]
+fn uninstall_no_stop_warns_in_session_supervision_survives_on_macos() {
+    let dir = TempDir::new().expect("tempdir");
+    let settings = settings_path(&dir);
+    let la_dir = dir.path().join("LaunchAgents");
+    let plist = la_dir.join("com.technicalpickles.bowerbird.daemon.plist");
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("bin dir");
+    write_executable(&bin_dir.join("launchctl"), FAKE_LAUNCHCTL);
+    let log = dir.path().join("launchctl.log");
+
+    bowerbird_bin()
+        .arg("install")
+        .arg("--settings")
+        .arg(&settings)
+        .arg("--no-start")
+        .env("HOME", dir.path())
+        .env("BOWERBIRD_LAUNCH_AGENTS_DIR", &la_dir)
+        .assert()
+        .success();
+    assert!(plist.exists(), "plist registered");
+
+    let mut cmd = bowerbird_bin();
+    cmd.arg("uninstall")
+        .arg("--settings")
+        .arg(&settings)
+        .arg("--no-stop")
+        .env("HOME", dir.path())
+        .env("BOWERBIRD_LAUNCH_AGENTS_DIR", &la_dir);
+    with_fake_launchctl(&mut cmd, &bin_dir, &log);
+    let assertion = cmd.assert().success();
+
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("launchd keeps supervising") && stderr.contains("bootout"),
+        "uninstall --no-stop must warn that in-session supervision survives plist removal; \
+         stderr={stderr}"
+    );
+    assert!(
+        !plist.exists(),
+        "uninstall --no-stop still removes the plist"
+    );
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !calls.contains("bootout"),
+        "--no-stop must NOT boot the agent out; calls=\n{calls}"
+    );
+}
+
 /// Story 5.9 review pass-3 F2: `bowerbird start` must look for the daemon where
 /// launchd will actually run it — the data dir registered in the plist's
 /// `EnvironmentVariables` — not the data dir in the *current* CLI env. We
@@ -1209,6 +1323,122 @@ fn install_fails_when_socket_live_after_clean_stop_on_macos() {
     assert!(
         !calls.contains("bootstrap"),
         "install must NOT bootstrap when the socket survives the stop; calls=\n{calls}"
+    );
+}
+
+/// Story 5.9 review pass-5 F2 (install side): the daemon takes the singleton
+/// (PID file) BEFORE binding the socket, so a holder can be alive with the
+/// ingest socket DOWN (wedged before bind / bound to a previous socket). Install
+/// must still stop that holder before bootstrap — the previous code only ran the
+/// handoff when the socket probe succeeded, so a socket-down holder was invisible
+/// and launchd would bootstrap into a singleton-lock crash loop. Here the holder
+/// is killable (reaped so the stop sees a clean `Stopped`), so install stops it
+/// and proceeds to bootstrap.
+#[cfg(target_os = "macos")]
+#[test]
+fn install_stops_singleton_holder_when_socket_down_on_macos() {
+    let dir = TempDir::new().expect("tempdir");
+    let settings = settings_path(&dir);
+    let la_dir = dir.path().join("LaunchAgents");
+    let data_dir = dir.path().join("data");
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&data_dir).expect("data dir");
+    fs::create_dir_all(&bin_dir).expect("bin dir");
+    write_executable(&bin_dir.join("launchctl"), FAKE_LAUNCHCTL);
+    let daemon = bin_dir.join("bowerbird-daemon");
+    write_executable(&daemon, "#!/bin/sh\nexit 0\n");
+    let log = dir.path().join("launchctl.log");
+
+    // NO socket listener: the ingest socket is DOWN. But a live PID holder.
+    let data_dir_canon = fs::canonicalize(&data_dir).expect("canonicalize data dir");
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleep");
+    let pid = child.id();
+    fs::write(data_dir_canon.join("bowerbird.pid"), pid.to_string()).expect("write pid file");
+    let reaper = std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+
+    let mut cmd = bowerbird_bin();
+    cmd.arg("install")
+        .arg("--settings")
+        .arg(&settings)
+        .env("HOME", dir.path())
+        .env("BOWERBIRD_DATA_DIR", &data_dir)
+        .env("BOWERBIRD_LAUNCH_AGENTS_DIR", &la_dir)
+        .env("BOWERBIRD_DAEMON_BIN", &daemon)
+        .env("FAKE_LAUNCHCTL_PRINT_EXIT", "1") // agent not loaded -> no bootout
+        .env("FAKE_LAUNCHCTL_BOOTSTRAP_EXIT", "0");
+    with_fake_launchctl(&mut cmd, &bin_dir, &log);
+    let assertion = cmd.assert().success();
+    reaper.join().ok();
+
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("stopping the running unsupervised daemon"),
+        "install must stop a singleton holder even when the socket is down; stdout={stdout}"
+    );
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        calls.contains("bootstrap"),
+        "install must bootstrap once the holder is stopped; calls=\n{calls}"
+    );
+}
+
+/// Story 5.9 review pass-5 F2 (start side): same singleton-before-socket gap for
+/// `bowerbird start`. With the socket DOWN but a live PID holder, start must stop
+/// the holder before driving launchd (kickstart/bootstrap), so the launchd start
+/// has a free singleton instead of crash-looping. The holder is killable
+/// (reaped), so start stops it then kickstarts the loaded agent (readiness then
+/// times out — no real daemon — but the stop + kickstart are what we verify).
+#[cfg(target_os = "macos")]
+#[test]
+fn start_stops_singleton_holder_when_socket_down_on_macos() {
+    let la_parent = TempDir::new().expect("tempdir");
+    let la_dir = la_parent.path().join("LaunchAgents");
+    let plist = la_dir.join("com.technicalpickles.bowerbird.daemon.plist");
+    let bin_dir = la_parent.path().join("bin");
+    // No-env plist => start resolves effective dir to launchd default $HOME/.bowerbird.
+    let bowerbird_home = la_parent.path().join(".bowerbird");
+    fs::create_dir_all(&la_dir).expect("la dir");
+    fs::create_dir_all(&bin_dir).expect("bin dir");
+    fs::create_dir_all(&bowerbird_home).expect("bowerbird home");
+    write_executable(&bin_dir.join("launchctl"), FAKE_LAUNCHCTL);
+    fs::write(&plist, "<plist/>\n").expect("write plist stub");
+    let log = la_parent.path().join("launchctl.log");
+
+    // Socket down (no listener); a live PID holder in the launchd-default dir.
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleep");
+    let pid = child.id();
+    fs::write(bowerbird_home.join("bowerbird.pid"), pid.to_string()).expect("write pid file");
+    let reaper = std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+
+    let mut cmd = bowerbird_bin();
+    cmd.arg("start")
+        .env("HOME", la_parent.path())
+        .env("BOWERBIRD_LAUNCH_AGENTS_DIR", &la_dir)
+        .env("FAKE_LAUNCHCTL_PRINT_EXIT", "0") // agent loaded -> kickstart path
+        .env("FAKE_LAUNCHCTL_KICKSTART_EXIT", "0");
+    with_fake_launchctl(&mut cmd, &bin_dir, &log);
+    let assertion = cmd.assert().failure(); // readiness times out; no real daemon
+    reaper.join().ok();
+
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("sending SIGTERM to bowerbird-daemon"),
+        "start must stop a singleton holder even when the socket is down; stdout={stdout}"
+    );
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        calls.contains("kickstart"),
+        "start must drive launchd (kickstart) once the holder is stopped; calls=\n{calls}"
     );
 }
 

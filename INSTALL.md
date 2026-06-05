@@ -175,8 +175,11 @@ This:
    and removes
    `~/Library/LaunchAgents/com.technicalpickles.bowerbird.daemon.plist`. On
    **Linux**, sends SIGTERM with a 10s graceful drain and SIGKILL fallback.
-   (`--no-stop` keeps the daemon running — on macOS it still removes the
-   plist so the registration is gone.)
+   (`--no-stop` keeps the daemon running. On macOS it removes the plist so
+   future logins will not reload the agent, but it does NOT boot out a job
+   already loaded this login session: launchd keeps supervising that daemon
+   until you log out or run `launchctl bootout
+   gui/$(id -u)/com.technicalpickles.bowerbird.daemon`.)
 3. Leaves `~/.bowerbird/` in place. Your event history survives uninstall.
 
 To remove the binaries themselves:

@@ -142,6 +142,23 @@ pub fn pid_alive(pid: i32) -> bool {
     errno == libc::EPERM
 }
 
+/// Is a live process recorded in the data dir's singleton PID file? This is
+/// distinct from [`super::daemon_is_up`] (a socket probe): the daemon acquires
+/// its singleton (flock + `bowerbird.pid`) BEFORE it binds the ingest socket
+/// (`crates/daemon/src/singleton.rs`, taken in `main` before any socket work),
+/// so a holder can be alive while the socket is still down — wedged before bind,
+/// or still bound to a previous socket path after the registered socket changed.
+/// The macOS launchd handoff uses this so it does not bootstrap/kickstart over a
+/// singleton holder the socket probe cannot see, which would fail the launchd
+/// daemon's singleton acquisition and crash-loop it under
+/// `KeepAlive={SuccessfulExit=false}` (Story 5.9 review pass-5 F2).
+pub fn pid_holder_alive(bowerbird_dir: &Path) -> bool {
+    match read_pid(&bowerbird_dir.join("bowerbird.pid")) {
+        Ok(Some(pid)) => pid_alive(pid),
+        _ => false,
+    }
+}
+
 fn send_signal(pid: i32, sig: libc::c_int) -> std::io::Result<()> {
     let r = unsafe { libc::kill(pid, sig) };
     if r == 0 {

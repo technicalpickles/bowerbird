@@ -93,8 +93,29 @@ fn start_daemon(bowerbird_dir: &std::path::Path) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Socket is down, so no daemon is competing for the singleton lock. Now —
-    // and only now — query launchd to decide how to start it: kickstart a
+    // The socket is down — but that does NOT prove no daemon competes for the
+    // singleton lock. The daemon takes the singleton (flock + PID file) BEFORE it
+    // binds the socket, so a manual / pre-5.9 daemon wedged before bind, or one
+    // bound to a previous socket path, can hold the singleton while the registered
+    // socket is unconnectable. launchd starting (or `kickstart -k` restarting)
+    // over such a holder would fail the singleton acquisition and crash-loop under
+    // KeepAlive={SuccessfulExit=false}. Stop a live PID-file holder first, and
+    // fail clearly if it survives, so the launchd start has a free singleton
+    // (Story 5.9 review pass-5 F2).
+    if daemon::pid_holder_alive(&effective_dir) {
+        daemon::stop_daemon_via_pid_file(&effective_dir)
+            .context("stop the unsupervised daemon holding the singleton before launchd start")?;
+        if daemon::pid_holder_alive(&effective_dir) {
+            anyhow::bail!(
+                "a daemon is still holding the singleton for {} after attempting to stop it; \
+                 launchd cannot start over it (it would fail the singleton lock and crash-loop) \
+                 — stop that daemon, then re-run `bowerbird start`",
+                effective_dir.display()
+            );
+        }
+    }
+
+    // Now — and only now — query launchd to decide how to start it: kickstart a
     // loaded-but-down agent (a clean `bowerbird stop` leaves it down under
     // KeepAlive={SuccessfulExit=false}), or bootstrap one that is merely
     // registered. Deferring the launchd query to here is what lets an
