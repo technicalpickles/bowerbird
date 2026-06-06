@@ -107,7 +107,7 @@
 generated: 2026-05-16
 # Exactly ONE active last_updated key (YAML keeps only the last on duplicates);
 # the full per-pass history lives in the commented breadcrumb block above.
-last_updated: 2026-06-05 (Story 5.9 → review; pass-6 decision + all six patch findings resolved on the CLI src/commands/* + tests + docs, no crates/ change. F1 (decided with @pickles) bowerbird stop stops through the lifecycle owner — launchctl bootout when a LaunchAgent is loaded (so a SIGKILL-escalated stop is not bounced back by KeepAlive), PID-file SIGTERM otherwise; session-scoped (RunAtLoad restarts next login). F2 tri-state launch_agent_load_state so an unverifiable launchctl print no longer bypasses the legacy load -w/unload fallback. F3 start reconciles a live-but-unsupervised daemon by launchd load state. F4 flock-based daemon::singleton_state (replacing pid_holder_alive) so a stale pid file is not signaled and a held-but-unidentifiable singleton fails clearly. F5 start clears a stale server.json before the launchd start. F6 start revalidates the registered ProgramArguments is launchable. F7 env-mutating resolver unit tests serialized by a module-local Mutex. Reversed the stop-never-addresses-launchd-by-label wording in AC 2 + ADR 0007 + INSTALL.md. +9 integration tests +1 unit test; cargo test -p bowerbird 167 passed; fmt + clippy + cargo-tree lightness green; only workspace failure is the documented/waived lag_invalidates_snapshot_coverage_resubscribe_resnapshots daemon flake [zero daemon code touched]. Ready for a fresh code-review pass.)
+last_updated: 2026-06-06 (Story 5.9 → in-progress; bmad-code-review pass 7 documented six unresolved patch findings in the story. Blind Hunter was incomplete due truncated diff output; Edge Case Hunter + Acceptance Auditor + local review found stop skipping a still-loaded LaunchAgent after uninstall --no-stop removes the plist, unreadable PID files being treated as singleton-free, a singleton-holder exit race between flock probe and SIGTERM, missing Unix-socket path-length validation before launchd registration/start, live socket + loaded label being treated as proof of launchd ownership, and stale docs that still describe stop as exit-code-based PID signaling.)
 project: bowerbird
 project_key: NOKEY
 tracking_system: file-system
@@ -170,7 +170,7 @@ development_status:
   5-6-idle-prompt-reclassified-as-transient: done
   5-7-session-cwd-on-the-wire: done                     # Finding 3 (+ ADR 0006); gates v0.1.0
   5-8-server-side-session-filter: done                   # Finding 5-filter; gates v0.1.0
-  5-9-daemon-start-on-login: review                      # Finding 1 (+ ADR 0007, authored as Task 1); pass-6 decision + 6 patch findings resolved (F1 launchd-aware stop, F2 tri-state load probe, F3 start migrates unsupervised daemon, F4 flock singleton probe, F5 stale server.json, F6 daemon-exe revalidation, F7 test env-lock); gates v0.1.0
+  5-9-daemon-start-on-login: in-progress                 # Finding 1 (+ ADR 0007, authored as Task 1); pass-7 review documented 6 unresolved patch findings; gates v0.1.0
   5-10-shim-names-daemon-down-cause: backlog            # Finding 2 (minor); gates v0.1.0
   5-11-release-pipeline-end-to-end-verification: ready-for-dev
   5-12-cookbook-consolidation: backlog
