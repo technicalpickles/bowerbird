@@ -94,6 +94,44 @@ impl Error {
             "ERROR"
         }
     }
+
+    /// Human-readable cause for the one-line stderr hint `main` emits on the
+    /// failure path. `Some(<cause>)` for every exit-1 (ERROR-level) variant,
+    /// `None` for every exit-0 (WARN-level) variant.
+    ///
+    /// The `None` for the WARN/exit-0 class is **by contract**: those errors
+    /// mean the daemon is up and answering (mid-write hiccup, backpressure, a
+    /// daemon-side 400). Per NFR20 the shim is fire-and-forget there, so Claude
+    /// must see success — surfacing a warning on stderr would regress that.
+    ///
+    /// The match arms are kept in the SAME order as `exit_code()` so the
+    /// exit-1/exit-0 partition can be diffed side by side; the
+    /// `stderr_hint_matches_exit_code` test below is the canary that a new
+    /// variant cannot be added without a deliberate hint decision.
+    ///
+    /// All cause strings are `&'static str` — no allocation.
+    pub fn stderr_hint(&self) -> Option<&'static str> {
+        match self {
+            // exit-1 (ERROR) class → name the cause
+            Error::Stdin(_) => Some("could not read hook payload from stdin"),
+            Error::StdinEmpty => Some("empty hook payload"),
+            Error::StdinNotJsonObject => Some("hook payload was not a JSON object"),
+            Error::StdinTooLarge { .. } => Some("hook payload exceeds size cap"),
+            Error::StdinJson(_) => Some("hook payload was not valid JSON"),
+            Error::Connect { .. } => Some("daemon not running, event dropped"),
+            Error::LogIo(_) => Some("could not write shim log"),
+            Error::BadArgs(_) => Some("invalid shim arguments"),
+            Error::NoHome => Some("HOME not set, cannot record event"),
+
+            // exit-0 (WARN) class → silent by contract (NFR20: daemon is up and
+            // answering, fire-and-forget, Claude must see success)
+            Error::SocketIo(_)
+            | Error::BadResponse(_)
+            | Error::Backpressure(_)
+            | Error::Backpressure503
+            | Error::DaemonError400(_) => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -147,5 +185,36 @@ mod tests {
                 other => panic!("unexpected exit code {other} for {e:?}"),
             }
         }
+    }
+
+    #[test]
+    fn stderr_hint_matches_exit_code() {
+        // The stderr-hint partition MUST track the exit-code partition exactly:
+        // a hint iff the error exits 1, no hint iff it exits 0. This is the
+        // canary against a future variant getting a hint (or no hint) by
+        // accident — mirrors `exit_code_never_2` / `level_matches_exit_code`.
+        for e in sample_variants() {
+            assert_eq!(
+                e.stderr_hint().is_some(),
+                e.exit_code() == 1,
+                "exit-1 variants must have a stderr hint: {e:?}"
+            );
+            assert_eq!(
+                e.stderr_hint().is_none(),
+                e.exit_code() == 0,
+                "exit-0 variants must NOT have a stderr hint: {e:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn connect_hint_names_the_daemon_down_cause() {
+        // Pins the dogfood-relevant wording (Finding 2): the daemon-down line
+        // Claude surfaces instead of its causeless "No stderr output".
+        let e = Error::Connect {
+            path: PathBuf::from("/tmp/nope.sock"),
+            source: dummy_io(),
+        };
+        assert_eq!(e.stderr_hint(), Some("daemon not running, event dropped"));
     }
 }

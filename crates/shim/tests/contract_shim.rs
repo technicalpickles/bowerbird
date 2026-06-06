@@ -197,6 +197,27 @@ fn shim_exit_nonzero_on_connection_refused() {
         log_contents.contains(&sock_str),
         "log line must include the socket path that failed to connect, got: {log_contents:?}"
     );
+
+    // Story 5.10 AC1/AC2: the exit-1 daemon-down path now NAMES its cause on
+    // stderr instead of leaving Claude with a causeless "No stderr output".
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.stderr.is_empty(),
+        "exit-1 connect failure must write a cause to stderr, got empty"
+    );
+    assert!(
+        stderr.contains("bowerbird:"),
+        "stderr line must be bowerbird-prefixed, got: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("daemon not running"),
+        "stderr line must name the daemon-down cause, got: {stderr:?}"
+    );
+    let log_str = log.to_string_lossy().into_owned();
+    assert!(
+        stderr.contains(&log_str),
+        "stderr line must point at the resolved log path, got: {stderr:?}"
+    );
 }
 
 // ─── AC #4: 503 → exit 0 with warning log ────────────────────────────────────
@@ -223,6 +244,15 @@ fn shim_exit_0_on_503_with_warning_log() {
         log_contents.matches('\n').count(),
         1,
         "expected exactly one WARN line, got: {log_contents:?}"
+    );
+
+    // Story 5.10 AC2 (NFR20 regression guard): the daemon is up and answering
+    // (503 backpressure), so this is fire-and-forget — stderr must stay EMPTY.
+    // The new exit-1 stderr voice must not leak into the exit-0 WARN class.
+    assert!(
+        out.stderr.is_empty(),
+        "exit-0 (503 backpressure) path must leave stderr empty, got: {:?}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
@@ -677,6 +707,14 @@ fn shim_exit_0_on_400_from_daemon() {
         log_contents.matches('\n').count(),
         1,
         "expected exactly one WARN line, got: {log_contents:?}"
+    );
+
+    // Story 5.10 AC2 (NFR20 regression guard): a daemon-answered 400 is
+    // fire-and-forget (exit 0) — stderr must stay EMPTY, no exit-1 leakage.
+    assert!(
+        out.stderr.is_empty(),
+        "exit-0 (daemon 400) path must leave stderr empty, got: {:?}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 

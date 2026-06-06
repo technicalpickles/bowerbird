@@ -3,7 +3,7 @@ mod log;
 mod socket;
 
 use std::ffi::OsString;
-use std::io::Read;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use error::{Error, Result};
@@ -13,11 +13,16 @@ const MAX_STDIN_BYTES: usize = 1 << 20; // 1 MiB cap on hook payload
 fn main() {
     // Resolve log_path BEFORE attempting any work that might need to log.
     // If neither HOME nor the env override is set we have nowhere to write
-    // the failure log — exit 1 silently with the daemon-unreachable exit
-    // code, which is the closest signal Claude Code will pick up.
+    // the failure log — name the cause on stderr (no `(see ...)` pointer: no
+    // log path could be resolved) and exit 1 with the daemon-unreachable exit
+    // code, which is the closest signal Claude Code will pick up. Swallow the
+    // stderr write error exactly as the failure-arm log append does (AC5).
     let log_path = match resolve_log_path() {
         Ok(p) => p,
-        Err(_) => std::process::exit(1),
+        Err(_) => {
+            let _ = writeln!(io::stderr(), "bowerbird: HOME not set, cannot record event");
+            std::process::exit(1);
+        }
     };
 
     match run(&log_path) {
@@ -26,6 +31,19 @@ fn main() {
             // Swallow log failures: we're already failing, and crashing the
             // shim makes things worse than dropping the log line.
             let _ = log::append(&log_path, e.level(), &e.to_string());
+            // Name the cause on stderr for the exit-1 (ERROR) class so Claude
+            // surfaces "bowerbird: <cause>" instead of its causeless
+            // "No stderr output" hook error. The exit-0 (WARN) class returns
+            // `None` by contract (NFR20: daemon up and answering → see success).
+            // Swallow write errors (AC5): a failed stderr write never panics
+            // and never changes the exit code, mirroring the log append above.
+            if let Some(hint) = e.stderr_hint() {
+                let _ = writeln!(
+                    io::stderr(),
+                    "bowerbird: {hint} (see {})",
+                    log_path.display()
+                );
+            }
             std::process::exit(e.exit_code());
         }
     }
