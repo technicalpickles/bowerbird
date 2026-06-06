@@ -151,3 +151,80 @@ server-side `?state=` / `?since=` filter on `GET /sessions` would let presenters
 stop re-implementing this client-side and would bound the snapshot-on-subscribe
 burst at reconnect; a retention sweep is the other half. Whether it is one, the
 other, or both is the gt-3cnt decision.
+
+---
+
+## 2026-06-06: launchd lifecycle (Story 5.9) holds up under live exercise
+
+**Session:** gt-gcqa Phase 1 dogfood · **Branch:** main
+
+Ran the Story 5.9 launchd lifecycle against real `launchctl` on this Mac, the
+test the whole story exists for. To avoid the live-DB hazard below, the dogfood
+used an isolated `BOWERBIRD_DATA_DIR=~/.bowerbird-dogfood` with the HEAD
+`target/debug` binaries and a throwaway `BOWERBIRD_CLAUDE_SETTINGS`, so the
+running production daemon (pid 92211) and the live 280MB `bower.db` were never
+touched. Every lifecycle path in the gt-gcqa Phase 1 checklist except the reboot
+passed: `install` (launchd `state = running`, `status` green), `start`/`stop`/
+`start` round-trips, reinstall-over-loaded (bootout-then-rebootstrap, new pid),
+`install --no-start` (plist written, not bootstrapped), `uninstall --no-stop`
+(plist+hooks gone, daemon left running), `kill -9` (KeepAlive restarted it in
+~1s, `runs = 2`), and a wedged-stop via `SIGSTOP` (booted out, stayed down, no
+KeepAlive bounce). The design held: `stop` boots the agent out by label rather
+than PID-file SIGTERM, so a forced/wedged stop is not bounced back by KeepAlive
+(the pass-6 F1 guarantee), and it works even with the plist already removed (the
+pass-7 F1 edge). Two real findings came out of actually running it; both are
+behavioral, not the exotic theoretical findings the review passes chased.
+
+### Finding 1: `stop` reports success before a wedged daemon is actually gone
+
+With the daemon frozen (`SIGSTOP`), `bowerbird stop` printed "daemon stopped" and
+exited 0 *immediately*, but the process did not actually die until ~3-4s later:
+launchd's `bootout` sends SIGTERM, waits its own timeout, then SIGKILLs. The
+agent was still `LOADED` at +0s and +2s, only `not-loaded` by +4s. The end state
+is correct (booted out, no KeepAlive bounce), but the success message precedes
+reality. `bootout_launch_agent` trusts the modern `launchctl bootout` exit code
+on the success path and does not re-verify the job is gone, so the unload is
+eventually-consistent for an unresponsive daemon. A script chaining `bowerbird
+stop && <assume the ingest socket is free>` could race the lingering process.
+Not a correctness bug for the interactive case; the open question is whether
+`stop` should block until the job is verified gone (or say "stopping" rather
+than "stopped" when it can't confirm).
+
+### Finding 2: `status` says "stale pid file" after every clean stop
+
+After any `stop`/`uninstall`, `bowerbird status` reports `stopped (stale pid
+file: pid N is not running)`. The launchd-driven teardown (bootout, or SIGTERM
+via the PID-file path) never clears `bowerbird.pid`, so the next `status` reads a
+pid whose process is gone and labels it stale. This is functionally harmless, the
+singleton is a BSD flock on the file, not its contents, so a stale pid file is
+explicitly tolerated, but the user-facing string reads like a fault for what is a
+completely normal clean stop. A cosmetic "stopped" (no scary parenthetical) would
+match the actual state.
+
+### Context: the live DB is already migrated past the installed binary
+
+The reason this dogfood had to be isolated: `~/.bowerbird/crash-*.log` shows
+`schema migration failed: ... migration number that is too high`. A newer-schema
+(dev) daemon already migrated the live 280MB `bower.db` past what the installed
+`~/.cargo/bin/bowerbird-daemon` (an older build) can open. Pointing launchd at
+the live data dir with that stale binary would crash-loop it forever under
+`KeepAlive={SuccessfulExit=false}`. This is the known
+[smoke-migrates-live-db](../) hazard, realized. It gates the Phase 2 "real
+cutover" (gt-gcqa): a `cargo install` of HEAD binaries must precede pointing the
+LaunchAgent at the live `~/.bowerbird`, so the supervised daemon's schema matches
+the already-migrated DB.
+
+### Cutover done (same day): the real daemon is now launchd-managed
+
+After Phase 1 passed, cut the live setup over: `cargo install`ed release HEAD
+(`bowerbird` + `bowerbird-daemon`, both at 3 migrations = the live DB's
+`user_version`, so it opens with no migration), stopped the unsupervised manual
+daemon (pid 92211, running detached since a manual start), and ran `bowerbird
+install` against the real `~/.bowerbird` + `~/.claude/settings.json`. Clean: the
+LaunchAgent now runs `~/.cargo/bin/bowerbird-daemon` under launchd, `daemon.err.log`
+is empty (no migration crash), the 283MB DB is intact at v3, and `status` shows
+`last event: 0s ago` with the id advancing in real time, so this session's own
+hooks are feeding the supervised daemon. The original incident that motivated
+Story 5.9 (reboot → daemon doesn't come back → silent drop window) is now closed
+by `RunAtLoad`; the only unproven leg is an actual reboot (gt-gcqa Phase 1). The
+live-DB backup taken before cutover is at `~/.bowerbird-backups/bower.db.bak-2026-06-06`.
