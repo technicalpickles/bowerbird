@@ -29,8 +29,12 @@ fn main() {
         Ok(()) => std::process::exit(0),
         Err(e) => {
             // Swallow log failures: we're already failing, and crashing the
-            // shim makes things worse than dropping the log line.
-            let _ = log::append(&log_path, e.level(), &e.to_string());
+            // shim makes things worse than dropping the log line. Capture
+            // whether the append actually landed: a failed append means the
+            // log path is unusable (a directory, unwritable, ...), so the
+            // `(see <log>)` pointer would send Claude to a file that was never
+            // written. Drop the pointer in that case.
+            let log_written = log::append(&log_path, e.level(), &e.to_string()).is_ok();
             // Name the cause on stderr for the exit-1 (ERROR) class so Claude
             // surfaces "bowerbird: <cause>" instead of its causeless
             // "No stderr output" hook error. The exit-0 (WARN) class returns
@@ -38,15 +42,41 @@ fn main() {
             // Swallow write errors (AC5): a failed stderr write never panics
             // and never changes the exit code, mirroring the log append above.
             if let Some(hint) = e.stderr_hint() {
-                let _ = writeln!(
-                    io::stderr(),
-                    "bowerbird: {hint} (see {})",
-                    log_path.display()
-                );
+                if log_written {
+                    // The log path is `BOWERBIRD_SHIM_LOG` verbatim, which a
+                    // hostile or odd environment could load with newlines or
+                    // other control bytes. Escape them so the pointer cannot
+                    // break the one-line hook message or inject terminal escape
+                    // sequences into Claude's transcript.
+                    let _ = writeln!(
+                        io::stderr(),
+                        "bowerbird: {hint} (see {})",
+                        one_line_path(&log_path)
+                    );
+                } else {
+                    let _ = writeln!(io::stderr(), "bowerbird: {hint}");
+                }
             }
             std::process::exit(e.exit_code());
         }
     }
+}
+
+/// Render a path on a single line for the stderr hint: any control character
+/// (newline, carriage return, ANSI ESC, ...) is escaped so a hostile or
+/// malformed `BOWERBIRD_SHIM_LOG` cannot inject extra lines or terminal control
+/// sequences into Claude's one-line hook message. Printable text (including
+/// non-ASCII) is kept verbatim so legitimate paths read naturally.
+fn one_line_path(path: &Path) -> String {
+    let mut out = String::new();
+    for c in path.to_string_lossy().chars() {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn run(_log_path: &Path) -> Result<()> {
@@ -162,4 +192,37 @@ fn read_stdin_capped() -> Result<Vec<u8>> {
         });
     }
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_line_path_passes_normal_paths_through() {
+        // A normal path has no control chars, so the hint pointer is unchanged
+        // (this is what keeps the connect-refused contract assertion exact).
+        let p = Path::new("/var/folders/xy/shim.log");
+        assert_eq!(one_line_path(p), "/var/folders/xy/shim.log");
+    }
+
+    #[test]
+    fn one_line_path_escapes_control_chars() {
+        // A newline (or other control byte) in BOWERBIRD_SHIM_LOG must not be
+        // able to turn the one-line stderr hint into multiple lines.
+        let p = Path::new("/tmp/foo\nbar\r\x1b[31m.log");
+        let rendered = one_line_path(p);
+        assert!(
+            !rendered.contains('\n') && !rendered.contains('\r') && !rendered.contains('\x1b'),
+            "control chars must be escaped, got: {rendered:?}"
+        );
+        assert_eq!(rendered, "/tmp/foo\\nbar\\r\\u{1b}[31m.log");
+    }
+
+    #[test]
+    fn one_line_path_keeps_non_ascii_verbatim() {
+        // Legitimate non-ASCII paths (e.g. a unicode username) read naturally.
+        let p = Path::new("/Users/jürgen/.bowerbird/shim.log");
+        assert_eq!(one_line_path(p), "/Users/jürgen/.bowerbird/shim.log");
+    }
 }

@@ -200,23 +200,119 @@ fn shim_exit_nonzero_on_connection_refused() {
 
     // Story 5.10 AC1/AC2: the exit-1 daemon-down path now NAMES its cause on
     // stderr instead of leaving Claude with a causeless "No stderr output".
+    // AC1 requires EXACTLY one line of a fixed shape — assert it verbatim so a
+    // regression that prints a duplicate line, drops "event dropped", or
+    // rewords the cause cannot slip through (the temp log path here has no
+    // control chars, so the sanitized pointer equals `log.display()`).
     let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr,
+        format!(
+            "bowerbird: daemon not running, event dropped (see {})\n",
+            log.display()
+        ),
+        "exit-1 connect failure must emit exactly the AC1 stderr line"
+    );
+}
+
+// Story 5.10 review F2: when the log append itself fails (here the log path is
+// an existing directory, so open(2) returns EISDIR), the stderr hint must NOT
+// append `(see <log>)` — Claude would be pointed at a file that was never
+// written. The cause is still named; the pointer is dropped.
+#[test]
+fn shim_omits_log_pointer_when_log_append_fails() {
+    let tmp = TempDir::new().expect("tempdir");
+    // Point BOWERBIRD_SHIM_LOG at a directory: log::append's open(2) fails.
+    let log_dir = TempDir::new().expect("log dir");
+    let log_as_dir = log_dir.path();
+    let bogus_sock = tmp.path().join("nonexistent.sock");
+
+    let out = run_shim_with_env(
+        &bogus_sock,
+        log_as_dir,
+        "PreToolUse",
+        br#"{"session_id":"s1","tool_name":"Bash"}"#,
+        None,
+    );
+
+    let code = out.status.code().expect("exited cleanly");
+    assert_eq!(code, 1, "connect failure with unusable log still exits 1");
+    assert_ne!(code, 2, "exit code 2 is forbidden");
+
+    // Pointer-less: names the cause, no `(see ...)` because the log was unwritable.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr, "bowerbird: daemon not running, event dropped\n",
+        "stderr must name the cause without a (see <log>) pointer when the log append failed"
+    );
+}
+
+// Story 5.10 review F3 (AC4 coverage): the pre-run log-path-resolution failure
+// branch (no HOME, no BOWERBIRD_SHIM_LOG) must emit exactly the pointer-less
+// cause line and exit 1. The standard helper always sets BOWERBIRD_SHIM_LOG, so
+// this test removes both vars to actually reach that branch.
+#[test]
+fn shim_names_cause_when_no_home_and_no_log_path() {
+    let mut cmd = Command::cargo_bin("bowerbird-shim").expect("cargo_bin");
+    cmd.arg("--hook-kind")
+        .arg("PreToolUse")
+        .env_remove("HOME")
+        .env_remove("BOWERBIRD_SHIM_LOG")
+        .write_stdin(br#"{"session_id":"s1","tool_name":"Bash"}"#.to_vec());
+    let out = cmd.output().expect("shim spawn");
+
+    let code = out.status.code().expect("exited cleanly");
+    assert_eq!(code, 1, "no resolvable log path must exit 1");
+    assert_ne!(code, 2, "exit code 2 is forbidden");
     assert!(
-        !out.stderr.is_empty(),
-        "exit-1 connect failure must write a cause to stderr, got empty"
+        out.stdout.is_empty(),
+        "stdout must stay empty, got: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "bowerbird: HOME not set, cannot record event\n",
+        "pre-run no-HOME branch must emit exactly the pointer-less cause line"
+    );
+}
+
+// Story 5.10 review F5: a BOWERBIRD_SHIM_LOG path containing a newline (a legal
+// byte in a unix filename) must NOT turn the one-line hook message into multiple
+// lines — the path is escaped before it is embedded in stderr.
+#[test]
+fn shim_stderr_stays_one_line_with_newline_in_log_path() {
+    let tmp = TempDir::new().expect("tempdir");
+    let log_tmp = TempDir::new().expect("log tmpdir");
+    // Newline inside the filename component; the parent dir exists so the append
+    // succeeds and the pointer (sanitized) is emitted.
+    let log = log_tmp.path().join("foo\nbar.log");
+    let bogus_sock = tmp.path().join("nonexistent.sock");
+
+    let out = run_shim_with_env(
+        &bogus_sock,
+        &log,
+        "PreToolUse",
+        br#"{"session_id":"s1","tool_name":"Bash"}"#,
+        None,
+    );
+
+    let code = out.status.code().expect("exited cleanly");
+    assert_eq!(code, 1, "connect failure exits 1");
+    assert_ne!(code, 2, "exit code 2 is forbidden");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr.matches('\n').count(),
+        1,
+        "stderr must be exactly one line (only the trailing newline), got: {stderr:?}"
     );
     assert!(
-        stderr.contains("bowerbird:"),
-        "stderr line must be bowerbird-prefixed, got: {stderr:?}"
+        stderr.starts_with("bowerbird: daemon not running, event dropped"),
+        "stderr must still name the cause, got: {stderr:?}"
     );
     assert!(
-        stderr.contains("daemon not running"),
-        "stderr line must name the daemon-down cause, got: {stderr:?}"
-    );
-    let log_str = log.to_string_lossy().into_owned();
-    assert!(
-        stderr.contains(&log_str),
-        "stderr line must point at the resolved log path, got: {stderr:?}"
+        stderr.contains("\\n"),
+        "the newline in the log path must be escaped to a literal backslash-n, got: {stderr:?}"
     );
 }
 
