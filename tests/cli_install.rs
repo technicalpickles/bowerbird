@@ -531,7 +531,14 @@ echo "$@" >> "$FAKE_LAUNCHCTL_LOG"
 case "$1" in
   print)
      code="${FAKE_LAUNCHCTL_PRINT_EXIT:-1}"
-     [ "$code" -ne 0 ] && echo "${FAKE_LAUNCHCTL_PRINT_STDERR:-Could not find service in domain for gui}" >&2
+     if [ "$code" -ne 0 ]; then
+       echo "${FAKE_LAUNCHCTL_PRINT_STDERR:-Could not find service in domain for gui}" >&2
+     elif [ -n "$FAKE_LAUNCHCTL_PRINT_PID" ]; then
+       # Story 5.9 review pass-7 F5: a loaded job that launchd is actually running
+       # carries a `pid = N` line; the CLI cross-checks it against the singleton
+       # holder. Absent this var, `print` reports loaded-but-not-running.
+       printf '\tpid = %s\n' "$FAKE_LAUNCHCTL_PRINT_PID"
+     fi
      exit "$code" ;;
   bootstrap) exit "${FAKE_LAUNCHCTL_BOOTSTRAP_EXIT:-0}" ;;
   bootout)
@@ -1765,9 +1772,12 @@ fn start_uses_legacy_load_when_bootstrap_and_print_unsupported_on_macos() {
     );
 }
 
-/// Pass-6 F3 (loaded side): a live socket whose LaunchAgent is positively loaded
-/// is truly already running AND supervised — `start` reports it and takes no
-/// launchd action.
+/// Pass-6 F3 / pass-7 F5 (loaded side): a live socket whose LaunchAgent is loaded
+/// is "already running under launchd" ONLY when launchd is actually RUNNING the
+/// job AND its reported pid is the singleton holder. A loaded label alone is not
+/// proof (pass-7 F5), so this test now also stands up a real flock holder whose
+/// pid matches launchd's reported pid. `start` reports it and takes no launchd
+/// action.
 #[cfg(target_os = "macos")]
 #[test]
 fn start_reports_supervised_when_loaded_and_socket_live_on_macos() {
@@ -1786,13 +1796,22 @@ fn start_reports_supervised_when_loaded_and_socket_live_on_macos() {
     let _listener = UnixListener::bind(data_dir.join("ingest.sock")).expect("bind socket");
     let log = dir.path().join("launchctl.log");
 
+    // A REAL singleton holder (flock + its pid in `bowerbird.pid`), and launchd's
+    // reported pid set to that same pid — the only state that proves supervision.
+    let mut holder = spawn_flock_holder(&data_dir.join("bowerbird.pid"));
+    let holder_pid = holder.id();
+
     let mut cmd = bowerbird_bin();
     cmd.arg("start")
         .env("HOME", dir.path())
         .env("BOWERBIRD_LAUNCH_AGENTS_DIR", &la_dir)
-        .env("FAKE_LAUNCHCTL_PRINT_EXIT", "0"); // loaded
+        .env("FAKE_LAUNCHCTL_PRINT_EXIT", "0") // loaded
+        .env("FAKE_LAUNCHCTL_PRINT_PID", holder_pid.to_string()); // running, pid == holder
     with_fake_launchctl(&mut cmd, &bin_dir, &log);
     let assertion = cmd.assert().success();
+
+    holder.kill().ok();
+    holder.wait().ok();
 
     let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).into_owned();
     assert!(
@@ -1803,6 +1822,246 @@ fn start_reports_supervised_when_loaded_and_socket_live_on_macos() {
     assert!(
         !calls.contains("bootstrap") && !calls.contains("kickstart"),
         "start must take no launchd action for an already-supervised daemon; calls=\n{calls}"
+    );
+}
+
+/// Pass-7 F5: a loaded LaunchAgent label is NOT proof launchd owns the live
+/// socket. Repro: the agent stays loaded after a clean daemon exit, then a manual
+/// / pre-5.9 daemon binds the registered socket. launchd reports the job is not
+/// running (no `pid =` line), so `start` must NOT report "already running under
+/// launchd" — it must try to migrate the manual daemon and fail clearly when it
+/// cannot stop the socket owner, rather than leaving it unsupervised.
+#[cfg(target_os = "macos")]
+#[test]
+fn start_does_not_claim_supervision_when_loaded_but_not_running_on_macos() {
+    use std::os::unix::net::UnixListener;
+
+    let dir = TempDir::new().expect("tempdir");
+    let la_dir = dir.path().join("LaunchAgents");
+    let plist = la_dir.join("com.technicalpickles.bowerbird.daemon.plist");
+    let bin_dir = dir.path().join("bin");
+    let data_dir = dir.path().join(".bowerbird");
+    fs::create_dir_all(&la_dir).expect("la dir");
+    fs::create_dir_all(&bin_dir).expect("bin dir");
+    fs::create_dir_all(&data_dir).expect("data dir");
+    write_executable(&bin_dir.join("launchctl"), FAKE_LAUNCHCTL);
+    fs::write(&plist, "<plist/>\n").expect("write plist stub");
+    // A manual daemon owns the live socket; NO flock holder (singleton Free), and
+    // launchd reports the job loaded-but-NOT-running (PRINT_EXIT=0, no pid line).
+    let _listener = UnixListener::bind(data_dir.join("ingest.sock")).expect("bind socket");
+    let log = dir.path().join("launchctl.log");
+
+    let mut cmd = bowerbird_bin();
+    cmd.arg("start")
+        .env("HOME", dir.path())
+        .env("BOWERBIRD_LAUNCH_AGENTS_DIR", &la_dir)
+        .env("FAKE_LAUNCHCTL_PRINT_EXIT", "0"); // loaded, but no FAKE_LAUNCHCTL_PRINT_PID => not running
+    with_fake_launchctl(&mut cmd, &bin_dir, &log);
+    let assertion = cmd.assert().failure();
+
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).into_owned();
+    assert!(
+        !stdout.contains("already running under launchd"),
+        "start must NOT claim launchd supervision when launchd is not running the job; stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("migrating it to launchd supervision"),
+        "start must attempt to migrate the unsupervised manual daemon; stdout={stdout}"
+    );
+    assert!(
+        stderr.contains("still accepting"),
+        "start must fail clearly when it cannot stop the manual daemon; stderr={stderr}"
+    );
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !calls.contains("bootstrap") && !calls.contains("kickstart"),
+        "start must NOT hand launchd a daemon it could not migrate; calls=\n{calls}"
+    );
+}
+
+// --- Story 5.9 review pass-7 -----------------------------------------------
+
+/// Pass-7 F1 (missing-plist loaded agent): `uninstall --no-stop` removes the plist
+/// while an already-loaded in-session agent keeps being supervised by launchd. A
+/// later `bowerbird stop` must still boot that agent out — probing launchd by
+/// LABEL, not by plist presence — instead of skipping launchd and SIGKILL-ing the
+/// daemon into a KeepAlive respawn.
+#[cfg(target_os = "macos")]
+#[test]
+fn stop_boots_out_loaded_agent_when_plist_absent_on_macos() {
+    let dir = TempDir::new().expect("tempdir");
+    let la_dir = dir.path().join("LaunchAgents");
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&la_dir).expect("la dir");
+    fs::create_dir_all(&bin_dir).expect("bin dir");
+    write_executable(&bin_dir.join("launchctl"), FAKE_LAUNCHCTL);
+    // Deliberately do NOT write the plist file (uninstall --no-stop removed it).
+    let log = dir.path().join("launchctl.log");
+
+    let mut cmd = bowerbird_bin();
+    cmd.arg("stop")
+        .env("HOME", dir.path())
+        .env("BOWERBIRD_LAUNCH_AGENTS_DIR", &la_dir)
+        .env("FAKE_LAUNCHCTL_PRINT_EXIT", "0") // agent still loaded in-session
+        .env("FAKE_LAUNCHCTL_BOOTOUT_EXIT", "0");
+    with_fake_launchctl(&mut cmd, &bin_dir, &log);
+    let assertion = cmd.assert().success();
+
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("supervision paused"),
+        "stop must boot the loaded agent out even with the plist gone; stdout={stdout}"
+    );
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        calls.contains("bootout"),
+        "stop must address launchd by label (bootout) when loaded and the plist is absent; calls=\n{calls}"
+    );
+}
+
+/// Pass-7 F1 (unverifiable-print bootout fallback): when launchd's load state
+/// cannot be verified (`Unknown`), `bowerbird stop` must PREFER a bootout (it
+/// addresses the agent by label and no-ops cleanly if absent) before the PID-file
+/// fallback, so a launchd-supervised daemon is not SIGKILL-ed into a KeepAlive
+/// respawn.
+#[cfg(target_os = "macos")]
+#[test]
+fn stop_attempts_bootout_on_unverifiable_print_on_macos() {
+    let dir = TempDir::new().expect("tempdir");
+    let la_dir = dir.path().join("LaunchAgents");
+    let plist = la_dir.join("com.technicalpickles.bowerbird.daemon.plist");
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&la_dir).expect("la dir");
+    fs::create_dir_all(&bin_dir).expect("bin dir");
+    write_executable(&bin_dir.join("launchctl"), FAKE_LAUNCHCTL);
+    fs::write(&plist, "<plist/>\n").expect("write plist stub");
+    let log = dir.path().join("launchctl.log");
+
+    let mut cmd = bowerbird_bin();
+    cmd.arg("stop")
+        .env("HOME", dir.path())
+        .env("BOWERBIRD_LAUNCH_AGENTS_DIR", &la_dir)
+        // print unverifiable => Unknown; bootout succeeds.
+        .env("FAKE_LAUNCHCTL_PRINT_EXIT", "1")
+        .env("FAKE_LAUNCHCTL_PRINT_STDERR", "Operation not permitted")
+        .env("FAKE_LAUNCHCTL_BOOTOUT_EXIT", "0");
+    with_fake_launchctl(&mut cmd, &bin_dir, &log);
+    cmd.assert().success();
+
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        calls.contains("bootout"),
+        "stop must attempt a bootout on an unverifiable load state before the PID-file fallback; calls=\n{calls}"
+    );
+}
+
+/// Pass-7 F2: an unreadable `bowerbird.pid` is NOT proof the singleton is free.
+/// `install` must classify it as a held-but-unidentifiable singleton and refuse to
+/// bootstrap launchd over it, rather than collapsing the open error into `Free` and
+/// crash-looping the launchd daemon against the singleton lock.
+#[cfg(target_os = "macos")]
+#[test]
+fn install_refuses_when_pid_file_unreadable_on_macos() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().expect("tempdir");
+    let settings = settings_path(&dir);
+    let la_dir = dir.path().join("LaunchAgents");
+    let data_dir = dir.path().join("data");
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&data_dir).expect("data dir");
+    fs::create_dir_all(&bin_dir).expect("bin dir");
+    write_executable(&bin_dir.join("launchctl"), FAKE_LAUNCHCTL);
+    let daemon = bin_dir.join("bowerbird-daemon");
+    write_executable(&daemon, "#!/bin/sh\nexit 0\n");
+    let log = dir.path().join("launchctl.log");
+
+    // An unreadable PID file: the CLI cannot open it to flock-probe, so it cannot
+    // prove the singleton free. (Owner-mode 000 denies even us — we run as non-root.)
+    let pid_file = data_dir.join("bowerbird.pid");
+    fs::write(&pid_file, "12345\n").expect("write pid file");
+    fs::set_permissions(&pid_file, fs::Permissions::from_mode(0o000)).expect("chmod 000");
+
+    let mut cmd = bowerbird_bin();
+    cmd.arg("install")
+        .arg("--settings")
+        .arg(&settings)
+        .env("HOME", dir.path())
+        .env("BOWERBIRD_DATA_DIR", &data_dir)
+        .env("BOWERBIRD_LAUNCH_AGENTS_DIR", &la_dir)
+        .env("BOWERBIRD_DAEMON_BIN", &daemon)
+        .env("FAKE_LAUNCHCTL_PRINT_EXIT", "1") // not loaded
+        .env("FAKE_LAUNCHCTL_BOOTSTRAP_EXIT", "0");
+    with_fake_launchctl(&mut cmd, &bin_dir, &log);
+    let assertion = cmd.assert().failure();
+
+    // Restore perms so TempDir cleanup is unobstructed.
+    fs::set_permissions(&pid_file, fs::Permissions::from_mode(0o644)).ok();
+
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("refusing to bootstrap"),
+        "install must refuse to bootstrap over an unreadable (unprovable-free) singleton; stderr={stderr}"
+    );
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !calls.contains("bootstrap"),
+        "install must NOT bootstrap when it cannot prove the singleton is free; calls=\n{calls}"
+    );
+}
+
+/// Pass-7 F4: an effective ingest socket path longer than `sockaddr_un.sun_path`
+/// would let the daemon "register" via launchd but crash-loop on bind under
+/// KeepAlive. `install` must reject it up front with a clear error and write no
+/// plist / invoke no launchctl.
+#[cfg(target_os = "macos")]
+#[test]
+fn install_rejects_too_long_ingest_sock_on_macos() {
+    let dir = TempDir::new().expect("tempdir");
+    let settings = settings_path(&dir);
+    let la_dir = dir.path().join("LaunchAgents");
+    let plist = la_dir.join("com.technicalpickles.bowerbird.daemon.plist");
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&bin_dir).expect("bin dir");
+    write_executable(&bin_dir.join("launchctl"), FAKE_LAUNCHCTL);
+    let daemon = bin_dir.join("bowerbird-daemon");
+    write_executable(&daemon, "#!/bin/sh\nexit 0\n");
+    let log = dir.path().join("launchctl.log");
+
+    // An absolute custom socket whose total path exceeds the 103-byte sun_path
+    // limit, but whose parent is a single creatable component.
+    let long_sock = dir.path().join("s".repeat(90)).join("ingest.sock");
+    assert!(
+        long_sock.as_os_str().len() > 103,
+        "test socket path must exceed the sun_path limit: {}",
+        long_sock.display()
+    );
+
+    let mut cmd = bowerbird_bin();
+    cmd.arg("install")
+        .arg("--settings")
+        .arg(&settings)
+        .env("HOME", dir.path())
+        .env("BOWERBIRD_LAUNCH_AGENTS_DIR", &la_dir)
+        .env("BOWERBIRD_DAEMON_BIN", &daemon)
+        .env("BOWERBIRD_INGEST_SOCK", &long_sock);
+    with_fake_launchctl(&mut cmd, &bin_dir, &log);
+    let assertion = cmd.assert().failure();
+
+    let stderr = String::from_utf8_lossy(&assertion.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("too long"),
+        "install must reject a too-long ingest socket path with a clear error; stderr={stderr}"
+    );
+    assert!(
+        !plist.exists(),
+        "install must not write a plist for a too-long socket"
+    );
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        calls.is_empty(),
+        "install must fail before invoking launchctl for a too-long socket; calls=\n{calls}"
     );
 }
 

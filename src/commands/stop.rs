@@ -31,31 +31,43 @@ fn stop_daemon() -> anyhow::Result<()> {
     use super::launch_agent;
     use anyhow::Context;
 
+    // Probe launchd by LABEL, not by plist presence (Story 5.9 review pass-7 F1):
+    // `uninstall --no-stop` removes the plist while documenting that an
+    // already-loaded in-session agent keeps being supervised by launchd until
+    // logout or an explicit bootout (`uninstall.rs` --no-stop note). A plist-gated
+    // check would skip launchd here, fall to the PID-file path, and a forced
+    // SIGKILL escalation would be bounced right back by `KeepAlive` (the pass-6 F1
+    // bug). `launch_agent_load_state()` / `bootout_launch_agent()` address the
+    // agent by `gui/<uid>/<label>`, so they still work with the plist gone — the
+    // modern `bootout` needs no file (only the legacy `unload` fallback reads it).
     let plist_path = launch_agent::plist_path()?;
-    if plist_path.exists() {
-        match launch_agent::launch_agent_load_state() {
-            launch_agent::LoadState::Loaded => {
-                launch_agent::bootout_launch_agent(&plist_path)
-                    .context("boot the bowerbird LaunchAgent out to stop the daemon")?;
-                println!(
-                    "daemon stopped (launchd supervision paused until next login; \
-                     run `bowerbird start` to resume now)"
-                );
-                return Ok(());
-            }
-            // Not loaded (a clean prior stop, or never bootstrapped): nothing for
-            // launchd to stop. Fall through to the PID-file path, which still
-            // catches a manual / pre-5.9 daemon.
-            launch_agent::LoadState::NotLoaded => {}
-            // Cannot verify launchd state (unverifiable `launchctl print`). Don't
-            // claim a launchd stop we can't prove; fall back to the PID-file path
-            // (correct for a manual daemon, and the historical behavior). Warn that
-            // a launchd-supervised daemon may be restarted by KeepAlive on a forced
-            // stop, and point at `uninstall` to remove supervision entirely.
-            launch_agent::LoadState::Unknown => {
+    match launch_agent::launch_agent_load_state() {
+        launch_agent::LoadState::Loaded => {
+            launch_agent::bootout_launch_agent(&plist_path)
+                .context("boot the bowerbird LaunchAgent out to stop the daemon")?;
+            println!(
+                "daemon stopped (launchd supervision paused until next login; \
+                 run `bowerbird start` to resume now)"
+            );
+            return Ok(());
+        }
+        // Not loaded (a clean prior stop, or never bootstrapped): nothing for
+        // launchd to stop. Fall through to the PID-file path, which still catches a
+        // manual / pre-5.9 daemon.
+        launch_agent::LoadState::NotLoaded => {}
+        // Cannot verify launchd's state (unverifiable `launchctl print`). A
+        // launchd-supervised daemon force-stopped via PID-file SIGKILL would be
+        // bounced back by `KeepAlive` (pass-6 F1), so PREFER a bootout first: it
+        // addresses the agent by label, no-ops cleanly if the agent is actually
+        // absent, and tries modern then legacy `unload`. Then STILL fall through to
+        // the PID-file stop to catch a manual / pre-5.9 daemon. If the bootout
+        // cannot be proven, warn that a forced stop may be restarted by launchd
+        // (pass-7 F1).
+        launch_agent::LoadState::Unknown => {
+            if let Err(e) = launch_agent::bootout_launch_agent(&plist_path) {
                 eprintln!(
-                    "warning: could not verify whether the LaunchAgent is loaded; falling back to \
-                     a PID-file stop — if launchd is supervising the daemon, a forced (SIGKILL) \
+                    "warning: could not boot the LaunchAgent out ({e:#}); falling back to a \
+                     PID-file stop — if launchd is supervising the daemon, a forced (SIGKILL) \
                      stop may be restarted by KeepAlive (run `bowerbird uninstall` to remove \
                      supervision)"
                 );

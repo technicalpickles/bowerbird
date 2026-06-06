@@ -89,8 +89,40 @@ pub fn stop_daemon_via_pid_file(bowerbird_dir: &Path) -> anyhow::Result<StopOutc
         ),
     };
 
-    println!("sending SIGTERM to bowerbird-daemon (pid {pid})");
-    send_signal(pid, libc::SIGTERM).context("send SIGTERM")?;
+    // Signal the singleton holder. There is an unavoidable gap between the flock
+    // probe above and this `kill`: a manual daemon can exit in that window, so
+    // `kill` can return ESRCH for a pid that was live a moment ago. That is NOT a
+    // stop failure — the daemon we wanted gone is gone. Re-probe the singleton and
+    // normalize: `Free` → it stopped (`NotRunning`); a NEW live holder raced in →
+    // retry once against it; anything else surfaces the real holder state. Without
+    // this, `install`'s handoff wraps a benign ESRCH as a false-fatal "could not
+    // stop the running daemon before handing off to launchd" (Story 5.9 review
+    // pass-7 F3).
+    let mut pid = pid;
+    let mut retried = false;
+    loop {
+        println!("sending SIGTERM to bowerbird-daemon (pid {pid})");
+        match send_signal(pid, libc::SIGTERM) {
+            Ok(()) => break,
+            Err(e) if e.raw_os_error() == Some(libc::ESRCH) => {
+                match esrch_reprobe(singleton_state(bowerbird_dir), retried) {
+                    EsrchReprobe::Stopped => return Ok(StopOutcome::NotRunning),
+                    EsrchReprobe::Retry(new_pid) => {
+                        retried = true;
+                        pid = new_pid;
+                        continue;
+                    }
+                    EsrchReprobe::Fail => anyhow::bail!(
+                        "the bowerbird daemon holding the singleton for {} could not be stopped: \
+                         its pid changed or became unidentifiable while signaling it — re-run \
+                         `bowerbird stop`",
+                        bowerbird_dir.display()
+                    ),
+                }
+            }
+            Err(e) => return Err(anyhow::Error::new(e).context("send SIGTERM")),
+        }
+    }
 
     // Wait up to twice the daemon's default drain timeout (5s). The CLI does
     // not link the daemon crate so it cannot read `Config::shutdown_drain_timeout`
@@ -195,7 +227,15 @@ pub fn singleton_state(bowerbird_dir: &Path) -> SingletonState {
     // on an O_RDONLY fd — the lock is independent of the open mode.)
     let file = match std::fs::OpenOptions::new().read(true).open(&pid_path) {
         Ok(f) => f,
-        Err(_) => return SingletonState::Free,
+        // Only a genuinely-absent file proves no daemon ever locked here (a holder
+        // always creates `bowerbird.pid` before locking). A `PermissionDenied`, an
+        // ACL failure, or a transient I/O error means we could NOT prove the flock
+        // is free — collapsing that into `Free` lets `install`/`start` bootstrap
+        // launchd over an unreadable-but-held singleton and crash-loop it under
+        // `KeepAlive={SuccessfulExit=false}`. Report `HeldUnknownPid` so callers
+        // fail clearly instead (Story 5.9 review pass-7 F2).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return SingletonState::Free,
+        Err(_) => return SingletonState::HeldUnknownPid,
     };
     let fd = file.as_raw_fd();
     // Retry only on EINTR; LOCK_NB means we never block.
@@ -233,6 +273,30 @@ pub fn singleton_state(bowerbird_dir: &Path) -> SingletonState {
     match read_pid(&bowerbird_dir.join("bowerbird.pid")) {
         Ok(Some(pid)) if pid_alive(pid) => SingletonState::Held(pid),
         _ => SingletonState::Free,
+    }
+}
+
+/// Decision for the ESRCH-after-probe race in [`stop_daemon_via_pid_file`]
+/// (Story 5.9 review pass-7 F3). Factored out as a pure function so the
+/// normalization is unit-testable without an actual signal race.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EsrchReprobe {
+    /// The singleton is now free — the holder we wanted gone is gone. Normalize
+    /// the benign ESRCH to a clean stop.
+    Stopped,
+    /// A (new) live holder is present; signal this pid. Only offered once, to
+    /// bound the retry.
+    Retry(i32),
+    /// A holder remains but cannot be safely re-signaled (already retried, or the
+    /// pid is unidentifiable). Fail clearly.
+    Fail,
+}
+
+fn esrch_reprobe(state: SingletonState, retried: bool) -> EsrchReprobe {
+    match state {
+        SingletonState::Free => EsrchReprobe::Stopped,
+        SingletonState::Held(pid) if !retried => EsrchReprobe::Retry(pid),
+        SingletonState::Held(_) | SingletonState::HeldUnknownPid => EsrchReprobe::Fail,
     }
 }
 
@@ -636,5 +700,43 @@ mod tests {
         assert_eq!(encode_path_segment("a/b"), "a%2Fb");
         assert_eq!(encode_path_segment("a b"), "a%20b");
         assert_eq!(encode_path_segment("foo?bar"), "foo%3Fbar");
+    }
+
+    // Story 5.9 review pass-7 F3: ESRCH after the flock probe is the holder
+    // exiting in the gap before SIGTERM — normalize by re-probing the singleton.
+    #[test]
+    fn esrch_reprobe_free_means_stopped() {
+        assert_eq!(
+            esrch_reprobe(SingletonState::Free, false),
+            EsrchReprobe::Stopped
+        );
+        // Even after a retry, a now-free singleton is a clean stop.
+        assert_eq!(
+            esrch_reprobe(SingletonState::Free, true),
+            EsrchReprobe::Stopped
+        );
+    }
+
+    #[test]
+    fn esrch_reprobe_new_holder_retries_once() {
+        // A new live holder raced in: retry against it the first time...
+        assert_eq!(
+            esrch_reprobe(SingletonState::Held(4321), false),
+            EsrchReprobe::Retry(4321)
+        );
+        // ...but not a second time — bound the retry so we can't loop on a holder
+        // that keeps changing pids.
+        assert_eq!(
+            esrch_reprobe(SingletonState::Held(4321), true),
+            EsrchReprobe::Fail
+        );
+    }
+
+    #[test]
+    fn esrch_reprobe_unknown_pid_fails() {
+        assert_eq!(
+            esrch_reprobe(SingletonState::HeldUnknownPid, false),
+            EsrchReprobe::Fail
+        );
     }
 }

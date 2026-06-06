@@ -151,6 +151,19 @@ fn supervise_or_start(no_start: bool) -> anyhow::Result<()> {
         }
     }
 
+    // Reject an effective ingest socket path that cannot fit a Unix-domain socket
+    // address BEFORE writing/bootstrapping (Story 5.9 review pass-7 F4) — for both
+    // the bootstrap and `--no-start` paths, since the plist is a future launch
+    // registration either way. The daemon binds `<data_dir>/ingest.sock` (or the
+    // custom socket) and `crates/daemon/src/ingest/listener.rs` fails on a too-long
+    // path; under KeepAlive={SuccessfulExit=false} that becomes a launchd restart
+    // loop even though install reported a clean handoff. Fail up front instead.
+    let effective_sock = match &ingest_sock_env {
+        Some(sock) => PathBuf::from(sock),
+        None => data_dir_abs.join("ingest.sock"),
+    };
+    launch_agent::ensure_ingest_sock_len(&effective_sock)?;
+
     let mut env: Vec<(&str, &str)> = vec![("BOWERBIRD_DATA_DIR", &data_dir_env)];
     if let Some(sock) = &ingest_sock_env {
         env.push(("BOWERBIRD_INGEST_SOCK", sock));

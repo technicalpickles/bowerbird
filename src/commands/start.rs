@@ -73,6 +73,13 @@ fn start_daemon(bowerbird_dir: &std::path::Path) -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| effective_dir.join("ingest.sock"));
 
+    // Reject an ingest socket path that cannot fit a Unix-domain socket address
+    // before asking launchd to (re)start the daemon (Story 5.9 review pass-7 F4):
+    // the daemon would fail to bind it after launchd starts the job and crash-loop
+    // under KeepAlive={SuccessfulExit=false}, while `start` only reported a bare
+    // readiness timeout.
+    launch_agent::ensure_ingest_sock_len(&ingest_sock)?;
+
     // Probe the registered socket BEFORE asking launchd to take any ACTION
     // (Story 5.9 review pass-4 #1): an unverifiable `launchctl print` must never
     // fail `start` when the daemon is already up. But a live socket alone does NOT
@@ -83,17 +90,50 @@ fn start_daemon(bowerbird_dir: &std::path::Path) -> anyhow::Result<()> {
     // (pass-6 F3):
     if super::daemon_is_up(&ingest_sock) {
         match launch_agent::launch_agent_load_state() {
-            // launchd owns the running daemon — truly already up AND supervised.
-            launch_agent::LoadState::Loaded => {
-                let pid = daemon::read_pid(&effective_dir.join("bowerbird.pid"))
-                    .ok()
-                    .flatten();
-                match pid {
-                    Some(p) => println!("daemon already running under launchd (pid {p})"),
-                    None => println!("daemon already running under launchd"),
+            // A loaded label proves the job is REGISTERED, not that launchd's
+            // process is the one accepting on the socket (Story 5.9 review pass-7
+            // F5): the agent can stay loaded after a clean daemon exit while a
+            // manual / pre-5.9 daemon binds the registered socket, leaving that
+            // daemon without crash-restart even though we'd report "under launchd".
+            // Proof of supervision = launchd is RUNNING the job AND its pid is the
+            // singleton holder. Verify both; otherwise migrate (fall through).
+            launch_agent::LoadState::Loaded => match launch_agent::launch_agent_running_pid() {
+                Ok(Some(lpid))
+                    if daemon::singleton_state(&effective_dir)
+                        == daemon::SingletonState::Held(lpid) =>
+                {
+                    println!("daemon already running under launchd (pid {lpid})");
+                    return Ok(());
                 }
-                return Ok(());
-            }
+                // Loaded but launchd is not running the job, or its pid does not
+                // match the singleton holder: a manual daemon owns the socket.
+                // Migrate it into launchd ownership (fall through to the
+                // stop-then-(re)start path below).
+                Ok(_) => {
+                    println!(
+                        "a daemon is accepting on {} but launchd is not running the registered \
+                         job (or its pid does not match the singleton holder); migrating it to \
+                         launchd supervision",
+                        ingest_sock.display()
+                    );
+                }
+                // Cannot read launchd's pid (unverifiable `launchctl print`). Do NOT
+                // kill a working daemon on a guess; leave it running and warn that
+                // supervision could not be confirmed (preserves the pass-4 #1 /
+                // pass-6 F3 unverifiable-print success path).
+                Err(_) => {
+                    eprintln!(
+                        "warning: a daemon is already accepting on {} but launchd's pid for the \
+                         registered LaunchAgent could not be verified; leaving the running daemon \
+                         in place — it may not be under launchd supervision (check `launchctl \
+                         print gui/$(id -u)/{}`)",
+                        ingest_sock.display(),
+                        launch_agent::LAUNCH_AGENT_LABEL
+                    );
+                    println!("daemon already running");
+                    return Ok(());
+                }
+            },
             // Can't prove launchd's state (unverifiable `launchctl print`). Do NOT
             // kill a working daemon to migrate it on a guess; leave it running and
             // warn that supervision could not be confirmed (pass-6 F3 keeps the

@@ -498,6 +498,39 @@ pub fn launch_agent_load_state() -> LoadState {
     }
 }
 
+/// The pid launchd reports for the LaunchAgent's running job, parsed from
+/// `launchctl print gui/<uid>/<label>`.
+///
+/// `Ok(Some(pid))` = the job is loaded AND running with that pid; `Ok(None)` =
+/// loaded but launchd is not currently running the job (no `pid =` line), or the
+/// job is absent; `Err` = `launchctl print` could not be run/verified.
+///
+/// A *loaded* label only proves the job is registered in the domain — it does not
+/// prove launchd's process is the one accepting on the ingest socket. After a
+/// clean daemon exit the agent can stay loaded while a manual / pre-5.9 daemon
+/// binds the registered socket; `bowerbird start` uses this pid (cross-checked
+/// against the singleton holder) to tell true launchd supervision from a manual
+/// daemon it must migrate (Story 5.9 review pass-7 F5).
+#[cfg(target_os = "macos")]
+pub fn launch_agent_running_pid() -> anyhow::Result<Option<i32>> {
+    let uid = current_uid();
+    let target = format!("gui/{uid}/{LAUNCH_AGENT_LABEL}");
+    let out = run_launchctl(&["print", &target])?;
+    if out.success {
+        return Ok(parse_launchctl_print_pid(&out.stdout));
+    }
+    // Mirror `agent_loaded`: an explicit absent signal is "no running pid"; any
+    // other non-zero exit is unverifiable and must propagate.
+    if print_signals_absent(out.code, &out.stderr) {
+        return Ok(None);
+    }
+    anyhow::bail!(
+        "could not verify launchd pid for {target}: `launchctl print` exited [{}] {}",
+        out.code_display(),
+        out.stderr_trimmed()
+    )
+}
+
 #[cfg(target_os = "macos")]
 fn agent_loaded(uid: u32) -> anyhow::Result<bool> {
     let target = format!("gui/{uid}/{LAUNCH_AGENT_LABEL}");
@@ -544,6 +577,7 @@ fn run_launchctl(args: &[&str]) -> anyhow::Result<LaunchctlOutput> {
     Ok(LaunchctlOutput {
         success: output.status.success(),
         code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
 }
@@ -553,6 +587,9 @@ fn run_launchctl(args: &[&str]) -> anyhow::Result<LaunchctlOutput> {
 struct LaunchctlOutput {
     success: bool,
     code: Option<i32>,
+    /// `launchctl print` writes the job's state (including a `pid = N` line for a
+    /// running job) to stdout; parsed by [`launch_agent_running_pid`] (pass-7 F5).
+    stdout: String,
     stderr: String,
 }
 
@@ -626,6 +663,64 @@ fn print_signals_absent(code: Option<i32>, stderr: &str) -> bool {
         || s.contains("no such")
         || s.contains("not find")
         || s.contains("not loaded")
+}
+
+/// Parse the running pid out of `launchctl print gui/<uid>/<label>` output.
+/// launchctl emits a `pid = <N>` line (indented) only when it is actually running
+/// the job; a loaded-but-not-running job has no such line. Returns `None` when no
+/// pid line is present (Story 5.9 review pass-7 F5). Pure so it unit-tests on
+/// Linux CI.
+#[cfg(any(target_os = "macos", test))]
+fn parse_launchctl_print_pid(stdout: &str) -> Option<i32> {
+    for line in stdout.lines() {
+        let t = line.trim_start();
+        // Match `pid = 1234` (and tolerate `pid=1234`); skip unrelated keys like
+        // `pid file = ...` by requiring the key to be exactly `pid`.
+        if let Some(rest) = t.strip_prefix("pid") {
+            let rest = rest.trim_start();
+            if let Some(val) = rest.strip_prefix('=') {
+                if let Ok(p) = val.trim().parse::<i32>() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Max bytes of a Unix-domain socket path: `sizeof(sockaddr_un.sun_path)` is 104
+/// on macOS/BSD, and the path must be NUL-terminated within it, so the usable
+/// path is 103 bytes.
+#[cfg(any(target_os = "macos", test))]
+pub const SUN_PATH_MAX: usize = 104;
+
+/// Validate the effective ingest socket path fits a Unix-domain socket address
+/// BEFORE registering/bootstrapping/kickstarting launchd (Story 5.9 review
+/// pass-7 F4).
+///
+/// `install`/`start` validate that a custom `BOWERBIRD_INGEST_SOCK` is absolute
+/// and create its parent, but neither checked the path *length*. The daemon's
+/// bind (`crates/daemon/src/ingest/listener.rs`) fails at runtime if the path
+/// exceeds `sun_path`, and under `KeepAlive={SuccessfulExit=false}` that bind
+/// failure becomes a launchd restart loop even though install/start reported a
+/// clean handoff. Failing up front turns that silent crash-loop into a clear
+/// error. Pure so it unit-tests cross-platform.
+#[cfg(any(target_os = "macos", test))]
+pub fn ensure_ingest_sock_len(sock: &Path) -> anyhow::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let len = sock.as_os_str().as_bytes().len();
+    // Need room for the trailing NUL inside sun_path.
+    if len + 1 > SUN_PATH_MAX {
+        anyhow::bail!(
+            "the ingest socket path is too long for a Unix domain socket: {} is {len} bytes but \
+             the platform limit (sockaddr_un.sun_path) allows {} — the daemon would fail to bind \
+             it after launchd starts the job and crash-loop under KeepAlive; choose a shorter data \
+             dir or BOWERBIRD_INGEST_SOCK",
+            sock.display(),
+            SUN_PATH_MAX - 1
+        );
+    }
+    Ok(())
 }
 
 /// Parse the `EnvironmentVariables` dict out of a rendered LaunchAgent plist,
@@ -1057,6 +1152,48 @@ mod tests {
         assert!(
             !signals_already_unloaded(Some(1), "Boot-out failed: 1: Operation not permitted"),
             "a permission error is a real failure"
+        );
+    }
+
+    // Story 5.9 review pass-7 F5: a loaded label is not proof launchd is running
+    // the job — `start` cross-checks the running pid against the singleton holder.
+    #[test]
+    fn parse_launchctl_print_pid_reads_running_pid() {
+        let out = "com.technicalpickles.bowerbird.daemon = {\n\tactive count = 1\n\tpid = 4321\n\tstate = running\n}\n";
+        assert_eq!(parse_launchctl_print_pid(out), Some(4321));
+        // Tolerate no spaces around `=`.
+        assert_eq!(parse_launchctl_print_pid("\tpid=99\n"), Some(99));
+    }
+
+    #[test]
+    fn parse_launchctl_print_pid_none_when_not_running() {
+        // A loaded-but-not-running job has no `pid =` line.
+        let out = "com.technicalpickles.bowerbird.daemon = {\n\tstate = not running\n}\n";
+        assert_eq!(parse_launchctl_print_pid(out), None);
+        // `pid file = ...` must NOT be mistaken for the running pid.
+        assert_eq!(parse_launchctl_print_pid("\tpid file = /tmp/x.pid\n"), None);
+    }
+
+    // Story 5.9 review pass-7 F4: reject an ingest socket path that cannot fit a
+    // Unix-domain socket address before launchd would crash-loop the daemon.
+    #[test]
+    fn ensure_ingest_sock_len_accepts_paths_within_sun_path() {
+        // 103 bytes + NUL == 104 == SUN_PATH_MAX: the longest path that fits.
+        let ok = "/".to_string() + &"a".repeat(102);
+        assert_eq!(ok.len(), 103);
+        assert!(ensure_ingest_sock_len(Path::new(&ok)).is_ok());
+        assert!(ensure_ingest_sock_len(Path::new("/tmp/x/ingest.sock")).is_ok());
+    }
+
+    #[test]
+    fn ensure_ingest_sock_len_rejects_too_long_paths() {
+        // 104 bytes needs a 105-byte sun_path — one over the limit.
+        let too_long = "/".to_string() + &"a".repeat(103);
+        assert_eq!(too_long.len(), 104);
+        let err = ensure_ingest_sock_len(Path::new(&too_long)).unwrap_err();
+        assert!(
+            err.to_string().contains("too long"),
+            "error must name the length problem: {err}"
         );
     }
 }
