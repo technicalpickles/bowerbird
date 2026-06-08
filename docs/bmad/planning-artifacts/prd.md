@@ -465,7 +465,7 @@ All three examples must run against `bowerbird replay` with bundled fixture file
 - FR2: The shim can operate without network timeouts or blocking calls that could delay Claude Code's hook execution
 - FR3: Tool builders can install and remove the bowerbird hook from Claude Code's configuration without manually editing configuration files
 - FR4: The Claude Code adapter can normalize Claude Code hook payloads into the canonical protocol event format
-- FR5: The shim logs failure information to a dedicated log file and stays stdout/stderr-silent on the success and exit-0 (daemon-answered) paths. On an exit-1 failure it additionally emits exactly one `bowerbird: <cause>` line to stderr so the failure is not causeless to Claude Code, appending the `(see <log-path>)` pointer only when the file-log append succeeded (Story 5.10)
+- FR5: The shim logs failure information to a dedicated log file and stays stdout/stderr-silent on the success and exit-0 (daemon-answered) paths. On an exit-1 failure it additionally emits exactly one `bowerbird: <cause>` line to stderr so the failure is not causeless to Claude Code, appending a fixed `(see the shim log)` pointer (never the env-controlled path) only when the file-log append succeeded (Story 5.10)
 
 ### Event Storage & Persistence
 

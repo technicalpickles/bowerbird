@@ -38,8 +38,8 @@ fn main() {
             // shim makes things worse than dropping the log line. Capture
             // whether the append actually landed: a failed append means the
             // log path is unusable (a directory, unwritable, ...), so the
-            // `(see <log>)` pointer would send Claude to a file that was never
-            // written. Drop the pointer in that case.
+            // pointer would imply a log file that was never written. Drop the
+            // pointer in that case.
             let log_written = log::append(&log_path, e.level(), &e.to_string()).is_ok();
             // Name the cause on stderr for the exit-1 (ERROR) class so Claude
             // surfaces "bowerbird: <cause>" instead of its causeless
@@ -48,17 +48,17 @@ fn main() {
             // Swallow write errors (AC5): a failed stderr write never panics
             // and never changes the exit code, mirroring the log append above.
             if let Some(hint) = e.stderr_hint() {
+                // The pointer is a FIXED string — we never interpolate the
+                // resolved log path. `BOWERBIRD_SHIM_LOG` is environment-
+                // controlled and Claude Code renders hook stderr verbatim
+                // (`${TH.stderr.trim()}`, no truncation), so embedding the path
+                // bought nothing but a hostile-input surface (newlines, bidi,
+                // non-UTF-8 bytes) that three review passes kept chasing. The
+                // real path lives in the file log and the docs. The pointer is
+                // still conditional on the append landing: omit it when the log
+                // was not written, so we never imply a log that does not exist.
                 if log_written {
-                    // The log path is `BOWERBIRD_SHIM_LOG` verbatim, which a
-                    // hostile or odd environment could load with newlines or
-                    // other control bytes. Escape them so the pointer cannot
-                    // break the one-line hook message or inject terminal escape
-                    // sequences into Claude's transcript.
-                    let _ = writeln!(
-                        io::stderr(),
-                        "bowerbird: {hint} (see {})",
-                        one_line_path(&log_path)
-                    );
+                    let _ = writeln!(io::stderr(), "bowerbird: {hint} (see the shim log)");
                 } else {
                     let _ = writeln!(io::stderr(), "bowerbird: {hint}");
                 }
@@ -66,58 +66,6 @@ fn main() {
             std::process::exit(e.exit_code());
         }
     }
-}
-
-/// Render a unix path on a single line for the stderr hint. A unix path is a
-/// bag of bytes that need not be valid UTF-8, and `BOWERBIRD_SHIM_LOG` is taken
-/// verbatim, so a hostile or malformed value could carry bytes that break the
-/// one-line hook message or spoof Claude's transcript. This sanitizes the raw
-/// path bytes:
-///   - C0/C1 controls and DEL (newline, CR, ANSI ESC, ...) → escaped
-///   - Unicode line/paragraph separators (U+2028, U+2029) → escaped (they split
-///     a line in Unicode-aware renderers even though `is_control()` is false)
-///   - bidi format/override controls (LRM/RLM/ALM, the U+202A–U+202E
-///     embeddings/overrides, the U+2066–U+2069 isolates) → escaped (they can
-///     reorder/spoof the rendered text)
-///   - bytes that are not valid UTF-8 → rendered as `\xNN`, so the pointer
-///     reflects the real (if unprintable) path instead of a lossy U+FFFD
-///
-/// Printable text (including ordinary non-ASCII) is kept verbatim so legitimate
-/// paths read naturally.
-fn one_line_path(path: &Path) -> String {
-    use std::os::unix::ffi::OsStrExt;
-    let mut out = String::new();
-    for chunk in path.as_os_str().as_bytes().utf8_chunks() {
-        for c in chunk.valid().chars() {
-            if needs_escape(c) {
-                out.extend(c.escape_default());
-            } else {
-                out.push(c);
-            }
-        }
-        for &b in chunk.invalid() {
-            out.push_str(&format!("\\x{b:02x}"));
-        }
-    }
-    out
-}
-
-/// True for chars that must not pass into the one-line stderr hint verbatim:
-/// every control char plus the Unicode separators and bidi controls that
-/// `char::is_control()` does not catch but that can still break or spoof the
-/// single-line rendering.
-fn needs_escape(c: char) -> bool {
-    c.is_control()
-        || matches!(
-            c,
-            '\u{2028}'              // LINE SEPARATOR
-            | '\u{2029}'            // PARAGRAPH SEPARATOR
-            | '\u{200E}'            // LEFT-TO-RIGHT MARK
-            | '\u{200F}'            // RIGHT-TO-LEFT MARK
-            | '\u{061C}'            // ARABIC LETTER MARK
-            | '\u{202A}'..='\u{202E}'  // LRE RLE PDF LRO RLO
-            | '\u{2066}'..='\u{2069}'  // LRI RLI FSI PDI
-        )
 }
 
 fn run(_log_path: &Path) -> Result<()> {
@@ -233,69 +181,4 @@ fn read_stdin_capped() -> Result<Vec<u8>> {
         });
     }
     Ok(buf)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn one_line_path_passes_normal_paths_through() {
-        // A normal path has no control chars, so the hint pointer is unchanged
-        // (this is what keeps the connect-refused contract assertion exact).
-        let p = Path::new("/var/folders/xy/shim.log");
-        assert_eq!(one_line_path(p), "/var/folders/xy/shim.log");
-    }
-
-    #[test]
-    fn one_line_path_escapes_control_chars() {
-        // A newline (or other control byte) in BOWERBIRD_SHIM_LOG must not be
-        // able to turn the one-line stderr hint into multiple lines.
-        let p = Path::new("/tmp/foo\nbar\r\x1b[31m.log");
-        let rendered = one_line_path(p);
-        assert!(
-            !rendered.contains('\n') && !rendered.contains('\r') && !rendered.contains('\x1b'),
-            "control chars must be escaped, got: {rendered:?}"
-        );
-        assert_eq!(rendered, "/tmp/foo\\nbar\\r\\u{1b}[31m.log");
-    }
-
-    #[test]
-    fn one_line_path_escapes_unicode_separators_and_bidi() {
-        // `char::is_control()` is false for the Unicode line/paragraph
-        // separators (U+2028, U+2029) and the bidi format/override controls
-        // (e.g. U+202E RIGHT-TO-LEFT OVERRIDE). They are still legal UTF-8 bytes
-        // in a unix filename, and they can split the hook line across renderers
-        // or spoof Claude's transcript — so they must be escaped, not passed
-        // through verbatim.
-        let p = Path::new("/tmp/a\u{2028}b\u{2029}c\u{202e}d.log");
-        let rendered = one_line_path(p);
-        assert!(
-            !rendered.contains('\u{2028}')
-                && !rendered.contains('\u{2029}')
-                && !rendered.contains('\u{202e}'),
-            "unicode separators/bidi controls must be escaped, got: {rendered:?}"
-        );
-        assert_eq!(rendered, "/tmp/a\\u{2028}b\\u{2029}c\\u{202e}d.log");
-    }
-
-    #[test]
-    fn one_line_path_renders_invalid_utf8_bytes() {
-        // A unix path is a bag of bytes that need not be valid UTF-8.
-        // `to_string_lossy` would replace the stray byte with U+FFFD, pointing
-        // the user at a path they cannot open. Render the raw byte as `\xNN` so
-        // the pointer reflects the real (if unprintable) path.
-        use std::ffi::OsStr;
-        use std::os::unix::ffi::OsStrExt;
-        let raw = b"/tmp/foo\xff\xfebar.log";
-        let p = Path::new(OsStr::from_bytes(raw));
-        assert_eq!(one_line_path(p), "/tmp/foo\\xff\\xfebar.log");
-    }
-
-    #[test]
-    fn one_line_path_keeps_non_ascii_verbatim() {
-        // Legitimate non-ASCII paths (e.g. a unicode username) read naturally.
-        let p = Path::new("/Users/jürgen/.bowerbird/shim.log");
-        assert_eq!(one_line_path(p), "/Users/jürgen/.bowerbird/shim.log");
-    }
 }

@@ -659,8 +659,9 @@ See [ADR-0002](../../decisions/0002-ingest-wire-framing-and-hook-kind.md).
 - No `eprintln!` / `println!` / `tracing` calls — silence on the success and
   exit-0 (daemon-answered) paths; failures write to `~/.bowerbird/shim.log`,
   and exit-1 failures additionally emit exactly one `bowerbird: <cause>` line to
-  stderr in `main`'s error arm (with the `(see <log-path>)` pointer only when the
-  log append succeeded) so a daemon outage is not causeless to Claude (Story 5.10)
+  stderr in `main`'s error arm (with a fixed `(see the shim log)` pointer — never
+  the env-controlled path — only when the log append succeeded) so a daemon
+  outage is not causeless to Claude (Story 5.10)
 
 **Transaction invariant (load-bearing correctness rule):**
 ```rust

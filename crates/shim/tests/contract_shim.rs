@@ -202,15 +202,13 @@ fn shim_exit_nonzero_on_connection_refused() {
     // stderr instead of leaving Claude with a causeless "No stderr output".
     // AC1 requires EXACTLY one line of a fixed shape — assert it verbatim so a
     // regression that prints a duplicate line, drops "event dropped", or
-    // rewords the cause cannot slip through (the temp log path here has no
-    // control chars, so the sanitized pointer equals `log.display()`).
+    // rewords the cause cannot slip through. The pointer is a FIXED string and
+    // never interpolates the (env-controlled) log path (see the Open Decision
+    // in the story: Claude renders hook stderr verbatim, so the path bought us
+    // nothing but a hostile-input surface).
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
-        stderr,
-        format!(
-            "bowerbird: daemon not running, event dropped (see {})\n",
-            log.display()
-        ),
+        stderr, "bowerbird: daemon not running, event dropped (see the shim log)\n",
         "exit-1 connect failure must emit exactly the AC1 stderr line"
     );
 }
@@ -276,15 +274,17 @@ fn shim_names_cause_when_no_home_and_no_log_path() {
     );
 }
 
-// Story 5.10 review F5: a BOWERBIRD_SHIM_LOG path containing a newline (a legal
-// byte in a unix filename) must NOT turn the one-line hook message into multiple
-// lines — the path is escaped before it is embedded in stderr.
+// Story 5.10 Open Decision resolution: the exit-1 stderr line uses a FIXED
+// pointer and never interpolates the (env-controlled) `BOWERBIRD_SHIM_LOG` path.
+// A pathological log path — here a newline inside the filename, a legal byte in
+// a unix filename — must therefore never reach stderr at all. This guards the
+// invariant that no env-controlled bytes leak into Claude's transcript.
 #[test]
-fn shim_stderr_stays_one_line_with_newline_in_log_path() {
+fn shim_stderr_never_interpolates_the_log_path() {
     let tmp = TempDir::new().expect("tempdir");
     let log_tmp = TempDir::new().expect("log tmpdir");
     // Newline inside the filename component; the parent dir exists so the append
-    // succeeds and the pointer (sanitized) is emitted.
+    // succeeds and the (fixed) pointer is emitted.
     let log = log_tmp.path().join("foo\nbar.log");
     let bogus_sock = tmp.path().join("nonexistent.sock");
 
@@ -301,16 +301,22 @@ fn shim_stderr_stays_one_line_with_newline_in_log_path() {
     assert_ne!(code, 2, "exit code 2 is forbidden");
 
     let stderr = String::from_utf8_lossy(&out.stderr);
-    // Exact sanitized pointer: the parent temp dir has no control chars, so it
-    // renders verbatim, and the embedded newline becomes a literal `\n`. This
-    // pins both "exactly one line" and "the path is the escaped real path".
-    let expected = format!(
-        "bowerbird: daemon not running, event dropped (see {}/foo\\nbar.log)\n",
-        log_tmp.path().display()
+    // The fixed pointer line — identical regardless of how pathological the log
+    // path is, because the path is no longer interpolated.
+    assert_eq!(
+        stderr, "bowerbird: daemon not running, event dropped (see the shim log)\n",
+        "stderr must be the fixed pointer line, got: {stderr:?}"
+    );
+    // Belt and suspenders: none of the path bytes leaked through, and the line
+    // is exactly one line (only the trailing newline).
+    assert!(
+        !stderr.contains("foo") && !stderr.contains("bar"),
+        "no env-controlled path bytes may appear in stderr, got: {stderr:?}"
     );
     assert_eq!(
-        stderr, expected,
-        "stderr must be exactly the sanitized one-line pointer, got: {stderr:?}"
+        stderr.matches('\n').count(),
+        1,
+        "exactly one line, got: {stderr:?}"
     );
 }
 
