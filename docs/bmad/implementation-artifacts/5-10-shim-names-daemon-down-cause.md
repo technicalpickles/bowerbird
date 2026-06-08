@@ -129,6 +129,30 @@ bmad-code-review pass 3 reviewed the cumulative Story 5.10 footprint (`d7ab6bf^.
 - [x] [Review][Patch] Persistent docs still state the old file-only/no-stderr shim failure contract [docs/bmad/planning-artifacts/prd.md:468] — Raised by Acceptance Auditor and verified locally. Story 5.10 intentionally creates a scoped exception for exit-1 failures, but the persistent docs still contradict it: PRD FR5 says the shim logs failures "without writing to stdout or stderr" (`docs/bmad/planning-artifacts/prd.md:468`), PRD Journey 4 still says "never stdout/stderr" (`docs/bmad/planning-artifacts/prd.md:258`), architecture still says "no stdout/stderr on any path" and "failure log only" (`docs/bmad/planning-artifacts/architecture.md:34`, `docs/bmad/planning-artifacts/architecture.md:658`), and project-context's shim hot-path rule says failure logging goes to a file, not stdout/stderr (`docs/bmad/project-context.md:348`) despite the Observability section already allowing the success-path-only exception (`docs/bmad/project-context.md:222`). Update the PRD, architecture, and project-context to preserve the real invariant: success and exit-0 daemon-answered paths stay stdout/stderr-silent; exit-1 shim failures emit one cause line to stderr, with the file log pointer only when the log append succeeded.
   - **Resolved:** updated PRD FR5 (`prd.md:468`) and Journey 4 (`prd.md:258`), architecture FR1–FR5 summary (`architecture.md:34`) and the shim hot-path rules (`architecture.md:657`), and project-context's Observability shim exception (`project-context.md:222`) + shim hot-path discipline rule (`project-context.md:348`). All now state the same invariant: success and exit-0 daemon-answered paths stay stdout/stderr-silent; exit-1 failures emit exactly one `bowerbird: <cause>` stderr line, with the `(see <log-path>)` pointer only when the log append succeeded.
 
+### Open Decision — log path in stderr + strict one-line guarantee (raised after pass 3, 2026-06-08)
+
+**Why this is here.** Three review passes converged on the same helper from different angles: F5 (pass 1) escaped control chars, pass 2 added Unicode line/paragraph separators + bidi controls, pass 3 added non-UTF-8 byte rendering. Each fix was "incomplete, not wrong." That escalation pattern is the reviews circling a design choice that was never decided: **the exit-1 stderr line interpolates an environment-controlled value (`BOWERBIRD_SHIM_LOG`) into Claude's transcript, and asserts an "exactly one line" property — neither the threat model nor the one-line requirement was ever grounded.** All of `one_line_path` / `needs_escape` and ~4 of the shim's tests exist only to make that interpolation safe.
+
+**What we now know (grounded, not assumed).** Investigated Claude Code's actual hook-error rendering via binary spelunking (`claude 2.1.168`). On a non-zero non-blocking hook exit the message is built as:
+
+```js
+stderr: `Failed with non-blocking status code: ${TH.stderr.trim() || "No stderr output"}`
+```
+
+`TH.stderr` is the hook process's full stderr; it is only `.trim()`med. There is **no** first-line extraction, `.slice()`, or truncation at any of the three hook-stderr render sites. So:
+
+- **The empty-stderr fix is correct and necessary.** `… || "No stderr output"` is exactly the causeless message Finding 2 reported; emitting one named line fixes it. (Not in question.)
+- **Claude renders multi-line stderr faithfully** — it does not collapse, truncate, or first-line it. A newline in the log path produces an *ugly multi-line* hook error, not a *broken* one.
+- Therefore **"exactly one line" is a UX/aesthetic property, not a correctness one.** Control-char / newline / separator escaping prevents an ugly multi-line blob repeating per tool call; it is not preventing a parse break.
+- The **bidi-control** escaping is the one item defending an actual integrity property (transcript spoofing via visual reordering) — real but low severity, and only reachable by someone who set their own `BOWERBIRD_SHIM_LOG` to a pathological value.
+
+**The decision to make (next review/dev cycle, or a follow-up story):**
+
+1. **Does the line need the variable path at all?** The threat model for every path-escaping finding is "a hostile/malformed `BOWERBIRD_SHIM_LOG`" — but the person who set that env var is the person reading the transcript. If the path is dropped in favor of a fixed pointer (e.g. `bowerbird: daemon not running, event dropped (see your shim log)`), the entire `one_line_path` / `needs_escape` helper and its tests delete themselves, and the real path stays where it is already safe (the file log + docs). Cost: a user who customized `BOWERBIRD_SHIM_LOG` doesn't see *which* file in the one-liner.
+2. **If the path stays, is the strict one-line guarantee worth the byte-level sanitizer,** now that we know multi-line only costs aesthetics? A cheaper `replace control/newline → space`, best-effort, may be enough — keeping only the bidi escaping as the deliberate anti-spoofing measure.
+
+**Recommendation:** option 1 (fixed pointer, drop the variable path) is the smallest faithful design and erases the recurring finding class; keep a one-line bidi/control note for the fixed-string case (trivially satisfied). This is a contract/spec choice, so it belongs to whoever owns the next pass — flagged, not silently changed. Related to the exit-0-vs-exit-1 reframing in the **Saved question** below (both ask "is the surfaced-failure contract right?").
+
 ## Dev Notes
 
 ### What this changes (and what it must NOT)
