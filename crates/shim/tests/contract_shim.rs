@@ -301,18 +301,16 @@ fn shim_stderr_stays_one_line_with_newline_in_log_path() {
     assert_ne!(code, 2, "exit code 2 is forbidden");
 
     let stderr = String::from_utf8_lossy(&out.stderr);
+    // Exact sanitized pointer: the parent temp dir has no control chars, so it
+    // renders verbatim, and the embedded newline becomes a literal `\n`. This
+    // pins both "exactly one line" and "the path is the escaped real path".
+    let expected = format!(
+        "bowerbird: daemon not running, event dropped (see {}/foo\\nbar.log)\n",
+        log_tmp.path().display()
+    );
     assert_eq!(
-        stderr.matches('\n').count(),
-        1,
-        "stderr must be exactly one line (only the trailing newline), got: {stderr:?}"
-    );
-    assert!(
-        stderr.starts_with("bowerbird: daemon not running, event dropped"),
-        "stderr must still name the cause, got: {stderr:?}"
-    );
-    assert!(
-        stderr.contains("\\n"),
-        "the newline in the log path must be escaped to a literal backslash-n, got: {stderr:?}"
+        stderr, expected,
+        "stderr must be exactly the sanitized one-line pointer, got: {stderr:?}"
     );
 }
 

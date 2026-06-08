@@ -14,14 +14,20 @@ fn main() {
     // Resolve log_path BEFORE attempting any work that might need to log.
     // If neither HOME nor the env override is set we have nowhere to write
     // the failure log — name the cause on stderr (no `(see ...)` pointer: no
-    // log path could be resolved) and exit 1 with the daemon-unreachable exit
-    // code, which is the closest signal Claude Code will pick up. Swallow the
-    // stderr write error exactly as the failure-arm log append does (AC5).
+    // log path could be resolved) and exit with the error's own exit code.
+    // Route through the same `Error::stderr_hint()` / `exit_code()` machinery
+    // the failure arm below uses so the cause and exit code are single-sourced
+    // and guarded by the `stderr_hint_matches_exit_code` canary — never
+    // hardcode the wording here, where it would silently drift from
+    // `Error::NoHome`. Swallow the stderr write error exactly as the
+    // failure-arm log append does (AC5).
     let log_path = match resolve_log_path() {
         Ok(p) => p,
-        Err(_) => {
-            let _ = writeln!(io::stderr(), "bowerbird: HOME not set, cannot record event");
-            std::process::exit(1);
+        Err(e) => {
+            if let Some(hint) = e.stderr_hint() {
+                let _ = writeln!(io::stderr(), "bowerbird: {hint}");
+            }
+            std::process::exit(e.exit_code());
         }
     };
 
@@ -62,21 +68,56 @@ fn main() {
     }
 }
 
-/// Render a path on a single line for the stderr hint: any control character
-/// (newline, carriage return, ANSI ESC, ...) is escaped so a hostile or
-/// malformed `BOWERBIRD_SHIM_LOG` cannot inject extra lines or terminal control
-/// sequences into Claude's one-line hook message. Printable text (including
-/// non-ASCII) is kept verbatim so legitimate paths read naturally.
+/// Render a unix path on a single line for the stderr hint. A unix path is a
+/// bag of bytes that need not be valid UTF-8, and `BOWERBIRD_SHIM_LOG` is taken
+/// verbatim, so a hostile or malformed value could carry bytes that break the
+/// one-line hook message or spoof Claude's transcript. This sanitizes the raw
+/// path bytes:
+///   - C0/C1 controls and DEL (newline, CR, ANSI ESC, ...) → escaped
+///   - Unicode line/paragraph separators (U+2028, U+2029) → escaped (they split
+///     a line in Unicode-aware renderers even though `is_control()` is false)
+///   - bidi format/override controls (LRM/RLM/ALM, the U+202A–U+202E
+///     embeddings/overrides, the U+2066–U+2069 isolates) → escaped (they can
+///     reorder/spoof the rendered text)
+///   - bytes that are not valid UTF-8 → rendered as `\xNN`, so the pointer
+///     reflects the real (if unprintable) path instead of a lossy U+FFFD
+///
+/// Printable text (including ordinary non-ASCII) is kept verbatim so legitimate
+/// paths read naturally.
 fn one_line_path(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
     let mut out = String::new();
-    for c in path.to_string_lossy().chars() {
-        if c.is_control() {
-            out.extend(c.escape_default());
-        } else {
-            out.push(c);
+    for chunk in path.as_os_str().as_bytes().utf8_chunks() {
+        for c in chunk.valid().chars() {
+            if needs_escape(c) {
+                out.extend(c.escape_default());
+            } else {
+                out.push(c);
+            }
+        }
+        for &b in chunk.invalid() {
+            out.push_str(&format!("\\x{b:02x}"));
         }
     }
     out
+}
+
+/// True for chars that must not pass into the one-line stderr hint verbatim:
+/// every control char plus the Unicode separators and bidi controls that
+/// `char::is_control()` does not catch but that can still break or spoof the
+/// single-line rendering.
+fn needs_escape(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{2028}'              // LINE SEPARATOR
+            | '\u{2029}'            // PARAGRAPH SEPARATOR
+            | '\u{200E}'            // LEFT-TO-RIGHT MARK
+            | '\u{200F}'            // RIGHT-TO-LEFT MARK
+            | '\u{061C}'            // ARABIC LETTER MARK
+            | '\u{202A}'..='\u{202E}'  // LRE RLE PDF LRO RLO
+            | '\u{2066}'..='\u{2069}'  // LRI RLI FSI PDI
+        )
 }
 
 fn run(_log_path: &Path) -> Result<()> {
@@ -217,6 +258,38 @@ mod tests {
             "control chars must be escaped, got: {rendered:?}"
         );
         assert_eq!(rendered, "/tmp/foo\\nbar\\r\\u{1b}[31m.log");
+    }
+
+    #[test]
+    fn one_line_path_escapes_unicode_separators_and_bidi() {
+        // `char::is_control()` is false for the Unicode line/paragraph
+        // separators (U+2028, U+2029) and the bidi format/override controls
+        // (e.g. U+202E RIGHT-TO-LEFT OVERRIDE). They are still legal UTF-8 bytes
+        // in a unix filename, and they can split the hook line across renderers
+        // or spoof Claude's transcript — so they must be escaped, not passed
+        // through verbatim.
+        let p = Path::new("/tmp/a\u{2028}b\u{2029}c\u{202e}d.log");
+        let rendered = one_line_path(p);
+        assert!(
+            !rendered.contains('\u{2028}')
+                && !rendered.contains('\u{2029}')
+                && !rendered.contains('\u{202e}'),
+            "unicode separators/bidi controls must be escaped, got: {rendered:?}"
+        );
+        assert_eq!(rendered, "/tmp/a\\u{2028}b\\u{2029}c\\u{202e}d.log");
+    }
+
+    #[test]
+    fn one_line_path_renders_invalid_utf8_bytes() {
+        // A unix path is a bag of bytes that need not be valid UTF-8.
+        // `to_string_lossy` would replace the stray byte with U+FFFD, pointing
+        // the user at a path they cannot open. Render the raw byte as `\xNN` so
+        // the pointer reflects the real (if unprintable) path.
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let raw = b"/tmp/foo\xff\xfebar.log";
+        let p = Path::new(OsStr::from_bytes(raw));
+        assert_eq!(one_line_path(p), "/tmp/foo\\xff\\xfebar.log");
     }
 
     #[test]

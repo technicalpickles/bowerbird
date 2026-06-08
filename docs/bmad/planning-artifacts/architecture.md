@@ -31,9 +31,11 @@ _This document builds collaboratively through step-by-step discovery. Sections a
 **Functional Requirements (39 total):**
 
 - **Hook Integration & Event Capture (FR1–FR5):** Shim captures Claude Code
-  hook events with < 5ms p95 marginal latency; no stdout/stderr on any path;
-  logs failures to `~/.bowerbird/shim.log` (mode 0600); adapter normalizes
-  payloads to canonical protocol format with raw payload preserved verbatim.
+  hook events with < 5ms p95 marginal latency; stdout/stderr-silent on the
+  success and exit-0 (daemon-answered) paths, with one `bowerbird: <cause>`
+  stderr line on exit-1 failures (Story 5.10); logs failures to
+  `~/.bowerbird/shim.log` (mode 0600); adapter normalizes payloads to canonical
+  protocol format with raw payload preserved verbatim.
 - **Event Storage & Persistence (FR6–FR9):** Events persisted atomically with
   session state projection in the same SQLite transaction; WAL-mode durability;
   cursor-based retrieval via `EventId(i64)`; `oldest_available_event_id`
@@ -654,8 +656,11 @@ See [ADR-0002](../../decisions/0002-ingest-wire-framing-and-hook-kind.md).
 - No heap allocation on the success path (best-effort; enforced via criterion
   benchmark with p95 < 5ms CI gate, not a compile-time guarantee)
 - No `unwrap()` or `expect()` anywhere in shim
-- No `eprintln!` / `println!` / `tracing` calls — silence on success path;
-  failures write to `~/.bowerbird/shim.log` only
+- No `eprintln!` / `println!` / `tracing` calls — silence on the success and
+  exit-0 (daemon-answered) paths; failures write to `~/.bowerbird/shim.log`,
+  and exit-1 failures additionally emit exactly one `bowerbird: <cause>` line to
+  stderr in `main`'s error arm (with the `(see <log-path>)` pointer only when the
+  log append succeeded) so a daemon outage is not causeless to Claude (Story 5.10)
 
 **Transaction invariant (load-bearing correctness rule):**
 ```rust

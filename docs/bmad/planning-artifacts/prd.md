@@ -255,7 +255,7 @@ He checks: what caused the lag? His tool was doing something CPU-intensive (rend
 
 Later that week the daemon does crash — a disk-full edge case during a long session. Claude Code keeps running; the shim gets a connection-refused error, logs it to `~/.bowerbird/shim.log`, and exits cleanly (no hook timeout visible to Claude). Marcus sees his tool disconnect. He frees disk space, restarts the daemon with `bowerbird start`. His tool reconnects. The session events from before the crash are gone (the daemon restarted clean), but his tool handles this gracefully — it resets its state on reconnect.
 
-**This journey requires:** `dropped` frame on WS lag with lag count, REST snapshot re-fetch on reconnect, shim failure logging to file (never stdout/stderr), daemon restart CLI, clear documentation of what survives a daemon crash vs. what doesn't.
+**This journey requires:** `dropped` frame on WS lag with lag count, REST snapshot re-fetch on reconnect, shim failure logging to file plus one cause line on stderr for exit-1 failures (the success and exit-0 daemon-answered paths stay stdout/stderr-silent — Story 5.10), daemon restart CLI, clear documentation of what survives a daemon crash vs. what doesn't.
 
 ---
 
@@ -270,7 +270,7 @@ Later that week the daemon does crash — a disk-full edge case during a long se
 | WS reconnect with snapshot re-fetch | Journeys 2, 4 |
 | `dropped` frame on lag with count | Journey 4 |
 | Health check endpoint (`/healthz`, `/readyz`) | Journey 1 |
-| Shim failure logging to file (never stdout/stderr) | Journey 4 |
+| Shim failure logging to file; stderr cause line on exit-1 only (success/exit-0 stay silent) | Journey 4 |
 | Stable protocol (community tools survive daemon updates) | Journey 3 |
 | Clear "what does install do" documentation | Journeys 1, 3 |
 | Clear "what survives a crash" documentation | Journey 4 |
@@ -465,7 +465,7 @@ All three examples must run against `bowerbird replay` with bundled fixture file
 - FR2: The shim can operate without network timeouts or blocking calls that could delay Claude Code's hook execution
 - FR3: Tool builders can install and remove the bowerbird hook from Claude Code's configuration without manually editing configuration files
 - FR4: The Claude Code adapter can normalize Claude Code hook payloads into the canonical protocol event format
-- FR5: The shim can log failure information to a dedicated log file without writing to stdout or stderr
+- FR5: The shim logs failure information to a dedicated log file and stays stdout/stderr-silent on the success and exit-0 (daemon-answered) paths. On an exit-1 failure it additionally emits exactly one `bowerbird: <cause>` line to stderr so the failure is not causeless to Claude Code, appending the `(see <log-path>)` pointer only when the file-log append succeeded (Story 5.10)
 
 ### Event Storage & Persistence
 
