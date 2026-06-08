@@ -773,6 +773,18 @@ fn shim_rejects_stdin_over_1mib_cap() {
         "oversized stdin log should describe the size cap, got: {log_contents:?}"
     );
 
+    // Story 5.10 AC2 (process-level): the StdinTooLarge exit-1 variant must
+    // also NAME its cause on stderr in `main`, not only log it. This guards
+    // AC2 for a stdin-derived error end-to-end — a regression that special-
+    // cased only `Connect` in `main`'s failure arm would still satisfy the
+    // log/exit assertions above but fail here. The temp log is writable, so
+    // the append lands and the fixed `(see the shim log)` pointer is present.
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "bowerbird: hook payload exceeds size cap (see the shim log)\n",
+        "oversized stdin must name its cause on stderr (AC2)"
+    );
+
     // Sleep briefly to give the mock listener a chance to capture if the shim
     // (incorrectly) sent anything before bailing.
     thread::sleep(Duration::from_millis(50));
@@ -780,6 +792,49 @@ fn shim_rejects_stdin_over_1mib_cap() {
     assert_eq!(
         captured_len, 0,
         "no bytes should reach the daemon when stdin is over the cap, got {captured_len} bytes"
+    );
+}
+
+// ─── AC2 (process-level): a bad --hook-kind names its cause on stderr ─────────
+
+#[test]
+fn shim_names_cause_on_bad_args() {
+    // Story 5.10 AC2 process-level coverage for the argument-derived exit-1
+    // class (`BadArgs`), distinct from the `Connect` and `NoHome` branches the
+    // other contract tests already exercise. `parse_hook_kind()` rejects an
+    // unknown kind before any socket or stdin work, so no mock ingest is
+    // needed; the writable temp log makes the append land, so the fixed
+    // `(see the shim log)` pointer is present. Together with the StdinTooLarge
+    // stderr assertion, this proves `main` emits the mapped hint for more than
+    // just `Connect`, so a Connect-only regression cannot satisfy AC2.
+    let log_tmp = TempDir::new().expect("log tmpdir");
+    let log = log_tmp.path().join("shim.log");
+
+    let mut cmd = Command::cargo_bin("bowerbird-shim").expect("cargo_bin");
+    cmd.arg("--hook-kind")
+        .arg("BogusKind")
+        .env("BOWERBIRD_INGEST_SOCK", log_tmp.path().join("nope.sock"))
+        .env("BOWERBIRD_SHIM_LOG", &log)
+        .write_stdin(Vec::new());
+    let out = cmd.output().expect("shim spawn");
+
+    let code = out.status.code().expect("exited cleanly");
+    assert_eq!(code, 1, "invalid --hook-kind must exit 1");
+    assert_ne!(code, 2, "exit code 2 is forbidden");
+    assert!(
+        out.stdout.is_empty(),
+        "stdout must be empty, got: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "bowerbird: invalid shim arguments (see the shim log)\n",
+        "invalid args must name the cause on stderr (AC2)"
+    );
+    let log_contents = std::fs::read_to_string(&log).expect("log should exist");
+    assert!(
+        log_contents.contains("ERROR"),
+        "invalid args must log ERROR: {log_contents:?}"
     );
 }
 

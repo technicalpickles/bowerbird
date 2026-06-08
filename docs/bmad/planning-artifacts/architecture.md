@@ -638,8 +638,12 @@ This is the single exception to the derive-based serde pattern.
 ### Process Conventions
 
 **Shim exit codes:**
-- `0` on success
-- `1` on any failure (daemon down, write error) — non-blocking warning; Claude continues
+- `0` on success — and on the daemon-answered / mid-write WARN class (`SocketIo`,
+  `BadResponse`, `Backpressure`, daemon `503`, daemon `400`): the daemon is up and
+  answering, so fire-and-forget per NFR20 means Claude must see success
+- `1` on the daemon-unreachable / bad-input ERROR class (`Connect`, the stdin
+  errors, `BadArgs`, `NoHome`, `LogIo`) — non-blocking warning; Claude continues,
+  and `main` additionally names the cause on stderr (Story 5.10)
 - `2` is **forbidden** — exit 2 blocks Claude tool calls, which violates the
   substrate-not-actor axiom
 
