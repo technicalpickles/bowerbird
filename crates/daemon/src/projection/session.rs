@@ -304,6 +304,16 @@ async fn supersede_predecessors(
         // current_state + last_pid unchanged, e.g. Working→Working on P)
         // also makes the synthetic write no-op — the victim emitted more
         // recently than our scan, so it is the survivor, not a predecessor.
+        //
+        // Granularity caveat (review pass 2, ADR 0009 §6): `last_event_at_ms`
+        // is millisecond wall-clock — non-decreasing, not strictly monotonic —
+        // so an equal-millisecond same-state re-emit could defeat this guard.
+        // Unreachable here: supersession runs only inside the serial ingest
+        // task and the probe only ends dead-PID sessions, so nothing writes a
+        // live-PID victim between this scan and the synthetic write. It becomes
+        // reachable only when gt-suf7's probe reconciliation pass adds
+        // concurrent live-PID writes — that pass must key on a strictly
+        // monotonic `events.event_id`, not this timestamp.
         let precondition = WritePrecondition {
             expected_current_state: stored.current_state,
             expected_last_pid: Some(pid),
