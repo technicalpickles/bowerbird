@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 
 pub async fn run(
     sock_path: PathBuf,
-    tx: mpsc::Sender<protocol::EventEnvelope>,
+    tx: mpsc::Sender<super::IngestItem>,
     shutdown: CancellationToken,
     adapter: Arc<ClaudeAdapter>,
 ) -> Result<()> {
@@ -38,7 +38,7 @@ pub fn bind(sock_path: &std::path::Path) -> Result<UnixListener> {
 pub async fn run_bound(
     listener: UnixListener,
     sock_path: PathBuf,
-    tx: mpsc::Sender<protocol::EventEnvelope>,
+    tx: mpsc::Sender<super::IngestItem>,
     shutdown: CancellationToken,
     adapter: Arc<ClaudeAdapter>,
 ) -> Result<()> {

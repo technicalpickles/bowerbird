@@ -238,6 +238,10 @@ pub async fn probe_once(
         let precondition = WritePrecondition {
             expected_current_state: stored.current_state,
             expected_last_pid: stored.last_pid,
+            // The probe acts only on dead/no-PID rows, which cannot emit new
+            // events, so it keeps the pre-5.11 (current_state, last_pid) guard
+            // — no monotonic `last_event_at_ms` pin needed (Story 5.11 #3).
+            expected_last_event_at_ms: None,
         };
         match write_if_state_matches(writer_pool, broadcaster, envelope, precondition).await {
             Ok(Some(_)) => {

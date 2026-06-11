@@ -5,7 +5,9 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
 use adapter_claude::ClaudeAdapter;
-use protocol::{EventEnvelope, SourceAdapter};
+use protocol::SourceAdapter;
+
+use super::{IngestItem, IngestOrigin};
 
 // Wire 400 responses are line-framed. Collapse internal newlines and cap
 // length so a multi-line serde_json::Error Display can't desync the client.
@@ -19,7 +21,7 @@ fn sanitize_for_wire(s: &str) -> String {
 #[tracing::instrument(skip_all)]
 pub(super) async fn handle(
     stream: UnixStream,
-    tx: mpsc::Sender<EventEnvelope>,
+    tx: mpsc::Sender<IngestItem>,
     adapter: Arc<ClaudeAdapter>,
 ) {
     let (read_half, mut write_half) = stream.into_split();
@@ -116,7 +118,10 @@ pub(super) async fn handle(
         return;
     }
 
-    match tx.try_send(envelope) {
+    match tx.try_send(IngestItem {
+        envelope,
+        origin: IngestOrigin::Live,
+    }) {
         Ok(()) => {
             tracing::debug!("ingest: 200 accepted");
             let _ = write_half.write_all(b"200\n").await;

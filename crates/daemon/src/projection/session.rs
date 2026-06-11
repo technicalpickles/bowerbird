@@ -31,10 +31,22 @@ pub struct RecordingStarted {
 /// row's `current_state` and `last_pid` still match the snapshot the probe
 /// observed — otherwise a real hook event has already moved the session and
 /// the probe should yield to it (story 5.3 review finding #2).
+///
+/// `expected_last_event_at_ms` (Story 5.11 review finding #3) is an OPTIONAL
+/// monotonic guard: when `Some(t)`, the write also requires the row's
+/// `last_event_at_ms` to still equal `t`. This closes the *same-state*
+/// interleaving the `current_state`+`last_pid` pair cannot see — e.g. a victim
+/// that emits another event on the same PID without changing `current_state`
+/// (`Working` → `Working`). Without it a stale synthetic `SessionEnded` would
+/// still pass and end the session that just emitted most recently, violating
+/// "whoever emitted most recently on the PID is the survivor." `None` keeps the
+/// pre-5.11 behavior (the liveness probe passes `None`; only supersession
+/// opts in, where the race matters and `last_event_at_ms` is in hand).
 #[derive(Debug, Clone, Copy)]
 pub struct WritePrecondition {
     pub expected_current_state: SessionCurrentState,
     pub expected_last_pid: Option<u32>,
+    pub expected_last_event_at_ms: Option<i64>,
 }
 
 /// Sole owner of the SQLite write transaction AND the sole publisher of
@@ -62,7 +74,7 @@ pub async fn write(
     envelope: EventEnvelope,
 ) -> Result<EventId> {
     // Story 5.11 / ADR 0009: capture the fields the supersession follow-up
-    // needs BEFORE `envelope` is moved into `write_inner`. A `SessionEnded`
+    // needs BEFORE `envelope` is moved into `write_committed`. A `SessionEnded`
     // event does not assert its session is the live PID holder, so it must
     // never supersede others (guards a replayed/odd `SessionEnded`).
     let successor_source = envelope.source.clone();
@@ -70,19 +82,17 @@ pub async fn write(
     let successor_pid = envelope.pid;
     let is_session_ended = matches!(envelope.kind, EventKind::SessionEnded);
 
-    let event_id = write_inner(writer_pool, broadcaster, envelope, None)
-        .await?
-        .ok_or_else(|| {
-            Error::Projection("write() with no precondition unexpectedly skipped".into())
-        })?;
+    let event_id = write_committed(writer_pool, broadcaster, envelope).await?;
 
-    // Story 5.11 / ADR 0009: event-driven PID supersession. Runs ONLY from
-    // this `write()` path (real ingest + `/replay`), AFTER `write_inner`
-    // committed the primary event and released its writer-pool connection.
-    // Gated on the event carrying a PID and not being a `SessionEnded`. A
-    // failure here is logged inside `supersede_predecessors` and NEVER
-    // propagates — `S′`'s write already succeeded and its `event_id` return
-    // value must be unchanged.
+    // Story 5.11 / ADR 0009 §6/§7: event-driven PID supersession. Runs ONLY on
+    // LIVE ingest (this `write()` path), AFTER `write_committed` committed the
+    // primary event and released its writer-pool connection. `/replay` uses
+    // `write_replayed` instead and skips this step — the synthetic
+    // `SessionEnded` rows are already in the log being replayed (§7). Gated on
+    // the event carrying a PID and not being a `SessionEnded`. A failure here
+    // is logged inside `supersede_predecessors` and NEVER propagates — `S′`'s
+    // write already succeeded and its `event_id` return value must be
+    // unchanged (the best-effort completion model, §6).
     if let Some(pid) = successor_pid {
         if !is_session_ended {
             supersede_predecessors(
@@ -99,11 +109,44 @@ pub async fn write(
     Ok(event_id)
 }
 
+/// Replay-path write (Story 5.11 / ADR 0009 §7). Identical to [`write`] for the
+/// primary event+projection write and broadcast, but does NOT run the
+/// PID-supersession follow-up. `/replay` reconstructs events from the stored
+/// log, and the synthetic `SessionEnded { reason: pid_superseded }` rows a
+/// prior live run produced are already in that log — replay re-applies them
+/// faithfully. Re-running supersession here would double-generate those rows
+/// and, when replaying co-PID history into a live DB, could end the current
+/// live PID holder on replay arrival order. See ADR 0009 §7.
+#[tracing::instrument(skip_all, fields(source = %envelope.source, session_id = %envelope.session_id))]
+pub async fn write_replayed(
+    writer_pool: &deadpool_sqlite::Pool,
+    broadcaster: &BroadcastHub,
+    envelope: EventEnvelope,
+) -> Result<EventId> {
+    write_committed(writer_pool, broadcaster, envelope).await
+}
+
+/// The primary write shared by [`write`] and [`write_replayed`]: commit the
+/// event+projection and publish, with no precondition. `write_inner` only
+/// returns `None` when a precondition is supplied, so a `None` here is a bug.
+async fn write_committed(
+    writer_pool: &deadpool_sqlite::Pool,
+    broadcaster: &BroadcastHub,
+    envelope: EventEnvelope,
+) -> Result<EventId> {
+    write_inner(writer_pool, broadcaster, envelope, None)
+        .await?
+        .ok_or_else(|| {
+            Error::Projection("write() with no precondition unexpectedly skipped".into())
+        })
+}
+
 /// Story 5.11 / ADR 0009 — event-driven PID supersession.
 ///
-/// Called from [`write`] (real ingest + `/replay`) after the successor `S′`'s
-/// event has committed, when that event carried `pid = Some(P)` and was NOT a
-/// `SessionEnded`. Ends every OTHER non-`Ended` session still claiming `P`:
+/// Called from [`write`] (LIVE ingest only — not `/replay`, see §7) after the
+/// successor `S′`'s event has committed, when that event carried `pid = Some(P)`
+/// and was NOT a `SessionEnded`. Ends every OTHER non-`Ended` session still
+/// claiming `P`:
 /// `S′`'s event proves it is the live holder of the PID, so any predecessor
 /// still on `P` is provably stale — the same observation ADR 0004 makes for
 /// PID death, one step earlier in time (ADR 0009 §1).
@@ -256,9 +299,15 @@ async fn supersede_predecessors(
         };
         // Same precondition discipline as the probe: yield to any concurrent
         // write that moved the row between the SELECT above and now (AC4).
+        // Story 5.11 review finding #3: also pin `last_event_at_ms` so a
+        // same-state interleave (a fresh event for this victim that kept
+        // current_state + last_pid unchanged, e.g. Working→Working on P)
+        // also makes the synthetic write no-op — the victim emitted more
+        // recently than our scan, so it is the survivor, not a predecessor.
         let precondition = WritePrecondition {
             expected_current_state: stored.current_state,
             expected_last_pid: Some(pid),
+            expected_last_event_at_ms: Some(stored.last_event_at_ms),
         };
         match write_if_state_matches(writer_pool, broadcaster, envelope, precondition).await {
             Ok(Some(_)) => {
@@ -425,6 +474,15 @@ async fn write_inner(
                     Some(s) => {
                         s.current_state == pc.expected_current_state
                             && s.last_pid == pc.expected_last_pid
+                            // Story 5.11 review finding #3: optional monotonic
+                            // guard. When the caller pins `last_event_at_ms`,
+                            // any newer event for this row (even one that left
+                            // current_state + last_pid unchanged) advances it
+                            // and fails the match — so the stale synthetic
+                            // write yields. `None` skips the guard (probe).
+                            && pc
+                                .expected_last_event_at_ms
+                                .is_none_or(|t| s.last_event_at_ms == t)
                     }
                     // No prev row means the projection was deleted (or
                     // never existed) after the probe SELECT — definitely

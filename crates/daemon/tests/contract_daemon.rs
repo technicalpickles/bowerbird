@@ -69,7 +69,8 @@ fn make_test_state_with_ws(
     // receiver-half being closed makes the sender error on use, which is
     // exactly what a non-replay test wants (any accidental /replay call in a
     // non-replay test would fail fast rather than silently succeed).
-    let (ingest_tx, _ingest_rx) = tokio::sync::mpsc::channel::<protocol::EventEnvelope>(1);
+    let (ingest_tx, _ingest_rx) =
+        tokio::sync::mpsc::channel::<bowerbird_daemon::ingest::IngestItem>(1);
     AppState {
         db: pools,
         migrations_complete,
@@ -731,10 +732,10 @@ async fn start_ingest_listener(
 ) -> (
     tokio_util::sync::CancellationToken,
     std::path::PathBuf,
-    tokio::sync::mpsc::Receiver<protocol::EventEnvelope>,
+    tokio::sync::mpsc::Receiver<bowerbird_daemon::ingest::IngestItem>,
 ) {
     let sock_path = tmp.path().join("ingest.sock");
-    let (tx, rx) = tokio::sync::mpsc::channel::<protocol::EventEnvelope>(capacity);
+    let (tx, rx) = tokio::sync::mpsc::channel::<bowerbird_daemon::ingest::IngestItem>(capacity);
     let shutdown = tokio_util::sync::CancellationToken::new();
     let path_clone = sock_path.clone();
     let shutdown_clone = shutdown.clone();
@@ -806,10 +807,16 @@ async fn ingest_event_reaches_channel_after_200() {
     .await;
     assert!(resp.starts_with("200"), "expected 200, got: {resp:?}");
 
-    let envelope = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+    let item = tokio::time::timeout(Duration::from_millis(500), rx.recv())
         .await
         .expect("timeout waiting for envelope")
         .expect("channel closed");
+    assert_eq!(
+        item.origin,
+        bowerbird_daemon::ingest::IngestOrigin::Live,
+        "shim hooks ingest as Live"
+    );
+    let envelope = item.envelope;
     assert!(
         envelope.payload.contains("session_id"),
         "payload should contain sent JSON"
@@ -1091,7 +1098,7 @@ async fn ingest_no_db_row_on_missing_hook_kind() {
     let sock_tmp = TempDir::new().expect("tempdir");
     let sock_path = sock_tmp.path().join("ingest.sock");
 
-    let (tx, rx) = tokio::sync::mpsc::channel::<EventEnvelope>(16);
+    let (tx, rx) = tokio::sync::mpsc::channel::<bowerbird_daemon::ingest::IngestItem>(16);
     let shutdown = CancellationToken::new();
     let adapter = Arc::new(ClaudeAdapter::new(
         sock_tmp.path().join("nonexistent-tool-reactions.toml"),
@@ -1233,10 +1240,11 @@ async fn shim_binary_round_trip_to_daemon_ingest() {
         String::from_utf8_lossy(&shim_result.stdout),
     );
 
-    let envelope = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+    let item = tokio::time::timeout(Duration::from_secs(2), rx.recv())
         .await
         .expect("timeout waiting for envelope")
         .expect("channel closed");
+    let envelope = item.envelope;
     assert_eq!(envelope.kind, EventKind::PreToolUse);
     assert_eq!(envelope.source, "claude");
     assert_eq!(envelope.session_id, "test-session-abc123");
@@ -1256,7 +1264,7 @@ async fn shim_user_prompt_submit_round_trip_persists_working() {
     let sock_path = sock_tmp.path().join("ingest.sock");
     let log_path = log_tmp.path().join("shim.log");
 
-    let (tx, rx) = tokio::sync::mpsc::channel::<EventEnvelope>(16);
+    let (tx, rx) = tokio::sync::mpsc::channel::<bowerbird_daemon::ingest::IngestItem>(16);
     let shutdown = CancellationToken::new();
     let adapter = Arc::new(ClaudeAdapter::new(
         sock_tmp.path().join("nonexistent-tool-reactions.toml"),
@@ -3388,7 +3396,8 @@ mod story_1_7_rest {
 
         // Use a non-zero started_at_ms so uptime is meaningful.
         let mc = Arc::new(AtomicBool::new(true));
-        let (ingest_tx, _ingest_rx) = tokio::sync::mpsc::channel::<protocol::EventEnvelope>(1);
+        let (ingest_tx, _ingest_rx) =
+            tokio::sync::mpsc::channel::<bowerbird_daemon::ingest::IngestItem>(1);
         let state = AppState {
             db: pools.clone(),
             migrations_complete: mc,
@@ -6710,7 +6719,8 @@ mod story_2_4_dropped {
         broadcast_capacity: usize,
         coalesce_window: Duration,
     ) -> AppState {
-        let (ingest_tx, _ingest_rx) = tokio::sync::mpsc::channel::<protocol::EventEnvelope>(1);
+        let (ingest_tx, _ingest_rx) =
+            tokio::sync::mpsc::channel::<bowerbird_daemon::ingest::IngestItem>(1);
         AppState {
             db: pools,
             migrations_complete: Arc::new(AtomicBool::new(true)),
@@ -9062,7 +9072,7 @@ mod story_4_1_replay {
         let migrations_complete = Arc::new(AtomicBool::new(true));
         let shutdown = CancellationToken::new();
         let broadcaster = Arc::new(BroadcastHub::new(32));
-        let (ingest_tx, ingest_rx) = mpsc::channel::<protocol::EventEnvelope>(64);
+        let (ingest_tx, ingest_rx) = mpsc::channel::<bowerbird_daemon::ingest::IngestItem>(64);
 
         let writer_task = tokio::spawn(writer::run(
             ingest_rx,
@@ -10074,6 +10084,7 @@ mod story_5_3_liveness {
         let precondition = bowerbird_daemon::projection::session::WritePrecondition {
             expected_current_state: SessionCurrentState::Working,
             expected_last_pid: None,
+            expected_last_event_at_ms: None,
         };
         let result = bowerbird_daemon::projection::session::write_if_state_matches(
             &pools.writer,
@@ -11444,18 +11455,54 @@ mod story_5_11_supersession {
     }
 
     /// AC5 — subagent gate (regression guard for the verified premise, ADR 0009
-    /// §"The subagent gate"). A single session that dispatches Task-tool
-    /// (`Agent`) subagents emits many events on one PID — including a tool-use
-    /// event whose tool_name is `Agent` — and must NEVER supersede itself: a
-    /// subagent does not surface as a distinct co-PID session_id, so the
-    /// emitter exclusion always holds. If a future Claude Code release registers
-    /// subagents as distinct co-PID sessions, this fails loudly instead of
-    /// silently ping-ponging parent ↔ subagent.
+    /// §"The subagent gate" + Story 5.11 review finding #4). A session that
+    /// dispatches Task-tool (`Agent`) subagents emits many events on one PID —
+    /// including tool-use events whose tool_name is `Agent` — and must NEVER
+    /// supersede itself.
+    ///
+    /// What this test PROVES (in-code mechanism): the supersession scan excludes
+    /// the emitter by `(source, session_id)` and supersedes only OTHER sessions
+    /// on the PID. We pin this *specifically* by seeding a genuine co-PID
+    /// predecessor `sess-pred` that the parent's turn DOES supersede, while the
+    /// parent (despite its `Agent` dispatches) is left live with no SessionEnded.
+    /// That distinguishes "the emitter is excluded" from the weaker "supersession
+    /// happened not to fire here."
+    ///
+    /// What this test CANNOT prove (the load-bearing premise): that a subagent
+    /// does not surface as a *distinct* co-PID session_id. bowerbird has no
+    /// subagent discriminator — `normalize` reads `session_id` verbatim from the
+    /// hook payload — so the premise is verified externally against live data
+    /// (ADR 0009 §gate: PID 6491 hosted exactly one session_id across 42 `Agent`
+    /// dispatches), not enforced in code. If a future Claude Code release emits a
+    /// distinct child session_id on the parent's PID, supersession would
+    /// ping-pong; ADR 0009 §"Revisit when" routes that to correct-course (add a
+    /// parent/child discriminator), and a real captured-hook adapter fixture
+    /// would be the place to catch it. There is no fabricated distinct-child
+    /// fixture here because an invented one would assert nothing about Claude
+    /// Code's actual behavior.
     #[tokio::test(flavor = "current_thread")]
     async fn subagent_activity_never_supersedes_its_parent() {
         let (_tmp, pools) = fresh_pools().await;
         let hub = BroadcastHub::new(64);
         const P: u32 = 6491;
+
+        // A genuine co-PID predecessor that SHOULD be superseded by the parent's
+        // turn — the control that proves supersession is live on P and the
+        // exclusion below is emitter-specific, not a no-op.
+        seed_session(
+            &pools,
+            "claude",
+            "sess-pred",
+            &SessionState {
+                current_state: SessionCurrentState::Idle,
+                last_event_kind: EventKind::Notification,
+                last_event_at_ms: 1_000,
+                last_pid: Some(P),
+                cwd: Some("/repo".to_string()),
+                started_at: Some(500),
+            },
+        )
+        .await;
 
         // The parent session emits a full turn on one PID, including a subagent
         // dispatch (tool_name "Agent"), as PID 6491 / session e0215166 did.
@@ -11470,6 +11517,7 @@ mod story_5_11_supersession {
                 .expect("write parent event");
         }
 
+        // The emitter (parent) is never superseded by its own activity...
         assert_ne!(
             read_state(&pools, "claude", "sess-parent")
                 .await
@@ -11482,6 +11530,21 @@ mod story_5_11_supersession {
                 .await
                 .is_empty(),
             "no synthetic co-PID SessionEnded may be emitted for the emitter"
+        );
+
+        // ...but a genuine OTHER predecessor on the same PID IS superseded, so
+        // the exclusion above is specific to the emitter, not vacuous.
+        assert_eq!(
+            read_state(&pools, "claude", "sess-pred")
+                .await
+                .current_state,
+            SessionCurrentState::Ended,
+            "a genuine co-PID predecessor must still be superseded by the parent"
+        );
+        assert_eq!(
+            ended_reasons(&pools, "claude", "sess-pred").await,
+            vec!["pid_superseded".to_string()],
+            "the predecessor ends with pid_superseded (control: supersession is live on P)"
         );
     }
 
@@ -11533,6 +11596,10 @@ mod story_5_11_supersession {
         let precondition = WritePrecondition {
             expected_current_state: SessionCurrentState::Working,
             expected_last_pid: Some(P),
+            // This AC4 case drives the no-op via the current_state mismatch
+            // (Working snapshot vs the row now at Idle); the monotonic guard is
+            // exercised separately by the #3 same-state test below.
+            expected_last_event_at_ms: None,
         };
         let result = write_if_state_matches(&pools.writer, &hub, envelope, precondition)
             .await
@@ -11549,6 +11616,212 @@ mod story_5_11_supersession {
         assert!(
             ended_reasons(&pools, "claude", "sess-A").await.is_empty(),
             "no SessionEnded row was written under the stale precondition"
+        );
+    }
+
+    /// Review finding #2 / ADR 0009 §7 — `/replay` does NOT run supersession.
+    /// Replaying A(pid P) then B(pid P) through the replay path must leave A
+    /// untouched: the synthetic `SessionEnded` rows live in the log being
+    /// replayed, so re-deriving them from replay arrival order would
+    /// double-generate and could end the current live holder. Contrast
+    /// `successor_supersedes_lone_predecessor`, where the same sequence on the
+    /// LIVE path does end A.
+    #[tokio::test(flavor = "current_thread")]
+    async fn replay_does_not_supersede_predecessor() {
+        let (_tmp, pools) = fresh_pools().await;
+        let hub = BroadcastHub::new(64);
+        const P: u32 = 5150;
+
+        // Replay A then B on the same PID, both via the replay entrypoint.
+        projection::session::write_replayed(
+            &pools.writer,
+            &hub,
+            envelope_with_pid("claude", "sess-A", EventKind::UserPromptSubmit, P),
+        )
+        .await
+        .expect("replay A");
+        projection::session::write_replayed(
+            &pools.writer,
+            &hub,
+            envelope_with_pid("claude", "sess-B", EventKind::UserPromptSubmit, P),
+        )
+        .await
+        .expect("replay B");
+
+        // A is NOT superseded by replay — supersession is live-ingest-only.
+        assert_ne!(
+            read_state(&pools, "claude", "sess-A").await.current_state,
+            SessionCurrentState::Ended,
+            "replay must not auto-supersede A; the log's own SessionEnded rows do that"
+        );
+        assert!(
+            ended_reasons(&pools, "claude", "sess-A").await.is_empty(),
+            "replay generated no synthetic SessionEnded for A"
+        );
+        // A replayed SessionEnded line still ends A through the normal write —
+        // replay re-applies the log faithfully, it just doesn't synthesize new
+        // lifecycle events.
+        projection::session::write_replayed(
+            &pools.writer,
+            &hub,
+            EventEnvelope {
+                pid: Some(P),
+                payload: r#"{"reason":"pid_superseded","pid":5150,"observed_at_ms":1}"#.to_string(),
+                ..envelope_for("claude", "sess-A", EventKind::SessionEnded)
+            },
+        )
+        .await
+        .expect("replay A's recorded SessionEnded");
+        assert_eq!(
+            read_state(&pools, "claude", "sess-A").await.current_state,
+            SessionCurrentState::Ended,
+            "replaying A's OWN recorded SessionEnded ends A (faithful reconstruction)"
+        );
+    }
+
+    /// Review finding #3 — same-state interleaving must not supersede the most
+    /// recent emitter. The `(current_state, last_pid)` precondition alone cannot
+    /// see a victim that emitted again WITHOUT changing either (e.g.
+    /// `Working` → `Working` on the same PID). The optional `last_event_at_ms`
+    /// guard catches it: a synthetic write carrying a stale `last_event_at_ms`
+    /// no-ops, so the session that just emitted survives. Asserted at the
+    /// `write_if_state_matches` seam (the deterministic version of the race).
+    #[tokio::test(flavor = "current_thread")]
+    async fn same_state_interleave_does_not_supersede_recent_emitter() {
+        let (_tmp, pools) = fresh_pools().await;
+        let hub = BroadcastHub::new(64);
+        const P: u32 = 9001;
+
+        // A is live (Working) on P.
+        projection::session::write(
+            &pools.writer,
+            &hub,
+            envelope_with_pid("claude", "sess-A", EventKind::UserPromptSubmit, P),
+        )
+        .await
+        .expect("write A → Working");
+        let actual = read_state(&pools, "claude", "sess-A").await;
+        assert_eq!(actual.current_state, SessionCurrentState::Working);
+
+        // A synthetic SessionEnded carrying the snapshot a supersession scan
+        // would have held — current_state + last_pid still match, but the
+        // monotonic guard is pinned to a STALER last_event_at_ms (as if A
+        // emitted again after the scan). The guard must reject it.
+        let stale_precondition = WritePrecondition {
+            expected_current_state: SessionCurrentState::Working,
+            expected_last_pid: Some(P),
+            expected_last_event_at_ms: Some(actual.last_event_at_ms - 1),
+        };
+        let result = write_if_state_matches(
+            &pools.writer,
+            &hub,
+            EventEnvelope {
+                pid: Some(P),
+                payload: r#"{"reason":"pid_superseded","pid":9001,"observed_at_ms":1}"#.to_string(),
+                ..envelope_for("claude", "sess-A", EventKind::SessionEnded)
+            },
+            stale_precondition,
+        )
+        .await
+        .expect("write_if_state_matches");
+        assert!(
+            result.is_none(),
+            "a stale last_event_at_ms must no-op even when current_state + last_pid match"
+        );
+        assert_ne!(
+            read_state(&pools, "claude", "sess-A").await.current_state,
+            SessionCurrentState::Ended,
+            "the most-recent emitter survives the stale supersession write"
+        );
+        assert!(
+            ended_reasons(&pools, "claude", "sess-A").await.is_empty(),
+            "no SessionEnded row written under the stale monotonic guard"
+        );
+
+        // Positive control: the SAME write with the CURRENT last_event_at_ms
+        // does commit — the guard isn't simply always-failing.
+        let fresh_precondition = WritePrecondition {
+            expected_current_state: SessionCurrentState::Working,
+            expected_last_pid: Some(P),
+            expected_last_event_at_ms: Some(actual.last_event_at_ms),
+        };
+        let ok = write_if_state_matches(
+            &pools.writer,
+            &hub,
+            EventEnvelope {
+                pid: Some(P),
+                payload: r#"{"reason":"pid_superseded","pid":9001,"observed_at_ms":1}"#.to_string(),
+                ..envelope_for("claude", "sess-A", EventKind::SessionEnded)
+            },
+            fresh_precondition,
+        )
+        .await
+        .expect("write_if_state_matches");
+        assert!(
+            ok.is_some(),
+            "a matching last_event_at_ms commits — guard rejects only stale snapshots"
+        );
+    }
+
+    /// Review finding #1 / ADR 0009 §6 — retry-on-next-event. The supersession
+    /// follow-up is best-effort: if it is skipped (daemon crash / transient
+    /// failure) after the successor commits, the predecessor stays stranded.
+    /// The contract is that the successor's NEXT pid-carrying event re-runs
+    /// supersession and recovers it. We model the stranded post-crash state by
+    /// committing A and B on P via the replay path (no supersession), then a
+    /// LIVE B event recovers it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stranded_predecessor_superseded_on_successors_next_event() {
+        let (_tmp, pools) = fresh_pools().await;
+        let hub = BroadcastHub::new(64);
+        const P: u32 = 7012;
+
+        // Simulate "B committed but its supersession follow-up was lost": both
+        // A and B land on P with no supersession (replay path skips it).
+        projection::session::write_replayed(
+            &pools.writer,
+            &hub,
+            envelope_with_pid("claude", "sess-A", EventKind::UserPromptSubmit, P),
+        )
+        .await
+        .expect("strand A on P");
+        projection::session::write_replayed(
+            &pools.writer,
+            &hub,
+            envelope_with_pid("claude", "sess-B", EventKind::UserPromptSubmit, P),
+        )
+        .await
+        .expect("B lands on P without superseding A");
+        assert_ne!(
+            read_state(&pools, "claude", "sess-A").await.current_state,
+            SessionCurrentState::Ended,
+            "precondition: A is stranded non-Ended (supersession was skipped)"
+        );
+
+        // B's NEXT event arrives on the LIVE path — supersession re-runs and
+        // recovers the stranded predecessor.
+        projection::session::write(
+            &pools.writer,
+            &hub,
+            envelope_with_pid("claude", "sess-B", EventKind::PostToolUse, P),
+        )
+        .await
+        .expect("B's next live event");
+
+        assert_eq!(
+            read_state(&pools, "claude", "sess-A").await.current_state,
+            SessionCurrentState::Ended,
+            "the stranded predecessor is recovered on the successor's next event"
+        );
+        assert_eq!(
+            ended_reasons(&pools, "claude", "sess-A").await,
+            vec!["pid_superseded".to_string()],
+            "recovered via pid_superseded"
+        );
+        assert_ne!(
+            read_state(&pools, "claude", "sess-B").await.current_state,
+            SessionCurrentState::Ended,
+            "B (the emitter) is unaffected"
         );
     }
 }

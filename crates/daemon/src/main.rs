@@ -234,7 +234,7 @@ async fn run(config: Config, bowerbird_dir: PathBuf) -> anyhow::Result<()> {
     let adapter = Arc::new(adapter);
 
     let (ingest_tx, ingest_rx) =
-        tokio::sync::mpsc::channel::<protocol::EventEnvelope>(config.ingest_channel_capacity);
+        tokio::sync::mpsc::channel::<ingest::IngestItem>(config.ingest_channel_capacity);
     let ingest_listener = ingest::listener::bind(&config.ingest_sock_path).with_context(|| {
         format!(
             "failed to bind ingest socket {}",

@@ -23,8 +23,10 @@ pub struct AppState {
     /// `ingest::listener::run_bound` as the live-shim ingest path; the clone
     /// here lets the `POST /replay` endpoint (Story 4.1) push envelopes onto
     /// the same channel so replayed events flow through the existing
-    /// `ingest::writer::run` → `projection::session::write` → broadcast path.
-    pub ingest_tx: tokio::sync::mpsc::Sender<protocol::EventEnvelope>,
+    /// `ingest::writer::run` → `projection::session::write*` → broadcast path.
+    /// Items carry an [`crate::ingest::IngestOrigin`] so the writer can run
+    /// PID-supersession for live hooks but skip it for `/replay` (ADR 0009 §7).
+    pub ingest_tx: tokio::sync::mpsc::Sender<crate::ingest::IngestItem>,
 }
 
 /// Small `Copy` snapshot of the WS-specific knobs so per-connection tasks

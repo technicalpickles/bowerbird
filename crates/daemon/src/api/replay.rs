@@ -27,6 +27,7 @@ use axum::response::{IntoResponse, Json, Response};
 use protocol::{Event, EventEnvelope};
 use serde::Serialize;
 
+use crate::ingest::{IngestItem, IngestOrigin};
 use crate::state::AppState;
 
 /// Per-line error in the JSONL request body. The `line` field is 1-based to
@@ -156,7 +157,16 @@ pub async fn run(State(state): State<AppState>, body: Bytes) -> Response {
         // full channel. A `TrySendError::Full` is reported back as a parse
         // error (with a distinct message so a developer can tell the
         // difference between a malformed line and a saturated queue).
-        match state.ingest_tx.try_send(envelope) {
+        //
+        // Tagged `IngestOrigin::Replay` so the ingest writer routes it to the
+        // supersession-free write path (ADR 0009 §7): the synthetic
+        // `SessionEnded { reason: pid_superseded }` rows are already in the log
+        // being replayed, so re-running supersession here would double-generate
+        // them and could end the current live PID holder on replay order.
+        match state.ingest_tx.try_send(IngestItem {
+            envelope,
+            origin: IngestOrigin::Replay,
+        }) {
             Ok(()) => {
                 replayed_count += 1;
                 tracing::debug!(line = line_no, "replay: forwarded envelope");
