@@ -1,14 +1,15 @@
-use protocol::{Event, EventEnvelope, EventId, SessionCurrentState, SessionState};
+use protocol::{Event, EventEnvelope, EventId, EventKind, SessionCurrentState, SessionState};
 use rusqlite::OptionalExtension;
 
 use crate::broadcast::{BroadcastEnvelope, BroadcastHub};
 use crate::db::queries::{
     event_kind_as_str, event_kind_from_db_str, reaction_as_db_string, INSERT_EVENT,
     INSERT_RECORDING_SESSION_STARTED, SELECT_DISTINCT_SESSIONS_FROM_EVENTS,
-    SELECT_EVENT_KINDS_FOR_SESSION, SELECT_SESSION_PROJECTION_STATE,
+    SELECT_EVENT_KINDS_FOR_SESSION, SELECT_NON_SENTINEL_SESSIONS, SELECT_SESSION_PROJECTION_STATE,
     UPDATE_RECORDING_SESSION_ENDED, UPSERT_SESSION_PROJECTION,
 };
 use crate::error::{Error, Result};
+use crate::projection::liveness::{EndedPayload, EndedReason};
 use crate::projection::state::{current_state_for_read, transition};
 
 /// Sentinel `source`/`session_id` for daemon-emitted lifecycle events.
@@ -60,11 +61,246 @@ pub async fn write(
     broadcaster: &BroadcastHub,
     envelope: EventEnvelope,
 ) -> Result<EventId> {
-    write_inner(writer_pool, broadcaster, envelope, None)
+    // Story 5.11 / ADR 0009: capture the fields the supersession follow-up
+    // needs BEFORE `envelope` is moved into `write_inner`. A `SessionEnded`
+    // event does not assert its session is the live PID holder, so it must
+    // never supersede others (guards a replayed/odd `SessionEnded`).
+    let successor_source = envelope.source.clone();
+    let successor_session_id = envelope.session_id.clone();
+    let successor_pid = envelope.pid;
+    let is_session_ended = matches!(envelope.kind, EventKind::SessionEnded);
+
+    let event_id = write_inner(writer_pool, broadcaster, envelope, None)
         .await?
         .ok_or_else(|| {
             Error::Projection("write() with no precondition unexpectedly skipped".into())
-        })
+        })?;
+
+    // Story 5.11 / ADR 0009: event-driven PID supersession. Runs ONLY from
+    // this `write()` path (real ingest + `/replay`), AFTER `write_inner`
+    // committed the primary event and released its writer-pool connection.
+    // Gated on the event carrying a PID and not being a `SessionEnded`. A
+    // failure here is logged inside `supersede_predecessors` and NEVER
+    // propagates — `S′`'s write already succeeded and its `event_id` return
+    // value must be unchanged.
+    if let Some(pid) = successor_pid {
+        if !is_session_ended {
+            supersede_predecessors(
+                writer_pool,
+                broadcaster,
+                &successor_source,
+                &successor_session_id,
+                pid,
+            )
+            .await;
+        }
+    }
+
+    Ok(event_id)
+}
+
+/// Story 5.11 / ADR 0009 — event-driven PID supersession.
+///
+/// Called from [`write`] (real ingest + `/replay`) after the successor `S′`'s
+/// event has committed, when that event carried `pid = Some(P)` and was NOT a
+/// `SessionEnded`. Ends every OTHER non-`Ended` session still claiming `P`:
+/// `S′`'s event proves it is the live holder of the PID, so any predecessor
+/// still on `P` is provably stale — the same observation ADR 0004 makes for
+/// PID death, one step earlier in time (ADR 0009 §1).
+///
+/// CRITICAL placement (do not move down into `write_inner` /
+/// `write_if_state_matches`): supersession runs ONLY from [`write`]. The
+/// liveness probe and supersession's own synthetic `SessionEnded` writes flow
+/// through [`write_if_state_matches`]; keeping supersession out of that path is
+/// what makes a synthetic `SessionEnded` unable to trigger another supersession
+/// pass — no recursion, no re-entrancy bookkeeping (ADR 0009 §3).
+///
+/// Each victim is ended through [`write_if_state_matches`] under the same
+/// precondition discipline the probe uses (Story 5.2 / ADR 0009 §3, AC4): a
+/// concurrent hook or probe write that moved the row makes the synthetic write
+/// no-op (`Ok(None)`) rather than stomp the transition. This is a side effect
+/// of an already-committed primary write — every failure is logged, never
+/// propagated, and never turns `S′`'s successful write into an `Err`.
+///
+/// Subagent gate (ADR 0009 §"The subagent gate", AC5): a Task-tool (`Agent`)
+/// subagent does NOT surface as a distinct co-PID session_id — subagent hooks
+/// carry the PARENT's session_id — so the `(source, session_id) != S′`
+/// exclusion below never matches the emitter, and a session never supersedes
+/// itself on account of its own subagent activity.
+async fn supersede_predecessors(
+    writer_pool: &deadpool_sqlite::Pool,
+    broadcaster: &BroadcastHub,
+    successor_source: &str,
+    successor_session_id: &str,
+    pid: u32,
+) {
+    // CRITICAL: the writer pool is max_size = 1 and `write_if_state_matches`
+    // checks out that same pool. Scope this read connection to JUST the SELECT
+    // and drop it before the per-victim write loop — exactly as the liveness
+    // probe does (liveness.rs:128) — or the loop deadlocks on its own held
+    // connection.
+    //
+    // Perf: `last_pid` lives inside the serialized `SessionState` JSON (no SQL
+    // column), so this scans + deserializes every non-sentinel row once per
+    // PID-carrying forward event — O(active sessions). Acceptable for V1 (the
+    // ingest path already deserializes `prev_state`); revisit with a
+    // `json_extract` index only if dogfooding shows a hot-path regression
+    // (ADR 0009 / story Dev Notes — a follow-up bean, not scope here).
+    let rows: Vec<(String, String, String)> = {
+        let conn = match writer_pool.get().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    pid,
+                    "supersession: writer pool get failed; skipping (primary write already committed)"
+                );
+                return;
+            }
+        };
+        // SELECT shape from queries.rs: (source, session_id, state, updated_at).
+        let res = conn
+            .interact(|c| -> rusqlite::Result<Vec<(String, String, String)>> {
+                let mut stmt = c.prepare(SELECT_NON_SENTINEL_SESSIONS)?;
+                let mapped = stmt.query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })?;
+                mapped.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await;
+        match res {
+            Ok(Ok(rows)) => rows,
+            Ok(Err(e)) => {
+                tracing::error!(error = %e, pid, "supersession: victim SELECT failed; skipping");
+                return;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, pid, "supersession: interact failed; skipping");
+                return;
+            }
+        }
+        // conn dropped here; the borrow returns to the pool before the loop.
+    };
+
+    let observed_at_ms = match current_unix_millis() {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = ?e, pid, "supersession: clock read failed; skipping");
+            return;
+        }
+    };
+
+    let mut emitted = 0usize;
+    let mut skipped_stale = 0usize;
+    let mut failed = 0usize;
+
+    for (source, session_id, state_json) in rows {
+        // Never supersede the emitter — only OTHER sessions claiming P
+        // (ADR 0009 §5 + the subagent gate, AC5).
+        if source == successor_source && session_id == successor_session_id {
+            continue;
+        }
+        let stored: SessionState = match serde_json::from_str(&state_json) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    source = %source,
+                    session_id = %session_id,
+                    "supersession: session_projections.state failed to deserialize; skipping row"
+                );
+                continue;
+            }
+        };
+        // Victim = a non-`Ended` session still claiming P. An already-`Ended`
+        // row is excluded (idempotence, AC2); a different PID is irrelevant.
+        if stored.current_state == SessionCurrentState::Ended || stored.last_pid != Some(pid) {
+            continue;
+        }
+
+        let payload = EndedPayload {
+            reason: EndedReason::PidSuperseded,
+            pid: Some(pid),
+            observed_at_ms,
+        };
+        let payload_str = match serde_json::to_string(&payload) {
+            Ok(s) => s,
+            Err(e) => {
+                failed += 1;
+                tracing::error!(
+                    error = %e,
+                    source = %source,
+                    session_id = %session_id,
+                    "supersession: SessionEnded payload serialize failed"
+                );
+                continue;
+            }
+        };
+        // Mirror the probe's synthetic envelope (liveness.rs:204-219): the
+        // envelope's `pid` is P, so last_pid carry-forward keeps the victim's
+        // last_pid intact, and `cwd: None` lets carry-forward preserve its
+        // last-known location.
+        let envelope = EventEnvelope {
+            source: source.clone(),
+            session_id: session_id.clone(),
+            kind: EventKind::SessionEnded,
+            reaction: None,
+            payload: payload_str,
+            pid: Some(pid),
+            notification_type: None,
+            cwd: None,
+        };
+        // Same precondition discipline as the probe: yield to any concurrent
+        // write that moved the row between the SELECT above and now (AC4).
+        let precondition = WritePrecondition {
+            expected_current_state: stored.current_state,
+            expected_last_pid: Some(pid),
+        };
+        match write_if_state_matches(writer_pool, broadcaster, envelope, precondition).await {
+            Ok(Some(_)) => {
+                emitted += 1;
+                tracing::info!(
+                    source = %source,
+                    session_id = %session_id,
+                    pid,
+                    "supersession: emitted SessionEnded(pid_superseded) for predecessor"
+                );
+            }
+            Ok(None) => {
+                skipped_stale += 1;
+                tracing::debug!(
+                    source = %source,
+                    session_id = %session_id,
+                    "supersession: row changed since SELECT; yielding to concurrent write"
+                );
+            }
+            Err(e) => {
+                failed += 1;
+                tracing::error!(
+                    error = ?e,
+                    source = %source,
+                    session_id = %session_id,
+                    "supersession: write(SessionEnded) failed; continuing with remaining victims"
+                );
+            }
+        }
+    }
+
+    if emitted > 0 || failed > 0 {
+        tracing::info!(
+            emitted,
+            skipped_stale,
+            failed,
+            pid,
+            successor_source = %successor_source,
+            successor_session_id = %successor_session_id,
+            "supersession: scan complete"
+        );
+    }
 }
 
 /// Conditional variant of [`write`] used by the liveness probe. Re-reads the

@@ -38,9 +38,15 @@ pub(crate) const PROBE_CADENCE: Duration = Duration::from_secs(5);
 /// The wire payload is mechanical fact only: which observation triggered the
 /// emission. Presenter-side interpretation (e.g. "hide ended sessions" vs
 /// "dim them") lives in the presenter, per Axiom 1.
+///
+/// `pub(crate)` so `projection::session` can construct the synthetic payload
+/// for the event-driven supersession write (Story 5.11 / ADR 0009). The enum
+/// stays here — ADR 0009 §2 records that `liveness.rs` is its home — because
+/// it is the home of the daemon's "why this session ended" vocabulary, whether
+/// the observation is probe-driven (PID death) or event-driven (PID rollover).
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum EndedReason {
+pub(crate) enum EndedReason {
     /// `last_pid IS NULL` at probe time. Either pre-migration legacy row OR a
     /// session that ingested before Story 5.3 shipped (the `bowerbird_ppid`
     /// injection didn't yet exist).
@@ -48,13 +54,19 @@ enum EndedReason {
     /// `kill(last_pid, 0)` returned ESRCH — the OS confirms the process is
     /// gone.
     PidDead,
+    /// The session's PID rolled over to a newer session_id, observed at
+    /// event-ingest time (NOT OS-confirmed dead). Emitted event-driven from the
+    /// projection write path (Story 5.11 / ADR 0009), not by the probe: when a
+    /// successor session emits on this PID, the predecessor still claiming it is
+    /// provably stale. One step earlier in time than `PidDead`.
+    PidSuperseded,
 }
 
 #[derive(Debug, Serialize)]
-struct EndedPayload {
-    reason: EndedReason,
-    pid: Option<u32>,
-    observed_at_ms: i64,
+pub(crate) struct EndedPayload {
+    pub(crate) reason: EndedReason,
+    pub(crate) pid: Option<u32>,
+    pub(crate) observed_at_ms: i64,
 }
 
 /// Outcome of one probe iteration. Splits "emitted SessionEnded" from

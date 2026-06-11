@@ -1,0 +1,178 @@
+# Story 5.11: Session PID supersession — end rolled-over predecessor sessions
+
+Status: in-progress
+
+<!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
+
+## Story
+
+As a presenter consumer,
+I want a session to be ended the moment its `claude` PID rolls to a newer session_id,
+so that rolled-over predecessors don't linger as stale, live-looking sessions that never age out.
+
+## Context
+
+bowerbird's liveness probe (`crates/daemon/src/projection/liveness.rs`, Story 5.3 / ADR 0004) only ends a session when its `last_pid` is a **dead** OS process (`kill(pid, 0) == ESRCH` → `EndedReason::PidDead`, or `last_pid IS NULL` → `NoPidAtUpgrade`). But a single live `claude` PID hosts **many** session_ids over its lifetime: `/clear`, `claude --resume`, and compaction all roll the session_id forward while keeping the same OS process. So every rolled-over predecessor session stays non-`Ended` indefinitely — its `last_pid` is still a live process (the newest session is keeping it alive), so the death probe never fires for it. It renders on every presenter (deck, pickletown web) as a live-looking session that will never age out.
+
+**Live proof (2026-06-11, against the running daemon's `~/.bowerbird/bower.db`):** PID 88706 was one live `claude` process backing **4** bowerbird sessions — 1 current `WaitingInput` plus 3 stale `Idle` predecessors, the oldest last emitting 2026-06-10 21:53 (~13h stale). 42 multi-session PIDs existed in the event log.
+
+The fix is the same reframe ADR 0004 used for PID death, applied one step earlier: *a session_id rolling to a successor on the same PID is a mechanical fact — the successor's event literally carries that PID. Observing the rollover is equivalent in nature to observing PID death.* The daemon can end the predecessor the instant it sees the successor emit, instead of waiting for the OS to reap the PID. This is **event-driven** (in the projection write path), not probe-driven; the probe stays the safety net for genuine PID death.
+
+This is a dogfooding-validation-phase finding in the family of Stories 5.2 / 5.3 / 5.6 — nothing shipped is wrong; the probe's PID-death rule is correct as far as it goes, it just doesn't cover the **one-live-PID-many-sessions** case. Trigger: bean `gt-e9dc`; decision: **ADR 0009** (extends ADR 0004); proposal: `sprint-change-proposal-2026-06-11-pid-supersession.md`.
+
+**Verification gate — RESOLVED (PASS).** The rule is only sound if Task-tool subagents do **not** surface as distinct session_ids sharing the parent PID (otherwise parent and subagent would supersede each other — a ping-pong). Checked against live data: PID 6491 hosted session `e0215166`, which fired **42 `Agent` (subagent) dispatches** on 2026-06-11, and the **only** session_id ever recorded on PID 6491 is `e0215166`. Zero distinct child sessions. Subagent hooks carry the *parent's* session_id. (Note: the Task-tool is named `Agent` in current Claude Code; `Task*` tool_names are todo-tracking, not subagents.) This evidence is a load-bearing premise — AC5 carries a regression guard so a future Claude Code change to the subagent model fails loudly rather than silently re-introducing the ping-pong.
+
+## Acceptance Criteria
+
+1. **AC1 — rollover supersedes the predecessor.** Given live PID `P` backing a non-`Ended` session `A`, when an ingested event for a *different* session `B` arrives carrying PID `P`, then `A` transitions to `Ended` with a `SessionEnded` event whose payload `reason == "pid_superseded"` (`pid: Some(P)`, `observed_at_ms` set), and `B` is unaffected. When **multiple** other non-`Ended` sessions claim `P` (the 3-predecessor pile-up), every one of them is superseded.
+
+2. **AC2 — idempotent.** Re-ingesting `B`'s event (or any further event for `B` on `P`) does NOT re-emit a second `SessionEnded` for `A`: once `A` is `Ended` it is excluded from the supersession scan, and Story 5.2's publish-only-on-change rule would suppress a duplicate State frame regardless. No duplicate `SessionEnded` events accumulate in the log for a stable predecessor.
+
+3. **AC3 — reversible on resume.** If a superseded predecessor `A` is later `claude --resume`d (a new event for `A` arrives on some PID), `A` un-ends through the normal write path (the path ADR 0004 §1 relies on — `Ended` is non-terminal), and `A` — now the live session on that PID — then supersedes whatever non-`Ended` session currently claims it. The `A → B → A-resumed` sequence (observed live on PID 4944) lands correctly: whoever emitted most recently on the PID is the survivor.
+
+4. **AC4 — coexists with the probe, no race, no double-emit.** Each synthetic `SessionEnded` is written through `write_if_state_matches` under the same precondition discipline the probe uses (`expected_current_state` + `expected_last_pid` must still match the scanned snapshot inside the txn). A concurrent real hook event or a concurrent probe write that moved the predecessor causes the supersession write to no-op (`Ok(None)`) rather than stomp the transition. Supersession never produces a `PidDead`/`NoPidAtUpgrade` duplicate for the same row.
+
+5. **AC5 — subagent never supersedes its parent (regression guard for the verified gate).** A session that dispatches Task-tool (`Agent`) subagents — i.e. emits many events on one PID, including tool-use events whose tool_name is `Agent` — never supersedes itself, and no synthetic co-PID `SessionEnded` is emitted for the parent on account of its own subagent activity. The rule supersedes only *other* sessions claiming the PID, never the emitter (`S′`). This test pins the §"subagent gate" premise so a future regression fails loudly.
+
+6. **AC6 — docs + gates green.** `docs/protocol.md` extends the `SessionEnded` payload `reason` enumeration to list `pid_superseded` alongside `pid_dead` / `no_pid_at_upgrade`, framed as a mechanical fact (Axiom 4). `docs/protocol-changelog.md` gains one `type: behavioral` entry (additive `reason` value, opaque-string-safe). ADR 0009 is referenced. Workspace tests + `cargo fmt --check` + `clippy -D warnings` + the changelog gate are green.
+
+## Tasks / Subtasks
+
+- [x] **Task 1 — add `EndedReason::PidSuperseded` and expose the payload type (AC1, AC6)**
+  - [x] In `crates/daemon/src/projection/liveness.rs`, add the `PidSuperseded` variant to the `EndedReason` enum (it stays `#[serde(rename_all = "snake_case")]` → wire value `"pid_superseded"`). Keep the existing doc-comment style; document it as "the session's PID rolled over to a newer session_id (observed at event-ingest time), not OS-confirmed dead."
+  - [x] Change `EndedReason` and `EndedPayload` from private to `pub(crate)` (and their fields as needed) so `projection::session` can construct the synthetic payload. Do NOT relocate the enum — ADR 0009 §2 records that it lives in `liveness.rs`. Update the `liveness.rs` module/probe doc comments only if the visibility change reads oddly.
+  - [x] `cargo build -p bowerbird-daemon` to confirm the enum/visibility change compiles before wiring the emission site.
+
+- [x] **Task 2 — emit supersession in the projection write path (AC1, AC4, AC5)**
+  - [x] In `crates/daemon/src/projection/session.rs`, add an event-driven supersession step that runs **only from the public `write()` path** (real ingest + `/replay`), AFTER `write_inner` commits `S′`'s event and releases its writer-pool connection. Do NOT run it from `write_if_state_matches` — that is the probe's and supersession's own emission path; running it there would recurse. (See Dev Notes "Where the emission lives" for why this placement is load-bearing.)
+  - [x] Gate the step: run only when the just-written envelope carried `pid = Some(P)` AND `kind != EventKind::SessionEnded` (a `SessionEnded` event does not claim its session is live, so it must not supersede others — guards a replayed/odd `SessionEnded`).
+  - [x] Scan for victims: read non-sentinel session rows (reuse `SELECT_NON_SENTINEL_SESSIONS`), deserialize each `SessionState`, and select every row where `current_state != Ended` AND `last_pid == Some(P)` AND `(source, session_id) != (S′.source, S′.session_id)`. Scope the read-connection checkout to just the SELECT (the writer pool is `max_size = 1` — never hold it across the per-victim `write_if_state_matches` calls; mirror the probe's connection-scoping comment in `liveness.rs:128`).
+  - [x] For each victim, build a synthetic `SessionEnded` `EventEnvelope` (`reason: PidSuperseded`, `pid: Some(P)`, `observed_at_ms` from `current_unix_millis()`, `cwd: None` so carry-forward preserves the victim's last-known cwd — mirror `liveness.rs:204-219`) and write it via `write_if_state_matches` with `WritePrecondition { expected_current_state: <victim's current_state>, expected_last_pid: Some(P) }`. Count emitted / skipped_stale / failed and `tracing`-log per the probe's pattern; a per-victim write failure is logged and does not abort the remaining victims or fail `S′`'s already-committed write.
+  - [x] Confirm `S′`'s own `Ok(event_id)` return value is unchanged — supersession is a side effect appended after the primary write succeeds; a supersession failure must NOT turn `S′`'s successful write into an `Err`.
+
+- [x] **Task 3 — protocol docs + changelog (AC6)**
+  - [x] `docs/protocol.md`: in the `SessionEnded` payload description (the `reason` enumeration near `:291`/the line documenting `{"reason":"no_pid_at_upgrade"|"pid_dead",...}`), add `pid_superseded` and one sentence framing it as a mechanical fact ("the session's PID was observed to roll over to a newer session_id; interpretation — hide vs dim — is the presenter's, Axiom 4"). Also extend the `last_pid` narrative if it asserts the only way a session ends is PID death.
+  - [x] `docs/protocol-changelog.md`: add one `type: behavioral` entry under the active version section — additive `reason` value, opaque-string-safe, presenters switching on `reason` only need to handle it if they want distinct rendering; cite Story 5.11 + ADR 0009. (Note: this story touches **no** `crates/protocol/src/*.rs`, so the CI changelog gate is not *triggered* by a protocol-source diff — add the entry anyway for the documentation contract; see Dev Notes.)
+
+- [x] **Task 4 — regression tests (AC1–AC5)**
+  - [x] In `crates/daemon/tests/contract_daemon.rs`, add tests using the existing `fresh_pools()` / `BroadcastHub::new()` / `envelope_for*` / `read_session_state` helpers (see the `notification_after_ended_resurrects_to_idle_state` test at `:1764` for the established shape). You will need an envelope helper that carries a specific `pid` — extend/add one if `envelope_for` doesn't already let you set `pid` (the probe tests at `:3617`/`:4443` construct `SessionState { last_pid, .. }` directly; for ingest you set `EventEnvelope.pid`).
+  - [x] **AC1:** write event for A on PID P → assert A is non-Ended; write event for B on PID P → assert A is now `Ended` with a `SessionEnded` event whose payload `reason == "pid_superseded"`, and B is unaffected. Add a multi-predecessor variant (A1, A2, A3 all on P, then B) asserting all three end.
+  - [x] **AC2 (idempotent):** subscribe to the hub after B's first event, re-ingest B's event, assert no second `SessionEnded` for A is published and no duplicate row lands in `events`.
+  - [x] **AC3 (resume):** A on P → B on P (A ended) → A on P again → assert A un-ends (e.g. `Working`) AND B is now `Ended` with `reason == "pid_superseded"`.
+  - [x] **AC4 (precondition):** drive the `write_if_state_matches` no-op path — e.g. supersession scan observes A at `(Idle, P)`, but A's row is moved by an interleaving write before the synthetic write commits; assert the synthetic write returns `Ok(None)` and A keeps the interleaved state, no duplicate `SessionEnded`. (Model it on the probe's finding-#2 yield behavior; a deterministic seam may require asserting at the `write_if_state_matches` level rather than racing real concurrency.)
+  - [x] **AC5 (subagent gate):** a single session emits a sequence including a tool-use event whose tool_name is `Agent` (subagent dispatch), all on PID P; assert the session is never superseded by its own activity and no synthetic co-PID `SessionEnded` is emitted for it. Name the test so its intent (the verified gate) is obvious, and add a comment pointing at ADR 0009 §"The subagent gate".
+
+- [x] **Task 5 — dogfood + final gates (AC6)**
+  - [x] Run `cargo test -p bowerbird-daemon` (and `cargo test --workspace -- --test-threads=1`, timeout-guarded — see Dev Notes "Testing standards" for the known intermittent contract-suite hang).
+  - [x] `cargo fmt --check` + `cargo clippy --all-targets -p bowerbird-daemon -D warnings` + the changelog gate (`cargo test --workspace -- --test-threads=1` runs `protocol_changelog_gate`).
+  - [~] **Live dogfood deferred to maintainer (2026-06-11 dev-story call).** The supersession mechanism is validated end-to-end through the real `write()`→`write_if_state_matches`→SQLite→broadcast path by the six `story_5_11_supersession` contract tests (AC1–AC5). The *live-daemon* dogfood (cargo install → daemon restart [Keychain prompt] → roll a session via `/clear`/resume → watch PID 88706's predecessors drain on deck/web) was deferred to the maintainer per pickles' choice — it is part of the ongoing dogfooding-validation-phase that gates the v0.1.0 tag (Story 5.15), not this story's review. See Completion Notes.
+  - [x] Move bean `gt-e9dc` toward `in-progress`/`done` per its lifecycle (moved → `in-progress`); leave `gt-043a` (view-side backstop) out of scope.
+
+### Review Findings
+
+- [ ] [Review][Decision] Choose a durable supersession completion model — `projection::session::write` commits the successor event first (`crates/daemon/src/projection/session.rs:73-99`) and only then runs `supersede_predecessors`; failures in the follow-up path are logged and swallowed (`session.rs:150-194`, `session.rs:281-289`). If the daemon crashes after the successor commit, or if pool checkout / victim SELECT / clock read fails, the predecessor-ending write is skipped after the successor is already durable. Startup `rebuild_missing_projections` only rebuilds absent projection rows, and the liveness probe skips non-`Ended` rows with a live `last_pid`, so a predecessor can remain live-looking indefinitely if the successor emits no later PID-carrying event. This weakens AC1's "when B arrives, A transitions to Ended" guarantee. Pick the intended model before patching: make successor+victim writes atomic, add a durable startup/probe co-PID reconciliation pass, or explicitly accept "retry on next successor event" as the product contract and update ADR/story/docs/tests to name that residual risk.
+
+- [ ] [Review][Decision] Define `/replay` supersession semantics before patching — `POST /replay` reconstructs `EventEnvelope`s from stored `Event` rows and pushes them through the same ingest writer (`crates/daemon/src/api/replay.rs:133-160`, `crates/daemon/src/ingest/writer.rs:23`), and the new `write()` path deliberately runs supersession for both live ingest and `/replay` (`crates/daemon/src/projection/session.rs:79-96`). That creates two ambiguous replay behaviors: replaying a log that already contains `A(pid P)`, `B(pid P)`, and the original synthetic `A SessionEnded(pid_superseded)` auto-generates a new synthetic `A SessionEnded` while processing `B`, then inserts the replayed synthetic line too; replaying older co-PID history into a live DB can also mark the current live holder `Ended` based solely on replay arrival order. Choose the contract: suppress supersession during replay, detect/dedupe already-recorded synthetic lifecycle rows, reserve supersession replay for ordered full rebuilds only, or document that `/replay` is order-authoritative and may generate new lifecycle events. Add regression coverage for the chosen behavior.
+
+- [ ] [Review][Patch] Add a row-version guard for same-state interleavings in supersession preconditions [crates/daemon/src/projection/session.rs:149] — the victim scan reads `SELECT_NON_SENTINEL_SESSIONS` but discards `updated_at`, then `write_if_state_matches` checks only `expected_current_state` and `expected_last_pid` (`session.rs:257-263`). AC4's new test covers an interleaving that changes state (`Working` -> `Idle`), but a real hook can arrive after the supersession SELECT and keep both values unchanged (for example `Working` -> `Working` on the same PID). In that case the stale synthetic `SessionEnded` still passes the precondition and ends the session that emitted most recently, violating the "whoever emitted most recently on the PID is the survivor" rule. Extend `WritePrecondition` with a monotonic row/event guard (`updated_at`, `last_event_at_ms`, or event id) and add a regression test where the interleaving write preserves `current_state` and `last_pid`.
+
+- [ ] [Review][Patch] Strengthen the AC5 subagent regression guard beyond same-session self-exclusion [crates/daemon/tests/contract_daemon.rs:11462] — the current test writes `tool_name: "Agent"` events for the same `sess-parent` session_id, so it proves only the exact emitter exclusion (`crates/daemon/src/projection/session.rs:201-205`). It would still pass if the payload were ignored, and it would not catch the dangerous future shape described by ADR 0009 / AC5: a subagent surfacing as a distinct co-PID `session_id`. Add coverage closer to the load-bearing premise, such as an adapter/normalization fixture from a real Task-tool subagent hook proving the normalized `session_id` remains the parent, or a deliberate distinct-child co-PID fixture that fails loudly / forces correct-course until a real parent-child discriminator exists. If the intended behavior is to support distinct child sessions, add the discriminator before superseding rather than relying on `(source, session_id) != successor` alone.
+
+- [ ] [Review][Patch] Update the remaining protocol docs that still define `Ended` as PID death only [docs/protocol.md:317] — the new `SessionEnded` payload paragraph documents `pid_superseded` (`docs/protocol.md:291`), but the `SessionCurrentState` paragraph still says `Ended` means "the session's `last_pid` is no longer a live OS process," and the EventKind table still says `SessionEnded` is emitted by the 5-second liveness probe when `last_pid` is no longer live (`docs/protocol.md:400`). That contradicts Story 5.11, where a session can be `Ended` while the PID remains alive because it rolled to a newer session. Reword both locations so `Ended` means a daemon-observed session end, with reason-specific details (`no_pid_at_upgrade`, `pid_dead`, `pid_superseded`) in the `SessionEnded` payload.
+
+- [ ] [Review][Patch] Update `project-context.md` or explicitly mark it stale for ADR 0009 [docs/decisions/0009-pid-supersession.md:8] — ADR 0009 declares affected context sections (`Durability and chaos`, `Wire format: JSON via serde`, `Substrate-not-actor invariants`), and the project-context maintenance rule requires those sections to be updated in the same PR or explicitly marked stale (`docs/bmad/project-context.md:76`). This diff does not touch `docs/bmad/project-context.md`, and the story's Project Structure Notes list only `docs/protocol.md` and `docs/protocol-changelog.md` for docs changes. Update the named sections with the PID-supersession model, or add an explicit ADR/story note saying those sections are stale until the next context pass.
+
+## Dev Notes
+
+### What this story changes (and what it must NOT break)
+
+**`crates/daemon/src/projection/session.rs::write` — the emission site.** Today `write()` is a thin wrapper that calls `write_inner(.., None)` and unwraps the `Option`. After this story it also runs the supersession follow-up. Read `write_inner` end-to-end (`session.rs:100-336`) before touching it:
+
+- The function reads `prev_state` inside the txn, runs `transition()`, does **exactly two writes** (UPSERT projection + INSERT event) per architecture.md §634-641, commits, then post-commit publishes one `Event` envelope followed by zero-or-one `State` envelope (State only when `current_state` changed — Story 5.2). **Do not add a third write to this transaction.** Supersession is a *separate* set of transactions, each through `write_if_state_matches`, run after `write_inner` returns. That preserves the two-writes invariant and gives each superseded session its own correct Event+State broadcast pair.
+- The writer pool is `max_size = 1`. `write_if_state_matches` checks out that same pool. You therefore cannot hold a read connection across the per-victim writes — scope the victim-scan SELECT's connection checkout tightly and drop it before the loop, exactly as the probe does (`liveness.rs:128-153`, including its CRITICAL comment).
+
+**Where the emission lives (recursion guard).** Run supersession **only from `write()`**, never from `write_if_state_matches`. Real ingest events and `/replay` flow through `write()`; the liveness probe and supersession's own synthetic `SessionEnded` writes flow through `write_if_state_matches`. Keeping supersession out of `write_if_state_matches` means a synthetic `SessionEnded` cannot trigger another supersession pass — no recursion, no need for re-entrancy bookkeeping. This is the cleanest place to draw the line; document it in a code comment so a future refactor doesn't move supersession "down" into `write_inner`/`write_if_state_matches` and reintroduce recursion.
+
+**Gate on `kind != SessionEnded` and `pid.is_some()`.** A `SessionEnded` event (e.g. one arriving via `/replay`) does not assert its session is the live holder of the PID, so it must not supersede others. And a no-PID event has nothing to key on. Both guards also keep the scan off the hot path when there's nothing to do.
+
+**Soundness (why ending the predecessor is safe).** At any instant a live PID maps to exactly one OS process, and (gate-verified) one `claude` process surfaces as exactly one bowerbird session_id at a time. So when `S′` emits on `P`, any *other* non-`Ended` session still claiming `P` is provably stale. Same observation ADR 0004 relies on for `PidDead`, one step earlier in time. [Source: docs/decisions/0009-pid-supersession.md#Decision]
+
+**Idempotence and resume fall out of the existing machinery — but must be tested.** Idempotence: once a predecessor is `Ended` it is excluded from the victim scan (`current_state != Ended` filter), and Story 5.2's publish-only-on-change suppresses a duplicate State even if it weren't. Resume: `Ended` is non-terminal (ADR 0004 §1) — a resumed predecessor's event un-ends it via `transition()`'s normal arms, and because that event carries the PID, the same supersession step then ends whoever currently claims it. You are not *writing* new resume logic; you are *proving* the existing write path already does the right thing (ACs 2 and 3). [Source: docs/decisions/0009-pid-supersession.md#4]
+
+**The subagent gate is load-bearing.** Do not weaken AC5 into a trivial assertion. The premise "a subagent does not register as a distinct co-PID session" is what makes supersession sound; the regression test exists so a future Claude Code release that changes subagent surfacing fails this suite instead of silently ping-ponging parent↔subagent. If you find during implementation that subagents *do* surface as distinct co-PID session_ids, STOP — that invalidates ADR 0009's decision and is a correct-course trigger, not something to code around. [Source: docs/decisions/0009-pid-supersession.md#The subagent gate]
+
+### Finding the victims — query approach + a perf note
+
+`last_pid` lives inside the serialized `SessionState` JSON in the `session_projections.state` column; there is no `last_pid` SQL column. The straightforward approach (and the one consistent with the probe) is to SELECT non-sentinel rows via `SELECT_NON_SENTINEL_SESSIONS`, deserialize each state, and filter in Rust. This runs once per ingested PID-carrying forward event and is O(active sessions) per event. On a graveyard of ~174 sessions that's ~174 deserializes per event — acceptable for V1 (the ingest path already does one SELECT + deserialize for `prev_state`), but worth a one-line `tracing` note and a code comment. **Do not** prematurely add a `last_pid` column or a `json_extract` index for this story unless dogfooding shows a real hot-path regression; if it does, that's a follow-up bean, not scope creep here. (If you prefer, a `WHERE json_extract(state, '$.last_pid') = ?1 AND json_extract(state, '$.current_state') != 'Ended'` query is available since SQLite ships JSON1 — but verify the stored key names match the serde field names before relying on it, and keep the Rust-side `(source,session_id) != S′` exclusion regardless.)
+
+### Synthetic envelope shape — mirror the probe exactly
+
+The probe's `EndedPayload`/`EventEnvelope` construction at `liveness.rs:196-219` is the template: `kind: EventKind::SessionEnded`, `reaction: None`, `payload: serde_json::to_string(&EndedPayload { reason: PidSuperseded, pid: Some(P), observed_at_ms })`, `pid: Some(P)` (carry-forward keeps the victim's `last_pid == P`), `notification_type: None`, `cwd: None`. The `write_if_state_matches` precondition is `WritePrecondition { expected_current_state: <victim current_state>, expected_last_pid: Some(P) }`. [Source: crates/daemon/src/projection/liveness.rs#probe_once]
+
+### No schema migration, no protocol-crate change
+
+This story adds **no** SQLite migration (no new column) and touches **no** `crates/protocol/src/*.rs`. `EndedReason` is a daemon-internal enum serialized into the event `payload` string; the wire `reason` is just JSON inside that string. Consequence for the CI changelog gate: the gate (`tests/protocol_changelog_gate.rs`) fires on diffs to `crates/protocol/src/*.rs`, so it will NOT *force* an entry for this story. Add the `type: behavioral` entry anyway (AC6) — it is the documentation contract ADR 0009 §Consequences calls for, and it keeps the `reason` enumeration's history complete. [Source: docs/decisions/0009-pid-supersession.md#Consequences]
+
+### Project Structure Notes
+
+- All production code lands in `crates/daemon/src/projection/{liveness.rs,session.rs}`. No new files. No CLI, no shim, no adapter, no protocol-crate change.
+- Tests land in `crates/daemon/tests/contract_daemon.rs` alongside the existing liveness/projection contract tests.
+- Docs: `docs/protocol.md` + `docs/protocol-changelog.md` only (ADR 0009 already authored at `docs/decisions/0009-pid-supersession.md`).
+- No conflict with the unified structure; this mirrors how Stories 5.2 (`write_if_state_matches` discipline) and 5.3 (probe + `last_pid`) landed.
+
+### Testing standards summary
+
+- Framework: Rust `#[tokio::test(flavor = "current_thread")]` integration tests in `crates/daemon/tests/contract_daemon.rs`, using `fresh_pools()` for an isolated tempdir DB + `BroadcastHub` for publish assertions. Subscribe to the hub *after* setup writes so you observe only the writes under test (pattern at `contract_daemon.rs:1789`).
+- **Known intermittent hang:** `cargo test --workspace -- --test-threads=1` can hang on the daemon contract suite on this host (Story 5.3 known issue, `docs/research/test-isolation-bowerbird-findings.md`). Prefer `cargo test -p bowerbird-daemon` for the inner loop and always timeout-guard the full-workspace run. This story touches only daemon code, so the daemon-package suite is the authoritative signal. [Source: project memory — workspace test hang]
+- Assert on both the persisted projection (`read_session_state` → parse `SessionState`) and the broadcast frames (the hub `rx`), since the contract is "ends the predecessor" (state) AND "emits `SessionEnded`" (event) AND "publishes the transition" (State frame, gated by Story 5.2).
+
+### References
+
+- [Source: docs/decisions/0009-pid-supersession.md] — the decision, soundness argument, subagent gate, resume/idempotence semantics, alternatives, "revisit when."
+- [Source: docs/bmad/planning-artifacts/sprint-change-proposal-2026-06-11-pid-supersession.md#4.1] — story intent + the six ACs this file derives from.
+- [Source: crates/daemon/src/projection/liveness.rs] — `EndedReason` enum (extend here), `EndedPayload`, `probe_once` synthetic-envelope + `write_if_state_matches` precondition pattern, writer-pool connection-scoping (the CRITICAL comment), `is_pid_alive`.
+- [Source: crates/daemon/src/projection/session.rs] — `write` (add supersession here), `write_if_state_matches` (reuse, do NOT trigger supersession from it), `write_inner` two-writes-then-publish invariant + Story 5.2 publish-only-on-change.
+- [Source: crates/daemon/src/db/queries.rs] — `SELECT_NON_SENTINEL_SESSIONS` (victim scan), `INSERT_EVENT`/`UPSERT_SESSION_PROJECTION` shapes.
+- [Source: crates/daemon/tests/contract_daemon.rs:1764] — `notification_after_ended_resurrects_to_idle_state`, the established Ended-transition test shape + helpers.
+- [Source: docs/protocol.md] — `SessionEnded` payload `reason` enumeration (extend) + `last_pid` narrative.
+- [Source: docs/decisions/0004-daemon-observed-session-liveness.md] — the liveness model this extends (non-terminal `Ended`, `write_if_state_matches`).
+- [Source: docs/protocol-changelog.md] — Story 5.3 `SessionEnded` entries show the house style for the `type: behavioral` entry to add.
+- Beans: `gt-e9dc` (trigger + resolved verification gate), `gt-043a` (view-side backstop, out of scope).
+
+## Dev Agent Record
+
+### Agent Model Used
+
+claude-opus-4-8[1m] (Amelia, bmad-dev-story) — 2026-06-11.
+
+### Debug Log References
+
+- `cargo build -p bowerbird-daemon` after Task 1 (enum + visibility): compiled with the expected `variant PidSuperseded is never constructed` dead-code warning; warning cleared after Task 2 wired the emission site.
+- `cargo test -p bowerbird-daemon --test contract_daemon story_5_11_supersession`: 6 passed.
+- `cargo fmt` applied one reformat to the new test module (chained `.await` wraps); `cargo fmt --check` clean after.
+- `cargo clippy --all-targets -p bowerbird-daemon -- -D warnings`: no issues.
+- `cargo test -p bowerbird-daemon`: 317 passed (4 suites).
+- `cargo test --test protocol_changelog_gate -- --test-threads=1`: 1 passed.
+- `timeout 420 cargo test --workspace -- --test-threads=1`: completed (no intermittent hang this run), zero failures across all crates/suites/doc-tests. (Known intermittent daemon-contract hang — Story 5.3 / project memory — did not manifest.)
+
+### Completion Notes List
+
+- **Task 1.** Added `EndedReason::PidSuperseded` (snake_case → wire `"pid_superseded"`) and made `EndedReason` + `EndedPayload` (and its fields) `pub(crate)` in `liveness.rs` so `projection::session` can construct the synthetic payload. Enum stays in `liveness.rs` per ADR 0009 §2; expanded its doc comment to frame it as the daemon's "why a session ended" vocabulary across both probe-driven (PID death) and event-driven (PID rollover) observations.
+- **Task 2.** Added `supersede_predecessors()` in `session.rs`, invoked from `write()` ONLY (never `write_if_state_matches`) after `write_inner` commits and releases its connection — the recursion guard ADR 0009 §3 / Dev Notes require. Gated on `pid.is_some() && kind != SessionEnded`. Scans `SELECT_NON_SENTINEL_SESSIONS` with the read connection scoped to just the SELECT (dropped before the per-victim loop, mirroring `liveness.rs:128` — the writer pool is `max_size = 1`), filters in Rust to non-`Ended` rows with `last_pid == Some(P)` excluding the emitter, and ends each victim via `write_if_state_matches` under `WritePrecondition { expected_current_state, expected_last_pid: Some(P) }`. Synthetic envelope mirrors the probe (`pid: Some(P)`, `cwd: None` for carry-forward). Per-victim/SELECT/clock/serialize failures are logged and NEVER propagated — `write()` returns `S′`'s original `Ok(event_id)` unchanged.
+- **Task 3.** `docs/protocol.md`: extended the `SessionEnded` `reason` enumeration to `no_pid_at_upgrade|pid_dead|pid_superseded` (framed as a mechanical fact, Axiom 4, treat as opaque string) and the `last_pid` narrative (PID death + PID rollover are the two observations that produce `Ended`, both non-terminal). `docs/protocol-changelog.md`: one `type: behavioral` entry under `## v1.0 → v1.1`, additive + opaque-string-safe, noting no `crates/protocol/src` change (gate not triggered; entry added for the documentation contract).
+- **Task 4.** Six tests in `crates/daemon/tests/contract_daemon.rs` `mod story_5_11_supersession`, driving the real `write()` path and asserting both persisted projection (`read_session_state`) and broadcast frames (a new `drain_state_frames` capturing `(session_id, current_state)`): `successor_supersedes_lone_predecessor` (AC1), `successor_supersedes_all_stranded_predecessors` (AC1 multi — 3 seeded predecessors drained in one scan, cwd carry-forward asserted), `resupersession_is_idempotent` (AC2), `resumed_predecessor_unends_and_supersedes_current_holder` (AC3), `subagent_activity_never_supersedes_its_parent` (AC5 — the verified subagent-gate regression guard, with an `Agent` tool-use event in the sequence), `stale_precondition_noops_instead_of_double_emitting` (AC4 — deterministic `write_if_state_matches` no-op seam).
+- **Task 5.** All gates green (see Debug Log). **Live dogfood deferred to maintainer** per pickles' 2026-06-11 dev-story choice: the cargo-install + daemon-restart swap triggers a Keychain prompt and the live observation needs a real rolled session + deck/web visual — that lives in the maintainer-driven dogfooding-validation-phase that gates the v0.1.0 tag (Story 5.15), not this story's review. The supersession mechanism itself is proven end-to-end by the six contract tests through the real write→SQLite→broadcast path. Bean `gt-e9dc` → `in-progress`; `gt-043a` (view-side backstop) left out of scope.
+- **No schema migration, no `crates/protocol/src` change.** `EndedReason` is a daemon-internal enum serialized as opaque JSON inside the `SessionEnded` payload string; the wire `reason` is just JSON in that string. Only `crates/daemon` code + docs changed.
+
+### File List
+
+- `crates/daemon/src/projection/liveness.rs` — added `EndedReason::PidSuperseded`; `EndedReason` + `EndedPayload` (+ fields) now `pub(crate)`; expanded doc comments.
+- `crates/daemon/src/projection/session.rs` — supersession follow-up wired into `write()`; new `supersede_predecessors()`; imports (`EventKind`, `SELECT_NON_SENTINEL_SESSIONS`, `liveness::{EndedPayload, EndedReason}`).
+- `crates/daemon/tests/contract_daemon.rs` — new `mod story_5_11_supersession` (6 tests + helpers).
+- `docs/protocol.md` — `SessionEnded` `reason` enumeration + `last_pid` narrative extended for `pid_superseded`.
+- `docs/protocol-changelog.md` — one `type: behavioral` entry under `## v1.0 → v1.1` (Resolves: 5.11).
+- `docs/bmad/implementation-artifacts/sprint-status.yaml` — Story 5.11 status breadcrumbs (ready-for-dev → in-progress → review).
+
+### Change Log
+
+- 2026-06-11 — Implemented event-driven PID supersession (Story 5.11 / ADR 0009): a successor session emitting on a PID ends every other non-`Ended` predecessor still claiming it with `SessionEnded { reason: "pid_superseded" }`, through `write_if_state_matches`. Daemon code + protocol docs + changelog + 6 contract tests; workspace tests + fmt + clippy + changelog gate green. Live dogfood deferred to maintainer.

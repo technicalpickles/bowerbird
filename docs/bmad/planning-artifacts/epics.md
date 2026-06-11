@@ -15,7 +15,8 @@ revisions:
   - 2026-05-27: Inserted new Story 5.8 (Session-process liveness via PID capture) into Epic 5; old 5.8 (crates.io + v0.1.0 tag) → 5.9. Adds `SessionState.last_pid` (mechanical fact), shim captures `getppid()`, presenters compute liveness via `kill(pid, 0)` per Axiom 1/4. Surfaced during Story 5.1 bowerbird-deck dogfooding (30+ stale session rows visible, no signal to mark dead-process tombstones). Source: docs/bmad/planning-artifacts/sprint-change-proposal-2026-05-27-pid-liveness.md.
   - 2026-05-27: Resequenced Epic 5 for dogfooding-first ordering. The two dogfood-surfaced correctness stories move forward (old 5.7 projection correctness → new 5.2; old 5.8 PID liveness → new 5.3) so they sit adjacent to Story 5.1's presenter and make daily dogfooding actually useful before the CI/release/docs polish work. Reader-facing and CI/release work shifts back (old 5.2 bench gates → new 5.5; old 5.3 release E2E → new 5.6; old 5.5 cookbook → new 5.7; old 5.6 first-time-reader docs → new 5.8). Story 5.1, 5.4, 5.9 unchanged. No story content modified; pure resequencing. Source: docs/bmad/planning-artifacts/sprint-change-proposal-2026-05-27-epic-5-resequencing.md.
   - 2026-05-29: Inserted new Story 5.6 (`idle_prompt` reclassified as transient) into Epic 5 after bench-gates (5.5); old 5.6 (release pipeline E2E) → 5.7, old 5.7 (cookbook consolidation) → 5.8, old 5.8 (first-time-reader docs) → 5.9, old 5.9 (crates.io + v0.1.0 tag) → 5.10. Moves `idle_prompt` from the input-required bucket to the transient (preserve-prior) bucket in `transition()`, narrowing `WaitingInput` to genuine hard blocks (`permission_prompt`/`elicitation_dialog`). Surfaced during 2026-05-29 bowerbird-deck dogfooding (13 of 15 live sessions falsely `WaitingInput`). Amends ADR 0004 §3; recorded as ADR 0005. Source: docs/bmad/planning-artifacts/sprint-change-proposal-2026-05-29-idle-prompt-reclassification.md.
-  - 2026-06-01: Inserted four dogfood-triage stories into Epic 5 after Story 5.6 — 5.7 (session cwd + started_at on the wire; +ADR 0006), 5.8 (server-side session filter), 5.9 (daemon start-on-login supervision; +ADR 0007), 5.10 (shim names the cause on daemon-down). Renumbered the release-readiness tail: old 5.7 (release pipeline E2E) → 5.11, old 5.8 (cookbook) → 5.12, old 5.9 (first-time-reader docs) → 5.13, old 5.10 (crates.io + v0.1.0 tag) → 5.14. All four new stories gate the v0.1.0 tag (now Story 5.14). Surfaced during 2026-06-01 deck+web triage-radar dogfooding (presenters can only triage on what the wire carries: no cwd to group by, full Ended graveyard dumped on connect, no daemon supervision across reboot, causeless hook-error wall). Story 5.7 fully specified here and landing first; 5.8–5.10 are stubs to be fleshed out at their own create-story time. Source: docs/bmad/planning-artifacts/sprint-change-proposal-2026-06-01-dogfood-triage.md.
+  - 2026-06-01: Inserted four dogfood-triage stories into Epic 5 after Story 5.6 — 5.7 (session cwd + started_at on the wire; +ADR 0006), 5.8 (server-side session filter), 5.9 (daemon start-on-login supervision; +ADR 0007), 5.10 (shim names the cause on daemon-down). Renumbered the release-readiness tail: old 5.7 (release pipeline E2E) → 5.11, old 5.8 (cookbook) → 5.12, old 5.9 (first-time-reader docs) → 5.13, old 5.10 (crates.io + v0.1.0 tag) → 5.14. All four new stories gate the v0.1.0 tag (now Story 5.15). Surfaced during 2026-06-01 deck+web triage-radar dogfooding (presenters can only triage on what the wire carries: no cwd to group by, full Ended graveyard dumped on connect, no daemon supervision across reboot, causeless hook-error wall). Story 5.7 fully specified here and landing first; 5.8–5.10 are stubs to be fleshed out at their own create-story time. Source: docs/bmad/planning-artifacts/sprint-change-proposal-2026-06-01-dogfood-triage.md.
+  - 2026-06-11: Inserted new Story 5.11 (Session PID supersession) into Epic 5 after Story 5.10; +ADR 0009 (extends ADR 0004). Renumbered the release-readiness tail: old 5.11 (release pipeline E2E) → 5.12, old 5.12 (cookbook) → 5.13, old 5.13 (first-time-reader docs) → 5.14, old 5.14 (crates.io + v0.1.0 tag) → 5.15. Adds event-driven `SessionEnded { reason: pid_superseded }` for rolled-over predecessor sessions sharing a live PID (the liveness probe only ends on PID death, but one live `claude` PID hosts many session_ids over `/clear`/resume/compaction). Gates the v0.1.0 tag (now Story 5.15). Verify-before-implementing gate PASSED (bean gt-e9dc): subagents do not surface as distinct co-PID session_ids. Story is a stub to be fleshed out at create-story time. Source: docs/bmad/planning-artifacts/sprint-change-proposal-2026-06-11-pid-supersession.md.
 ---
 
 # bowerbird - Epic Breakdown
@@ -1161,7 +1162,7 @@ As a presenter author,
 I want each session's working directory (`cwd`) and start time (`started_at`) carried as mechanical facts on the wire,
 So that I can group, filter, and label sessions by repo/directory and render session age from the snapshot, without reading transcript content or inventing a persona model.
 
-Inserted by `sprint-change-proposal-2026-06-01-dogfood-triage.md` (§4.1, Finding 3/4) after Story 5.6. First of four dogfood-triage stories (5.7–5.10); all four gate the v0.1.0 tag (Story 5.14). Operationalizes **ADR 0006** (`docs/decisions/0006-session-cwd-on-the-wire.md`). `cwd` mirrors the Story 5.3 `last_pid` additive-field pattern exactly — `Option<T>`, overwrite-on-Some carry-forward, schema migration v3, `#[serde(other)]`-safe — with one divergence: `cwd` rides the **native Claude Code hook payload** (no shim change; the adapter reads it in `normalize`). `started_at` (the deferred Story 5.3 item) is bundled in per proposal §6: daemon-derived, **set-once / keep-earliest** (the inverse of cwd), session-level only (no `Event` field, no migration).
+Inserted by `sprint-change-proposal-2026-06-01-dogfood-triage.md` (§4.1, Finding 3/4) after Story 5.6. First of four dogfood-triage stories (5.7–5.10); all four gate the v0.1.0 tag (Story 5.15). Operationalizes **ADR 0006** (`docs/decisions/0006-session-cwd-on-the-wire.md`). `cwd` mirrors the Story 5.3 `last_pid` additive-field pattern exactly — `Option<T>`, overwrite-on-Some carry-forward, schema migration v3, `#[serde(other)]`-safe — with one divergence: `cwd` rides the **native Claude Code hook payload** (no shim change; the adapter reads it in `normalize`). `started_at` (the deferred Story 5.3 item) is bundled in per proposal §6: daemon-derived, **set-once / keep-earliest** (the inverse of cwd), session-level only (no `Event` field, no migration).
 
 **Acceptance Criteria:**
 
@@ -1199,7 +1200,7 @@ As a presenter author,
 I want `GET /sessions` to accept `?state=`/`?since=`/`?limit=` filters AND the WS snapshot-on-subscribe burst to be scopeable by an optional `states` filter,
 So that a new presenter isn't blasted with the full `Ended` graveyard and can fetch (and be handed) only the sessions it cares about.
 
-Inserted by `sprint-change-proposal-2026-06-01-dogfood-triage.md` (§4.2, Finding 5-filter); operationalized by **ADR 0008** (presenter-controlled filtering on both surfaces — the maintainer's choice to scope the snapshot by a presenter-supplied predicate modified the wire protocol, which §4.2's "no ADR" assumption did not anticipate). Gates v0.1.0 (Story 5.14). ACs (see `implementation-artifacts/5-8-server-side-session-filter.md` for the full set):
+Inserted by `sprint-change-proposal-2026-06-01-dogfood-triage.md` (§4.2, Finding 5-filter); operationalized by **ADR 0008** (presenter-controlled filtering on both surfaces — the maintainer's choice to scope the snapshot by a presenter-supplied predicate modified the wire protocol, which §4.2's "no ADR" assumption did not anticipate). Gates v0.1.0 (Story 5.15). ACs (see `implementation-artifacts/5-8-server-side-session-filter.md` for the full set):
 
 - **REST `GET /sessions`** gains optional `?state=<csv>` (case-insensitive `SessionCurrentState` tokens, filtered in Rust on the read-time `current_state`), `?since=<updated_at_ms>` (exclusive recency lower bound, SQL), and `?limit=<n>` (SQL row cap) — all default-unfiltered so pre-5.8 behavior is byte-identical; invalid values `400`. `limit` caps the pre-state-filter set, so `?state=`+`?limit=` may return fewer than `n` (documented). `?since=`/`?limit=` are a recency filter and a row cap, not true cursor pagination (no stable exact-N page — a real cursor stays deferred).
 - **WS `ClientMessage::Subscribe` gains an optional `states: Vec<String>`** (`#[serde(default)]`) that scopes the snapshot-on-subscribe burst by the same read-time `current_state` predicate; empty/absent = unfiltered. An invalid token closes the connection (`bad message`/1008). Scopes ONLY the snapshot — the live stream is unchanged.
@@ -1213,7 +1214,7 @@ As the bowerbird maintainer,
 I want `bowerbird install` to register the daemon to start on login with crash-restart (and `bowerbird uninstall` to remove that registration symmetrically),
 So that a reboot doesn't silently drop every event until I manually restart the daemon.
 
-Inserted by `sprint-change-proposal-2026-06-01-dogfood-triage.md` (§4.3, Finding 1); operationalized by **ADR 0007** (`docs/decisions/0007-daemon-start-on-login.md`, authored as the story's Task 1 — `Affects context.md sections: Durability and chaos`). Gates v0.1.0 (Story 5.14). ACs (see `implementation-artifacts/5-9-daemon-start-on-login.md` for the full set):
+Inserted by `sprint-change-proposal-2026-06-01-dogfood-triage.md` (§4.3, Finding 1); operationalized by **ADR 0007** (`docs/decisions/0007-daemon-start-on-login.md`, authored as the story's Task 1 — `Affects context.md sections: Durability and chaos`). Gates v0.1.0 (Story 5.15). ACs (see `implementation-artifacts/5-9-daemon-start-on-login.md` for the full set):
 
 - **macOS `bowerbird install`** writes `~/Library/LaunchAgents/com.technicalpickles.bowerbird.daemon.plist` (atomic `.tmp`→rename, mode 0644) with `ProgramArguments` = the **absolute** daemon path (launchd's minimal PATH lacks `/usr/local/bin`, so the PATH-relative `bowerbird-daemon` will not exec), `RunAtLoad=true`, and `KeepAlive={SuccessfulExit=false}` (crash-restart on a non-zero exit; macOS `bowerbird stop` keeps the daemon down by booting the LaunchAgent out via `launchctl bootout`, not by relying on the daemon's exit code — Story 5.9 review pass-6 F1). Install bootstraps the agent (`launchctl bootstrap gui/<uid>`) INSTEAD of the `setsid` spawn; `--no-start` writes the plist but skips the bootstrap (launchctl-free CI path).
 - **macOS `bowerbird uninstall`** boots the agent out (`launchctl bootout gui/<uid>/<label>`) and removes the plist; `--no-stop` removes the plist but skips the bootout; round-trip leaves no residue. `~/.bowerbird/` is never deleted (unchanged).
@@ -1226,9 +1227,17 @@ As a Claude Code user,
 I want the shim to print one human-readable line naming the cause when the daemon is down,
 So that a daemon outage doesn't render as Claude Code's generic causeless no-stderr hook error on every call.
 
-Inserted by `sprint-change-proposal-2026-06-01-dogfood-triage.md` (§4.4, Finding 2 — minor). Gates v0.1.0 (Story 5.14). **Stub** — ACs to be derived from proposal §4.4 at `bmad-create-story` time. Scope: `crates/shim/src/main.rs` writes one stderr line on the exit-1 path, e.g. `bowerbird: daemon not running, event dropped (see ~/.bowerbird/shim.log)`; keep `Error::Connect → exit 1` (NFR20 contract intact); the success path stays stderr-silent (no hot-path cost). Per-call coalescing / exit-0-vs-exit-1 reconsideration is **deferred** (proposal §6 — the shim is stateless per-invocation, so cross-call rate-limiting needs shared state).
+Inserted by `sprint-change-proposal-2026-06-01-dogfood-triage.md` (§4.4, Finding 2 — minor). Gates v0.1.0 (Story 5.15). **Stub** — ACs to be derived from proposal §4.4 at `bmad-create-story` time. Scope: `crates/shim/src/main.rs` writes one stderr line on the exit-1 path, e.g. `bowerbird: daemon not running, event dropped (see ~/.bowerbird/shim.log)`; keep `Error::Connect → exit 1` (NFR20 contract intact); the success path stays stderr-silent (no hot-path cost). Per-call coalescing / exit-0-vs-exit-1 reconsideration is **deferred** (proposal §6 — the shim is stateless per-invocation, so cross-call rate-limiting needs shared state).
 
-### Story 5.11: Release pipeline end-to-end verification
+### Story 5.11: Session PID supersession — end rolled-over predecessor sessions (stub — refine at create-story)
+
+As a presenter consumer,
+I want a session to be ended the moment its `claude` PID rolls to a newer session,
+So that rolled-over predecessors don't linger as stale, live-looking sessions that never age out.
+
+Inserted by `sprint-change-proposal-2026-06-11-pid-supersession.md` (bean `gt-e9dc`). Gates v0.1.0 (Story 5.15). **Stub** — ACs to be derived from proposal §4.1 at `bmad-create-story` time, alongside **ADR 0009** (extends ADR 0004). The liveness probe (`crates/daemon/src/projection/liveness.rs`) only ends a session on PID *death*, but one live `claude` PID hosts many session_ids over its life (`/clear`, resume, compaction roll the session_id, keep the PID), so predecessors never reach `Ended` (live proof 2026-06-11: PID 88706 backing 4 sessions). Fix: a new event-driven rule in the projection write path (`crates/daemon/src/projection/session.rs`) — when an event for session S′ carries PID P, emit `SessionEnded { reason: PidSuperseded }` for every *other* non-`Ended` session whose `last_pid == P`, under the same `write_if_state_matches` discipline (Story 5.2); add `EndedReason::PidSuperseded` (wire value `pid_superseded`, additive `type: behavioral` changelog entry). Sound because one live PID = one process = one bowerbird session at any instant. **Verify-before-implementing gate PASSED** (proposal §1): subagents do not surface as distinct co-PID session_ids (PID 6491 / 42 `Agent` dispatches / 0 child sessions), so supersession cannot ping-pong parent↔subagent. Must be **idempotent** and **reversible-on-resume** (a superseded session that resumes un-ends via the normal write path and then supersedes the current PID holder) — both are ACs, not deferrals. View-side backstop (presenter pid-collapse + staleness) stays separate as bean `gt-043a`; no retroactive sweep of already-stranded predecessors (no-list "no `gc`").
+
+### Story 5.12: Release pipeline end-to-end verification
 
 As a release manager,
 I want the GitHub Releases pipeline driven to a real (non-prerelease) tag, producing artifacts that install and run on a fresh machine,
@@ -1247,7 +1256,7 @@ Resequenced from 5.3 → 5.6 by `sprint-change-proposal-2026-05-27-epic-5-resequ
 **Then** events appear in `~/.bowerbird/bower.db`, the daemon is running, and the first-party presenter from Story 5.1 receives state frames
 
 **Given** the cross-version upgrade contract test `cross_version_upgrade.rs`
-**When** Story 5.11 lands
+**When** Story 5.12 lands
 **Then** its SKIP guard (currently load-bearing on the absence of a real prior tag) is removed or asserts against `v0.1.0-rc1`'s data directory, depending on which boundary is tested
 
 **Given** Gatekeeper warnings on first run of unsigned macOS tarball binaries
@@ -1256,9 +1265,9 @@ Resequenced from 5.3 → 5.6 by `sprint-change-proposal-2026-05-27-epic-5-resequ
 
 **Given** the rc1 release surfaces a behavioral, install, or release-pipeline issue
 **When** the maintainer escalates it
-**Then** a `5.X-hotfix-<topic>` story is created inline before moving to Story 5.12
+**Then** a `5.X-hotfix-<topic>` story is created inline before moving to Story 5.13
 
-### Story 5.12: Cookbook consolidation into self-contained directory entries
+### Story 5.13: Cookbook consolidation into self-contained directory entries
 
 As the bowerbird maintainer,
 I want each cookbook entry to be one self-contained directory under `docs/cookbook/<name>/` containing prose (`README.md`) and runnable code (`src/`, `package.json`, `tsconfig.json`) colocated,
@@ -1269,11 +1278,11 @@ Closes Story 4.2 AC at `epics.md:817-819`, Story 4.3 AC at `epics.md:843`, and `
 **Acceptance Criteria:**
 
 **Given** the existing `examples/multi-session-router/`, `examples/event-log-viewer/`, and `examples/reconnect-recovery/` directories
-**When** Story 5.12 lands
+**When** Story 5.13 lands
 **Then** they have been `git mv`'d to `docs/cookbook/state-session-fanout/`, `docs/cookbook/rest-cursor-pagination/`, and `docs/cookbook/dropped-frame-recovery/` respectively; the `examples/` directory no longer exists at the repo root; `cargo build --workspace`, `cargo test --workspace`, and the TypeScript smoke tests all pass against the new paths
 
 **Given** the three standalone cookbook prose files (`docs/cookbook/state-session-fanout.md`, `docs/cookbook/rest-cursor-pagination.md`, `docs/cookbook/dropped-frame-recovery.md`)
-**When** Story 5.12 lands
+**When** Story 5.13 lands
 **Then** they have been deleted; their Problem / Approach / Variants content has been folded into the per-entry `docs/cookbook/<name>/README.md` files alongside the existing per-example README content
 
 **Given** each new `docs/cookbook/<name>/README.md`
@@ -1281,26 +1290,26 @@ Closes Story 4.2 AC at `epics.md:817-819`, Story 4.3 AC at `epics.md:843`, and `
 **Then** the README contains no embedded TypeScript code blocks — only prose sections (*What this is*, *Run it*, *How it works*, *How to apply it*, *Files* with relative links to `src/index.ts` and any sidecar code files); code is read by opening `src/index.ts` directly, matching the pocketflow cookbook pattern
 
 **Given** the `// cookbook-begin:<name>` / `// cookbook-end:<name>` comment markers in each `src/index.ts`
-**When** Story 5.12 lands
+**When** Story 5.13 lands
 **Then** the markers have been deleted; the smoke test `tests/cli_examples.rs::each_example_source_carries_cookbook_anchors` (or its current equivalent) has been deleted; the drift-check test `tests/cli_docs_drift.rs::cookbook_include_directives_match_example_anchors` has been deleted
 
 **Given** the smoke-test crate `tests/cli_examples.rs` and CI workflow at `.github/workflows/ci.yml`
-**When** Story 5.12 lands
+**When** Story 5.13 lands
 **Then** all `examples/*/src/index.ts` path references have been retargeted to `docs/cookbook/*/src/index.ts`; shell loops over `examples/*/` similarly retarget
 
 **Given** the planning and project-context artifacts
-**When** Story 5.12 lands
+**When** Story 5.13 lands
 **Then** `prd.md:327, 445, 448-450`, `architecture.md:760-829, 915, 946`, and `project-context.md:242-258, 524-545` have been updated to reflect the single-directory shape; `deferred-work.md:104` is struck through with a backlink to this story's merge commit; path-retarget edits applied to `deferred-work.md:101, 102, 105, 106, 107`
 
 **Given** the project's update protocol (`project-context.md` L77: "Every merged ADR includes Affects context.md sections: field")
-**When** Story 5.12 lands
+**When** Story 5.13 lands
 **Then** ADR 0008 has been authored at `docs/decisions/0008-cookbook-consolidation.md` documenting the decision, considered alternatives (mdBook `{{#include}}`, hand-rolled preprocessor, pocketflow pattern), the chosen path, and `Affects context.md sections: Repository layout, Cookbook discipline` (ADR 0005 is the idle_prompt reclassification per Story 5.6; ADR 0006 is session cwd + started_at on the wire per Story 5.7; ADR 0007 is reserved for daemon start-on-login per Story 5.9 — 0008 is the next free number. If the number should not be allocated until this story lands, treat the path as TBD and claim the next free ADR number then.)
 
 **Given** reader-facing docs
-**When** Story 5.12 lands
+**When** Story 5.13 lands
 **Then** `README.md` (entries at L7-8 and L162-166), `docs/quickstart.md:19`, and `docs/presenter-authoring.md` (grep pass) have all `examples/` path references retargeted to `docs/cookbook/<name>/`
 
-### Story 5.13: First-time-reader docs pass
+### Story 5.14: First-time-reader docs pass
 
 As a developer who has never seen bowerbird before,
 I want the README and quickstart to answer "what is this, why would I care, how do I try it in five minutes" before I bounce,
@@ -1320,17 +1329,17 @@ Resequenced from 5.6 → 5.8 by `sprint-change-proposal-2026-05-27-epic-5-resequ
 
 **Given** the docs path Quickstart → presenter-authoring → protocol → cookbook (PRD §Documentation Requirements line 436)
 **When** the first-time reader graduates from Quickstart and reaches `docs/presenter-authoring.md`
-**Then** the first paragraph names the audience switch ("you've seen it work; now you're going to build something") rather than starting directly in technical detail; cross-references to the cookbook target the per-entry directory shape introduced by Story 5.12 (e.g. `docs/cookbook/state-session-fanout/`), not pre-5.8 standalone .md files
+**Then** the first paragraph names the audience switch ("you've seen it work; now you're going to build something") rather than starting directly in technical detail; cross-references to the cookbook target the per-entry directory shape introduced by Story 5.13 (e.g. `docs/cookbook/state-session-fanout/`), not pre-consolidation standalone .md files
 
 **Given** the README in its current state mentions install before motivation
-**When** Story 5.13 lands
-**Then** motivation precedes install; the "Status: V1 in development" framing is removed in favor of "Status: v0.1.0 — first stable release" once Story 5.14 tags it
+**When** Story 5.14 lands
+**Then** motivation precedes install; the "Status: V1 in development" framing is removed in favor of "Status: v0.1.0 — first stable release" once Story 5.15 tags it
 
-**Given** the Story 5.13 PR
+**Given** the Story 5.14 PR
 **When** review runs
 **Then** the review explicitly invokes the `bmad-editorial-review-prose` and `bmad-editorial-review-structure` skills against `README.md` and `docs/quickstart.md`, and the priority-1 findings are addressed in the same PR
 
-### Story 5.14: Crates.io namespace decision and v0.1.0 tag
+### Story 5.15: Crates.io namespace decision and v0.1.0 tag
 
 As the project owner,
 I want a deliberate decision on crates.io publishing,
@@ -1341,17 +1350,17 @@ Closes Epic 3 retro AI-3 / Epic 4 retro AI-5.
 **Acceptance Criteria:**
 
 **Given** `cargo search bowerbird`
-**When** Story 5.14 is started
+**When** Story 5.15 is started
 **Then** the namespace availability is documented (available / squatted / taken-by-related-project); if available, the four workspace crates are published with `description`, `repository`, `keywords`, `categories`, and `[package.metadata.docs.rs]` blocks added to each `Cargo.toml`; if not available, an ADR documents the renaming decision or the decision to publish under a different namespace
 
-**Given** all Epic 5 stories 5.1 through 5.9 are complete and any hotfix stories are merged
+**Given** all Epic 5 stories 5.1 through 5.14 are complete and any hotfix stories are merged
 **When** the maintainer tags `v0.1.0`
 **Then** the release workflow runs end-to-end producing artifacts; the GitHub Release is published (not draft); release notes name the V1 scope, the dogfooding signal that motivated the tag, and the contract-test summary
 
 **Given** the v0.1.0 tag exists
 **When** the maintainer reads `docs/bmad/implementation-artifacts/deferred-work.md`
-**Then** every entry referenced in this Epic 5 (Story 5.5 AI-1/AI-2/AI-3, Story 5.4's five entries, Story 5.12's deferred-work-104 closure, Story 5.14's AI-3/AI-5) is struck through with a backlink to its closing story's merge commit
+**Then** every entry referenced in this Epic 5 (Story 5.5 AI-1/AI-2/AI-3, Story 5.4's five entries, Story 5.13's deferred-work-104 closure, Story 5.15's AI-3/AI-5) is struck through with a backlink to its closing story's merge commit
 
 **Given** the v0.1.0 release notes
-**When** a first-time reader (Story 5.13's audience) finds them
+**When** a first-time reader (Story 5.14's audience) finds them
 **Then** they include the install one-liner, a link to Quickstart, and an honest statement of "what works today and what doesn't" (the deferred-work entries that remain — code-signing, second-adapter, etc.)

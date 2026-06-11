@@ -11100,3 +11100,455 @@ mod story_5_8_session_filter {
         );
     }
 }
+
+/// Story 5.11 / ADR 0009 — event-driven PID supersession. When a successor
+/// session emits on a PID, every OTHER non-`Ended` session still claiming that
+/// PID is superseded → `SessionEnded { reason: "pid_superseded" }`. These tests
+/// drive the real `projection::session::write` path (where supersession lives)
+/// and assert both the persisted projection AND the broadcast frames.
+mod story_5_11_supersession {
+    use super::*;
+    use bowerbird_daemon::projection::session::{write_if_state_matches, WritePrecondition};
+
+    /// An ingest envelope carrying a specific `pid` (the shim-injected
+    /// `bowerbird_ppid`). The supersession rule keys on this PID.
+    fn envelope_with_pid(
+        source: &str,
+        session_id: &str,
+        kind: EventKind,
+        pid: u32,
+    ) -> EventEnvelope {
+        EventEnvelope {
+            pid: Some(pid),
+            ..envelope_for(source, session_id, kind)
+        }
+    }
+
+    /// A `PreToolUse` whose payload names the Task-tool (`Agent`) — a subagent
+    /// dispatch. The supersession code is tool-name-agnostic; this makes the
+    /// AC5 subagent-gate intent explicit on the wire.
+    fn agent_dispatch_with_pid(source: &str, session_id: &str, pid: u32) -> EventEnvelope {
+        EventEnvelope {
+            pid: Some(pid),
+            payload: r#"{"tool_name":"Agent"}"#.to_string(),
+            ..envelope_for(source, session_id, EventKind::PreToolUse)
+        }
+    }
+
+    /// Seed a projection row directly (no event, no supersession side effect) —
+    /// models the live pre-fix backlog of predecessors stranded non-`Ended` on
+    /// a still-live PID (ADR 0009 §Consequences).
+    async fn seed_session(pools: &DbPools, source: &str, session_id: &str, state: &SessionState) {
+        let state_json = serde_json::to_string(state).expect("serialize state");
+        let source = source.to_string();
+        let session_id = session_id.to_string();
+        let conn = pools.writer.get().await.expect("writer pool");
+        conn.interact(move |c| -> rusqlite::Result<()> {
+            c.execute(
+                UPSERT_SESSION_PROJECTION,
+                rusqlite::params![source, session_id, state_json, 1_000_i64],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("interact")
+        .expect("seed upsert");
+    }
+
+    async fn read_state(pools: &DbPools, source: &str, session_id: &str) -> SessionState {
+        let raw = read_session_state(&pools.reader, source, session_id).await;
+        serde_json::from_str(&raw).expect("parse state")
+    }
+
+    /// The `reason` field of every `SessionEnded` event for a session, in
+    /// `event_id` order. Length == number of SessionEnded events emitted.
+    async fn ended_reasons(pools: &DbPools, source: &str, session_id: &str) -> Vec<String> {
+        let conn = pools.reader.get().await.expect("reader pool");
+        let s = source.to_string();
+        let sid = session_id.to_string();
+        let payloads: Vec<String> = conn
+            .interact(move |c| -> rusqlite::Result<Vec<String>> {
+                let mut stmt = c.prepare(
+                    "SELECT payload FROM events WHERE source = ? AND session_id = ? \
+                     AND kind = 'SessionEnded' ORDER BY event_id ASC",
+                )?;
+                let rows = stmt.query_map(rusqlite::params![s, sid], |r| r.get::<_, String>(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await
+            .expect("interact")
+            .expect("query");
+        payloads
+            .iter()
+            .map(|p| {
+                serde_json::from_str::<serde_json::Value>(p)
+                    .ok()
+                    .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(String::from))
+                    .unwrap_or_else(|| format!("<unparsable: {p}>"))
+            })
+            .collect()
+    }
+
+    /// Drain a broadcast receiver, collecting `(session_id, current_state)` for
+    /// each State frame and tallying Event frames.
+    fn drain_state_frames(
+        rx: &mut tokio::sync::broadcast::Receiver<bowerbird_daemon::broadcast::BroadcastEnvelope>,
+    ) -> (usize, Vec<(String, SessionCurrentState)>) {
+        use bowerbird_daemon::broadcast::BroadcastEnvelope;
+        let mut events = 0usize;
+        let mut states = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(BroadcastEnvelope::Event(_)) => events += 1,
+                Ok(BroadcastEnvelope::State {
+                    session_id, state, ..
+                }) => states.push((session_id, state.current_state)),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(e) => panic!("unexpected recv error: {e:?}"),
+            }
+        }
+        (events, states)
+    }
+
+    /// AC1 — a successor's event on PID P supersedes the lone predecessor on P;
+    /// the successor is unaffected. The victim gets a `SessionEnded` whose
+    /// payload `reason == "pid_superseded"`, persisted AND published as a State
+    /// frame carrying `Ended`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn successor_supersedes_lone_predecessor() {
+        let (_tmp, pools) = fresh_pools().await;
+        let hub = BroadcastHub::new(64);
+        const P: u32 = 4242;
+
+        // Predecessor A goes live on P.
+        projection::session::write(
+            &pools.writer,
+            &hub,
+            envelope_with_pid("claude", "sess-A", EventKind::UserPromptSubmit, P),
+        )
+        .await
+        .expect("write A");
+        assert_ne!(
+            read_state(&pools, "claude", "sess-A").await.current_state,
+            SessionCurrentState::Ended,
+            "A is live before B claims its PID"
+        );
+
+        // Subscribe AFTER A's write so we observe only B's write + the
+        // supersession it triggers.
+        let mut rx = hub.subscribe();
+
+        // Successor B emits on the same PID.
+        projection::session::write(
+            &pools.writer,
+            &hub,
+            envelope_with_pid("claude", "sess-B", EventKind::UserPromptSubmit, P),
+        )
+        .await
+        .expect("write B");
+
+        // A is superseded; B is live.
+        let a = read_state(&pools, "claude", "sess-A").await;
+        assert_eq!(
+            a.current_state,
+            SessionCurrentState::Ended,
+            "A must be Ended after B claims its PID"
+        );
+        assert_eq!(a.last_event_kind, EventKind::SessionEnded);
+        assert_eq!(a.last_pid, Some(P), "carry-forward keeps A's last_pid");
+        assert_eq!(
+            ended_reasons(&pools, "claude", "sess-A").await,
+            vec!["pid_superseded".to_string()],
+            "exactly one SessionEnded for A, reason pid_superseded"
+        );
+        assert_ne!(
+            read_state(&pools, "claude", "sess-B").await.current_state,
+            SessionCurrentState::Ended,
+            "B (the emitter) is never superseded"
+        );
+
+        // B's own Event + State, plus A's supersession Event + State.
+        let (events, states) = drain_state_frames(&mut rx);
+        assert_eq!(events, 2, "B's event + A's synthetic SessionEnded event");
+        assert!(
+            states.contains(&("sess-A".to_string(), SessionCurrentState::Ended)),
+            "A's transition to Ended must be published as a State frame; got {states:?}"
+        );
+    }
+
+    /// AC1 multi-predecessor — three predecessors stranded non-`Ended` on the
+    /// same live PID (the live PID 88706 pile-up) are ALL superseded in a single
+    /// supersession scan when the live session emits.
+    #[tokio::test(flavor = "current_thread")]
+    async fn successor_supersedes_all_stranded_predecessors() {
+        let (_tmp, pools) = fresh_pools().await;
+        let hub = BroadcastHub::new(64);
+        const P: u32 = 88706;
+
+        for sid in ["sess-A1", "sess-A2", "sess-A3"] {
+            seed_session(
+                &pools,
+                "claude",
+                sid,
+                &SessionState {
+                    current_state: SessionCurrentState::Idle,
+                    last_event_kind: EventKind::Notification,
+                    last_event_at_ms: 1_000,
+                    last_pid: Some(P),
+                    cwd: Some("/repo".to_string()),
+                    started_at: Some(500),
+                },
+            )
+            .await;
+        }
+
+        // The current live session on P emits.
+        projection::session::write(
+            &pools.writer,
+            &hub,
+            envelope_with_pid("claude", "sess-live", EventKind::UserPromptSubmit, P),
+        )
+        .await
+        .expect("write live session");
+
+        for sid in ["sess-A1", "sess-A2", "sess-A3"] {
+            assert_eq!(
+                read_state(&pools, "claude", sid).await.current_state,
+                SessionCurrentState::Ended,
+                "{sid} must be superseded in the single scan"
+            );
+            assert_eq!(
+                ended_reasons(&pools, "claude", sid).await,
+                vec!["pid_superseded".to_string()],
+                "{sid} ended exactly once with pid_superseded"
+            );
+            assert_eq!(
+                read_state(&pools, "claude", sid).await.cwd,
+                Some("/repo".to_string()),
+                "carry-forward preserves the victim's last-known cwd ({sid})"
+            );
+        }
+        assert_ne!(
+            read_state(&pools, "claude", "sess-live")
+                .await
+                .current_state,
+            SessionCurrentState::Ended,
+            "the live emitter is untouched"
+        );
+    }
+
+    /// AC2 — idempotent. Re-ingesting the successor's event does NOT re-emit a
+    /// second `SessionEnded` for an already-superseded predecessor, and no
+    /// duplicate row accumulates.
+    #[tokio::test(flavor = "current_thread")]
+    async fn resupersession_is_idempotent() {
+        let (_tmp, pools) = fresh_pools().await;
+        let hub = BroadcastHub::new(64);
+        const P: u32 = 4242;
+
+        projection::session::write(
+            &pools.writer,
+            &hub,
+            envelope_with_pid("claude", "sess-A", EventKind::UserPromptSubmit, P),
+        )
+        .await
+        .expect("write A");
+        projection::session::write(
+            &pools.writer,
+            &hub,
+            envelope_with_pid("claude", "sess-B", EventKind::UserPromptSubmit, P),
+        )
+        .await
+        .expect("write B (ends A)");
+        assert_eq!(
+            ended_reasons(&pools, "claude", "sess-A").await.len(),
+            1,
+            "A ended exactly once after B's first event"
+        );
+
+        // Subscribe AFTER A is already Ended; re-ingest another B event on P.
+        let mut rx = hub.subscribe();
+        projection::session::write(
+            &pools.writer,
+            &hub,
+            envelope_with_pid("claude", "sess-B", EventKind::PreToolUse, P),
+        )
+        .await
+        .expect("re-ingest B");
+
+        assert_eq!(
+            ended_reasons(&pools, "claude", "sess-A").await.len(),
+            1,
+            "no duplicate SessionEnded row accumulates for A"
+        );
+        let (_events, states) = drain_state_frames(&mut rx);
+        assert!(
+            !states.iter().any(|(sid, _)| sid == "sess-A"),
+            "no second State frame is published for the already-Ended A; got {states:?}"
+        );
+    }
+
+    /// AC3 — reversible on resume. A → B (A ended) → A resumes on P: A un-ends
+    /// through the normal write path AND, now the live holder of P, supersedes
+    /// B. Whoever emitted most recently on the PID is the survivor.
+    #[tokio::test(flavor = "current_thread")]
+    async fn resumed_predecessor_unends_and_supersedes_current_holder() {
+        let (_tmp, pools) = fresh_pools().await;
+        let hub = BroadcastHub::new(64);
+        const P: u32 = 4944;
+
+        projection::session::write(
+            &pools.writer,
+            &hub,
+            envelope_with_pid("claude", "sess-A", EventKind::UserPromptSubmit, P),
+        )
+        .await
+        .expect("write A");
+        projection::session::write(
+            &pools.writer,
+            &hub,
+            envelope_with_pid("claude", "sess-B", EventKind::UserPromptSubmit, P),
+        )
+        .await
+        .expect("write B (ends A)");
+        assert_eq!(
+            read_state(&pools, "claude", "sess-A").await.current_state,
+            SessionCurrentState::Ended,
+            "A is superseded by B"
+        );
+
+        // A resumes (claude --resume) — a new event for A on P.
+        projection::session::write(
+            &pools.writer,
+            &hub,
+            envelope_with_pid("claude", "sess-A", EventKind::UserPromptSubmit, P),
+        )
+        .await
+        .expect("resume A");
+
+        assert_eq!(
+            read_state(&pools, "claude", "sess-A").await.current_state,
+            SessionCurrentState::Working,
+            "A un-ends through the normal write path (Ended is non-terminal)"
+        );
+        assert_eq!(
+            read_state(&pools, "claude", "sess-B").await.current_state,
+            SessionCurrentState::Ended,
+            "B is now superseded by the resumed A"
+        );
+        assert_eq!(
+            ended_reasons(&pools, "claude", "sess-B").await,
+            vec!["pid_superseded".to_string()],
+            "B ended with pid_superseded once A resumed"
+        );
+    }
+
+    /// AC5 — subagent gate (regression guard for the verified premise, ADR 0009
+    /// §"The subagent gate"). A single session that dispatches Task-tool
+    /// (`Agent`) subagents emits many events on one PID — including a tool-use
+    /// event whose tool_name is `Agent` — and must NEVER supersede itself: a
+    /// subagent does not surface as a distinct co-PID session_id, so the
+    /// emitter exclusion always holds. If a future Claude Code release registers
+    /// subagents as distinct co-PID sessions, this fails loudly instead of
+    /// silently ping-ponging parent ↔ subagent.
+    #[tokio::test(flavor = "current_thread")]
+    async fn subagent_activity_never_supersedes_its_parent() {
+        let (_tmp, pools) = fresh_pools().await;
+        let hub = BroadcastHub::new(64);
+        const P: u32 = 6491;
+
+        // The parent session emits a full turn on one PID, including a subagent
+        // dispatch (tool_name "Agent"), as PID 6491 / session e0215166 did.
+        for env in [
+            envelope_with_pid("claude", "sess-parent", EventKind::UserPromptSubmit, P),
+            agent_dispatch_with_pid("claude", "sess-parent", P),
+            envelope_with_pid("claude", "sess-parent", EventKind::PostToolUse, P),
+            agent_dispatch_with_pid("claude", "sess-parent", P),
+        ] {
+            projection::session::write(&pools.writer, &hub, env)
+                .await
+                .expect("write parent event");
+        }
+
+        assert_ne!(
+            read_state(&pools, "claude", "sess-parent")
+                .await
+                .current_state,
+            SessionCurrentState::Ended,
+            "a session must never supersede itself on its own (subagent) activity"
+        );
+        assert!(
+            ended_reasons(&pools, "claude", "sess-parent")
+                .await
+                .is_empty(),
+            "no synthetic co-PID SessionEnded may be emitted for the emitter"
+        );
+    }
+
+    /// AC4 — coexists with the probe, no race, no double-emit. Supersession's
+    /// per-victim write goes through `write_if_state_matches` under the same
+    /// precondition discipline the probe uses: if a concurrent hook/probe write
+    /// moved the victim row between the supersession SELECT and the synthetic
+    /// write, the precondition fails and the write no-ops (`Ok(None)`) rather
+    /// than stomping the interleaved state. Asserted deterministically at the
+    /// `write_if_state_matches` seam (no real concurrency race).
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_precondition_noops_instead_of_double_emitting() {
+        let (_tmp, pools) = fresh_pools().await;
+        let hub = BroadcastHub::new(64);
+        const P: u32 = 7777;
+
+        // A is live on P (Working). Imagine the supersession scan observed A at
+        // (Working, P), but before the synthetic write commits an interleaving
+        // hook moved A to Idle.
+        projection::session::write(
+            &pools.writer,
+            &hub,
+            envelope_with_pid("claude", "sess-A", EventKind::UserPromptSubmit, P),
+        )
+        .await
+        .expect("write A → Working");
+        projection::session::write(
+            &pools.writer,
+            &hub,
+            envelope_with_pid("claude", "sess-A", EventKind::Stop, P),
+        )
+        .await
+        .expect("interleaving hook moves A → Idle");
+        assert_eq!(
+            read_state(&pools, "claude", "sess-A").await.current_state,
+            SessionCurrentState::Idle,
+            "setup: A is now Idle (moved since the imagined scan)"
+        );
+
+        // Replay supersession's own write with the STALE snapshot the scan
+        // would have carried (Working, P). The row is Idle now → precondition
+        // fails → Ok(None), nothing touched.
+        let payload = r#"{"reason":"pid_superseded","pid":7777,"observed_at_ms":1}"#.to_string();
+        let envelope = EventEnvelope {
+            pid: Some(P),
+            payload,
+            ..envelope_for("claude", "sess-A", EventKind::SessionEnded)
+        };
+        let precondition = WritePrecondition {
+            expected_current_state: SessionCurrentState::Working,
+            expected_last_pid: Some(P),
+        };
+        let result = write_if_state_matches(&pools.writer, &hub, envelope, precondition)
+            .await
+            .expect("write_if_state_matches");
+        assert!(
+            result.is_none(),
+            "stale precondition must no-op (Ok(None)), not stomp the interleaved state"
+        );
+        assert_eq!(
+            read_state(&pools, "claude", "sess-A").await.current_state,
+            SessionCurrentState::Idle,
+            "A keeps its interleaved Idle state"
+        );
+        assert!(
+            ended_reasons(&pools, "claude", "sess-A").await.is_empty(),
+            "no SessionEnded row was written under the stale precondition"
+        );
+    }
+}
