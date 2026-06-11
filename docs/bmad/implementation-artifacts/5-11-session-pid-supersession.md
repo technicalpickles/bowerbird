@@ -1,6 +1,6 @@
 # Story 5.11: Session PID supersession — end rolled-over predecessor sessions
 
-Status: review
+Status: done
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
