@@ -296,7 +296,7 @@ pub fn write_launch_agent_plist(plist_path: &Path, xml: &str) -> anyhow::Result<
 /// A per-writer temp path beside `plist_path` (same directory, so the rename is
 /// atomic). The pid + process-local sequence keep two concurrent installs from
 /// sharing a temp name (F5).
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn unique_tmp_path(plist_path: &Path) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
