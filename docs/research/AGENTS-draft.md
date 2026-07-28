@@ -207,7 +207,10 @@ The shim must not call `git`, `tmux`, or any other subprocess on the success pat
 cargo build --workspace
 
 # Run all tests including examples
-cargo test --workspace
+# (always use scripts/test.sh, not raw `cargo test` — it serializes runs and
+# enforces a timeout; see docs/research/test-isolation-bowerbird-findings.md
+# for why a second concurrent cargo test process is the confirmed hang trigger)
+scripts/test.sh
 
 # Check formatting and lints
 cargo fmt --all -- --check
