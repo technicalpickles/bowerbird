@@ -12,9 +12,10 @@
 //! The CLI stays light: `launchctl` is invoked via `std::process::Command` and
 //! the plist is a hand-rendered XML string — no new deps, no `tokio`/`axum`.
 //!
-//! Everything that talks to launchd is gated behind `#[cfg(target_os =
-//! "macos")]`. The plist *renderer* and the path/dir resolvers are
-//! cross-platform so their unit tests run on Linux CI too.
+//! Everything that talks to launchd, plus the path resolvers and file I/O that
+//! only those launchd callers use, is gated behind `#[cfg(target_os =
+//! "macos")]`. Only the plist *renderer* (`render_launch_agent_plist`) is
+//! cross-platform, so its unit tests run on Linux CI too.
 
 use std::path::{Path, PathBuf};
 
@@ -27,6 +28,7 @@ pub const LAUNCH_AGENT_LABEL: &str = "com.technicalpickles.bowerbird.daemon";
 ///
 /// Order: `BOWERBIRD_LAUNCH_AGENTS_DIR` env override (test isolation, mirrors
 /// `BOWERBIRD_CLAUDE_SETTINGS`) → `$HOME/Library/LaunchAgents`.
+#[cfg(target_os = "macos")]
 pub fn launch_agents_dir() -> anyhow::Result<PathBuf> {
     if let Some(p) = std::env::var_os("BOWERBIRD_LAUNCH_AGENTS_DIR") {
         if !p.is_empty() {
@@ -38,6 +40,7 @@ pub fn launch_agents_dir() -> anyhow::Result<PathBuf> {
 }
 
 /// Absolute path of the LaunchAgent plist (`<dir>/<label>.plist`).
+#[cfg(target_os = "macos")]
 pub fn plist_path() -> anyhow::Result<PathBuf> {
     Ok(launch_agents_dir()?.join(format!("{LAUNCH_AGENT_LABEL}.plist")))
 }
@@ -251,6 +254,7 @@ fn xml_escape(s: &str) -> String {
 
 /// Write `xml` to `plist_path` atomically (`.tmp` → rename, mode 0644),
 /// creating the parent directory if absent.
+#[cfg(target_os = "macos")]
 pub fn write_launch_agent_plist(plist_path: &Path, xml: &str) -> anyhow::Result<()> {
     use anyhow::Context;
 
@@ -292,6 +296,7 @@ pub fn write_launch_agent_plist(plist_path: &Path, xml: &str) -> anyhow::Result<
 /// A per-writer temp path beside `plist_path` (same directory, so the rename is
 /// atomic). The pid + process-local sequence keep two concurrent installs from
 /// sharing a temp name (F5).
+#[cfg(target_os = "macos")]
 fn unique_tmp_path(plist_path: &Path) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -306,6 +311,7 @@ fn unique_tmp_path(plist_path: &Path) -> PathBuf {
 }
 
 /// Remove the LaunchAgent plist file. A missing file is a clean no-op.
+#[cfg(target_os = "macos")]
 pub fn remove_launch_agent_plist(plist_path: &Path) -> anyhow::Result<()> {
     match std::fs::remove_file(plist_path) {
         Ok(()) => Ok(()),
