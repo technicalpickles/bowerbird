@@ -20,6 +20,7 @@
 # Usage:
 #   scripts/test.sh                        # cargo test --workspace -- --test-threads=1
 #   scripts/test.sh -p bowerbird-daemon --test contract_daemon -- --exact some_test
+#   scripts/test.sh --unlock               # force-kill a stuck/old run and clear its lock
 #
 # Env overrides:
 #   BOWERBIRD_TEST_TIMEOUT_SECS   per-run timeout, seconds (default 300)
@@ -89,6 +90,78 @@ acquire_lock() {
 release_lock() {
   rm -rf "$LOCK_DIR"
 }
+
+# Descendants of $1, in post-order (children before parent), one pid per line.
+# Best-effort: if `pgrep` isn't available, prints nothing and the caller falls
+# back to killing just the recorded pid.
+collect_descendants() {
+  local parent="$1"
+  local child
+  if ! command -v pgrep >/dev/null 2>&1; then
+    return 0
+  fi
+  for child in $(pgrep -P "$parent" 2>/dev/null || true); do
+    collect_descendants "$child"
+    echo "$child"
+  done
+}
+
+force_unlock() {
+  if [ ! -d "$LOCK_DIR" ]; then
+    echo "test.sh: no lock held (${LOCK_DIR} does not exist); nothing to do" >&2
+    exit 0
+  fi
+
+  local pid
+  pid="$(lock_holder_pid)"
+
+  if [ "$pid" = "unknown" ] || ! kill -0 "$pid" 2>/dev/null; then
+    echo "test.sh: lock holder (pid ${pid}) is not running; clearing stale lock" >&2
+    rm -rf "$LOCK_DIR"
+    exit 0
+  fi
+
+  local pids
+  pids="$(collect_descendants "$pid")
+$pid"
+
+  echo "test.sh: sending SIGTERM to pid ${pid} and its descendants:" >&2
+  echo "$pids" | tr '\n' ' ' >&2
+  echo >&2
+
+  local p
+  for p in $pids; do
+    kill -TERM "$p" 2>/dev/null || true
+  done
+
+  local waited=0
+  while [ "$waited" -lt 5 ]; do
+    local any_alive=0
+    for p in $pids; do
+      if kill -0 "$p" 2>/dev/null; then
+        any_alive=1
+      fi
+    done
+    [ "$any_alive" -eq 0 ] && break
+    sleep 1
+    waited=$((waited + 1))
+  done
+
+  for p in $pids; do
+    if kill -0 "$p" 2>/dev/null; then
+      echo "test.sh: pid ${p} still alive after SIGTERM; sending SIGKILL" >&2
+      kill -KILL "$p" 2>/dev/null || true
+    fi
+  done
+
+  rm -rf "$LOCK_DIR"
+  echo "test.sh: lock cleared" >&2
+  exit 0
+}
+
+if [ "${1:-}" = "--unlock" ] || [ "${1:-}" = "--force-unlock" ]; then
+  force_unlock
+fi
 
 acquire_lock
 trap release_lock EXIT

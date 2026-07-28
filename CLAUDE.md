@@ -20,5 +20,11 @@ This applies to background/parallel agent work too: never launch a second
 test run while one is already in flight in this worktree, even in a
 different subagent or terminal.
 
+If a run is stuck (hung past its timeout, or the lock looks stale) and you
+need to clear it, don't hand-kill processes or `rm -rf` the lock directory —
+run `scripts/test.sh --unlock`. It kills the stuck run's process tree (SIGTERM,
+then SIGKILL after a grace period) and removes the lock, so a fresh
+`scripts/test.sh` can proceed.
+
 Full project context (architecture, decisions, conventions) lives in
 `docs/bmad/project-context.md`.
