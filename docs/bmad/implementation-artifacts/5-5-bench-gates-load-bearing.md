@@ -1,6 +1,6 @@
 # Story 5.5: Bench gates converted to load-bearing
 
-Status: ready-for-dev
+Status: in-progress
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -30,16 +30,16 @@ so that the bench infrastructure is producing signal — not just running.
 
 ## Tasks / Subtasks
 
-- [ ] **Task 0: Confirm a green CI run on `main` with daemon-bench artifacts exists** (AC: 1)
-  - [ ] `gh run list --branch main --workflow ci.yml --limit 10` to find the most recent green run that includes the `daemon-bench-gate` matrix jobs (macOS + Linux). Story 5.4 just merged (`de88c45` + CI-green fix `7f1e402`), so a recent green `main` run should exist.
-  - [ ] If no green `main` run has the daemon-bench artifacts (e.g. the gate was added but artifacts expired), fall back to this story's own PR CI run once it's green — the AC explicitly permits sourcing from the PR run.
+- [x] **Task 0: Confirm a green CI run on `main` with daemon-bench artifacts exists** (AC: 1)
+  - [x] `gh run list --branch main --workflow ci.yml --limit 10` to find the most recent green run that includes the `daemon-bench-gate` matrix jobs (macOS + Linux). **CI billing was still broken as of 2026-06-12** (every `main` run since 2026-05-20 failed instantly on account billing); resolved externally by 2026-07-28. Once billing was fixed, the next real run surfaced a genuine (non-billing) `ci (ubuntu-latest)` clippy dead-code failure from Story 5.9's `launch_agent.rs` (macOS-gated call sites left 4 helper fns unreachable on Linux) — fixed in two follow-up commits (`db37115`, `4b8d224`), verified against a real `linux/amd64 rust:1.94-bookworm` container, not just cross-checked by reasoning. Run `30398582292` (rerun) has both `daemon-bench-gate` and `shim-bench-gate` matrix legs green on both platforms.
+  - [x] Fallback not needed — `main` itself produced the green run once the two blockers above were cleared.
 
-- [ ] **Task 1: Seed the daemon-bench baselines (AC #1)** (AC: 1)
-  - [ ] `gh run download <run-id> -n daemon-bench-macos-latest` and `-n daemon-bench-ubuntu-latest` to pull each run's `target/daemon-bench-summary.json`. (Artifact names per `ci.yml:103,145`: `daemon-bench-${{ matrix.os }}` → `daemon-bench-macos-latest`, `daemon-bench-ubuntu-latest`.)
-  - [ ] For `macos.json`: copy the four `*_p99_nanos` values from the macOS summary into `crates/daemon/benches/baselines/macos.json`. Keep `samples`, `absolute_budget_nanos: 100000000`, `regression_max_ratio: 1.30`. **Delete the `_seeding_note` field** (its presence is the signal the baseline is unseeded).
-  - [ ] Same for `linux.json` from the ubuntu summary.
-  - [ ] Sanity: all four `*_p99_nanos` are non-zero and well under 100ms (Story 4.4 smoke saw solo 1.713ms / fanout3 1.608ms / burst 1.928ms / steady 1.242ms — same order of magnitude is expected). If any shape's p99 is implausibly high (>10ms), the source run was noisy — pick a cleaner run.
-  - [ ] Verify locally that the gate no longer auto-skips: `cargo bench -p bowerbird-daemon --bench hook_to_presenter` then `python3 scripts/check-daemon-bench-p99.py target/daemon-bench-summary.json crates/daemon/benches/baselines/<your-platform>.json` — confirm the output shows `regression gate OK` (not `regression gate skipped — baseline p99 is zero`).
+- [x] **Task 1: Seed the daemon-bench baselines (AC #1)** — **macOS only; Linux punted, see Debug Log** (AC: 1, partial)
+  - [x] `gh run download 30398582292 -n daemon-bench-macos-latest` and `-n daemon-bench-ubuntu-latest` to pull each run's `daemon-bench-summary.json`.
+  - [x] For `macos.json`: copied the four `*_p99_nanos` values from the macOS summary (solo 680916 / fanout3 906250 / burst 1812792 / steady 1555042 ns) into `crates/daemon/benches/baselines/macos.json`. Kept `samples: 50`, `absolute_budget_nanos: 100000000`, `regression_max_ratio: 1.30`; deleted `_seeding_note`.
+  - [ ] Same for `linux.json` from the ubuntu summary — **not done, deliberately.** See Debug Log: solo/fanout3/burst landed at ~40ms (vs ~1ms macOS) reproducibly across two independent CI runs. Punted post-launch per maintainer call (2026-07-28); `linux.json` stays at placeholder zero (daemon regression gate stays auto-skipped on Linux; the 100ms absolute gate still enforces NFR2 there). Tracked in `deferred-work.md` § "Deferred from: Story 5.5" — *not* struck through since it isn't resolved.
+  - [x] Sanity check applied to the macOS numbers: all four well under 100ms and same order of magnitude as the Story 4.4 reference (solo 1.713ms / fanout3 1.608ms / burst 1.928ms / steady 1.242ms). The Linux numbers *did* trip the ">10ms is noisy, pick a cleaner run" heuristic — except a second independent run reproduced the same ~40ms band, so it reads as a real platform characteristic rather than noise (see Debug Log). Investigating root cause and picking a genuinely clean run is exactly the punted work.
+  - [x] Verified locally (macOS only — this dev session ran on macOS): `python3 scripts/check-daemon-bench-p99.py <macos summary> crates/daemon/benches/baselines/macos.json` → all four shapes report `regression gate OK`, none `skipped`.
 
 - [ ] **Task 2: Daemon-bench chaos-injection sanity PRs (AC #2)** [HUMAN-IN-THE-LOOP — requires real draft PRs + CI]
   - [ ] Prepare the chaos patch: in `crates/daemon/src/projection/session.rs::write_inner`, after `interact_res?` resolves (~`session.rs:262`) and before `broadcaster.publish(BroadcastEnvelope::Event(event))` (~`session.rs:289`), insert `tokio::time::sleep(std::time::Duration::from_millis(50)).await;` with a `// CHAOS: revert before merge` comment.
@@ -129,8 +129,23 @@ Tasks 2 and 3 require opening real draft PRs and reading their CI results — th
 ### Agent Model Used
 
 claude-opus-4-8[1m] (Opus 4.8, 1M context) — dev-story session 2026-05-29.
+claude-sonnet-5 — dev-story resume session 2026-07-28.
 
 ### Debug Log References
+
+**Resumed 2026-07-28.** CI billing (blocking since 2026-05-29, bean `gt-9205`) was already fixed externally by the time this session started — `daemon-bench-gate` / `shim-bench-gate` jobs ran and uploaded real artifacts on the first push. But `ci (ubuntu-latest)` failed on a genuine, unrelated `cargo clippy --all-targets --workspace -D warnings` dead-code error: Story 5.9's `src/commands/launch_agent.rs` has `launch_agents_dir`, `plist_path`, `write_launch_agent_plist`, and `remove_launch_agent_plist` as plain (non-`cfg`-gated) functions, but every real caller lives inside `#[cfg(target_os = "macos")]`-gated functions in `install.rs`/`start.rs`/`uninstall.rs`/`stop.rs` — so on Linux they're genuinely dead. This slipped through unnoticed because CI's billing outage covered the entire Story 5.9/5.10/5.11 development window, so `ci (ubuntu-latest)` never actually ran clean until now.
+
+Fixed in two commits, pushed directly to `main` (outside this story's scope — a CI-wide blocker, not a Story 5.5 change):
+- `db37115` — gated the four functions `#[cfg(target_os = "macos")]` to match their real usage; corrected the module doc comment's now-inaccurate "cross-platform, unit-tested on Linux" claim.
+- `4b8d224` — follow-up: `db37115` missed that `unique_tmp_path` (the private helper `write_launch_agent_plist` calls) has its own cross-platform unit test (`unique_tmp_path_is_distinct_per_call_and_stays_in_dir`), so hard-gating it broke the Linux test build (`E0425: cannot find function`). Re-gated it `#[cfg(any(target_os = "macos", test))]`, matching the file's existing pattern for other test-covered macOS-only functions. Verified this time in a real `linux/amd64 rust:1.94-bookworm` Docker container (not just cross-checked by reasoning): fmt, clippy, and all 18 `launch_agent` unit tests pass.
+
+With clippy green, `cargo test --workspace -- --test-threads=1` still fails intermittently on `ci (ubuntu-latest)`/`ci (macos-latest)` — but on a *different* individual `contract_daemon.rs` test each run (`story_2_1_ws::ws_subscribe_accumulates_then_unsubscribe_removes`, then on rerun `story_2_5_shutdown::sigint_uses_graceful_shutdown_path_and_exits_zero`). This matches the project's already-documented, already-investigated `contract_daemon` test-isolation flake (`docs/research/test-isolation-bowerbird-findings.md`, `docs/bmad/implementation-artifacts/investigations/test-serialization-investigation.md`) that every story since 5.3 has explicitly waived rather than chased — not a regression from this session's changes (confirmed: full local `cargo test --workspace -- --test-threads=1` on this macOS dev box passed 100% twice, zero failures). Not investigated further here, per established project precedent.
+
+**Task 1 (baseline seeding):** downloaded `daemon-bench-{macos-latest,ubuntu-latest}` artifacts from the green run (`30398582292`). macOS numbers are clean and in the expected order of magnitude — seeded `macos.json`, verified the regression gate now reports `OK` (not `skipped`) for all four shapes.
+
+Linux numbers were not: `solo_p99_nanos`/`fanout3_p99_nanos`/`burst_p99_nanos` all landed at **~40ms**, vs **~1ms** on macOS for the identical shapes — a ~45–60× platform gap. `steady` (paced, 5 events/sec — no back-to-back sends) was fine on both platforms (~0.7–1.6ms), which narrows the gap to rapid-fire ingestion specifically. Checked whether this was one noisy run (the story's own escape hatch: ">10ms p99 → pick a cleaner run") by pulling the daemon-bench-ubuntu-latest artifact from a *second*, independent CI run (`30398023749`, before the clippy fix): nearly identical numbers (solo 40.48ms / fanout3 40.56ms / burst 40.99ms vs run 2's 40.77/40.91/40.83ms). Reproducible across independent runs rules out one-off CI noise. Checked `crates/daemon/benches/hook_to_presenter.rs` for a fixed delay that could artificially produce ~40ms — none found; leading unconfirmed hypothesis is SQLite WAL fsync/disk-I/O characteristics specific to GitHub's `ubuntu-latest` runner under rapid consecutive writes. Still comfortably inside the 100ms NFR2 absolute ceiling (not release-blocking), but per this story's own anti-pattern note ("a surprisingly high seeded number is a finding, not a reason to bump the budget"), committing it as the regression baseline without understanding it would silently normalize a 40× platform gap for every future Linux CI run.
+
+**Decision (2026-07-28, maintainer call):** punt the Linux daemon-bench baseline/regression-gate arming post-launch — "this is going to be way too flaky to do reliably." `linux.json` stays at placeholder zero (absolute gate still enforces NFR2 there; regression gate stays auto-skipped). Documented as a new `deferred-work.md` entry ("Deferred from: Story 5.5"). Tasks 2–3 (chaos-injection sanity PRs) and Task 4 (strike-through epic-4-retro AI-1/2/3) were **not** attempted this session — AC1 is only partially satisfied (macOS only), so striking AI-1 as resolved would be inaccurate, and the maintainer redirected to Story 5.12 (release pipeline) as the higher-value next step rather than continuing 5.5's remaining tasks.
 
 **BLOCKED at Task 0 (2026-05-29): GitHub Actions billing failure — CI cannot run.**
 
@@ -152,8 +167,23 @@ Task 0 requires a green CI run on `main` with `daemon-bench-gate` artifacts to s
 
 ### Completion Notes List
 
-- Story is **blocked**, not failed. No production code, baseline, or doc changes have been made — the all-zero baselines and unstruck retro items remain accurate until the gates are genuinely armed and proven in CI.
+- CI billing blocker (2026-05-29) resolved externally; a real, unrelated Linux clippy dead-code bug (Story 5.9 fallout) was found and fixed instead — this was outside Story 5.5's stated scope ("no net production code") but was a hard prerequisite for Task 0, so it landed as its own two commits on `main` rather than inside this story's diff.
+- Task 0 (green CI run with daemon-bench artifacts): done.
+- Task 1 (baseline seeding): **partial**. macOS baseline seeded and verified armed. Linux baseline deliberately left unseeded — see Debug Log for the ~40× macOS/Linux gap finding and the maintainer's punt-to-post-launch decision. Tracked in `deferred-work.md`.
+- Tasks 2, 3, 4: not started. AC1 is only partially met, so AC4's strike-through would be inaccurate. Story stays `in-progress`, not `review`.
+- Next session picking this back up should start at Task 1's Linux sub-item (once the post-launch investigation happens) or Task 2 (daemon chaos-injection PRs), whichever the maintainer prioritizes.
 
 ### File List
 
-_(none yet — story blocked at Task 0 pending CI billing restoration)_
+- `src/commands/launch_agent.rs` — CI prerequisite fix (commits `db37115`, `4b8d224` on `main`, outside this story's own diff): gated 4 macOS-only helper functions + doc comment correction.
+- `crates/daemon/benches/baselines/macos.json` — seeded with real p99 values (Task 1).
+- `docs/bmad/implementation-artifacts/deferred-work.md` — new "Deferred from: Story 5.5" entry (Linux bench baseline punt).
+- `docs/bmad/implementation-artifacts/5-5-bench-gates-load-bearing.md` — this file.
+- `docs/bmad/implementation-artifacts/sprint-status.yaml` — status update.
+
+### Change Log
+
+| Date | Author | Summary |
+|------|--------|---------|
+| 2026-05-29 | claude-opus-4-8 (1M context) | Blocked at Task 0 — GitHub Actions billing failure, CI cannot run. Parked as blocked per pickles. |
+| 2026-07-28 | claude-sonnet-5 | Resumed. CI billing was already fixed; found + fixed an unrelated Linux clippy dead-code regression from Story 5.9 (2 commits on `main`, outside this story's diff) that was the real remaining blocker. Task 0 done. Task 1 partial: macOS baseline seeded and armed; Linux baseline punted post-launch (maintainer call) after finding a reproducible ~40× macOS/Linux p99 gap on rapid-fire ingestion shapes — documented in `deferred-work.md` rather than silently seeded. Tasks 2–4 not started; maintainer redirected to Story 5.12 as the higher-value next step. Story stays `in-progress`. |
