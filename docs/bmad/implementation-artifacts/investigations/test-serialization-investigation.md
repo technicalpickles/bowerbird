@@ -304,3 +304,74 @@ Attempting to *fix* Symptom A (the teardown guard, spec `spec-status-test-teardo
 **Corrected scope of the at-risk set (reliable parser-based audit):** the deadlock class is **not** "in-process oneshot tests" — it is **every test that calls `fresh_pools()`** (each opens a migration writer connection). That is **79 in-process** `fresh_pools` tests (the quick-dev guarded 21) **+ 63 real-server** `fresh_pools` tests. Per-test enumeration proved unreliable (helper indirection: `seed()`, `list_ids()`); the only robust identification is "calls `fresh_pools`".
 
 **Open diagnostic to settle it:** reproduce Symptom A *under controlled load* (status test in a loop while a `--workspace` build/test or CPU stressor runs). If the unfixed control hangs under load and the leak/teardown variants don't, that both confirms the mechanism and validates a fix. Until then, A and B should likely be treated as one load-sensitivity problem with a shared fix (nextest binary-concurrency control / testability seam), per the §"Leads" in `docs/research/test-isolation-bowerbird-findings.md`.
+
+## Follow-up: 2026-07-28 — Root cause found and fixed (SQLite 3.51.1 close deadlock)
+
+**The hang is diagnosed, confirmed from source and a live specimen, and
+fixed.** Symptom A's mechanism (sqlite3_close racing teardown) was right;
+its framing (a per-test missing-teardown problem) was not.
+
+**Root cause:** SQLite 3.51.1 — the exact version bundled by
+libsqlite3-sys 0.36.0, and the only affected release — has a lock-order
+inversion in the unix VFS, introduced in 3.51.1 and fixed upstream in
+3.51.2 (SQLite forum: "TSAN: lock-order-inversion since 3.51.1", reported
+and fixed 2025-12-05). When two connections to the same WAL database are
+closed concurrently:
+
+- the close that can delete the WAL runs `sqlite3WalClose ->
+  sqlite3OsLock(EXCLUSIVE) -> unixLock`, which takes the per-inode
+  `pLockMutex` (sqlite3.c:41142) and then, still holding it, calls
+  `unixIsSharingShmNode` -> `unixEnterMutex` (global VFS mutex) — the
+  order sqlite3.c's own comment (lines 40088-40098) marks `ERROR`;
+- the other close runs `unixClose`, which correctly takes the global VFS
+  mutex first (41545) and then wants `pLockMutex` (41551).
+
+Textbook ABBA deadlock. Both blocking threads park in
+`__psynch_mutexwait` forever; the test (or daemon) thread then hangs in
+`Runtime` drop -> `BlockingPool::shutdown` waiting for them.
+
+**The live specimen:** an orphaned `contract_daemon` binary (pid 64520,
+parented to launchd, hung ~90+ minutes in
+`story_5_8_session_filter::sessions_state_filter_multi_drops_ended`) was
+found and sampled before killing. The `sample` backtrace shows exactly
+the two threads above, both inside `sqlite3_close` on the same
+`bower.db` inode (lsof-confirmed), plus the test thread parked in
+blocking-pool shutdown. Evidence preserved in
+`scratch/hang-hunt-evidence/` (orphan-sample-64520.txt,
+orphan-lsof-64520.txt).
+
+**Why the drop-ordering guards never fully worked:** deadpool's
+connection drops are fire-and-forget — `deadpool_sync::SyncWrapper::drop`
+spawns the real `sqlite3_close` onto a background blocking thread and
+returns immediately (deadpool-sync 0.2.0 src/lib.rs:162-176), and
+`Pool::close()`/`drop(pools)` pops idle connections in a tight loop.
+`DbPools` holds writer(max 1) + reader(max 4) pools on one file, so any
+teardown with >=2 idle connections fires concurrent closes no matter how
+drops are ordered; `drop(pools)` is itself the trigger. That made the
+exposure 130 of 151 `fresh_pools()` tests, and also the daemon's
+graceful shutdown (`main.rs` `reader.close(); writer.close();`) — a
+latent prod hang, not just a test flake.
+
+**Why it only showed under concurrent-worktree load:** the window is a
+few instructions wide inside `unixClose`. 44 instrumented runs under
+saturating synthetic CPU load (10x `yes` + a scratch cargo-build loop)
+all passed; a concurrent cargo test's scheduler churn is simply a much
+better source of the fine-grained jitter needed. Absence under synthetic
+load was never evidence of absence.
+
+**Fix:** vendored libsqlite3-sys 0.36.0 with the 3.51.3 amalgamation
+swapped in (bindings identical except version constants), wired via
+`[patch.crates-io]` — see `vendor/libsqlite3-sys/README-VENDORED.md`. A
+plain dependency bump is blocked: fixed SQLite needs libsqlite3-sys
+>=0.37 -> rusqlite >=0.39, and deadpool-sqlite (0.13.0, latest) pins
+rusqlite ^0.38 (tracking:
+https://github.com/deadpool-rs/deadpool/issues/490). Remove the vendor
+patch when that lands. Full workspace suite (630 tests) passes on
+3.51.3.
+
+**Status of the symptoms:** Symptom A is resolved (root cause was never
+specific to the status-sentinel test). Symptom B (the WS delivery
+deadline flake in `lag_invalidates_snapshot_coverage_resubscribe_resnapshots`)
+is unrelated to this deadlock and remains open. The `scripts/test.sh`
+timeout+`sample` diagnostics added the same day (commit 4f7ca57) remain
+as the safety net for any future hang class.
