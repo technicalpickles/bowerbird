@@ -59,6 +59,11 @@ pub fn plist_path() -> anyhow::Result<PathBuf> {
 /// 3. A `PATH` search canonicalized to absolute.
 /// 4. Error (no plist written) if none resolves — better than a plist launchd
 ///    silently fails to exec.
+///
+/// macOS-gated like its only caller (`install::supervise_or_start`); the
+/// `_with_override` resolver below stays cross-platform so its unit tests run
+/// on Linux CI too.
+#[cfg(target_os = "macos")]
 pub fn resolve_daemon_bin_absolute() -> anyhow::Result<PathBuf> {
     resolve_daemon_bin_absolute_with_override(std::env::var_os("BOWERBIRD_DAEMON_BIN"))
 }
@@ -68,6 +73,11 @@ pub fn resolve_daemon_bin_absolute() -> anyhow::Result<PathBuf> {
 /// snapshots the env var. Tests call this directly so they never mutate
 /// process-global env (`std::env::set_var` races under parallel execution —
 /// same seam shape as `token::TokenEnv`).
+///
+/// `cfg(any(macos, test))`: production callers are macOS-only, but the unit
+/// tests exercise this on Linux CI too (same pattern as `unique_tmp_path`,
+/// commit 4b8d224).
+#[cfg(any(target_os = "macos", test))]
 fn resolve_daemon_bin_absolute_with_override(
     override_bin: Option<std::ffi::OsString>,
 ) -> anyhow::Result<PathBuf> {
@@ -109,6 +119,7 @@ fn resolve_daemon_bin_absolute_with_override(
 /// Search `$PATH` for `bin`, returning the first hit canonicalized to an
 /// absolute path. `None` if `PATH` is unset or no entry contains an executable
 /// file by that name.
+#[cfg(any(target_os = "macos", test))]
 fn search_path_absolute(bin: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
