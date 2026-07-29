@@ -3687,8 +3687,19 @@ mod story_2_1_ws {
         .await
         .expect("send subscribe events");
 
-        // Yield so the daemon processes the subscribes before publish races.
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Prove both subscribes are live before publishing. The Event probe
+        // suffices for both: the connection task consumes inbound ops in
+        // order, so an events.* probe arriving implies the earlier
+        // state.session.* subscribe was processed too. (This used to be a
+        // 20ms sleep; on a loaded 4-vCPU CI runner the subscribes hadn't
+        // been processed yet, the publish fanned out to nobody, and the
+        // recv waited forever — CI runs #118-#120.)
+        crate::story_2_2_publish::wait_subscribe_live(
+            &mut ws,
+            &state,
+            crate::story_2_2_publish::ProbeKind::Event { source: "claude" },
+        )
+        .await;
 
         state.broadcaster.publish(make_state_envelope("sess-1"));
         let msg = read_text_frame_or_close(&mut ws).await;
@@ -3721,7 +3732,17 @@ mod story_2_1_ws {
         ))
         .await
         .expect("send unsubscribe");
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Deterministic fence instead of a sleep: returns only once a state
+        // probe has been provably filtered by the connection task.
+        crate::story_2_2_publish::wait_unsubscribe_processed(
+            &mut ws,
+            &state,
+            crate::story_2_2_publish::ProbeKind::State {
+                session_id: "__probe__",
+            },
+            crate::story_2_2_publish::ProbeKind::Event { source: "claude" },
+        )
+        .await;
 
         // After unsubscribing from state.*, a state envelope must NOT arrive,
         // but an events envelope still should.
@@ -4501,6 +4522,13 @@ mod story_2_2_publish {
             .and_then(|num| num.parse::<u64>().ok())
     }
 
+    /// A global atomic keeps probe tokens unique across parallel `cargo
+    /// test` workers running their own daemons; the bare value is
+    /// irrelevant — only its monotonic order within one helper
+    /// invocation matters. Shared by `wait_subscribe_live*` and
+    /// `wait_unsubscribe_processed`.
+    static TOKEN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     /// True if `msg` is a probe of the same kind currently being probed
     /// for. Frames from the prior (different-kind) probe call are also
     /// probes — they get drained but do NOT advance readiness for the
@@ -4547,12 +4575,9 @@ mod story_2_2_publish {
         state: &AppState,
         probe: ProbeKind,
     ) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        // A global atomic keeps the token unique across parallel `cargo
-        // test` workers running their own daemons; the bare value is
-        // irrelevant — only its monotonic order within one helper
-        // invocation matters.
-        static TOKEN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        // 30s: a hang guard sized for a starved CI scheduler, not a
+        // latency expectation (see read_text_frame_or_close).
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         let mut max_seen: Vec<Option<u64>> = vec![None; clients.len()];
         let mut latest_token: u64 = 0;
         loop {
@@ -4577,6 +4602,9 @@ mod story_2_2_publish {
                 loop {
                     match tokio::time::timeout(Duration::from_millis(20), ws.next()).await {
                         Ok(Some(Ok(msg))) => {
+                            if matches!(msg, Message::Ping(_) | Message::Pong(_)) {
+                                continue;
+                            }
                             let token = extract_probe_token(&msg).unwrap_or_else(|| {
                                 panic!("non-probe frame on client #{i} during readiness: {msg:?}")
                             });
@@ -4605,16 +4633,76 @@ mod story_2_2_publish {
         }
     }
 
+    /// Block until a previously-sent `Unsubscribe` for `dead`'s topic has
+    /// been applied by the connection task. There is no unsubscribe ack on
+    /// the wire, and "no frame arrived" is not directly provable, so this
+    /// uses a paired-probe fence: each iteration publishes a `dead`-kind
+    /// probe immediately followed by a `live`-kind probe on the same
+    /// broadcast channel. The channel is FIFO per receiver, so the
+    /// connection task dispatches the pair in order; when the client
+    /// observes the pair's live probe WITHOUT its paired dead probe, the
+    /// task must have filtered the dead one — the unsubscribe was applied
+    /// before the pair was dispatched. Seeing the dead probe means the old
+    /// subscription was still active for that pair; drain and retry.
+    pub(super) async fn wait_unsubscribe_processed(
+        ws: &mut WsStream,
+        state: &AppState,
+        dead: ProbeKind,
+        live: ProbeKind,
+    ) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let dead_token = TOKEN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            state
+                .broadcaster
+                .publish(build_probe_with_token(dead, dead_token));
+            let live_token = TOKEN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            state
+                .broadcaster
+                .publish(build_probe_with_token(live, live_token));
+
+            let mut saw_dead_of_pair = false;
+            loop {
+                if std::time::Instant::now() >= deadline {
+                    panic!("unsubscribe not observed as processed within 30s");
+                }
+                match tokio::time::timeout(Duration::from_millis(20), ws.next()).await {
+                    Ok(Some(Ok(msg))) => {
+                        if matches!(msg, Message::Ping(_) | Message::Pong(_)) {
+                            continue;
+                        }
+                        let token = extract_probe_token(&msg).unwrap_or_else(|| {
+                            panic!("non-probe frame during unsubscribe wait: {msg:?}")
+                        });
+                        if probe_matches_kind(&msg, dead) && token == dead_token {
+                            saw_dead_of_pair = true;
+                        }
+                        if probe_matches_kind(&msg, live) && token == live_token {
+                            break;
+                        }
+                        // Probes from earlier iterations are stale; discard.
+                    }
+                    Ok(Some(Err(e))) => panic!("ws error during unsubscribe wait: {e:?}"),
+                    Ok(None) => panic!("client closed during unsubscribe wait"),
+                    Err(_) => continue, // nothing queued yet — keep waiting
+                }
+            }
+            if !saw_dead_of_pair {
+                return;
+            }
+        }
+    }
+
     /// Retry `connect_authed` until the daemon accepts the upgrade. A 503
     /// (ws_semaphore exhausted) is "not ready yet" — retry until success
-    /// or a 2s deadline. Other errors fail the test. Mirrors the pattern
-    /// `story_2_1_ws::ws_257th_connection_rejected_503` uses to verify
-    /// permit release after a graceful close.
+    /// or a 30s hang-guard deadline. Other errors fail the test. Mirrors
+    /// the pattern `story_2_1_ws::ws_257th_connection_rejected_503` uses
+    /// to verify permit release after a graceful close.
     pub(super) async fn connect_until_ready(addr: std::net::SocketAddr) -> WsStream {
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
             if std::time::Instant::now() >= deadline {
-                panic!("connect never succeeded within 2s deadline");
+                panic!("connect never succeeded within 30s deadline");
             }
             let req = authed_request(&ws_url_header(addr), TEST_BEARER);
             match tokio_tungstenite::connect_async(req).await {
