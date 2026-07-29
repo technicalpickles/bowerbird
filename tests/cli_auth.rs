@@ -1,9 +1,9 @@
 //! End-to-end tests for `bowerbird auth token` (Story 3.3).
 //!
-//! Run under `--test-threads=1` (workspace default for daemon contract tests
-//! and lifecycle tests; see `crates/daemon/tests/contract_daemon.rs` and
-//! `tests/cli_lifecycle.rs`). These tests spawn real `bowerbird` and
-//! `bowerbird-daemon` subprocesses and share TempDir-relative env state.
+//! Parallel-safe: these tests spawn real `bowerbird` and `bowerbird-daemon`
+//! subprocesses, but every env var is passed per-child via `assert_cmd` /
+//! `Command::env` (never `std::env::set_var`) and all state lives under a
+//! per-test TempDir.
 //!
 //! **Keychain isolation discipline:** every test sets
 //! `BOWERBIRD_KEYRING_BACKEND` to `disable` or `mock` explicitly. A test

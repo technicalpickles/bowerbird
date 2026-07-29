@@ -16,10 +16,11 @@
 //!     `~/.bowerbird/` data directory + mode `0700`, the keychain
 //!     `service=bowerbird-daemon` entry, and `bowerbird uninstall`'s
 //!     data-preserving semantics) appear in BOTH README.md and INSTALL.md.
-//!   - **AC #6:** `.github/workflows/ci.yml` invokes `cargo test --workspace
-//!     -- --test-threads=1` for the daemon contract suite serialization
-//!     (Epic 2 retro AI-3 / Discovery #3). Drop the flag and the contract
-//!     tests flake under parallel execution.
+//!   - **AC #6 (revised 2026-07-29):** `.github/workflows/ci.yml` invokes
+//!     `cargo test --workspace` WITHOUT `--test-threads=1`. The original
+//!     serialization (Epic 2 retro AI-3 / Discovery #3) was retired once the
+//!     auth tests stopped mutating process env (TokenEnv seam); the gate now
+//!     rejects re-pinning the flag.
 //!   - **AC #7:** `docs/bmad/planning-artifacts/architecture.md`'s
 //!     "WebSocket subsystem" section names all six runtime config knobs from
 //!     `crates/daemon/src/config.rs::Config::with_bowerbird_dir`. The pinning
@@ -168,11 +169,13 @@ fn install_md_walkthrough_covers_a_through_g_markers() {
 }
 
 // ---------------------------------------------------------------------------
-// AC #6: the CI workflow serializes the daemon contract suite via
-// `cargo test --workspace -- --test-threads=1`. Epic 2 retro AI-3 documented
-// the failure mode (process-wide state shared by signal handlers, the
-// keychain mock backend, BOWERBIRD_DATA_DIR fixtures, and assert_cmd
-// subprocesses); a regression here re-introduces the entire class of flake.
+// AC #6 (revised 2026-07-29): the CI workflow runs the workspace suite in
+// parallel. The original AC pinned `--test-threads=1` (Epic 2 retro AI-3)
+// because the auth tests mutated process env; that was fixed by injecting a
+// TokenEnv snapshot, and the suites are TempDir-isolated with ephemeral
+// ports. The gate now points the other way: a reappearing `--test-threads=1`
+// means someone reintroduced process-global test state instead of isolating
+// it — fix the state, don't re-serialize.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -199,16 +202,26 @@ fn ci_workflow_sets_up_node_22_6() {
 }
 
 #[test]
-fn ci_workflow_runs_workspace_tests_single_threaded() {
+fn ci_workflow_runs_workspace_tests_in_parallel() {
     let ci = read_workspace_file(".github/workflows/ci.yml");
-    // The exact command — note the `--` separator is what makes
-    // `--test-threads=1` reach the test binary instead of cargo.
     assert!(
-        ci.contains("cargo test --workspace -- --test-threads=1"),
-        "AC #6: .github/workflows/ci.yml must invoke \
-         `cargo test --workspace -- --test-threads=1` for the daemon \
-         contract-test serialization (Epic 2 retro AI-3). Found ci.yml \
-         without that exact step."
+        ci.contains("cargo test --workspace"),
+        "AC #6: .github/workflows/ci.yml must invoke `cargo test --workspace`. \
+         Found ci.yml without that step."
+    );
+    // Only non-comment lines count — the workflow's own comments narrate the
+    // retired serialization and legitimately mention the flag.
+    let effective: String = ci
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !effective.contains("--test-threads=1"),
+        "AC #6 (revised 2026-07-29): ci.yml must NOT re-pin --test-threads=1. \
+         The suite is parallel-safe (TokenEnv seam, TempDir isolation, \
+         ephemeral ports); if a test needs serial execution, isolate its \
+         state instead of serializing the whole workspace."
     );
 }
 

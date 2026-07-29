@@ -2,8 +2,8 @@
 //!
 //! These tests spawn real `bowerbird-daemon` subprocesses and run a replay
 //! to populate the DB, then exercise `bowerbird export` against the
-//! resulting sessions. Run under `--test-threads=1` (workspace default for
-//! CLI E2E tests).
+//! resulting sessions. Parallel-safe: per-test TempDir data dirs and
+//! ephemeral daemon ports.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};

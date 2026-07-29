@@ -16,10 +16,13 @@
 #      exits immediately (does NOT block/poll) so a caller (human or agent)
 #      gets a fast, clear answer instead of a tool call sitting open for
 #      minutes. Re-run once the other one finishes, or use --unlock.
-#   2. Tees all cargo test output to target/test-logs/<run>/run.log. With
-#      --test-threads=1, libtest prints "test name ... " BEFORE running each
-#      test and the result after, so on a hang the log's last line names the
-#      stuck test.
+#   2. Tees all cargo test output to target/test-logs/<run>/run.log. For a
+#      serial run (explicit `-- --test-threads=1`), libtest prints
+#      "test name ... " BEFORE running each test, so on a hang the log's last
+#      line names the stuck test. The default parallel run doesn't get that
+#      property; hang forensics there come from the `sample` backtraces
+#      captured on timeout (#3). To pin down WHICH test hangs, re-run
+#      serially.
 #   3. Watches a deadline (BOWERBIRD_TEST_TIMEOUT_SECS) itself instead of
 #      wrapping cargo in timeout(1). On timeout it captures diagnostics
 #      BEFORE killing anything: the likely hung test, the live process tree,
@@ -30,8 +33,9 @@
 #      leaving orphaned processes behind.
 #
 # Usage:
-#   scripts/test.sh                        # cargo test --workspace -- --test-threads=1
+#   scripts/test.sh                        # cargo test --workspace (parallel)
 #   scripts/test.sh -p bowerbird-daemon --test contract_daemon -- --exact some_test
+#   scripts/test.sh --workspace -- --test-threads=1   # serial (names a hung test)
 #   scripts/test.sh --unlock               # force-kill a stuck/old run and clear its lock
 #
 # Env overrides:
@@ -192,9 +196,11 @@ prune_old_runs() {
   done
 }
 
-# One line describing the log's final line: with --test-threads=1, an
-# in-flight test's start line ("test name ... ", no result, no newline) is
-# always the last thing in the log, so that line IS the hung test.
+# One line describing the log's final line: under --test-threads=1 (explicit
+# serial run), an in-flight test's start line ("test name ... ", no result,
+# no newline) is always the last thing in the log, so that line IS the hung
+# test. Parallel runs only print completions, so the "likely hung test" case
+# won't fire there — rely on the sample backtraces instead.
 describe_last_line() {
   local last="$1"
   case "$last" in
@@ -280,9 +286,13 @@ on_interrupt() {
 trap 'on_interrupt INT' INT
 trap 'on_interrupt TERM' TERM
 
+# Parallel by default since 2026-07-29 (the auth tests' TokenEnv seam removed
+# the last process-global test state). The serialized-concurrent-INVOCATION
+# guard above is unrelated and stays: two cargo test processes in one
+# worktree is still the confirmed hang trigger.
 args=("$@")
 if [ "$#" -eq 0 ]; then
-  args=(--workspace -- --test-threads=1)
+  args=(--workspace)
 fi
 
 echo "test.sh: cargo test ${args[*]}" >&2

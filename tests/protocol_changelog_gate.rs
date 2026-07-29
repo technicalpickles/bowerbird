@@ -4,7 +4,7 @@
 //! to `docs/protocol-changelog.md` under the active version section with a
 //! `type:` header (`type: schema`, `type: behavioral`, or `type: security`).
 //! The gate fires as a compiled workspace-root test that runs under
-//! `cargo test --workspace -- --test-threads=1` (the standard CI lane) —
+//! `cargo test --workspace` (the standard CI lane) —
 //! "compiled tests beat greps" per Epic 3 retro Team Agreement A7.
 //!
 //! Base-ref resolution chain (first that resolves wins):

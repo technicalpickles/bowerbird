@@ -5,7 +5,7 @@ This changelog is CI-enforced (Story 4.4, FR39). Any PR that modifies
 version section below with a `type:` header — one of `type: schema`,
 `type: behavioral`, or `type: security`. The gate is implemented as a
 compiled workspace-root test at `tests/protocol_changelog_gate.rs` that
-runs under `cargo test --workspace -- --test-threads=1`; see the test's
+runs under `cargo test --workspace`; see the test's
 source comment for the exact diff-parsing rules.
 
 The discipline is documented in

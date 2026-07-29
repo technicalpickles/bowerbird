@@ -1,9 +1,8 @@
 //! End-to-end tests for `bowerbird replay` (Story 4.1).
 //!
-//! Run under `--test-threads=1` (workspace default for CLI E2E tests;
-//! see `tests/cli_lifecycle.rs`). These tests spawn real `bowerbird-daemon`
-//! subprocesses, so parallel runs would collide on TCP ports and signal
-//! handlers.
+//! Parallel-safe: these tests spawn real `bowerbird-daemon` subprocesses,
+//! but each binds an ephemeral port and owns a per-test TempDir, so runs
+//! do not collide (see `tests/cli_lifecycle.rs`).
 //!
 //! Every test isolates state via `BOWERBIRD_DATA_DIR` → `TempDir` plus
 //! `BOWERBIRD_DAEMON_BIN` → the workspace-built daemon. No test touches

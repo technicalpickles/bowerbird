@@ -2,10 +2,9 @@
 //!
 //! Each test orchestrates a real daemon subprocess + a Node subprocess
 //! running one of the TypeScript examples, then asserts the example's
-//! canonical stdout/stderr shape. Mirrors the `tests/cli_replay.rs` shape
-//! and inherits the `--test-threads=1` discipline (Epic 2 retro AI-3 / Story
-//! 3.4 AC #6); Node + daemon + assert_cmd processes share TCP ports and
-//! signal handlers, so parallel execution would collide.
+//! canonical stdout/stderr shape. Mirrors the `tests/cli_replay.rs` shape.
+//! Parallel-safe: each daemon binds an ephemeral port the example reads
+//! from its own server.json, and all state is TempDir-scoped per test.
 //!
 //! Tests gracefully skip when Node 22.6+ is unavailable. CI's `ubuntu-latest`
 //! and `macos-latest` runners ship Node 22+ natively; the skip path covers

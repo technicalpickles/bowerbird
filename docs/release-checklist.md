@@ -48,12 +48,14 @@ cargo clippy --all-targets --workspace -- -D warnings
 scripts/test.sh
 ```
 
-All three must be green. The workspace test suite **must** run serialized
-(`--test-threads=1`, which `scripts/test.sh` passes by default): the daemon
-contract + CLI E2E suites share process-wide state and hang/flake under
-parallel execution (see
-[Epic 2 retro AI-3](bmad/implementation-artifacts/epic-2-retro-2026-05-24.md); full root-cause writeup in
+All three must be green. The workspace test suite runs in parallel (libtest
+default threads) as of 2026-07-29; the earlier `--test-threads=1`
+serialization was retired once the auth tests stopped mutating process env
+(see
+[Epic 2 retro AI-3](bmad/implementation-artifacts/epic-2-retro-2026-05-24.md) for the original rationale; full root-cause writeup in
 [the investigation doc](bmad/implementation-artifacts/investigations/test-serialization-investigation.md)).
+Never run two `cargo test` processes concurrently in one worktree — that is
+the confirmed hang trigger `scripts/test.sh`'s lock exists to prevent.
 Always run tests via `scripts/test.sh` rather than raw `cargo test`: a
 *second* concurrent `cargo test` invocation in this worktree is the
 confirmed trigger for this project's intermittent hangs (see

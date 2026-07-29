@@ -1,9 +1,10 @@
 //! End-to-end tests for `bowerbird start` / `stop` / `status` (Story 3.2).
 //!
-//! Run under `--test-threads=1` (workspace default for daemon contract tests;
-//! see `project-context.md` and `crates/daemon/tests/contract_daemon.rs`).
-//! These tests spawn real `bowerbird-daemon` subprocesses and share TCP-port
-//! and signal-handler state; running them in parallel produces flakes.
+//! Parallel-safe: these tests spawn real `bowerbird-daemon` subprocesses,
+//! but each daemon binds an ephemeral port (`127.0.0.1:0`) and signals are
+//! sent to specific child PIDs, so tests do not contend. (An earlier header
+//! claimed shared TCP-port/signal-handler state required `--test-threads=1`;
+//! that predated the ephemeral-port default.)
 //!
 //! Every test isolates state via `BOWERBIRD_DATA_DIR` pointing at a `TempDir`
 //! plus `BOWERBIRD_DAEMON_BIN` pointing at the workspace-built daemon. This
