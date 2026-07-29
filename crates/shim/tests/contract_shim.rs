@@ -61,6 +61,62 @@ fn start_mock_ingest(tmp: &TempDir, response: &'static [u8]) -> MockIngest {
     }
 }
 
+/// A mock ingest socket that accepts, reads the request, and then **never
+/// replies**, holding the connection open (Story 5.16).
+///
+/// This makes the shim's `SO_RCVTIMEO` expiry deterministic rather than raced:
+/// no reply can ever arrive, so the read budget MUST expire. There is no sleep
+/// used for synchronization and no ordering to lose — the only thing being
+/// waited on is the shim's own 3ms timeout, which is the behavior under test.
+///
+/// Holding the accepted stream alive is load-bearing. Dropping it would close
+/// the socket, `read_line` would return `Ok(0)` on EOF, and the shim would
+/// report `BadResponse` instead of a timeout — testing the wrong path.
+fn start_mock_ingest_silent(tmp: &TempDir) -> MockIngest {
+    let sock_path = tmp.path().join("ingest.sock");
+    let listener = UnixListener::bind(&sock_path).expect("bind");
+    listener.set_nonblocking(true).expect("set_nonblocking");
+
+    let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_clone = captured.clone();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop.clone();
+
+    thread::spawn(move || {
+        // Accepted connections are parked here so they stay open (see above).
+        let mut held: Vec<UnixStream> = Vec::new();
+        while !stop_clone.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                    let mut line = Vec::new();
+                    let _ = reader.read_until(b'\n', &mut line);
+                    {
+                        let mut g = captured_clone.lock().expect("lock");
+                        g.extend_from_slice(&line);
+                    }
+                    // Deliberately no write: this is the timeout under test.
+                    held.push(stream);
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_micros(200));
+                }
+                Err(_) => break,
+            }
+        }
+        drop(held);
+    });
+
+    thread::sleep(Duration::from_millis(10));
+
+    MockIngest {
+        sock_path,
+        captured,
+        stop,
+    }
+}
+
 impl Drop for MockIngest {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -354,6 +410,88 @@ fn shim_exit_0_on_503_with_warning_log() {
         "exit-0 (503 backpressure) path must leave stderr empty, got: {:?}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+// ─── Story 5.16 AC #6: a socket timeout is diagnosable in the log ────────────
+
+/// The end-to-end half of AC #6: drive a REAL expired read timeout through the
+/// real shim binary and assert the log line names it as a timeout rather than
+/// the old generic `socket I/O failed: Resource temporarily unavailable (os
+/// error 35)` — the exact wording that made the rc1 dogfood finding
+/// undiagnosable.
+///
+/// The classification function itself is unit-tested in `socket.rs`; this test
+/// covers what that one cannot, namely that the classified error actually
+/// reaches the log with the right level and without touching stderr.
+#[test]
+fn shim_names_socket_timeout_in_log_and_stays_silent() {
+    let tmp = TempDir::new().expect("tempdir");
+    let log_tmp = TempDir::new().expect("log tmpdir");
+    let log = log_tmp.path().join("shim.log");
+    let mock = start_mock_ingest_silent(&tmp);
+
+    let out = run_shim_with_env(
+        &mock.sock_path,
+        &log,
+        "PreToolUse",
+        br#"{"session_id":"s1","tool_name":"Bash"}"#,
+        None,
+    );
+
+    // The daemon answered the connect and the event was handed over; per NFR20
+    // this is fire-and-forget, so Claude must still see success.
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a socket timeout must stay exit-0 (NFR20 fire-and-forget)"
+    );
+
+    // Story 5.10 partition: the exit-0 class never speaks on stderr. Story 5.16
+    // improves the LOG line, not stderr.
+    assert!(
+        out.stderr.is_empty(),
+        "exit-0 timeout path must leave stderr empty, got: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let log_contents = std::fs::read_to_string(&log).expect("log should exist");
+    assert!(
+        log_contents.contains("WARN"),
+        "timeout must log at WARN: {log_contents:?}"
+    );
+    assert_eq!(
+        log_contents.matches('\n').count(),
+        1,
+        "expected exactly one WARN line, got: {log_contents:?}"
+    );
+
+    // The contract: a timeout is distinguishable from a generic socket error.
+    // Assert on "timed out" rather than on which operation expired — the write
+    // budget could in principle be the one to blow on a starved runner, and
+    // either way the diagnosability contract is met.
+    assert!(
+        log_contents.contains("timed out"),
+        "log must name the failure as a timeout: {log_contents:?}"
+    );
+    assert!(
+        log_contents.contains("event dropped"),
+        "log must say the event was dropped: {log_contents:?}"
+    );
+    assert!(
+        !log_contents.contains("socket I/O failed"),
+        "timeout must NOT reuse the generic SocketIo wording (the rc1 dogfood \
+         bug): {log_contents:?}"
+    );
+    assert!(
+        !log_contents.contains("os error"),
+        "timeout must name the budget, not restate the errno: {log_contents:?}"
+    );
+
+    // Sanity: the shim really did send the payload before giving up, so this
+    // exercised the reply-read timeout and not some earlier failure.
+    let captured = wait_for_capture(&mock);
+    let payload = parse_captured_payload(&captured);
+    assert_eq!(payload["session_id"], "s1");
 }
 
 // ─── AC #5: log file mode is 0600 regardless of umask ────────────────────────

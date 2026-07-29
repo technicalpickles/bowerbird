@@ -29,6 +29,21 @@ pub enum Error {
     #[error("socket I/O failed: {0}")]
     SocketIo(#[source] std::io::Error),
 
+    /// An expired `SO_SNDTIMEO` / `SO_RCVTIMEO` on the ingest round-trip
+    /// (Story 5.16). Distinct from [`Error::SocketIo`] so a dropped event is
+    /// diagnosable: the operator can tell "the daemon did not answer inside
+    /// the budget" from "the socket genuinely failed", which the shared
+    /// `Error::SocketIo` bucket made impossible.
+    ///
+    /// Names the operation and the budget it blew rather than restating the
+    /// errno, because the errno is the least informative part — see
+    /// `socket::classify` for why the platform spelling is worthless here.
+    ///
+    /// Both fields are `&'static str` / `u64` — no allocation, per the shim's
+    /// hot-path discipline.
+    #[error("socket {op} timed out after {budget_ms}ms; event dropped")]
+    Timeout { op: &'static str, budget_ms: u64 },
+
     #[error("log file I/O failed: {0}")]
     LogIo(#[source] std::io::Error),
 
@@ -78,7 +93,14 @@ impl Error {
 
             // Mid-write / daemon-responding-with-error class → 0
             // (fire-and-forget per NFR20: the daemon is up and answering)
+            //
+            // `Timeout` belongs here and NOT with the exit-1 class: the connect
+            // succeeded, so the daemon is up — it just did not answer inside the
+            // budget (Story 5.16 Task 1 traced this to the daemon's runtime
+            // thread being starved by the OS scheduler under heavy load, not to
+            // the daemon being down or broken). Claude must still see success.
             Error::SocketIo(_)
+            | Error::Timeout { .. }
             | Error::BadResponse(_)
             | Error::Backpressure(_)
             | Error::Backpressure503
@@ -125,7 +147,15 @@ impl Error {
 
             // exit-0 (WARN) class → silent by contract (NFR20: daemon is up and
             // answering, fire-and-forget, Claude must see success)
+            //
+            // `Timeout` is silent here on purpose. Story 5.16 is a
+            // diagnosability story, and the surface it improves is the shim
+            // LOG LINE, not stderr — a timeout means the daemon answered the
+            // connect, so putting it on stderr would regress Story 5.10's
+            // exit-1/exit-0 partition and surface a hook warning to Claude for
+            // an event loss Claude can do nothing about.
             Error::SocketIo(_)
+            | Error::Timeout { .. }
             | Error::BadResponse(_)
             | Error::Backpressure(_)
             | Error::Backpressure503
@@ -158,6 +188,16 @@ mod tests {
                 source: dummy_io(),
             },
             Error::SocketIo(dummy_io()),
+            // Both operations, so the partition canaries cover each spelling of
+            // the Story 5.16 timeout rather than just whichever came first.
+            Error::Timeout {
+                op: "write",
+                budget_ms: 2,
+            },
+            Error::Timeout {
+                op: "read",
+                budget_ms: 3,
+            },
             Error::LogIo(dummy_io()),
             Error::BadResponse("x".into()),
             Error::Backpressure("x".into()),
