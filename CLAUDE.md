@@ -8,7 +8,12 @@ trigger for this project's intermittent test hangs. See
 `docs/research/test-isolation-bowerbird-findings.md` and
 `docs/bmad/implementation-artifacts/investigations/test-serialization-investigation.md`.
 `scripts/test.sh` takes an exclusive lock and runs under a timeout (so a
-real hang fails loudly instead of hanging forever). If another run already
+real hang fails loudly instead of hanging forever). Every run's output is
+tee'd to `target/test-logs/<run>/run.log`; on a timeout the script first
+captures which test was mid-run plus `sample` backtraces of the live test
+and daemon processes into that same run dir, then kills the tree and exits
+124. If a run times out, look there before rerunning — that capture is the
+evidence the hang investigation needs. If another run already
 holds the lock, it exits immediately rather than waiting — it does not
 block/poll, so don't retry-loop on it either; re-run once the other one
 finishes, or use `--unlock` (below) if it looks stuck.

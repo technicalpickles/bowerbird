@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Lock-guarded, timeout-guarded cargo test runner.
+# Lock-guarded, timeout-guarded cargo test runner with hang diagnostics.
 #
 # Concurrent cargo test invocations against this worktree have been the
 # reproducible trigger for the workspace's intermittent test hangs: every
@@ -16,10 +16,18 @@
 #      exits immediately (does NOT block/poll) so a caller (human or agent)
 #      gets a fast, clear answer instead of a tool call sitting open for
 #      minutes. Re-run once the other one finishes, or use --unlock.
-#   2. Runs cargo test under a timeout so a genuine hang fails loudly instead
-#      of hanging forever.
-#   3. Traps Ctrl-C/SIGTERM: kills the cargo test process tree and releases
-#      the lock immediately instead of leaving orphaned processes behind.
+#   2. Tees all cargo test output to target/test-logs/<run>/run.log. With
+#      --test-threads=1, libtest prints "test name ... " BEFORE running each
+#      test and the result after, so on a hang the log's last line names the
+#      stuck test.
+#   3. Watches a deadline (BOWERBIRD_TEST_TIMEOUT_SECS) itself instead of
+#      wrapping cargo in timeout(1). On timeout it captures diagnostics
+#      BEFORE killing anything: the likely hung test, the live process tree,
+#      and a `sample` backtrace of each live test/daemon process, all into
+#      the run's log dir. Then it kills the tree and exits 124.
+#   4. Traps Ctrl-C/SIGTERM: records the kill in run.log, kills the cargo
+#      test process tree, and releases the lock immediately instead of
+#      leaving orphaned processes behind.
 #
 # Usage:
 #   scripts/test.sh                        # cargo test --workspace -- --test-threads=1
@@ -30,16 +38,23 @@
 #   BOWERBIRD_TEST_TIMEOUT_SECS   per-run timeout, seconds (default 300)
 #
 # Compatibility: portable bash (mkdir-based lock, no `mapfile`/flock); works
-# on macOS bash 3.2 and Ubuntu bash 5.
+# on macOS bash 3.2 and Ubuntu bash 5. `sample` backtrace capture is
+# macOS-only and skipped elsewhere.
 
 set -eu
 
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 LOCK_DIR="$TARGET_DIR/.bowerbird-test-lock"
+LOG_ROOT="$TARGET_DIR/test-logs"
+KEEP_RUNS=10
 TIMEOUT_SECS="${BOWERBIRD_TEST_TIMEOUT_SECS:-300}"
 STALE_AFTER_SECS=$((TIMEOUT_SECS * 2 + 60))
 
 mkdir -p "$TARGET_DIR"
+
+timestamp() {
+  date '+%Y-%m-%d %H:%M:%S'
+}
 
 lock_holder_pid() {
   cat "$LOCK_DIR/pid" 2>/dev/null || echo "unknown"
@@ -163,6 +178,75 @@ force_unlock() {
   exit 0
 }
 
+# Oldest run dirs beyond KEEP_RUNS get deleted. Dir names are sortable
+# timestamps, so lexical sort == chronological.
+prune_old_runs() {
+  local total prune d
+  total="$(ls -1 "$LOG_ROOT" 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "$total" -le "$KEEP_RUNS" ]; then
+    return 0
+  fi
+  prune=$((total - KEEP_RUNS))
+  ls -1 "$LOG_ROOT" | sort | head -n "$prune" | while read -r d; do
+    rm -rf "${LOG_ROOT:?}/$d"
+  done
+}
+
+# One line describing the log's final line: with --test-threads=1, an
+# in-flight test's start line ("test name ... ", no result, no newline) is
+# always the last thing in the log, so that line IS the hung test.
+describe_last_line() {
+  local last="$1"
+  case "$last" in
+    test*"... ")
+      printf 'likely hung test (started, never finished): %s\n' "$last"
+      ;;
+    *)
+      printf 'no test was mid-run per run.log; last log line: %s\n' "$last"
+      ;;
+  esac
+}
+
+# Capture everything a post-mortem needs while the processes are still
+# alive: hung test name, process tree, and a `sample` backtrace per live
+# test/daemon process. Called BEFORE kill_tree on the timeout path.
+capture_hang_diagnostics() {
+  echo "test.sh: TIMEOUT after ${TIMEOUT_SECS}s; capturing diagnostics into ${RUN_DIR} before killing" >&2
+
+  local pids p cmd name last
+  pids="$(collect_descendants "$run_pid")
+$run_pid"
+  last="$(tail -n 1 "$RUN_LOG" 2>/dev/null || true)"
+
+  {
+    echo ""
+    echo "=== test.sh: TIMEOUT after ${TIMEOUT_SECS}s at $(timestamp) ==="
+    describe_last_line "$last"
+    echo ""
+    echo "live processes at timeout (pid ppid etime command):"
+    for p in $pids; do
+      ps -o pid=,ppid=,etime=,command= -p "$p" 2>/dev/null || true
+    done
+  } >>"$RUN_LOG" 2>/dev/null || true
+
+  if command -v sample >/dev/null 2>&1; then
+    for p in $pids; do
+      kill -0 "$p" 2>/dev/null || continue
+      cmd="$(ps -o comm= -p "$p" 2>/dev/null || true)"
+      name="$(basename "${cmd:-unknown}")"
+      case "$name" in
+        cargo | bash | sh | zsh | tee) continue ;;
+      esac
+      echo "test.sh: sampling pid ${p} (${name})" >&2
+      sample "$p" 2 -file "$RUN_DIR/sample-${p}-${name}.txt" >/dev/null 2>&1 || true
+    done
+  else
+    echo "(no 'sample' command on this host; skipped backtrace capture)" >>"$RUN_LOG" 2>/dev/null || true
+  fi
+
+  echo "test.sh: diagnostics captured in ${RUN_DIR}" >&2
+}
+
 if [ "${1:-}" = "--unlock" ] || [ "${1:-}" = "--force-unlock" ]; then
   force_unlock
 fi
@@ -170,12 +254,24 @@ fi
 acquire_lock
 trap release_lock EXIT
 
+RUN_DIR="$LOG_ROOT/$(date +%Y%m%d-%H%M%S)-$$"
+RUN_LOG="$RUN_DIR/run.log"
+mkdir -p "$RUN_DIR"
+prune_old_runs
+
 run_pid=""
 
 on_interrupt() {
   local sig="$1"
   echo "test.sh: received ${sig}; stopping the test run..." >&2
   if [ -n "$run_pid" ]; then
+    local last
+    last="$(tail -n 1 "$RUN_LOG" 2>/dev/null || true)"
+    {
+      echo ""
+      echo "=== test.sh: killed by SIG${sig} at $(timestamp) ==="
+      describe_last_line "$last"
+    } >>"$RUN_LOG" 2>/dev/null || true
     kill_tree "$run_pid"
   fi
   exit 130
@@ -184,26 +280,49 @@ on_interrupt() {
 trap 'on_interrupt INT' INT
 trap 'on_interrupt TERM' TERM
 
-timeout_cmd=""
-if command -v timeout >/dev/null 2>&1; then
-  timeout_cmd="timeout"
-elif command -v gtimeout >/dev/null 2>&1; then
-  timeout_cmd="gtimeout"
-else
-  echo "test.sh: warning: no 'timeout'/'gtimeout' found; running WITHOUT a hang timeout (brew install coreutils for one)" >&2
-fi
-
 args=("$@")
 if [ "$#" -eq 0 ]; then
   args=(--workspace -- --test-threads=1)
 fi
 
 echo "test.sh: cargo test ${args[*]}" >&2
+echo "test.sh: logging to ${RUN_LOG}" >&2
 
-if [ -n "$timeout_cmd" ]; then
-  "$timeout_cmd" "$TIMEOUT_SECS" cargo test "${args[@]}" &
-else
-  cargo test "${args[@]}" &
-fi
+{
+  echo "=== test.sh run started at $(timestamp) ==="
+  echo "command: cargo test ${args[*]}"
+  echo "timeout: ${TIMEOUT_SECS}s"
+  echo ""
+} >>"$RUN_LOG"
+
+cargo test "${args[@]}" > >(tee -a "$RUN_LOG") 2>&1 &
 run_pid=$!
-wait "$run_pid"
+printf 'wrapper pid: %s\ncargo pid: %s\n' "$$" "$run_pid" >"$RUN_DIR/pids"
+
+start_ts="$(date +%s)"
+timed_out=0
+while kill -0 "$run_pid" 2>/dev/null; do
+  if [ $(($(date +%s) - start_ts)) -ge "$TIMEOUT_SECS" ]; then
+    capture_hang_diagnostics
+    timed_out=1
+    kill_tree "$run_pid"
+    break
+  fi
+  sleep 2
+done
+
+status=0
+wait "$run_pid" || status=$?
+
+if [ "$timed_out" -eq 1 ]; then
+  echo "=== test.sh: process tree killed after timeout; exiting 124 ===" >>"$RUN_LOG" 2>/dev/null || true
+  echo "test.sh: run timed out after ${TIMEOUT_SECS}s; diagnostics in ${RUN_DIR}" >&2
+  exit 124
+fi
+
+{
+  echo ""
+  echo "=== test.sh: finished at $(timestamp) with exit status ${status} ==="
+} >>"$RUN_LOG" 2>/dev/null || true
+
+exit "$status"
