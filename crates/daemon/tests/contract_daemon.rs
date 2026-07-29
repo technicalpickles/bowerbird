@@ -45,6 +45,14 @@ async fn teardown_pools(pools: DbPools, tmp: TempDir) {
 
 const TEST_BEARER: &str = "test-bearer-token-1.7";
 
+/// Deadline for any await that should only time out on a REAL hang: WS frame
+/// recvs, readiness polls, child-exit waits, probe fences. This is a hang
+/// detector, not a latency assertion — size it for a starved scheduler on a
+/// loaded 4-vCPU CI runner (5s deadlines flaked there: CI runs #118-#120),
+/// never for how fast the operation "should" be. Semantic timings (ping
+/// intervals, coalesce windows, paused-clock tests) do NOT use this.
+const HANG_GUARD: Duration = Duration::from_secs(30);
+
 fn make_test_state(pools: DbPools, migrations_complete: Arc<AtomicBool>) -> AppState {
     make_test_state_with_ws(
         pools,
@@ -2274,7 +2282,7 @@ async fn state_plus_event_atomicity_under_sigkill_during_load() {
     // real sleep() for synchronization, but socket bind has no signal-style
     // signal — this is the documented exception (Story 1.6 Task 7 Dev Notes).
     let socket_ready = async {
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + crate::HANG_GUARD;
         loop {
             if std::fs::metadata(&sock_path).is_ok() {
                 break true;
@@ -3557,7 +3565,7 @@ mod story_2_1_ws {
         // starvation on that same CI runner, run #119) receives the
         // daemon's Ping interleaved with data frames. Tests that assert on
         // pings themselves read the raw stream instead of this helper.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let deadline = tokio::time::Instant::now() + crate::HANG_GUARD;
         loop {
             let msg = tokio::time::timeout_at(deadline, ws.next())
                 .await
@@ -3773,7 +3781,7 @@ mod story_2_1_ws {
     ) {
         // The next non-keepalive message must be a Close frame with code
         // 1008 (Ping/Pong may interleave on a slow runner).
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let deadline = tokio::time::Instant::now() + crate::HANG_GUARD;
         let msg = loop {
             let msg = tokio::time::timeout_at(deadline, ws.next())
                 .await
@@ -4577,7 +4585,7 @@ mod story_2_2_publish {
     ) {
         // 30s: a hang guard sized for a starved CI scheduler, not a
         // latency expectation (see read_text_frame_or_close).
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + crate::HANG_GUARD;
         let mut max_seen: Vec<Option<u64>> = vec![None; clients.len()];
         let mut latest_token: u64 = 0;
         loop {
@@ -4650,7 +4658,7 @@ mod story_2_2_publish {
         dead: ProbeKind,
         live: ProbeKind,
     ) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + crate::HANG_GUARD;
         loop {
             let dead_token = TOKEN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             state
@@ -4699,7 +4707,7 @@ mod story_2_2_publish {
     /// the pattern `story_2_1_ws::ws_257th_connection_rejected_503` uses
     /// to verify permit release after a graceful close.
     pub(super) async fn connect_until_ready(addr: std::net::SocketAddr) -> WsStream {
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + crate::HANG_GUARD;
         loop {
             if std::time::Instant::now() >= deadline {
                 panic!("connect never succeeded within 30s deadline");
@@ -6882,7 +6890,7 @@ mod story_2_4_dropped {
     ) -> Option<(u64, usize, EventId, EventId)> {
         let mut events_before: usize = 0;
         for _ in 0..max_frames {
-            let msg = match tokio::time::timeout(Duration::from_secs(30), ws.next()).await {
+            let msg = match tokio::time::timeout(crate::HANG_GUARD, ws.next()).await {
                 Ok(Some(Ok(m))) => m,
                 Ok(Some(Err(e))) => panic!("ws recv error while hunting for Dropped: {e:?}"),
                 Ok(None) => return None,
@@ -7107,7 +7115,7 @@ mod story_2_4_dropped {
             if found.len() == 3 {
                 break;
             }
-            let msg = tokio::time::timeout(Duration::from_secs(30), ws.next())
+            let msg = tokio::time::timeout(crate::HANG_GUARD, ws.next())
                 .await
                 .expect("read within 30s")
                 .expect("stream not ended")
@@ -8080,7 +8088,7 @@ mod story_2_4_dropped {
         // `state.session.*` frame the daemon sends, and that send flushes the
         // queued sess-A snapshot too. Without the fix sess-A is never
         // re-snapshotted, so it never appears and the 30s deadline fails the test.
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + crate::HANG_GUARD;
         let mut saw_sess_a = false;
         let mut pump = 0u64;
         while !saw_sess_a && std::time::Instant::now() < deadline {
@@ -8320,7 +8328,7 @@ mod story_2_5_shutdown {
     }
 
     async fn wait_for_daemon_ready(sock_path: &std::path::Path, stderr_path: &std::path::Path) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + crate::HANG_GUARD;
         loop {
             let socket_ready = std::fs::metadata(sock_path).is_ok();
             let log_ready = std::fs::read_to_string(stderr_path)
@@ -8580,7 +8588,7 @@ mod story_3_1_singleton {
     }
 
     async fn wait_for_daemon_ready(sock_path: &std::path::Path, stderr_path: &std::path::Path) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + crate::HANG_GUARD;
         loop {
             let socket_ready = std::fs::metadata(sock_path).is_ok();
             let log_ready = std::fs::read_to_string(stderr_path)
@@ -8636,12 +8644,12 @@ mod story_3_1_singleton {
         let (second_child, _sock2, stderr2) =
             spawn_daemon_against_data_dir(&tmp, &data_dir, "ingest2.sock");
         let second_pid = second_child.id();
-        let second_output = wait_for_child_exit(second_child, Duration::from_secs(30)).await;
+        let second_output = wait_for_child_exit(second_child, crate::HANG_GUARD).await;
 
         // Tear down the first daemon BEFORE the assertions so a panic does
         // not leak a live subprocess into the test runner.
         kill(Pid::from_raw(first_pid as i32), Signal::SIGTERM).expect("SIGTERM first daemon");
-        let _ = wait_for_child_exit(first_child, Duration::from_secs(30)).await;
+        let _ = wait_for_child_exit(first_child, crate::HANG_GUARD).await;
 
         assert!(
             !second_output.status.success(),
@@ -8683,7 +8691,7 @@ mod story_3_1_singleton {
         wait_for_daemon_ready(&sock2, &stderr2).await;
         let second_pid = second_child.id();
         kill(Pid::from_raw(second_pid as i32), Signal::SIGTERM).expect("SIGTERM second daemon");
-        let _ = wait_for_child_exit(second_child, Duration::from_secs(30)).await;
+        let _ = wait_for_child_exit(second_child, crate::HANG_GUARD).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -8700,14 +8708,14 @@ mod story_3_1_singleton {
         // that proves the self-healing claim in the singleton module's doc.
         kill(Pid::from_raw(first_child.id() as i32), Signal::SIGKILL)
             .expect("SIGKILL first daemon");
-        let _ = wait_for_child_exit(first_child, Duration::from_secs(30)).await;
+        let _ = wait_for_child_exit(first_child, crate::HANG_GUARD).await;
 
         let (second_child, sock2, stderr2) =
             spawn_daemon_against_data_dir(&tmp, &data_dir, "ingest2.sock");
         wait_for_daemon_ready(&sock2, &stderr2).await;
         kill(Pid::from_raw(second_child.id() as i32), Signal::SIGTERM)
             .expect("SIGTERM second daemon");
-        let _ = wait_for_child_exit(second_child, Duration::from_secs(30)).await;
+        let _ = wait_for_child_exit(second_child, crate::HANG_GUARD).await;
     }
 }
 
@@ -9074,7 +9082,7 @@ mod story_3_3_auth {
 
         // Wait up to 30s for exit (the resolver runs before any port binding;
         // generous because a loaded CI runner can starve the child).
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + crate::HANG_GUARD;
         let mut maybe_status = None;
         while Instant::now() < deadline {
             match child.try_wait().expect("try_wait") {

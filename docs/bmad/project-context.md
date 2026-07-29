@@ -647,8 +647,10 @@ Bench rule: **a bench that prints numbers but doesn't fail the build doesn't gat
 
 #### Deterministic test discipline — Proposed
 
-- **No real `sleep()`** for synchronization in tests. Use `tokio::test(start_paused = true)` + `tokio::time::advance` for time-dependent assertions.
+- **No real `sleep()`** for synchronization in tests. Use `tokio::test(start_paused = true)` + `tokio::time::advance` for time-dependent assertions. For "wait until the daemon has processed my message" (subscribe/unsubscribe acks don't exist on the wire), use the probe fences in `contract_daemon.rs::story_2_2_publish` — `wait_subscribe_live` / `wait_unsubscribe_processed` — not a sleep. A 20ms "yield so the daemon catches up" sleep passed locally for months, then failed 3/3 on a loaded 4-vCPU CI runner (2026-07-29, CI runs #118-#120): the publish fanned out before the subscribe was processed and the recv starved forever.
 - **No sleeps in CI workarounds.** A test that "works locally but is flaky on CI" should fail loudly, not get a `sleep(100ms)` patch.
+- **Hang guards are 30s, not "how fast it should be".** Timeouts wrapping recvs/readiness polls exist to fail fast on a real hang, not to assert latency; a starved CI scheduler can stall one test's thread for multiple seconds. Use `contract_daemon.rs`'s `HANG_GUARD` constant.
+- **No process-env mutation in tests** (`std::env::set_var` races concurrent env reads and `Command` spawns; it's what forced the retired `--test-threads=1` serialization). Enforced by `clippy.toml` `disallowed-methods`. Inject a snapshot instead — see `token::TokenEnv` and `launch_agent::resolve_daemon_bin_absolute_with_override` for the seam shape.
 - **Property tests** via `proptest` for invariants where the input space is non-trivial — projection determinism, ring-queue invariants if any get hand-rolled, monotonic event-id ordering.
 - **Snapshot tests** via `insta` for wire-format serialization. Cheap way to catch unintentional JSON shape changes.
 - **`unwrap()`/`expect()` is fine in tests.** The production discipline doesn't extend to tests; test code reads better with `unwrap`.

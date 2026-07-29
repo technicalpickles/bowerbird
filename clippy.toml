@@ -1,0 +1,14 @@
+# Enforced by `cargo clippy --all-targets --workspace -- -D warnings` in CI,
+# so these rules bite test code too.
+
+disallowed-methods = [
+    # Process-global env mutation races with concurrent env reads (and with
+    # Command spawns snapshotting the environment), which is what forced the
+    # workspace's old --test-threads=1 serialization. Inject a snapshot
+    # instead: see token::TokenEnv and
+    # launch_agent::resolve_daemon_bin_absolute_with_override for the seam
+    # shape. If a use is genuinely unavoidable, #[allow] it locally with a
+    # comment explaining why it cannot race.
+    { path = "std::env::set_var", reason = "races under parallel tests; inject an env snapshot (see token::TokenEnv)" },
+    { path = "std::env::remove_var", reason = "races under parallel tests; inject an env snapshot (see token::TokenEnv)" },
+]

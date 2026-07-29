@@ -60,9 +60,20 @@ pub fn plist_path() -> anyhow::Result<PathBuf> {
 /// 4. Error (no plist written) if none resolves — better than a plist launchd
 ///    silently fails to exec.
 pub fn resolve_daemon_bin_absolute() -> anyhow::Result<PathBuf> {
+    resolve_daemon_bin_absolute_with_override(std::env::var_os("BOWERBIRD_DAEMON_BIN"))
+}
+
+/// [`resolve_daemon_bin_absolute`] with the `BOWERBIRD_DAEMON_BIN` override
+/// passed explicitly. The whole resolver lives here; the no-arg wrapper just
+/// snapshots the env var. Tests call this directly so they never mutate
+/// process-global env (`std::env::set_var` races under parallel execution —
+/// same seam shape as `token::TokenEnv`).
+fn resolve_daemon_bin_absolute_with_override(
+    override_bin: Option<std::ffi::OsString>,
+) -> anyhow::Result<PathBuf> {
     const BIN: &str = "bowerbird-daemon";
 
-    if let Some(p) = std::env::var_os("BOWERBIRD_DAEMON_BIN") {
+    if let Some(p) = override_bin {
         if !p.is_empty() {
             let p = PathBuf::from(p);
             if p.is_absolute() {
@@ -821,14 +832,6 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    /// Serializes the tests that mutate the process-global `BOWERBIRD_DAEMON_BIN`
-    /// env var (Story 5.9 review pass-6 F7). Rust runs unit tests in parallel by
-    /// default; without this lock a targeted `cargo test -p bowerbird
-    /// launch_agent::tests` (no `--test-threads=1`) can interleave the two
-    /// resolver tests and corrupt each other's set/remove + restore, instead of
-    /// relying on the workspace-wide single-thread convention.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn plist_is_well_formed_and_carries_required_keys() {
         let xml = render_launch_agent_plist(
@@ -921,25 +924,16 @@ mod tests {
 
     #[test]
     fn daemon_bin_resolver_prefers_absolute_env_override() {
-        // Serialize against the other BOWERBIRD_DAEMON_BIN-mutating test (F7).
-        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Save/restore the env var so the test is order-independent.
-        let prev = std::env::var_os("BOWERBIRD_DAEMON_BIN");
-        std::env::set_var("BOWERBIRD_DAEMON_BIN", "/custom/abs/bowerbird-daemon");
-        let resolved = resolve_daemon_bin_absolute().expect("absolute override resolves");
+        let resolved =
+            resolve_daemon_bin_absolute_with_override(Some("/custom/abs/bowerbird-daemon".into()))
+                .expect("absolute override resolves");
         assert_eq!(resolved, PathBuf::from("/custom/abs/bowerbird-daemon"));
 
         // A non-absolute override is rejected (launchd needs absolute).
-        std::env::set_var("BOWERBIRD_DAEMON_BIN", "bowerbird-daemon");
         assert!(
-            resolve_daemon_bin_absolute().is_err(),
+            resolve_daemon_bin_absolute_with_override(Some("bowerbird-daemon".into())).is_err(),
             "non-absolute override must error"
         );
-
-        match prev {
-            Some(v) => std::env::set_var("BOWERBIRD_DAEMON_BIN", v),
-            None => std::env::remove_var("BOWERBIRD_DAEMON_BIN"),
-        }
     }
 
     #[test]
@@ -949,19 +943,12 @@ mod tests {
         // target/debug; a sibling `bowerbird-daemon` may or may not exist there,
         // so we only assert the resolver does not panic and returns an absolute
         // path when it succeeds.
-        // Serialize against the other BOWERBIRD_DAEMON_BIN-mutating test (F7).
-        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var_os("BOWERBIRD_DAEMON_BIN");
-        std::env::remove_var("BOWERBIRD_DAEMON_BIN");
-        if let Ok(p) = resolve_daemon_bin_absolute() {
+        if let Ok(p) = resolve_daemon_bin_absolute_with_override(None) {
             assert!(
                 p.is_absolute(),
                 "resolved daemon path must be absolute: {}",
                 p.display()
             );
-        }
-        if let Some(v) = prev {
-            std::env::set_var("BOWERBIRD_DAEMON_BIN", v);
         }
     }
 
