@@ -2274,7 +2274,7 @@ async fn state_plus_event_atomicity_under_sigkill_during_load() {
     // real sleep() for synchronization, but socket bind has no signal-style
     // signal — this is the documented exception (Story 1.6 Task 7 Dev Notes).
     let socket_ready = async {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
             if std::fs::metadata(&sock_path).is_ok() {
                 break true;
@@ -3547,9 +3547,13 @@ mod story_2_1_ws {
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
         >,
     ) -> Message {
-        tokio::time::timeout(Duration::from_secs(5), ws.next())
+        // 30s, not 5s: this is a hang guard, not a latency assertion. A
+        // starved scheduler on a loaded 4-vCPU CI runner blew a 5s recv
+        // under parallel execution (CI run #118); a real hang still fails
+        // fast enough at 30s.
+        tokio::time::timeout(Duration::from_secs(30), ws.next())
             .await
-            .expect("recv within 5s")
+            .expect("recv within 30s")
             .expect("stream not ended")
             .expect("recv ok")
     }
@@ -3734,7 +3738,7 @@ mod story_2_1_ws {
         >,
     ) {
         // The next message must be a Close frame with code 1008.
-        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        let msg = tokio::time::timeout(Duration::from_secs(30), ws.next())
             .await
             .expect("close arrived in time")
             .expect("stream produced item")
@@ -6769,7 +6773,7 @@ mod story_2_4_dropped {
     ) -> Option<(u64, usize, EventId, EventId)> {
         let mut events_before: usize = 0;
         for _ in 0..max_frames {
-            let msg = match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+            let msg = match tokio::time::timeout(Duration::from_secs(30), ws.next()).await {
                 Ok(Some(Ok(m))) => m,
                 Ok(Some(Err(e))) => panic!("ws recv error while hunting for Dropped: {e:?}"),
                 Ok(None) => return None,
@@ -6994,9 +6998,9 @@ mod story_2_4_dropped {
             if found.len() == 3 {
                 break;
             }
-            let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            let msg = tokio::time::timeout(Duration::from_secs(30), ws.next())
                 .await
-                .expect("read within 5s")
+                .expect("read within 30s")
                 .expect("stream not ended")
                 .expect("recv ok");
             let text = match msg {
@@ -7862,7 +7866,8 @@ mod story_2_4_dropped {
     /// binaries sequentially, and the failures tracked concurrent-worktree
     /// session load on older hardware (`scripts/test.sh` now locks that
     /// out). On current hardware it passes 20/20 under 2x CPU
-    /// oversubscription, finishing in ~0.05s against the 5s deadline. If
+    /// oversubscription, finishing in ~0.05s against the deadline (5s at
+    /// the time; widened to 30s with the rest of the hang guards). If
     /// it ever flakes again (e.g. a slow CI runner), the durable fix is
     /// the testability seam sketched in
     /// `docs/research/test-isolation-bowerbird-findings.md` §Leads #3;
@@ -7965,8 +7970,8 @@ mod story_2_4_dropped {
         // throwaway session and drain everything queued. The probe is a
         // `state.session.*` frame the daemon sends, and that send flushes the
         // queued sess-A snapshot too. Without the fix sess-A is never
-        // re-snapshotted, so it never appears and the 5s deadline fails the test.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        // re-snapshotted, so it never appears and the 30s deadline fails the test.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         let mut saw_sess_a = false;
         let mut pump = 0u64;
         while !saw_sess_a && std::time::Instant::now() < deadline {
@@ -8206,7 +8211,7 @@ mod story_2_5_shutdown {
     }
 
     async fn wait_for_daemon_ready(sock_path: &std::path::Path, stderr_path: &std::path::Path) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
             let socket_ready = std::fs::metadata(sock_path).is_ok();
             let log_ready = std::fs::read_to_string(stderr_path)
@@ -8466,7 +8471,7 @@ mod story_3_1_singleton {
     }
 
     async fn wait_for_daemon_ready(sock_path: &std::path::Path, stderr_path: &std::path::Path) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
             let socket_ready = std::fs::metadata(sock_path).is_ok();
             let log_ready = std::fs::read_to_string(stderr_path)
@@ -8522,12 +8527,12 @@ mod story_3_1_singleton {
         let (second_child, _sock2, stderr2) =
             spawn_daemon_against_data_dir(&tmp, &data_dir, "ingest2.sock");
         let second_pid = second_child.id();
-        let second_output = wait_for_child_exit(second_child, Duration::from_secs(5)).await;
+        let second_output = wait_for_child_exit(second_child, Duration::from_secs(30)).await;
 
         // Tear down the first daemon BEFORE the assertions so a panic does
         // not leak a live subprocess into the test runner.
         kill(Pid::from_raw(first_pid as i32), Signal::SIGTERM).expect("SIGTERM first daemon");
-        let _ = wait_for_child_exit(first_child, Duration::from_secs(5)).await;
+        let _ = wait_for_child_exit(first_child, Duration::from_secs(30)).await;
 
         assert!(
             !second_output.status.success(),
@@ -8569,7 +8574,7 @@ mod story_3_1_singleton {
         wait_for_daemon_ready(&sock2, &stderr2).await;
         let second_pid = second_child.id();
         kill(Pid::from_raw(second_pid as i32), Signal::SIGTERM).expect("SIGTERM second daemon");
-        let _ = wait_for_child_exit(second_child, Duration::from_secs(5)).await;
+        let _ = wait_for_child_exit(second_child, Duration::from_secs(30)).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -8586,14 +8591,14 @@ mod story_3_1_singleton {
         // that proves the self-healing claim in the singleton module's doc.
         kill(Pid::from_raw(first_child.id() as i32), Signal::SIGKILL)
             .expect("SIGKILL first daemon");
-        let _ = wait_for_child_exit(first_child, Duration::from_secs(5)).await;
+        let _ = wait_for_child_exit(first_child, Duration::from_secs(30)).await;
 
         let (second_child, sock2, stderr2) =
             spawn_daemon_against_data_dir(&tmp, &data_dir, "ingest2.sock");
         wait_for_daemon_ready(&sock2, &stderr2).await;
         kill(Pid::from_raw(second_child.id() as i32), Signal::SIGTERM)
             .expect("SIGTERM second daemon");
-        let _ = wait_for_child_exit(second_child, Duration::from_secs(5)).await;
+        let _ = wait_for_child_exit(second_child, Duration::from_secs(30)).await;
     }
 }
 
@@ -8958,8 +8963,9 @@ mod story_3_3_auth {
             .spawn()
             .expect("spawn daemon");
 
-        // Wait up to 5s for exit (the resolver runs before any port binding).
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Wait up to 30s for exit (the resolver runs before any port binding;
+        // generous because a loaded CI runner can starve the child).
+        let deadline = Instant::now() + Duration::from_secs(30);
         let mut maybe_status = None;
         while Instant::now() < deadline {
             match child.try_wait().expect("try_wait") {
@@ -8972,7 +8978,7 @@ mod story_3_3_auth {
         }
         let status = maybe_status.unwrap_or_else(|| {
             let _ = child.kill();
-            panic!("daemon did not exit within 5s when token chain was exhausted");
+            panic!("daemon did not exit within 30s when token chain was exhausted");
         });
         assert!(
             !status.success(),
