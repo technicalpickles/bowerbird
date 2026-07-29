@@ -233,6 +233,16 @@ async fn run(config: Config, bowerbird_dir: PathBuf) -> anyhow::Result<()> {
     }
     let adapter = Arc::new(adapter);
 
+    // Register signal handlers BEFORE anything externally observable as
+    // "ready" (ingest socket, server.json, the "daemon listening" log).
+    // Registration installs the process-level handler immediately; a signal
+    // arriving before the streams are first polled is queued, not fatal. If
+    // this happened lazily inside the graceful-shutdown future (as it used
+    // to), a SIGTERM landing between the readiness markers and the first
+    // poll of the serve loop would hit the default disposition and kill the
+    // daemon uncleanly — observed as a test flake under CPU oversubscription.
+    let shutdown_signals = ShutdownSignals::register();
+
     let (ingest_tx, ingest_rx) =
         tokio::sync::mpsc::channel::<ingest::IngestItem>(config.ingest_channel_capacity);
     let ingest_listener = ingest::listener::bind(&config.ingest_sock_path).with_context(|| {
@@ -323,7 +333,10 @@ async fn run(config: Config, bowerbird_dir: PathBuf) -> anyhow::Result<()> {
     tracing::warn!(addr = %local_addr, "daemon listening");
 
     let serve = axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal(shutdown_requested.clone()))
+        .with_graceful_shutdown(shutdown_signal(
+            shutdown_requested.clone(),
+            shutdown_signals,
+        ))
         .into_future();
     tokio::pin!(serve);
     let mut serve_result = None;
@@ -401,14 +414,16 @@ async fn run(config: Config, bowerbird_dir: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn shutdown_signal(token: CancellationToken) {
+async fn shutdown_signal(token: CancellationToken, mut signals: ShutdownSignals) {
     tokio::select! {
-        _ = next_signal() => {
+        _ = signals.next() => {
             tracing::warn!("shutdown signal received");
             token.cancel();
             // Arm a force-exit watcher for the next signal so a hung graceful
-            // shutdown can be terminated with a second Ctrl-C / SIGTERM.
-            tokio::spawn(force_exit_on_next_signal());
+            // shutdown can be terminated with a second Ctrl-C / SIGTERM. The
+            // same streams are reused, so a signal delivered mid-handoff is
+            // not lost.
+            tokio::spawn(force_exit_on_next_signal(signals));
         }
         _ = token.cancelled() => {
             tracing::warn!("shutdown requested via cancellation token");
@@ -416,44 +431,62 @@ async fn shutdown_signal(token: CancellationToken) {
     }
 }
 
-async fn force_exit_on_next_signal() {
-    next_signal().await;
+async fn force_exit_on_next_signal(mut signals: ShutdownSignals) {
+    signals.next().await;
     eprintln!("second shutdown signal received; forcing exit");
     std::process::exit(130);
 }
 
-async fn next_signal() {
-    use tokio::signal::unix::{signal, Signal, SignalKind};
+/// Registered shutdown-signal streams. Constructing this installs the
+/// process-level handlers immediately (replacing the fatal default
+/// dispositions), so it must happen before the daemon advertises readiness.
+struct ShutdownSignals {
+    sigint: Option<tokio::signal::unix::Signal>,
+    sigterm: Option<tokio::signal::unix::Signal>,
+    sighup: Option<tokio::signal::unix::Signal>,
+    sigquit: Option<tokio::signal::unix::Signal>,
+}
 
-    fn register(kind: SignalKind, name: &str) -> Option<Signal> {
-        match signal(kind) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                tracing::error!("failed to register {name} handler: {e}");
-                None
+impl ShutdownSignals {
+    /// Must be called from within the tokio runtime. A registration failure
+    /// is logged and that signal keeps its default disposition.
+    fn register() -> Self {
+        use tokio::signal::unix::{signal, Signal, SignalKind};
+
+        fn register(kind: SignalKind, name: &str) -> Option<Signal> {
+            match signal(kind) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    tracing::error!("failed to register {name} handler: {e}");
+                    None
+                }
             }
+        }
+
+        Self {
+            sigint: register(SignalKind::interrupt(), "SIGINT"),
+            sigterm: register(SignalKind::terminate(), "SIGTERM"),
+            sighup: register(SignalKind::hangup(), "SIGHUP"),
+            sigquit: register(SignalKind::quit(), "SIGQUIT"),
         }
     }
 
-    let mut sigint = register(SignalKind::interrupt(), "SIGINT");
-    let mut sigterm = register(SignalKind::terminate(), "SIGTERM");
-    let mut sighup = register(SignalKind::hangup(), "SIGHUP");
-    let mut sigquit = register(SignalKind::quit(), "SIGQUIT");
-
-    async fn recv_or_pending(s: &mut Option<Signal>) {
-        match s {
-            Some(s) => {
-                let _ = s.recv().await;
+    async fn next(&mut self) {
+        async fn recv_or_pending(s: &mut Option<tokio::signal::unix::Signal>) {
+            match s {
+                Some(s) => {
+                    let _ = s.recv().await;
+                }
+                None => std::future::pending::<()>().await,
             }
-            None => std::future::pending::<()>().await,
         }
-    }
 
-    tokio::select! {
-        _ = recv_or_pending(&mut sigint) => {}
-        _ = recv_or_pending(&mut sigterm) => {}
-        _ = recv_or_pending(&mut sighup) => {}
-        _ = recv_or_pending(&mut sigquit) => {}
+        tokio::select! {
+            _ = recv_or_pending(&mut self.sigint) => {}
+            _ = recv_or_pending(&mut self.sigterm) => {}
+            _ = recv_or_pending(&mut self.sighup) => {}
+            _ = recv_or_pending(&mut self.sigquit) => {}
+        }
     }
 }
 
