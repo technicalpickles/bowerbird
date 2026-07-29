@@ -435,3 +435,28 @@ tracked concurrent-worktree load that `scripts/test.sh` now locks out.
 Re-open via the seam sketch if it fires again (the failure signature is
 the `re-subscribe after lag MUST re-snapshot sess-A` assertion at a 5s
 deadline).
+
+## Follow-up 2026-07-29 #3: parallel-by-default flip
+
+With both symptoms closed, the workspace suite went parallel-by-default
+(`scripts/test.sh` and CI now run `cargo test --workspace` with libtest's
+default thread count; commit `2be689a`). Enabling work:
+
+- `story_3_3_auth` stopped mutating process env: `token::load_or_generate`
+  gained a `TokenEnv` snapshot seam (`33313a5`), removing the last
+  `--test-threads=1` dependency.
+- Parallel soaks at 16 threads on 10 cores surfaced exactly one failure in
+  ~12 pre-fix full-workspace runs — not a deadlock but a startup race:
+  SIGTERM landing between the "daemon listening" readiness marker and the
+  lazy signal-handler registration killed the daemon via default
+  disposition (`unix_wait_status(15)`). Fixed by registering the signal
+  streams synchronously before any readiness marker (`a61b0a6`).
+- Post-fix evidence: 18 consecutive 16-thread contract-suite runs plus 10
+  mixed default/16-thread full-workspace runs, all green (see final-soak
+  numbers in the session that landed the flip).
+
+The `release_pipeline_docs.rs` AC #6 gate now points the other way: it
+fails if `--test-threads=1` reappears in an effective (non-comment) line
+of `ci.yml`. The serialized-invocation lock in `scripts/test.sh` is
+unchanged — two concurrent `cargo test` *processes* in one worktree remain
+the confirmed hang trigger.
