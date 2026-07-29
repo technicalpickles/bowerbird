@@ -3551,11 +3551,24 @@ mod story_2_1_ws {
         // starved scheduler on a loaded 4-vCPU CI runner blew a 5s recv
         // under parallel execution (CI run #118); a real hang still fails
         // fast enough at 30s.
-        tokio::time::timeout(Duration::from_secs(30), ws.next())
-            .await
-            .expect("recv within 30s")
-            .expect("stream not ended")
-            .expect("recv ok")
+        //
+        // Keepalive Ping/Pong frames are skipped, like any real WS client:
+        // a connection that lives past ws_ping_interval (30s of scheduler
+        // starvation on that same CI runner, run #119) receives the
+        // daemon's Ping interleaved with data frames. Tests that assert on
+        // pings themselves read the raw stream instead of this helper.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let msg = tokio::time::timeout_at(deadline, ws.next())
+                .await
+                .expect("recv within 30s")
+                .expect("stream not ended")
+                .expect("recv ok");
+            match msg {
+                Message::Ping(_) | Message::Pong(_) => continue,
+                other => return other,
+            }
+        }
     }
 
     pub(super) fn parse_hello(msg: &Message) -> HelloFrame {
@@ -3737,12 +3750,20 @@ mod story_2_1_ws {
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
         >,
     ) {
-        // The next message must be a Close frame with code 1008.
-        let msg = tokio::time::timeout(Duration::from_secs(30), ws.next())
-            .await
-            .expect("close arrived in time")
-            .expect("stream produced item")
-            .expect("recv ok");
+        // The next non-keepalive message must be a Close frame with code
+        // 1008 (Ping/Pong may interleave on a slow runner).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let msg = loop {
+            let msg = tokio::time::timeout_at(deadline, ws.next())
+                .await
+                .expect("close arrived in time")
+                .expect("stream produced item")
+                .expect("recv ok");
+            match msg {
+                Message::Ping(_) | Message::Pong(_) => continue,
+                other => break other,
+            }
+        };
         match msg {
             Message::Close(Some(CloseFrame { code, reason })) => {
                 assert_eq!(
