@@ -330,6 +330,10 @@ jobs:
           body_path: release-notes.md
           # Treat `v0.1.0-rc1` (or any tag containing `-`) as prerelease.
           prerelease: ${{ contains(steps.tag.outputs.tag, '-') }}
+          # rc tags stage as drafts so the maintainer can verify the
+          # fresh-machine install (Story 5.12 AC2) before the release goes
+          # public; the tag itself still exists as soon as it's pushed.
+          draft: ${{ contains(steps.tag.outputs.tag, '-') }}
           # Auto-generate the "What's Changed" section from PR history.
           generate_release_notes: true
           files: |
