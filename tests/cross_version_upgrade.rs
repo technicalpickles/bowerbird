@@ -10,18 +10,25 @@
 //! The test CANNOT pass on a fresh checkout because it requires the prior-
 //! version daemon binary. Two env vars are consulted in order:
 //!
-//! 1. `BOWERBIRD_PRIOR_VERSION_BINARY` — explicit path override (release-
-//!    pipeline CI sets this).
+//! 1. `BOWERBIRD_PRIOR_VERSION_BINARY` — explicit path override. This is the
+//!    one the release-pipeline CI actually sets, and it tracks whatever the
+//!    real prior tag is (`git tag --sort=-v:refname`, see release.yml's
+//!    `cross-version-test` job) — it is NOT pinned to `v0.1.0`.
 //! 2. The conventional install path under
-//!    `target/cross-version-installs/v0.1.0/bin/bowerbird-daemon` (what the
-//!    AC #5 release checklist tells developers to populate via
-//!    `cargo install --git . --tag v0.1.0 --root target/cross-version-installs/v0.1.0`).
+//!    `target/cross-version-installs/v0.1.0/bin/bowerbird-daemon`, for a
+//!    human populating the cache by hand per the release checklist. This
+//!    segment is intentionally still the literal `v0.1.0` — `v0.1.0` is the
+//!    first non-prerelease tag this project will ever cut (Story 5.12: rc1
+//!    has no prior tag at all, so both paths correctly resolve to `None` and
+//!    the test SKIPs). Once `v0.1.1` (or later) needs cross-version coverage,
+//!    update this segment to the actual prior tag — env override still wins,
+//!    so this only matters for the manual/local path.
 //!
 //! If neither resolves, the test SKIPs with a `println!` and returns. Cargo
 //! treats `return` after `println!` as a PASS — which is what we want: the
 //! per-PR lane (which never sets the env var) runs the test as a no-op; the
-//! release-pipeline lane (which DOES set the env var, once v0.1.0 ships)
-//! exercises the full path.
+//! release-pipeline lane (which DOES set the env var, once a prior tag
+//! exists) exercises the full path.
 //!
 //! Additionally, the entire test is gated behind
 //! `BOWERBIRD_RUN_CROSS_VERSION_TEST=1`. Local `cargo test` does not pay the
@@ -46,6 +53,9 @@ fn resolve_prior_version_binary() -> Option<PathBuf> {
             return Some(path);
         }
     }
+    // rc1 is the first tag; this conventional path guard lifts once a real
+    // prior tag exists (Epic 4 retro AI-8). CI never hits this branch — it
+    // always sets BOWERBIRD_PRIOR_VERSION_BINARY above.
     let conventional = workspace_root()
         .join("target")
         .join("cross-version-installs")
