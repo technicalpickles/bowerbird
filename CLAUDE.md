@@ -4,12 +4,14 @@
 
 Always run tests via `scripts/test.sh`, never raw `cargo test`. A second
 `cargo test` process running concurrently in this worktree is the confirmed
-trigger for this project's intermittent test hangs — see
+trigger for this project's intermittent test hangs. See
 `docs/research/test-isolation-bowerbird-findings.md` and
 `docs/bmad/implementation-artifacts/investigations/test-serialization-investigation.md`.
-`scripts/test.sh` takes an exclusive lock (so a second invocation queues
-instead of racing) and runs under a timeout (so a real hang fails loudly
-instead of hanging forever).
+`scripts/test.sh` takes an exclusive lock and runs under a timeout (so a
+real hang fails loudly instead of hanging forever). If another run already
+holds the lock, it exits immediately rather than waiting — it does not
+block/poll, so don't retry-loop on it either; re-run once the other one
+finishes, or use `--unlock` (below) if it looks stuck.
 
 ```sh
 scripts/test.sh                          # cargo test --workspace -- --test-threads=1
@@ -18,7 +20,9 @@ scripts/test.sh -p bowerbird-daemon --test contract_daemon -- --exact some_test
 
 This applies to background/parallel agent work too: never launch a second
 test run while one is already in flight in this worktree, even in a
-different subagent or terminal.
+different subagent or terminal. Ctrl-C / SIGTERM on a running
+`scripts/test.sh` stops it immediately (kills the test process tree,
+releases the lock) rather than leaving it running.
 
 If a run is stuck (hung past its timeout, or the lock looks stale) and you
 need to clear it, don't hand-kill processes or `rm -rf` the lock directory —

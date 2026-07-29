@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Serialized, timeout-guarded cargo test runner.
+# Lock-guarded, timeout-guarded cargo test runner.
 #
 # Concurrent cargo test invocations against this worktree have been the
 # reproducible trigger for the workspace's intermittent test hangs: every
@@ -12,10 +12,14 @@
 #
 # This script:
 #   1. Takes an exclusive lock (mkdir-based; portable, no flock(1) dependency
-#      since macOS doesn't ship one) so a second invocation queues instead of
-#      racing with the first.
+#      since macOS doesn't ship one). If another run already holds it, this
+#      exits immediately (does NOT block/poll) so a caller (human or agent)
+#      gets a fast, clear answer instead of a tool call sitting open for
+#      minutes. Re-run once the other one finishes, or use --unlock.
 #   2. Runs cargo test under a timeout so a genuine hang fails loudly instead
 #      of hanging forever.
+#   3. Traps Ctrl-C/SIGTERM: kills the cargo test process tree and releases
+#      the lock immediately instead of leaving orphaned processes behind.
 #
 # Usage:
 #   scripts/test.sh                        # cargo test --workspace -- --test-threads=1
@@ -24,7 +28,6 @@
 #
 # Env overrides:
 #   BOWERBIRD_TEST_TIMEOUT_SECS   per-run timeout, seconds (default 300)
-#   BOWERBIRD_TEST_LOCK_WAIT_SECS max time to wait for the lock (default 900)
 #
 # Compatibility: portable bash (mkdir-based lock, no `mapfile`/flock); works
 # on macOS bash 3.2 and Ubuntu bash 5.
@@ -34,7 +37,6 @@ set -eu
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 LOCK_DIR="$TARGET_DIR/.bowerbird-test-lock"
 TIMEOUT_SECS="${BOWERBIRD_TEST_TIMEOUT_SECS:-300}"
-LOCK_WAIT_SECS="${BOWERBIRD_TEST_LOCK_WAIT_SECS:-900}"
 STALE_AFTER_SECS=$((TIMEOUT_SECS * 2 + 60))
 
 mkdir -p "$TARGET_DIR"
@@ -58,33 +60,30 @@ lock_is_stale() {
   [ "$age" -gt "$STALE_AFTER_SECS" ]
 }
 
-acquire_lock() {
-  local waited=0
-  local announced=0
-
-  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
-    if lock_is_stale; then
-      echo "test.sh: clearing a stale lock left by pid $(lock_holder_pid)" >&2
-      rm -rf "$LOCK_DIR"
-      continue
-    fi
-
-    if [ "$announced" -eq 0 ]; then
-      echo "test.sh: another cargo test run (pid $(lock_holder_pid)) holds the lock; waiting..." >&2
-      announced=1
-    fi
-
-    if [ "$waited" -ge "$LOCK_WAIT_SECS" ]; then
-      echo "test.sh: waited ${LOCK_WAIT_SECS}s for the test lock and gave up; is a run stuck?" >&2
-      exit 1
-    fi
-
-    sleep 1
-    waited=$((waited + 1))
-  done
-
+write_lock() {
   echo "$$" >"$LOCK_DIR/pid"
   date +%s >"$LOCK_DIR/created"
+}
+
+# Fails fast (no polling/blocking) — see header comment #1.
+acquire_lock() {
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    write_lock
+    return 0
+  fi
+
+  if lock_is_stale; then
+    echo "test.sh: clearing a stale lock left by pid $(lock_holder_pid)" >&2
+    rm -rf "$LOCK_DIR"
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+      write_lock
+      return 0
+    fi
+  fi
+
+  echo "test.sh: another cargo test run (pid $(lock_holder_pid)) already holds the lock (${LOCK_DIR})." >&2
+  echo "test.sh: not waiting. Re-run once it finishes, or run 'scripts/test.sh --unlock' to force-clear a stuck run." >&2
+  exit 2
 }
 
 release_lock() {
@@ -93,7 +92,7 @@ release_lock() {
 
 # Descendants of $1, in post-order (children before parent), one pid per line.
 # Best-effort: if `pgrep` isn't available, prints nothing and the caller falls
-# back to killing just the recorded pid.
+# back to killing just the given pid.
 collect_descendants() {
   local parent="$1"
   local child
@@ -106,28 +105,14 @@ collect_descendants() {
   done
 }
 
-force_unlock() {
-  if [ ! -d "$LOCK_DIR" ]; then
-    echo "test.sh: no lock held (${LOCK_DIR} does not exist); nothing to do" >&2
-    exit 0
-  fi
-
-  local pid
-  pid="$(lock_holder_pid)"
-
-  if [ "$pid" = "unknown" ] || ! kill -0 "$pid" 2>/dev/null; then
-    echo "test.sh: lock holder (pid ${pid}) is not running; clearing stale lock" >&2
-    rm -rf "$LOCK_DIR"
-    exit 0
-  fi
-
+# SIGTERM the given pid + its descendants, SIGKILL any stragglers after a
+# short grace period. Used both by --unlock (on a lock file's recorded pid)
+# and by the INT/TERM trap below (on the run we just started).
+kill_tree() {
+  local root="$1"
   local pids
-  pids="$(collect_descendants "$pid")
-$pid"
-
-  echo "test.sh: sending SIGTERM to pid ${pid} and its descendants:" >&2
-  echo "$pids" | tr '\n' ' ' >&2
-  echo >&2
+  pids="$(collect_descendants "$root")
+$root"
 
   local p
   for p in $pids; do
@@ -153,6 +138,25 @@ $pid"
       kill -KILL "$p" 2>/dev/null || true
     fi
   done
+}
+
+force_unlock() {
+  if [ ! -d "$LOCK_DIR" ]; then
+    echo "test.sh: no lock held (${LOCK_DIR} does not exist); nothing to do" >&2
+    exit 0
+  fi
+
+  local pid
+  pid="$(lock_holder_pid)"
+
+  if [ "$pid" = "unknown" ] || ! kill -0 "$pid" 2>/dev/null; then
+    echo "test.sh: lock holder (pid ${pid}) is not running; clearing stale lock" >&2
+    rm -rf "$LOCK_DIR"
+    exit 0
+  fi
+
+  echo "test.sh: killing pid ${pid} and its descendants" >&2
+  kill_tree "$pid"
 
   rm -rf "$LOCK_DIR"
   echo "test.sh: lock cleared" >&2
@@ -165,6 +169,20 @@ fi
 
 acquire_lock
 trap release_lock EXIT
+
+run_pid=""
+
+on_interrupt() {
+  local sig="$1"
+  echo "test.sh: received ${sig}; stopping the test run..." >&2
+  if [ -n "$run_pid" ]; then
+    kill_tree "$run_pid"
+  fi
+  exit 130
+}
+
+trap 'on_interrupt INT' INT
+trap 'on_interrupt TERM' TERM
 
 timeout_cmd=""
 if command -v timeout >/dev/null 2>&1; then
@@ -183,7 +201,9 @@ fi
 echo "test.sh: cargo test ${args[*]}" >&2
 
 if [ -n "$timeout_cmd" ]; then
-  "$timeout_cmd" "$TIMEOUT_SECS" cargo test "${args[@]}"
+  "$timeout_cmd" "$TIMEOUT_SECS" cargo test "${args[@]}" &
 else
-  cargo test "${args[@]}"
+  cargo test "${args[@]}" &
 fi
+run_pid=$!
+wait "$run_pid"

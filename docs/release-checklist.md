@@ -49,17 +49,19 @@ scripts/test.sh
 ```
 
 All three must be green. The workspace test suite **must** run serialized
-(`--test-threads=1`, which `scripts/test.sh` passes by default) — the daemon
+(`--test-threads=1`, which `scripts/test.sh` passes by default): the daemon
 contract + CLI E2E suites share process-wide state and hang/flake under
 parallel execution (see
 [Epic 2 retro AI-3](bmad/implementation-artifacts/epic-2-retro-2026-05-24.md); full root-cause writeup in
 [the investigation doc](bmad/implementation-artifacts/investigations/test-serialization-investigation.md)).
-Always run tests via `scripts/test.sh` rather than raw `cargo test` — a
+Always run tests via `scripts/test.sh` rather than raw `cargo test`: a
 *second* concurrent `cargo test` invocation in this worktree is the
 confirmed trigger for this project's intermittent hangs (see
-[the test-isolation findings](research/test-isolation-bowerbird-findings.md)),
-so the script serializes runs with a lock and enforces a timeout instead of
-letting a hang run forever.
+[the test-isolation findings](research/test-isolation-bowerbird-findings.md)).
+The script takes a lock and enforces a timeout so a hang fails loudly
+instead of running forever; if another run already holds the lock it exits
+immediately rather than waiting, and `scripts/test.sh --unlock` force-clears
+a stuck one.
 
 ## 4. Local tarball smoke test
 
