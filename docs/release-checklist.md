@@ -54,16 +54,14 @@ serialization was retired once the auth tests stopped mutating process env
 (see
 [Epic 2 retro AI-3](bmad/implementation-artifacts/epic-2-retro-2026-05-24.md) for the original rationale; full root-cause writeup in
 [the investigation doc](bmad/implementation-artifacts/investigations/test-serialization-investigation.md)).
-Never run two `cargo test` processes concurrently in one worktree — that is
-the confirmed hang trigger `scripts/test.sh`'s lock exists to prevent.
-Always run tests via `scripts/test.sh` rather than raw `cargo test`: a
-*second* concurrent `cargo test` invocation in this worktree is the
-confirmed trigger for this project's intermittent hangs (see
+Always run tests via `scripts/test.sh`, never raw `cargo test`: a *second*
+concurrent `cargo test` invocation in this worktree is the confirmed trigger
+for this project's intermittent hangs (see
 [the test-isolation findings](research/test-isolation-bowerbird-findings.md)).
-The script takes a lock and enforces a timeout so a hang fails loudly
-instead of running forever; if another run already holds the lock it exits
-immediately rather than waiting, and `scripts/test.sh --unlock` force-clears
-a stuck one.
+The script takes an exclusive lock and enforces a timeout so a hang fails
+loudly instead of running forever; if another run already holds the lock it
+exits immediately rather than waiting, and `scripts/test.sh --unlock`
+force-clears a stuck one.
 
 ## 4. Local tarball smoke test
 

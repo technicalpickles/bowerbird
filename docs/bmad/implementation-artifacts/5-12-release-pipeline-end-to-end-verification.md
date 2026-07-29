@@ -1,6 +1,6 @@
 # Story 5.12: Release pipeline end-to-end verification
 
-Status: ready-for-dev
+Status: in-progress
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -36,23 +36,23 @@ so that v0.1.0 is the second release we cut — not the first.
 
 ## Tasks / Subtasks
 
-- [ ] **Task 1: Pre-tag local verification (AC: 1, 6, 7)**
-  - [ ] Run `cargo test --workspace -- --test-threads=1`, `cargo fmt --check`, `cargo clippy --all-targets --workspace -- -D warnings` — all green. (Serialized run is mandatory; see Dev Notes "Test execution.")
-  - [ ] Run `./scripts/tarball-smoke-test.sh v0.1.0-rc1` against locally built binaries; confirm the 10 expected extracted paths and executable bits ([tarball-smoke-test.sh:144-176](../../scripts/tarball-smoke-test.sh)).
-  - [ ] Confirm Story 5.5 has seeded `crates/daemon/benches/baselines/{macos,linux}.json` (non-zero p99). If not yet done, note the dependency and surface to the maintainer — do not seed them here.
+- [x] **Task 1: Pre-tag local verification (AC: 1, 6, 7)**
+  - [x] Run `cargo test --workspace -- --test-threads=1`, `cargo fmt --check`, `cargo clippy --all-targets --workspace -- -D warnings` — all green. (Serialized run is mandatory; see Dev Notes "Test execution.")
+  - [x] Run `./scripts/tarball-smoke-test.sh v0.1.0-rc1` against locally built binaries; confirm the 10 expected extracted paths and executable bits ([tarball-smoke-test.sh:144-176](../../scripts/tarball-smoke-test.sh)).
+  - [x] Confirm Story 5.5 has seeded `crates/daemon/benches/baselines/{macos,linux}.json` (non-zero p99). If not yet done, note the dependency and surface to the maintainer — do not seed them here.
 
-- [ ] **Task 2: Resolve the draft-vs-prerelease decision (AC: 1)**
-  - [ ] Inspect `release.yml:326-338` (`softprops/action-gh-release@v2` block). Decide (a) accept prerelease semantics or (b) add `draft: ${{ contains(steps.tag.outputs.tag, '-') }}`.
-  - [ ] If (b): make the one-key edit; re-run `cargo test --test release_pipeline_docs` to confirm no pinned-string regression. Document the choice + rationale in the Dev Agent Record.
+- [x] **Task 2: Resolve the draft-vs-prerelease decision (AC: 1)**
+  - [x] Inspect `release.yml:326-338` (`softprops/action-gh-release@v2` block). Decide (a) accept prerelease semantics or (b) add `draft: ${{ contains(steps.tag.outputs.tag, '-') }}`.
+  - [x] If (b): make the one-key edit; re-run `cargo test --test release_pipeline_docs` to confirm no pinned-string regression. Document the choice + rationale in the Dev Agent Record.
 
-- [ ] **Task 3: Reconcile the cross-version SKIP guard (AC: 3)**
-  - [ ] Read `tests/cross_version_upgrade.rs:42-85` (the two-layer guard + `resolve_prior_version_binary`). Confirm the hardcoded `target/cross-version-installs/v0.1.0/...` path at line ~53.
-  - [ ] Apply resolution (a) and/or (b) from AC #3. Recommended minimal change: leave the env-override path as the CI mechanism (already correct — `release.yml:230-237` sets `BOWERBIRD_PRIOR_VERSION_BINARY`), and update the source comment + hardcoded segment so a human populating the conventional path for an rc lineage doesn't silently mis-resolve. Add a `// rc1 is the first tag; this guard lifts at rc2 (Epic 4 retro AI-8)` note.
-  - [ ] `cargo test --test cross_version_upgrade -- --test-threads=1 --nocapture` still passes (SKIPs cleanly for rc1).
+- [x] **Task 3: Reconcile the cross-version SKIP guard (AC: 3)**
+  - [x] Read `tests/cross_version_upgrade.rs:42-85` (the two-layer guard + `resolve_prior_version_binary`). Confirm the hardcoded `target/cross-version-installs/v0.1.0/...` path at line ~53.
+  - [x] Apply resolution (a) and/or (b) from AC #3. Recommended minimal change: leave the env-override path as the CI mechanism (already correct — `release.yml:230-237` sets `BOWERBIRD_PRIOR_VERSION_BINARY`), and update the source comment + hardcoded segment so a human populating the conventional path for an rc lineage doesn't silently mis-resolve. Add a `// rc1 is the first tag; this guard lifts at rc2 (Epic 4 retro AI-8)` note.
+  - [x] `cargo test --test cross_version_upgrade -- --test-threads=1 --nocapture` still passes (SKIPs cleanly for rc1). **Both SKIP layers verified independently; see Debug Log.**
 
-- [ ] **Task 4: Author `docs/release-checklist.md` (AC: 6)**
-  - [ ] Write the ordered pre-tag runbook (steps in AC #6). Cross-link `INSTALL.md`, `release.yml`, `tarball-smoke-test.sh`, and this story.
-  - [ ] Strike through Epic 4 retro AI-9 in `epic-4-retro-2026-05-25.md` §"Action items for V1 release readiness" with a backlink to this story's merge commit (follow the strike-through-not-delete convention used for resolved items).
+- [x] **Task 4: Author `docs/release-checklist.md` (AC: 6)**
+  - [x] Write the ordered pre-tag runbook (steps in AC #6). Cross-link `INSTALL.md`, `release.yml`, `tarball-smoke-test.sh`, and this story.
+  - [x] Strike through Epic 4 retro AI-9 in `epic-4-retro-2026-05-25.md` §"Action items for V1 release readiness" with a backlink to this story's merge commit (follow the strike-through-not-delete convention used for resolved items).
 
 - [ ] **Task 5: MAINTAINER — push the rc1 tag and verify the pipeline (AC: 1)**
   - [ ] Maintainer pushes `v0.1.0-rc1` (or runs `workflow_dispatch` with `tag: v0.1.0-rc1`). Dev agent provides the exact command in the checklist.
@@ -133,14 +133,67 @@ Run the workspace suite **serialized**: `cargo test --workspace -- --test-thread
 
 ### Agent Model Used
 
+claude-opus-5 (Claude Code), 2026-07-28 → 2026-07-29.
+
 ### Debug Log References
+
+Local pre-tag verification, 2026-07-29 (all on macOS arm64, `aarch64-apple-darwin`):
+
+| Gate | Command | Result |
+| --- | --- | --- |
+| Format | `cargo fmt --check` | clean, exit 0 |
+| Lint | `cargo clippy --all-targets --workspace -- -D warnings` | clean, exit 0 |
+| Workspace suite | `scripts/test.sh` | **630 passed, 0 failed**, 28 test binaries. Log: `target/test-logs/20260729-113012-1788/run.log` |
+| Doc-drift guard (AC #7) | (within the above) `tests/release_pipeline_docs.rs` | 16 passed, 0 failed — verified green *with* the new `draft:` key in `release.yml` |
+| Tarball layout | `./scripts/tarball-smoke-test.sh v0.1.0-rc1` | `tarball-smoke-test OK`; 13 tar entries (10 files + 3 dirs): `bin/{bowerbird,bowerbird-daemon,bowerbird-shim}`, `adapters/claude/tool-reactions.toml`, `LICENSE`, `LICENSE-MIT`, `LICENSE-APACHE`, `README.md`, `INSTALL.md`, `CHANGELOG.md` |
+
+Cross-version SKIP guard (AC #3) — both layers exercised independently:
+
+- Ungated (`scripts/test.sh --test cross_version_upgrade -- --nocapture`) → layer 1 fires:
+  `SKIPPED: ... set BOWERBIRD_RUN_CROSS_VERSION_TEST=1 to enable.`
+- Gated (`BOWERBIRD_RUN_CROSS_VERSION_TEST=1 scripts/test.sh --test cross_version_upgrade -- --nocapture`) → layer 2 fires:
+  `SKIPPED: ... no prior-version binary resolvable.`
+
+Both report `1 passed; 0 failed` (the SKIP-then-`return` shape libtest scores as a pass, as designed).
+
+Repo tag state at verification time: `git tag --list` → **0 tags**. This is the mechanical proof behind AC #3's "rc1 is the first tag": in CI the `cross-version-test` job takes its `steps.prior.outputs.prior == ''` branch and emits the `::notice::No prior v* tag found` message, so for rc1 the test body is never reached at the *job* level either.
 
 ### Completion Notes List
 
+1. **[Decision — needs maintainer call] The story's own "Test execution" Dev Note is stale and now contradicts the repo.** Task 1, AC #6, AC #7 and Dev Notes §"Test execution" all mandate `cargo test --workspace -- --test-threads=1`. That serialization was **retired** after this story was authored: the root cause (process-global `std::env::set_var` in the auth tests) was fixed, `ci.yml:32` records the retirement, `CLAUDE.md` now requires `scripts/test.sh` (parallel, lock-guarded) over raw `cargo test`, and the doc-drift guard itself flipped — `tests/release_pipeline_docs.rs` now asserts `ci_workflow_runs_workspace_tests_in_parallel`, i.e. it verifies the **absence** of the flag the story demands. Verification was therefore run as `scripts/test.sh`, which is both the project rule and the stricter gate. `docs/release-checklist.md` step 3 already documents the current discipline correctly. The story prose was left untouched because dev-story may only edit the Dev Agent Record / checkboxes / File List / Change Log / Status — **the maintainer should decide whether to correct Dev Notes §"Test execution" + the AC #6/#7 command strings, or leave them as a dated artifact.** Nothing about the verification outcome depends on the answer.
+
+2. **[Decision — resolved] draft-vs-prerelease (AC #1): chose option (b), add the `draft:` key.** `release.yml` now carries `draft: ${{ contains(steps.tag.outputs.tag, '-') }}` alongside the existing `prerelease:` key with the same predicate, so any tag containing `-` stages as a **draft prerelease**. Rationale: this is the first time the pipeline has ever run against a real tag, and a draft is the only shape that lets the maintainer complete AC #2's fresh-machine install *before* anything is publicly visible — a bad rc1 can be deleted rather than retracted. It also makes the AC's original "draft assets" wording true instead of reinterpreting it. Costs, all accepted: draft assets are only downloadable by an authenticated user with repo access (fine — the maintainer is the only consumer of an rc), and publishing becomes a manual step (captured as `gh release edit <tag> --draft=false` in release-checklist step 8). The tag itself is public the moment it is pushed regardless of draft state, so prior-tag resolution for rc2 (`git tag --sort=-v:refname`) is unaffected. Non-prerelease `v0.1.0` is untouched by the predicate and still publishes live.
+
+3. **[Decision — resolved] cross-version SKIP guard (AC #3): resolution (b), documented, with the hardcode deliberately retained.** The env override (`BOWERBIRD_PRIOR_VERSION_BINARY`) is the mechanism CI actually uses and it already tracks the real prior tag, so it needed no change. The conventional fallback path keeps its literal `v0.1.0` segment because `v0.1.0` is the first *non-prerelease* tag this project will cut — the hardcode is correct for the case it serves (a human populating the cache by hand) and only becomes wrong at `v0.1.1`+. What changed is that this is now *stated* rather than implied: the module doc comment explains why the segment is literal and when to update it, and an inline comment at `resolve_prior_version_binary()` records that CI never reaches that branch. This satisfies AC #3's "no silent no-op" requirement. Epic 4 retro AI-8 stays **open** — it lifts at rc2, and `docs/release-checklist.md` §"After rc1" carries the concrete change rc2 will need.
+
+4. **Bench baseline dependency (Task 1, subtask 3): partially met, surfaced not resolved.** `crates/daemon/benches/baselines/macos.json` is seeded and armed (solo 1.569ms / fanout3 1.587ms / burst 3.120ms / steady 2.838ms, reseeded 2026-07-29 from the per-shape max across 7 CI runs). `linux.json` is still all-zero on purpose: Story 5.5 found a reproducible ~40x macOS/Linux p99 gap on the three rapid-fire ingestion shapes and the maintainer punted seeding it post-launch rather than baking "~40ms is normal" into the gate. That deferral is recorded in `deferred-work.md:155`, which is exactly the escape hatch release-checklist step 1 requires, so this does **not** block rc1 — the Linux regression gate stays auto-skipped per-shape while the 100ms NFR2 absolute gate still applies on both platforms. Per the task's own instruction, no baseline was seeded here.
+
+5. **AI-9 backlink target (Task 4).** The task text asks for a backlink to "this story's merge commit," which does not exist while the story is in flight. The strike-through in `epic-4-retro-2026-05-25.md` instead names Story 5.12 (Task 4) and links `docs/release-checklist.md` directly — stable identifiers that survive a rebase, per the project's slug-over-ordinal convention.
+
+6. **`docs/release-checklist.md` was authored earlier in this story but rode in on an unrelated commit.** It landed in `35f5d18` (`feat(scripts): serialize cargo test runs...`) rather than a 5.12 commit, because the test-hang work and this story's Task 1 were interleaved. It is tracked and in-tree; this session edited it once more to cut a duplicated paragraph in step 3 (the "never run two `cargo test` processes" warning was stated twice). Flagging the commit-attribution mismatch so review does not read the file as untouched-by-this-story.
+
+7. **Task 1's verification is what produced the last ~16 commits on `main`.** "Run the workspace suite green" was not a formality: it surfaced a SQLite 3.51.1 close deadlock (patched via vendored `libsqlite3-sys`, `7c028b2`), sleep-based test synchronization that failed 3/3 on loaded CI runners (replaced with probe fences, `0dcdb7d`), keepalive Ping/Pong leaking into shared frame readers (`19a6794`), hang guards tuned as latency assertions rather than hang detectors (widened 5s → 30s, `2374e0c`), and process-env mutation in the token resolver (replaced with an injected `TokenEnv` snapshot, `33313a5`). Those landed on `main` outside this story's diff and are **not** in the File List below; they are named here because a reviewer comparing "Task 1 = run three commands" against the elapsed work will otherwise find the gap unexplained.
+
+8. **Minor, not changed: `release.yml:237` still runs the cross-version test with `--test-threads=1`.** That invocation targets a single test binary containing one test, so the flag is inert there and does not contradict the retired workspace-level serialization. Left alone to keep this story's diff to the one `draft:` key; noted so a future reader does not read it as surviving policy.
+
+**Tasks 5-7 are not startable by the dev agent.** They require pushing a public tag and provisioning a clean macOS arm64 target — explicitly maintainer-executed per the story's own framing. Story stays `in-progress`; all dev-agent-autonomous work (Tasks 1-4, ACs #3, #6, #7 and the AC #1 decision) is complete and verified. ACs #1 (pipeline observation), #2, #4, #5 remain open pending the maintainer's rc1 run.
+
 ### File List
+
+| Path | Change |
+| --- | --- |
+| `.github/workflows/release.yml` | UPDATE — added `draft: ${{ contains(steps.tag.outputs.tag, '-') }}` + rationale comment (Task 2). |
+| `tests/cross_version_upgrade.rs` | UPDATE — module doc comment reworked (env override is not pinned to `v0.1.0`; why the conventional segment stays literal) + inline note at `resolve_prior_version_binary()` (Task 3). Comments only, no behavior change. |
+| `docs/release-checklist.md` | NEW (committed in `35f5d18`), edited this session to remove a duplicated paragraph in step 3 (Task 4). |
+| `docs/bmad/implementation-artifacts/epic-4-retro-2026-05-25.md` | UPDATE — AI-9 struck through with backlink (Task 4). AI-8 intentionally left open. |
+| `docs/bmad/implementation-artifacts/5-12-release-pipeline-end-to-end-verification.md` | UPDATE — Status, Tasks 1-4 checkboxes, Dev Agent Record, File List, Change Log (this file). |
+| `docs/bmad/implementation-artifacts/sprint-status.yaml` | UPDATE — story key → `in-progress`, `last_updated` breadcrumb. |
+
+Unchanged as expected: `INSTALL.md`, `README.md`, `scripts/tarball-smoke-test.sh`, `tests/release_pipeline_docs.rs`. No `crates/protocol/src` touch, so the changelog gate is correctly not triggered.
 
 ## Change Log
 
 - 2026-06-02: Story created via bmad-create-story. Comprehensive context-engine analysis completed — release pipeline mapped (3 jobs, never run against a real tag), 5 epic ACs expanded to 7 with the draft-vs-prerelease decision, cross-version SKIP reconciliation, Gatekeeper/deferred-signing boundary, hotfix escape hatch, and the AI-9 release-checklist surfaced. Status → ready-for-dev.
 - 2026-06-02: Re-homed 5.7 → 5.11. The story was authored on a stale `isolation-audit` branch (based pre-dogfood-triage); merging `main` brought in `sprint-change-proposal-2026-06-01-dogfood-triage.md`, which inserted four v0.1.0-gating stories at 5.7–5.10 and renumbered release-pipeline to 5.11. File renamed, internal/cross-references updated (closing story 5.10→5.14, next story 5.8→5.12, epics.md anchor → Story 5.11 @ 1220). No content/scope change.
 - 2026-07-28: Re-homed 5.11 → 5.12. `sprint-change-proposal-2026-06-11-pid-supersession.md` (2026-06-11) inserted Story 5.11 session-pid-supersession and renumbered this story to 5.12 in `sprint-status.yaml` and `epics.md`, but the implementation-artifact file itself was never renamed or updated — found as a filename/sprint-status-key mismatch while starting dev-story for the next ready-for-dev story. File renamed `5-11-...` → `5-12-...`, H1 header, both `Story 5.11 lands` AC references, the resequencing-history sentence, and the `epics.md` self-reference (line numbers 1220-1248 → 1240-1268) all updated to match. No content/scope change; story remains untouched otherwise (still `ready-for-dev`, empty Dev Agent Record).
+- 2026-07-29: Tasks 1-4 complete via bmad-dev-story; ACs #3, #6, #7 satisfied and the AC #1 decision resolved. Pre-tag verification green on macOS arm64 (fmt, clippy `-D warnings`, `scripts/test.sh` 630 passed / 0 failed across 28 binaries, `tarball-smoke-test.sh v0.1.0-rc1` OK). Draft-vs-prerelease resolved as option (b): `draft:` key added so rc tags stage as draft prereleases, letting the fresh-machine install finish before anything is public. Cross-version SKIP guard resolved as (b): env override unchanged, conventional `v0.1.0` segment deliberately retained with the reasoning now written into the source; both SKIP layers verified against a repo with 0 tags. Epic 4 retro AI-9 struck through (checklist authored); AI-8 intentionally still open until rc2. Two items surfaced for the maintainer: the story's own Dev Notes §"Test execution" is stale (still mandates the retired `--test-threads=1`, which the doc-drift guard now asserts the absence of), and `linux.json` bench baseline remains deliberately unseeded per Story 5.5's recorded deferral. Story stays `in-progress` — Tasks 5-7 (real tag push, fresh-machine install, rc1 triage) are maintainer-executed by design and cannot be started by the dev agent.
