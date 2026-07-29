@@ -182,16 +182,43 @@ impl std::fmt::Display for TokenError {
 
 impl std::error::Error for TokenError {}
 
+/// Snapshot of the environment [`load_or_generate`] consults. Production
+/// callers use [`TokenEnv::from_process_env`]; tests construct one directly
+/// so they never have to mutate process-global env vars (`std::env::set_var`
+/// races with concurrent env reads, which forbids parallel test execution).
+#[derive(Debug, Clone, Default)]
+pub struct TokenEnv {
+    /// `BOWERBIRD_TOKEN`
+    pub token: Option<String>,
+    /// `BOWERBIRD_KEYRING_BACKEND`
+    pub keyring_backend: Option<String>,
+    /// `BOWERBIRD_DATA_DIR`
+    pub data_dir: Option<std::ffi::OsString>,
+    /// `HOME`
+    pub home: Option<std::ffi::OsString>,
+}
+
+impl TokenEnv {
+    pub fn from_process_env() -> Self {
+        Self {
+            token: std::env::var("BOWERBIRD_TOKEN").ok(),
+            keyring_backend: std::env::var("BOWERBIRD_KEYRING_BACKEND").ok(),
+            data_dir: std::env::var_os("BOWERBIRD_DATA_DIR"),
+            home: std::env::var_os("HOME"),
+        }
+    }
+}
+
 /// Look up the data directory for the config.toml fallback. Mirrors the
 /// `bowerbird-daemon` `resolve_bowerbird_dir` precedence (env wins, else
 /// `$HOME/.bowerbird`) so the daemon and the CLI agree without sharing code.
-fn data_dir_for_config() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("BOWERBIRD_DATA_DIR") {
+fn data_dir_for_config(env: &TokenEnv) -> Option<PathBuf> {
+    if let Some(p) = &env.data_dir {
         if !p.is_empty() {
             return Some(PathBuf::from(p));
         }
     }
-    let home = std::env::var_os("HOME")?;
+    let home = env.home.as_ref()?;
     if home.is_empty() {
         return None;
     }
@@ -210,18 +237,19 @@ enum KeyringBackend {
     Disabled,
 }
 
-fn install_keyring_backend() -> KeyringBackend {
-    // `BOWERBIRD_KEYRING_BACKEND` is re-read on every call so the contract
-    // tests can flip between `disable` and the real backend within one
-    // process. The mock-builder install, however, is permanent for the rest
-    // of the process — keyring's `set_default_credential_builder` has no
-    // inverse, so once mocked the process stays mocked. Tests that need a
-    // mix of real and mock backends live in separate test binaries.
+fn install_keyring_backend(env: &TokenEnv) -> KeyringBackend {
+    // `BOWERBIRD_KEYRING_BACKEND` is re-read (via the caller's snapshot) on
+    // every call so the contract tests can flip between `disable` and the
+    // real backend within one process. The mock-builder install, however, is
+    // permanent for the rest of the process — keyring's
+    // `set_default_credential_builder` has no inverse, so once mocked the
+    // process stays mocked. Tests that need a mix of real and mock backends
+    // live in separate test binaries.
     static MOCK_INSTALLED: OnceLock<()> = OnceLock::new();
-    match std::env::var("BOWERBIRD_KEYRING_BACKEND") {
-        Ok(ref v) if v == "disable" => KeyringBackend::Disabled,
+    match env.keyring_backend.as_deref() {
+        Some("disable") => KeyringBackend::Disabled,
         #[cfg(feature = "mock-keyring")]
-        Ok(ref v) if v == "mock" => {
+        Some("mock") => {
             MOCK_INSTALLED.get_or_init(|| {
                 keyring::set_default_credential_builder(
                     keyring::mock::default_credential_builder(),
@@ -233,7 +261,7 @@ fn install_keyring_backend() -> KeyringBackend {
         // `disable` so a production binary cannot be coerced into using the
         // in-memory backend via env-var injection.
         #[cfg(not(feature = "mock-keyring"))]
-        Ok(ref v) if v == "mock" => KeyringBackend::Disabled,
+        Some("mock") => KeyringBackend::Disabled,
         _ => KeyringBackend::Real,
     }
 }
@@ -277,18 +305,25 @@ fn keychain_write_generated() -> Result<String, keyring::Error> {
 /// every path tried; the caller is expected to print the rendered message to
 /// stderr and exit non-zero (NFR13).
 pub fn load_or_generate() -> Result<(BearerToken, TokenSource), TokenError> {
+    load_or_generate_with_env(&TokenEnv::from_process_env())
+}
+
+/// [`load_or_generate`] against an explicit environment snapshot. This is the
+/// whole resolver; the no-arg wrapper just snapshots the process env. Tests
+/// call this directly so they can run in parallel without `env::set_var`.
+pub fn load_or_generate_with_env(env: &TokenEnv) -> Result<(BearerToken, TokenSource), TokenError> {
     let mut tried = Vec::with_capacity(3);
 
     // Step 1: env var
-    match std::env::var("BOWERBIRD_TOKEN") {
-        Ok(v) if !v.is_empty() => {
-            return Ok((BearerToken::new(v), TokenSource::Env));
+    match &env.token {
+        Some(v) if !v.is_empty() => {
+            return Ok((BearerToken::new(v.clone()), TokenSource::Env));
         }
         _ => tried.push(TriedPath::EnvUnset),
     }
 
     // Step 2: keychain (gated by BOWERBIRD_KEYRING_BACKEND)
-    match install_keyring_backend() {
+    match install_keyring_backend(env) {
         KeyringBackend::Disabled => {
             tried.push(TriedPath::Keychain(
                 "skipped via BOWERBIRD_KEYRING_BACKEND".to_string(),
@@ -315,7 +350,7 @@ pub fn load_or_generate() -> Result<(BearerToken, TokenSource), TokenError> {
     }
 
     // Step 3: config.toml
-    let cfg_path = data_dir_for_config()
+    let cfg_path = data_dir_for_config(env)
         .map(|d| d.join("config.toml"))
         .unwrap_or_else(|| PathBuf::from("~/.bowerbird/config.toml"));
     match read_config_token(&cfg_path) {
