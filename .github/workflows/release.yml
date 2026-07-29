@@ -78,12 +78,29 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        # dtolnay/rust-toolchain auto-reads rust-toolchain.toml when no
-        # explicit `toolchain:` input is given. `targets` adds the cross
-        # target on top of the host target.
+        # The `@stable` ref IS the toolchain selection, so this installs
+        # stable and adds `targets` to *stable* — it does NOT read
+        # rust-toolchain.toml. Since that file pins channel = 1.94.1,
+        # rustup switches toolchains the moment cargo runs, and the target
+        # added here would be on a toolchain nothing uses. See the next
+        # step; do not drop it.
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Add cross-compilation target to the pinned toolchain
+        # Runs with the repo as cwd, so rustup resolves the toolchain via
+        # rust-toolchain.toml (1.94.1) and adds the target THERE. This is
+        # the step that actually makes `--target` work.
+        #
+        # Only load-bearing for the one matrix row that genuinely
+        # cross-compiles (x86_64-apple-darwin on an ARM runner); a no-op
+        # where target == host. That asymmetry is why v0.1.0-rc1's first
+        # run built 2 of 3 targets and failed the third with
+        # `error[E0463]: can't find crate for core` (Story 5.12, AC #5).
+        # Deliberately not pinned to a version here: it tracks whatever
+        # rust-toolchain.toml says, so a channel bump needs no edit.
+        run: rustup target add ${{ matrix.target }}
 
       - name: Resolve release tag
         id: tag
