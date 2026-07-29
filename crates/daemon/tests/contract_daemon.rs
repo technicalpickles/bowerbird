@@ -7856,11 +7856,19 @@ mod story_2_4_dropped {
     /// `state.session.*` frame the daemon sends, flushing everything pending
     /// including the sess-A re-snapshot.
     ///
-    /// KNOWN FLAKE under `cargo test --workspace` (passes reliably when the
-    /// `contract_daemon` binary runs alone): see
-    /// `docs/research/test-isolation-parallelism-research-results.md` and the
-    /// Story 5.8 pass-4 Debug Log. The fix itself is verified independently
-    /// (tracing + the binary-alone runs + the without-fix negative check).
+    /// Flake history (resolved 2026-07-28): this test failed 3/3 under
+    /// `cargo test --workspace` in June 2026 while passing alone, and was
+    /// blamed on cross-binary concurrency. That was wrong: cargo runs test
+    /// binaries sequentially, and the failures tracked concurrent-worktree
+    /// session load on older hardware (`scripts/test.sh` now locks that
+    /// out). On current hardware it passes 20/20 under 2x CPU
+    /// oversubscription, finishing in ~0.05s against the 5s deadline. If
+    /// it ever flakes again (e.g. a slow CI runner), the durable fix is
+    /// the testability seam sketched in
+    /// `docs/research/test-isolation-bowerbird-findings.md` §Leads #3;
+    /// full re-examination in
+    /// `docs/bmad/implementation-artifacts/investigations/test-serialization-investigation.md`
+    /// (follow-up 2026-07-28 #2).
     #[tokio::test(flavor = "current_thread")]
     async fn lag_invalidates_snapshot_coverage_resubscribe_resnapshots() {
         let (_tmp, pools) = fresh_pools().await;

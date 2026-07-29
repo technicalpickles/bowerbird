@@ -34,6 +34,15 @@ Because it reproduces in isolation, the cause is process-local to that one test
 
 ### Symptom B — an e2e test that passes alone but flakes under `--workspace`
 
+> **Resolved 2026-07-28:** the workspace-vs-alone framing below was a
+> proxy for external load (concurrent-worktree sessions, older hardware);
+> cargo runs test binaries sequentially, so there is no cross-binary
+> contention in a workspace run. Not reproducible on current hardware
+> (20/20 green under 2x CPU oversubscription, ~0.05s vs the 5s deadline).
+> See the 2026-07-28 #2 follow-up in
+> `docs/bmad/implementation-artifacts/investigations/test-serialization-investigation.md`.
+> The seam sketch in Leads #3 remains the fix if it ever fires again.
+
 `story_2_4_dropped::lag_invalidates_snapshot_coverage_resubscribe_resnapshots`
 (added in 5.8 pass-4) reliably passes when the `contract_daemon` binary runs
 **alone**, but reliably **fails** under `cargo test --workspace`:

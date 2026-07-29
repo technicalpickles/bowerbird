@@ -375,3 +375,63 @@ deadline flake in `lag_invalidates_snapshot_coverage_resubscribe_resnapshots`)
 is unrelated to this deadlock and remains open. The `scripts/test.sh`
 timeout+`sample` diagnostics added the same day (commit 4f7ca57) remain
 as the safety net for any future hang class.
+
+## Follow-up: 2026-07-28 #2: Symptom B re-examined (B1 refuted; flake not reproducible on current hardware)
+
+Re-opened the Symptom B thread after the SQLite fix landed. Two findings,
+one refuting a prior one, one closing the symptom.
+
+**Finding B1 is wrong: cargo does NOT run test binaries concurrently.**
+`cargo test` builds in parallel but executes test targets one at a time;
+`--test-threads=1` then serializes within each binary, so a
+`cargo test --workspace -- --test-threads=1` run is fully serial end to
+end. Two lines of evidence from this worktree's own logs
+(`target/test-logs/`): every run's output is strictly sequential per
+binary (test output is unbuffered by cargo, so concurrent binaries would
+interleave), and `contract_daemon` completes in 9.00s inside full
+workspace runs, identical to its "binary alone" timing. The June
+measurement of ~14s under `--workspace` was not cross-binary contention;
+there is no cross-binary execution to contend with.
+
+**What actually made B fail 3/3 in June:** the same confounder the
+2026-06-03 #2 follow-up documented for Symptom A. The June B evidence was
+captured on older, slower hardware, during Story 5.8 pass-4 work that
+carried a second concurrent session running builds/suites in the same
+worktree. "Workspace vs alone" was a proxy for "loaded box vs quiet box":
+the longer workspace run simply spent more wall time overlapping the
+external load window.
+
+**Reproduction attempts on current hardware (2026-07-28), all negative:**
+
+- 3/3 full `scripts/test.sh` workspace runs green, plus the prior
+  evening's run: 4/4, lag test passing in each.
+- 20/20 green running the lag test in a loop via the built
+  `contract_daemon` binary while 20 `yes` processes saturated all 10
+  cores (2x oversubscription). Under that load the test still completes
+  in **0.05s** against its 5s observation deadline, roughly 100x
+  headroom. The helper deadlines (`wait_subscribe_live`, 2s) were never
+  approached either.
+
+**Implications:**
+
+- The interim "nextest serialized test-group" recommendation for B is
+  moot: it presumed cross-binary concurrency that does not exist. (nextest
+  remains interesting for other reasons, e.g. per-test process isolation,
+  but it would *add* parallelism, not remove it.)
+- The testability seam (assert the re-snapshot on `snapshotted_keys` via
+  a test hook instead of racing a real-socket deadline) remains the
+  durable fix *if the flake ever resurfaces*, e.g. on a slow CI runner.
+  Not built now: the project is pre-MVP, the test has ~100x deadline
+  headroom on current hardware, and the seam would add daemon code that
+  exists only for one test's observability. Sketch stays in
+  `docs/research/test-isolation-bowerbird-findings.md` §Leads #3.
+- The test's "KNOWN FLAKE under `cargo test --workspace`" doc-comment was
+  corrected the same day to stop attributing the flake to workspace runs.
+
+**Status: Symptom B closed** as a misattributed-trigger, hardware-bound
+flake: the assertion's wall-clock timing model is real but has two orders
+of magnitude of headroom on current hardware, and the historical failures
+tracked concurrent-worktree load that `scripts/test.sh` now locks out.
+Re-open via the seam sketch if it fires again (the failure signature is
+the `re-subscribe after lag MUST re-snapshot sess-A` assertion at a 5s
+deadline).
