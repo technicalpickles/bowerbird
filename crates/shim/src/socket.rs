@@ -24,17 +24,26 @@ const READ_BUDGET_MS: u64 = 3;
 /// `SO_RCVTIMEO` becomes [`Error::Timeout`]; anything else stays
 /// [`Error::SocketIo`].
 ///
-/// **Why both `WouldBlock` and `TimedOut` map to a timeout.** The platform
-/// spelling of "your socket timeout expired" is not portable: macOS reports it
-/// as `EAGAIN` (errno 35) → [`std::io::ErrorKind::WouldBlock`], while Linux
-/// reports `ETIMEDOUT` → [`std::io::ErrorKind::TimedOut`]. Story 5.16 Task 1
-/// proved the macOS half directly — a peer that accepts and never replies
-/// yields `ErrorKind::WouldBlock` / `raw_os_error == Some(35)`, whose `Display`
-/// is `Resource temporarily unavailable (os error 35)`. That is exactly the line
-/// the rc1 dogfood logged, which is how two dropped events came to look like
-/// generic I/O failures. Matching on only one kind would leave the other
-/// platform silently misclassified, so this is a cross-platform classification
-/// rather than a macOS special case.
+/// **Why both `WouldBlock` and `TimedOut` map to a timeout.** `std` does not
+/// pin which kind an expired socket timeout produces — it documents *either*
+/// for a timed-out read/write — so matching both is coding to the documented
+/// contract rather than to one platform's observed errno.
+///
+/// What is actually verified here (Story 5.16 Task 1): on **macOS**, an expired
+/// `SO_RCVTIMEO` yields `ErrorKind::WouldBlock` with `raw_os_error == Some(35)`
+/// (`EAGAIN`), whose `Display` is `Resource temporarily unavailable (os error
+/// 35)` — exactly the line the rc1 dogfood logged, which is how two dropped
+/// events came to look like generic I/O failures. The same holds for an expired
+/// `SO_SNDTIMEO`.
+///
+/// Note the story spec described `TimedOut` as "the Linux spelling"; that is not
+/// right, and the arm is kept for a better reason. POSIX specifies `EAGAIN` for
+/// `SO_RCVTIMEO`/`SO_SNDTIMEO` expiry on Linux *and* macOS alike, so Unix
+/// generally lands on `WouldBlock`; `TimedOut` is where Windows
+/// (`WSAETIMEDOUT`) would land. bowerbird scope-cuts Windows, so the `TimedOut`
+/// arm is not there to serve a supported platform — it is there because `std`
+/// permits it and a silent misclassification would cost another dogfood cycle to
+/// rediscover. Cheap arm, real downside avoided.
 ///
 /// **Why `WouldBlock` is unambiguous here.** On a *non-blocking* socket
 /// `WouldBlock` means "no data yet, try again" — but this socket is never set
