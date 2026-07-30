@@ -2,6 +2,46 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+/// Which half of the ingest round-trip blew its budget.
+///
+/// This exists to carry the **consequence for the event**, which differs
+/// between the two halves and is the whole point of Story 5.16's log line. The
+/// first cut of that line said "event dropped" for both, which was false for
+/// the read case and therefore worse than the vague message it replaced: an
+/// operator would go hunting for an event that is actually present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeoutOp {
+    /// The payload never fully reached the daemon. The daemon frames on a
+    /// trailing `\n` and discards a line it never finished reading
+    /// (`ingest: EOF before newline`), so the event is genuinely lost.
+    Write,
+    /// The payload landed and only the acknowledgement was lost. The daemon
+    /// enqueues via `try_send` *before* it writes `200\n`
+    /// (`daemon/src/ingest/handler.rs`), and it reads the payload out of the
+    /// kernel buffer whether or not the shim is still waiting, so by the time
+    /// this fires the event has almost certainly been recorded.
+    Read,
+}
+
+impl TimeoutOp {
+    fn name(self) -> &'static str {
+        match self {
+            TimeoutOp::Write => "write",
+            TimeoutOp::Read => "read",
+        }
+    }
+
+    /// What the timeout means for the event. Distinguishing "lost" from
+    /// "unacknowledged" is the diagnosability contract; do not collapse these
+    /// back into one phrase.
+    fn consequence(self) -> &'static str {
+        match self {
+            TimeoutOp::Write => "event not sent",
+            TimeoutOp::Read => "no reply from daemon, event may already be recorded",
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("stdin read failed: {0}")]
@@ -29,20 +69,26 @@ pub enum Error {
     #[error("socket I/O failed: {0}")]
     SocketIo(#[source] std::io::Error),
 
-    /// An expired `SO_SNDTIMEO` / `SO_RCVTIMEO` on the ingest round-trip
-    /// (Story 5.16). Distinct from [`Error::SocketIo`] so a dropped event is
-    /// diagnosable: the operator can tell "the daemon did not answer inside
-    /// the budget" from "the socket genuinely failed", which the shared
-    /// `Error::SocketIo` bucket made impossible.
+    /// The ingest round-trip blew its time budget (Story 5.16). Distinct from
+    /// [`Error::SocketIo`] so a lost event is diagnosable: the operator can
+    /// tell "the daemon did not answer inside the budget" from "the socket
+    /// genuinely failed", which the shared `Error::SocketIo` bucket made
+    /// impossible.
     ///
-    /// Names the operation and the budget it blew rather than restating the
-    /// errno, because the errno is the least informative part — see
-    /// `socket::classify` for why the platform spelling is worthless here.
+    /// Names the operation, the budget it blew, and **what that means for the
+    /// event**, see [`TimeoutOp`], and note the two halves have opposite
+    /// consequences. Deliberately does not restate the errno, which is the
+    /// least informative part; see `socket::classify`.
     ///
-    /// Both fields are `&'static str` / `u64` — no allocation, per the shim's
-    /// hot-path discipline.
-    #[error("socket {op} timed out after {budget_ms}ms; event dropped")]
-    Timeout { op: &'static str, budget_ms: u64 },
+    /// `budget_ms` is the **aggregate** budget for the operation, which
+    /// `socket::write_all_within` enforces across a partial-write loop. It is
+    /// not a per-syscall figure, so the number here is honest even when the
+    /// payload takes several `write(2)` calls.
+    ///
+    /// Both fields are `Copy`, no allocation, per the shim's hot-path
+    /// discipline.
+    #[error("socket {} timed out after {budget_ms}ms; {}", .op.name(), .op.consequence())]
+    Timeout { op: TimeoutOp, budget_ms: u64 },
 
     #[error("log file I/O failed: {0}")]
     LogIo(#[source] std::io::Error),
@@ -94,11 +140,17 @@ impl Error {
             // Mid-write / daemon-responding-with-error class → 0
             // (fire-and-forget per NFR20: the daemon is up and answering)
             //
-            // `Timeout` belongs here and NOT with the exit-1 class: the connect
-            // succeeded, so the daemon is up — it just did not answer inside the
-            // budget (Story 5.16 Task 1 traced this to the daemon's runtime
-            // thread being starved by the OS scheduler under heavy load, not to
-            // the daemon being down or broken). Claude must still see success.
+            // `Timeout` belongs here and NOT with the exit-1 class: the ingest
+            // socket exists and the payload was handed to the kernel, so this is
+            // the fire-and-forget class rather than the daemon-unreachable one.
+            //
+            // Note what is deliberately NOT claimed: a successful connect does
+            // not prove the daemon is alive or scheduled, only that a listener
+            // FD exists (see the connect discussion in `socket::send`). Story
+            // 5.16 Task 1 traced these timeouts to the daemon's runtime thread
+            // being starved by the OS scheduler, which is exactly a case where
+            // the listener is healthy and the daemon is not running. Claude must
+            // still see success either way, per NFR20.
             Error::SocketIo(_)
             | Error::Timeout { .. }
             | Error::BadResponse(_)
@@ -150,10 +202,14 @@ impl Error {
             //
             // `Timeout` is silent here on purpose. Story 5.16 is a
             // diagnosability story, and the surface it improves is the shim
-            // LOG LINE, not stderr — a timeout means the daemon answered the
-            // connect, so putting it on stderr would regress Story 5.10's
-            // exit-1/exit-0 partition and surface a hook warning to Claude for
-            // an event loss Claude can do nothing about.
+            // LOG LINE, not stderr. Putting it on stderr would regress Story
+            // 5.10's exit-1/exit-0 partition and surface a hook warning to
+            // Claude for an event loss Claude can do nothing about.
+            //
+            // Known consequence, accepted: a wedged daemon that still holds its
+            // listener FD swallows every event at exit-0 with empty stderr, and
+            // only the shim log shows it. That is the NFR20 trade, not an
+            // oversight, see taskwarrior 719e7027.
             Error::SocketIo(_)
             | Error::Timeout { .. }
             | Error::BadResponse(_)
@@ -188,14 +244,17 @@ mod tests {
                 source: dummy_io(),
             },
             Error::SocketIo(dummy_io()),
-            // Both operations, so the partition canaries cover each spelling of
-            // the Story 5.16 timeout rather than just whichever came first.
+            // Both ops are listed for the *message* tests below, not for the
+            // partition canaries: `exit_code()`/`stderr_hint()` match
+            // `Error::Timeout { .. }` and discard `op`, so one entry would give
+            // identical partition coverage. Do not read this as `op` being
+            // partition-relevant.
             Error::Timeout {
-                op: "write",
+                op: TimeoutOp::Write,
                 budget_ms: 2,
             },
             Error::Timeout {
-                op: "read",
+                op: TimeoutOp::Read,
                 budget_ms: 3,
             },
             Error::LogIo(dummy_io()),
@@ -243,6 +302,81 @@ mod tests {
                 e.stderr_hint().is_none(),
                 e.exit_code() == 0,
                 "exit-0 variants must NOT have a stderr hint: {e:?}"
+            );
+        }
+    }
+
+    /// Story 5.16 review finding (HIGH): the two timeout halves have OPPOSITE
+    /// consequences for the event, and the log line must not blur them.
+    ///
+    /// A read timeout fires *after* the daemon has already `try_send`-ed the
+    /// event, so claiming "event dropped" there sends the operator hunting for
+    /// an event that is actually present, which is worse than the vague
+    /// `socket I/O failed` message this story replaced. `Error::Connect` owns
+    /// the "event dropped" phrasing, where the drop is real.
+    #[test]
+    fn timeout_consequence_distinguishes_lost_from_unacknowledged() {
+        let write = Error::Timeout {
+            op: TimeoutOp::Write,
+            budget_ms: 2,
+        }
+        .to_string();
+        let read = Error::Timeout {
+            op: TimeoutOp::Read,
+            budget_ms: 3,
+        }
+        .to_string();
+
+        // The write half is a genuine loss: the daemon frames on a trailing
+        // newline and discards a line it never finished reading.
+        assert!(
+            write.contains("event not sent"),
+            "write timeout must say the event never went out: {write:?}"
+        );
+
+        // The read half is NOT a loss, and must not imply one.
+        assert!(
+            read.contains("may already be recorded"),
+            "read timeout must say delivery is unconfirmed, not lost: {read:?}"
+        );
+        assert!(
+            !read.contains("event dropped"),
+            "read timeout must NOT claim the event was dropped, the daemon \
+             enqueues before it replies, so the event has almost certainly \
+             landed: {read:?}"
+        );
+        assert!(
+            !read.contains("not sent"),
+            "read timeout must not claim the event was never sent: {read:?}"
+        );
+
+        // And the two must not read identically, or the distinction is lost.
+        assert_ne!(write, read);
+    }
+
+    /// The phrase `event dropped` stays reserved for the one case where the
+    /// event really is gone, so it remains a reliable signal.
+    ///
+    /// It lives in exactly one place, `Connect`'s stderr hint, where the daemon
+    /// is genuinely unreachable. No *log line* may use it, because `Display` is
+    /// what the shim log carries and a read timeout is not a drop.
+    #[test]
+    fn event_dropped_phrasing_is_reserved_for_real_drops() {
+        let connect = Error::Connect {
+            path: PathBuf::from("/tmp/nope.sock"),
+            source: dummy_io(),
+        };
+        assert_eq!(
+            connect.stderr_hint(),
+            Some("daemon not running, event dropped"),
+            "the reserved phrase should still be here, on the one real drop"
+        );
+
+        for e in sample_variants() {
+            assert!(
+                !e.to_string().contains("event dropped"),
+                "no log line may use the reserved 'event dropped' phrasing, \
+                 each variant must describe its own outcome: {e:?}"
             );
         }
     }

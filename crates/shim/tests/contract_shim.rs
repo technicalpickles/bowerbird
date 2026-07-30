@@ -65,13 +65,19 @@ fn start_mock_ingest(tmp: &TempDir, response: &'static [u8]) -> MockIngest {
 /// replies**, holding the connection open (Story 5.16).
 ///
 /// This makes the shim's `SO_RCVTIMEO` expiry deterministic rather than raced:
-/// no reply can ever arrive, so the read budget MUST expire. There is no sleep
-/// used for synchronization and no ordering to lose — the only thing being
+/// no reply can ever arrive, so the read budget MUST expire. The only thing
 /// waited on is the shim's own 3ms timeout, which is the behavior under test.
+///
+/// No readiness sleep is needed, and there deliberately is not one:
+/// `UnixListener::bind` happens below on the *calling* thread, so the socket
+/// path exists before this function returns and the kernel backlogs the shim's
+/// connect whether or not the accept loop has been scheduled yet. (The sibling
+/// `start_mock_ingest` still carries a 10ms sleep copied from its own origin;
+/// that one is pre-existing and equally unnecessary.)
 ///
 /// Holding the accepted stream alive is load-bearing. Dropping it would close
 /// the socket, `read_line` would return `Ok(0)` on EOF, and the shim would
-/// report `BadResponse` instead of a timeout — testing the wrong path.
+/// report `BadResponse` instead of a timeout, testing the wrong path.
 fn start_mock_ingest_silent(tmp: &TempDir) -> MockIngest {
     let sock_path = tmp.path().join("ingest.sock");
     let listener = UnixListener::bind(&sock_path).expect("bind");
@@ -107,8 +113,6 @@ fn start_mock_ingest_silent(tmp: &TempDir) -> MockIngest {
         }
         drop(held);
     });
-
-    thread::sleep(Duration::from_millis(10));
 
     MockIngest {
         sock_path,
@@ -417,7 +421,7 @@ fn shim_exit_0_on_503_with_warning_log() {
 /// The end-to-end half of AC #6: drive a REAL expired read timeout through the
 /// real shim binary and assert the log line names it as a timeout rather than
 /// the old generic `socket I/O failed: Resource temporarily unavailable (os
-/// error 35)` — the exact wording that made the rc1 dogfood finding
+/// error 35)`, the exact wording that made the rc1 dogfood finding
 /// undiagnosable.
 ///
 /// The classification function itself is unit-tested in `socket.rs`; this test
@@ -466,16 +470,32 @@ fn shim_names_socket_timeout_in_log_and_stays_silent() {
     );
 
     // The contract: a timeout is distinguishable from a generic socket error.
-    // Assert on "timed out" rather than on which operation expired — the write
-    // budget could in principle be the one to blow on a starved runner, and
-    // either way the diagnosability contract is met.
+    //
+    // Asserts the READ timeout specifically. An earlier version accepted either
+    // operation "in case the write budget blows on a starved runner", but that
+    // tolerance was incoherent: if the write timed out mid-payload the mock's
+    // `read_until` would never see a newline, and the `wait_for_capture` below
+    // would panic on its own guard. The test cannot survive that case, so it
+    // should not claim to. The payload here is a few hundred bytes against an
+    // 8 KiB send buffer, so the write completes in one syscall.
     assert!(
-        log_contents.contains("timed out"),
-        "log must name the failure as a timeout: {log_contents:?}"
+        log_contents.contains("read timed out"),
+        "log must name the failure as a read timeout: {log_contents:?}"
+    );
+
+    // The heart of the diagnosability contract: a read timeout means the daemon
+    // never acked, NOT that the event was lost. The daemon enqueues before it
+    // replies, so claiming a drop here would send the operator hunting for an
+    // event that is actually present, and `event dropped` stays reserved for
+    // `Error::Connect`, where the drop is real.
+    assert!(
+        log_contents.contains("event may already be recorded"),
+        "log must report delivery as unconfirmed, not lost: {log_contents:?}"
     );
     assert!(
-        log_contents.contains("event dropped"),
-        "log must say the event was dropped: {log_contents:?}"
+        !log_contents.contains("event dropped"),
+        "a read timeout must NOT claim the event was dropped, the daemon \
+         enqueues before replying: {log_contents:?}"
     );
     assert!(
         !log_contents.contains("socket I/O failed"),
@@ -487,8 +507,9 @@ fn shim_names_socket_timeout_in_log_and_stays_silent() {
         "timeout must name the budget, not restate the errno: {log_contents:?}"
     );
 
-    // Sanity: the shim really did send the payload before giving up, so this
-    // exercised the reply-read timeout and not some earlier failure.
+    // This is also the proof that the log line above is telling the truth: the
+    // peer really did receive the whole payload, so the event was delivered and
+    // only the ack was lost.
     let captured = wait_for_capture(&mock);
     let payload = parse_captured_payload(&captured);
     assert_eq!(payload["session_id"], "s1");
