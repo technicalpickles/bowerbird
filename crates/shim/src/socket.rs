@@ -1,7 +1,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::error::{Error, Result, TimeoutOp};
 
@@ -11,27 +11,41 @@ pub(crate) enum Response {
     DaemonError(String),
 }
 
-/// Aggregate budgets for the ingest round-trip: at most `WRITE_BUDGET_MS` in
-/// total to hand the payload over, then at most `READ_BUDGET_MS` waiting for the
-/// one-line ack.
+/// Socket timeout values for the ingest round-trip.
 ///
 /// Single-sourced as `u64` milliseconds so the `Duration` handed to the socket
-/// and the number in the [`Error::Timeout`] message can never drift apart, a
-/// log line claiming "timed out after 2ms" after an operation that actually
-/// consumed tens of ms is worse than no message at all.
+/// and the number in the [`Error::Timeout`] message cannot drift apart.
 ///
-/// **These are aggregates, and that takes work to be true.** `SO_SNDTIMEO`
-/// bounds a single `write(2)`, NOT a loop over several of them, so
-/// `io::Write::write_all` is not bounded by it: every partial write that makes
-/// progress gets a *fresh* budget. With the shim's 1 MiB stdin cap
-/// (`main.rs::MAX_STDIN_BYTES`) against an 8 KiB Unix-stream send buffer
-/// (`net.local.stream.sendspace`), a large `PostToolUse` payload could take
-/// ~128 syscalls and stall Claude for hundreds of milliseconds while still
-/// returning `Ok`. Measured before the fix: a 256 KiB payload to a slow-draining
-/// peer took **82ms** through `write_all` and reported success, 16x the entire
-/// nominal round-trip budget, inside Claude's hook, which is exactly the
-/// trust-boundary stall Axiom 3 forbids. [`write_all_within`] is what makes the
-/// aggregate claim real; do not swap it back for `write_all`.
+/// **Read these as per-wait values, NOT as a bound on the round-trip.** Getting
+/// this wrong has now cost two review passes, so the true shape, measured:
+///
+/// `SO_SNDTIMEO` / `SO_RCVTIMEO` bound how long the kernel will *wait* for
+/// socket-buffer space or data. They do not bound a syscall that keeps making
+/// progress, and they do not bound a loop of syscalls:
+///
+/// * **A single `write(2)` can far exceed its timeout.** macOS's `sosend` loop
+///   re-waits per buffer refill, so as long as the peer drains *anything* the
+///   call keeps going. Measured with a 1 MiB payload against a peer draining
+///   8 KiB at a time and this socket armed at 2ms: **40ms** (peer at 200µs
+///   intervals), **97ms** (500µs), **189ms** (1000µs), each returning `Ok` from
+///   ONE `write(2)`.
+/// * **`write_all` compounds it**, since each partial write starts a fresh wait.
+/// * **`read_line` has the same shape**, looping `fill_buf` until it sees `\n`;
+///   measured at 12ms and 24ms against this 3ms value with a dribbling peer.
+///
+/// So the honest statement is: each *wait* is bounded at 2ms/3ms, the aggregate
+/// is **not** bounded, and `connect` sits outside both. The worst case is
+/// therefore proportional to payload size and to how slowly the peer drains, up
+/// to the 1 MiB `main.rs::MAX_STDIN_BYTES` cap against an 8 KiB
+/// `net.local.stream.sendspace`.
+///
+/// That is a real Axiom 3 trust-boundary exposure and it is **not fixed here**.
+/// An attempt to bound it inside Story 5.16 was backed out after measurement
+/// showed it did not work (the loop never iterated, so its deadline check was
+/// unreachable), and it is tracked as its own story with the measurements
+/// attached, rather than being retried as a rider on a diagnosability hotfix:
+/// see `docs/bmad/implementation-artifacts/5-17-shim-write-budget-is-not-a-bound.md`.
+/// Do not add a bound here without reading that story's measurements first.
 const WRITE_BUDGET_MS: u64 = 2;
 const READ_BUDGET_MS: u64 = 3;
 
@@ -74,59 +88,6 @@ fn classify(op: TimeoutOp, budget_ms: u64, e: std::io::Error) -> Error {
     }
 }
 
-/// Write the whole payload under a bound on **total** elapsed time.
-///
-/// This replaces `io::Write::write_all`, which cannot honor an aggregate budget:
-/// `SO_SNDTIMEO` applies per `write(2)`, and `write_all` loops on every partial
-/// success, so each syscall gets a fresh budget and the total is unbounded (see
-/// [`WRITE_BUDGET_MS`] for the measured 82ms case). Here the socket is re-armed
-/// with only the time *remaining* before each subsequent syscall, so the loop
-/// cannot outlive the deadline.
-///
-/// **Costs nothing on the success path.** The common case is a payload smaller
-/// than the socket send buffer: one `write` returns everything and the function
-/// returns without re-arming. The extra `setsockopt` happens only when a write
-/// came back partial, which is already the slow path.
-///
-/// The caller must have armed the socket with the full budget before calling.
-fn write_all_within(stream: &UnixStream, mut buf: &[u8], deadline: Instant) -> Result<()> {
-    loop {
-        match (&*stream).write(buf) {
-            // Wrote everything: the overwhelmingly common path, one syscall.
-            Ok(n) if n >= buf.len() => return Ok(()),
-            Ok(0) => {
-                // Peer will not accept more and did not error. Not a timeout ,
-                // keep it in the genuine-I/O bucket.
-                return Err(Error::SocketIo(std::io::Error::from(
-                    std::io::ErrorKind::WriteZero,
-                )));
-            }
-            Ok(n) => {
-                buf = &buf[n..];
-                // Partial write. Re-arm with what is LEFT of the budget rather
-                // than letting the next syscall start a fresh one.
-                let left = deadline.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    return Err(Error::Timeout {
-                        op: TimeoutOp::Write,
-                        budget_ms: WRITE_BUDGET_MS,
-                    });
-                }
-                // A sub-microsecond `left` is safe: `std` rejects a zero
-                // `Duration` (guarded above) and floors the resulting `timeval`
-                // at 1µs, so this can never degrade into "no timeout".
-                stream
-                    .set_write_timeout(Some(left))
-                    .map_err(Error::SocketIo)?;
-            }
-            // `write_all` retries `Interrupted`; match that so a signal does not
-            // surface as a spurious failure.
-            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(classify(TimeoutOp::Write, WRITE_BUDGET_MS, e)),
-        }
-    }
-}
-
 /// Synchronously send one wire payload to the daemon ingest socket and read
 /// back the single-line status response.
 ///
@@ -137,17 +98,22 @@ pub(crate) fn send(sock_path: &Path, wire_bytes: &[u8]) -> Result<Response> {
         source,
     })?;
 
-    // What the two budgets actually bound, stated precisely, because the
-    // previous version of this comment was wrong in a way that hid a real stall
-    // for two stories (Story 5.16 AC #4):
+    // What these two values actually bound, stated precisely, because two
+    // successive versions of this comment got it wrong and each wrong version
+    // hid a real stall (Story 5.16 AC #4, and its pass-2 review):
     //
-    //   * hand-off  ≤ 2ms  AGGREGATE, enforced by `write_all_within` re-arming
-    //                      the socket with the remaining time after any partial
-    //                      write. `SO_SNDTIMEO` alone would only bound each
-    //                      `write(2)`; see WRITE_BUDGET_MS for the 82ms case
-    //                      that proves the difference.
-    //   * ack wait  ≤ 3ms  a single `recv`, so `SO_RCVTIMEO` bounds it directly.
-    //   * connect          NOT bounded, and outside both numbers.
+    //   * each WAIT for send-buffer space  ≤ 2ms
+    //   * each WAIT for reply data         ≤ 3ms
+    //   * the write as a whole             NOT bounded
+    //   * the read as a whole              NOT bounded
+    //   * connect                          NOT bounded, and outside both
+    //
+    // A single `write(2)` keeps going while the peer drains anything, so it can
+    // exceed 2ms by orders of magnitude (measured: 189ms for 1 MiB against a
+    // peer draining 8 KiB per millisecond, returning Ok from one syscall).
+    // `write_all` and `read_line` both loop, compounding it. See
+    // WRITE_BUDGET_MS for the full measurement table and for the story that
+    // owns fixing it; do not restate a total here without measuring one.
     //
     // The connect exclusion is a measured judgement, not an oversight, but it
     // has a precondition worth stating: a Unix-socket connect completes in the
@@ -179,12 +145,12 @@ pub(crate) fn send(sock_path: &Path, wire_bytes: &[u8]) -> Result<Response> {
         .set_read_timeout(Some(Duration::from_millis(READ_BUDGET_MS)))
         .map_err(Error::SocketIo)?;
 
-    // Deadline is taken AFTER the socket options are armed so the budget covers
-    // the hand-off itself rather than setup syscalls.
-    let write_deadline = Instant::now() + Duration::from_millis(WRITE_BUDGET_MS);
+    let mut write_stream = &stream;
     // A connected `UnixStream` is unbuffered, flush is a no-op syscall and is
     // intentionally skipped to keep the hot path tight.
-    write_all_within(&stream, wire_bytes, write_deadline)?;
+    write_stream
+        .write_all(wire_bytes)
+        .map_err(|e| classify(TimeoutOp::Write, WRITE_BUDGET_MS, e))?;
 
     let mut reader = BufReader::with_capacity(64, &stream);
     let mut line = String::with_capacity(64);
@@ -332,100 +298,22 @@ mod tests {
         }
     }
 
-    /// The budget constants are the single source of truth for both the socket
+    /// The timeout constants are the single source of truth for both the socket
     /// options and the message. Pin them so a change is a deliberate edit here
     /// (and, per AC #3/#5, a measured one).
     ///
-    /// Deliberately does NOT assert `WRITE + READ == 5`. The earlier version of
-    /// this test did, which pinned the very claim that turned out to be false:
-    /// a sum of constants says nothing about the aggregate the code enforces.
-    /// `write_all_within_bounds_the_aggregate_not_each_syscall` is the test that
-    /// actually has something to say about it.
+    /// Deliberately does NOT assert `WRITE + READ == 5`, and there is
+    /// deliberately no test here claiming an aggregate bound. Two earlier
+    /// versions of this module asserted one: first a sum of constants (which
+    /// says nothing about what the code enforces), then a wall-clock test whose
+    /// peer was slower than the budget, so the write always failed on its first
+    /// wait and the mechanism under test never ran. Both went green while the
+    /// stall they were supposed to guard was live. A meaningful test here has to
+    /// drive a peer that drains *faster* than the budget but still slowly, which
+    /// is what Story 5.17 owns along with the fix.
     #[test]
     fn budgets_match_the_documented_contract() {
         assert_eq!(WRITE_BUDGET_MS, 2);
         assert_eq!(READ_BUDGET_MS, 3);
-    }
-
-    /// The regression guard for the review's HIGH finding: `write_all` gives each
-    /// partial write a *fresh* `SO_SNDTIMEO`, so a payload larger than the socket
-    /// send buffer can stall far past the budget and still return `Ok`. Measured
-    /// at 82ms for 256 KiB against a slow-draining peer, inside Claude's hook,
-    /// which Axiom 3 forbids.
-    ///
-    /// Drives a real slow-draining peer (deterministic: the payload cannot fit
-    /// the 8 KiB send buffer, so partial writes are guaranteed) and asserts the
-    /// aggregate is honored.
-    ///
-    /// Sized for a wide margin rather than a tight latency assertion, per the
-    /// project's rule that timing assumptions which hold on a fast laptop are
-    /// bugs. A 1 MiB payload (the actual `MAX_STDIN_BYTES` cap) against a peer
-    /// draining 8 KiB every 2ms needs ~256ms to push through under the old
-    /// `write_all`; the bounded version bails in single-digit ms. The 100ms
-    /// ceiling sits an order of magnitude above the expected value and well
-    /// below the regression, so a starved 4-vCPU runner cannot flip it.
-    #[test]
-    fn write_all_within_bounds_the_aggregate_not_each_syscall() {
-        use std::io::Read;
-        use std::os::unix::net::UnixListener;
-
-        let dir = std::env::temp_dir().join(format!("bb516-agg-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("tmpdir");
-        let sock = dir.join("s.sock");
-        let _ = std::fs::remove_file(&sock);
-        let listener = UnixListener::bind(&sock).expect("bind");
-
-        let drain = std::thread::spawn(move || {
-            let (mut s, _) = listener.accept().expect("accept");
-            let mut buf = vec![0u8; 8192];
-            // Drain slowly so the writer keeps making partial progress. This is
-            // the starved-daemon shape, not a synchronization sleep.
-            while let Ok(n) = s.read(&mut buf) {
-                if n == 0 {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(2));
-            }
-        });
-
-        let stream = UnixStream::connect(&sock).expect("connect");
-        stream
-            .set_write_timeout(Some(Duration::from_millis(WRITE_BUDGET_MS)))
-            .expect("arm");
-
-        // The real worst case: the shim's full 1 MiB stdin cap, ~128x the 8 KiB
-        // send buffer.
-        let payload = vec![b'x'; 1024 * 1024];
-        let deadline = Instant::now() + Duration::from_millis(WRITE_BUDGET_MS);
-
-        let started = Instant::now();
-        let result = write_all_within(&stream, &payload, deadline);
-        let elapsed = started.elapsed();
-
-        // It must give up rather than grind through the whole payload.
-        assert!(
-            matches!(
-                result,
-                Err(Error::Timeout {
-                    op: TimeoutOp::Write,
-                    ..
-                })
-            ),
-            "a payload that cannot be handed over inside the budget must report a \
-             write timeout, got {result:?}"
-        );
-
-        let ceiling = Duration::from_millis(100);
-        assert!(
-            elapsed < ceiling,
-            "write must stay near its {WRITE_BUDGET_MS}ms aggregate budget; took \
-             {elapsed:?} (ceiling {ceiling:?}). If this fails, the aggregate bound \
-             regressed, most likely write_all_within was replaced by write_all, \
-             which gives every partial write a fresh SO_SNDTIMEO."
-        );
-
-        drop(stream);
-        let _ = drain.join();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
