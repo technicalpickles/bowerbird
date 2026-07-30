@@ -66,10 +66,11 @@ const READ_BUDGET_MS: u64 = 3;
 /// `SO_SNDTIMEO`.
 ///
 /// Note the story spec described `TimedOut` as "the Linux spelling", which is
-/// misleading: POSIX specifies `EAGAIN` for `SO_RCVTIMEO`/`SO_SNDTIMEO` expiry
-/// on both supported platforms, so Unix normally lands on `WouldBlock` (macOS
-/// errno 35, Linux errno 11). The `TimedOut` arm is therefore not the Linux
-/// counterpart to a macOS quirk. It is kept for a better reason: `std` reserves
+/// misleading. Both supported platforms were measured and both yield
+/// `WouldBlock`: macOS `raw_os_error == Some(35)`, Linux (glibc)
+/// `Some(11)`, i.e. `EAGAIN` either way, exactly as POSIX specifies for
+/// `SO_RCVTIMEO`/`SO_SNDTIMEO` expiry. So `TimedOut` is not the Linux
+/// counterpart to a macOS quirk; nothing we ship produces it. It is kept for a better reason: `std` reserves
 /// the right to produce either kind, and being wrong in that direction would
 /// silently restore the undiagnosable behavior this story exists to remove. One
 /// extra pattern, one whole class of silent regression avoided.
