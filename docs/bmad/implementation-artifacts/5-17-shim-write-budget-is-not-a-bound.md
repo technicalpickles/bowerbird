@@ -31,6 +31,10 @@ so that a slow-draining or starved daemon cannot stall Claude Code for hundreds 
 
 Note the shape: the *worst* cases return **success**. A peer slow enough to trip the timeout is the lucky case; a peer that dribbles just fast enough keeps the syscall alive for hundreds of milliseconds. The read side has the same shape (`read_line` loops `fill_buf` until `\n`), measured at 12ms and 24ms against its 3ms value with a dribbling peer.
 
+**Confirmed on Linux too, so this is not a macOS quirk** (2026-07-30, `rust:slim`/glibc container). An expired `SO_SNDTIMEO` armed at 2ms returned after **6.80ms** having written **255,360 bytes in a single `write(2)`** (macOS managed 8,192 in the comparable run). The read side matched macOS exactly: `WouldBlock` / `raw_os_error == Some(11)` (`EAGAIN`), so the classification in Story 5.16 holds on both platforms.
+
+That settles Task 1's open question about whether Linux's `unix_stream_sendmsg` behaves like macOS's `sosend`: **it does, and if anything it is worse**, since it will push ~31x more data inside one syscall before the timeout is consulted. Any fix must therefore be cross-platform rather than a macOS special case, and a chunk size tuned to macOS's 8 KiB send buffer should not be assumed correct for Linux without re-measuring.
+
 **A verified candidate fix exists.** Capping each `write(2)` at the send-buffer size (`buf.len().min(8192)`) so the syscall cannot loop in the kernel, then checking a deadline between chunks, measured **2.01ms to 2.50ms at every drain rate above**, with a 400-byte hook payload still completing in one syscall (7.6µs vs 8.1µs, no regression). Treat this as a starting point, not a settled design: it was measured in a harness, not in the shim.
 
 **Why Story 5.16's attempt failed, so it is not repeated.** It re-armed the socket with the remaining budget after a partial write, which is correct in principle but unreachable in practice: the first match arm returned `Ok(())` whenever the syscall wrote everything, and as the table shows a single syscall *does* write everything even while taking 189ms. Measured on the shipped code: **1 syscall, 0 re-arms.** The deadline was never consulted. Its test missed this because the test's peer drained *slower* than the budget, so the write always failed on its first wait and the re-arm path never executed.
@@ -53,7 +57,7 @@ Note the shape: the *worst* cases return **success**. A peer slow enough to trip
 
 - [ ] **Task 1: Reproduce the measurements above in-tree (AC: 1)**
   - [ ] Port the harness shape into a test or bench so the numbers are reproducible from the repo rather than from a scratchpad. The Story 5.16 pass-2 review noted, correctly, that its measurement basis was uncommitted prose.
-  - [ ] Confirm the drain-rate sweep on Linux as well as macOS. The `sosend` re-wait behavior was measured on macOS; Linux's `unix_stream_sendmsg` may differ, and the fix must not assume one platform.
+  - [ ] Confirm the drain-rate sweep on Linux as well as macOS. **Partly answered already:** Linux was measured (2026-07-30) and behaves the same way, returning after 6.80ms against a 2ms budget with 255,360 bytes written in one `write(2)`, so `unix_stream_sendmsg` re-waits like `sosend` and is ~31x more permissive per syscall. What remains is the full drain-rate sweep on Linux, not the existence of the bug. Do not assume a macOS-tuned chunk size transfers.
 
 - [ ] **Task 2: Bound the write (AC: 1, 2, 3)**
   - [ ] Implement a bound. The chunk-at-send-buffer approach is measured and is the suggested starting point; a deadline-aware loop alone is proven insufficient.
