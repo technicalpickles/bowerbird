@@ -11,9 +11,19 @@ use thiserror::Error;
 /// operator would go hunting for an event that is actually present.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeoutOp {
-    /// The payload never fully reached the daemon. The daemon frames on a
-    /// trailing `\n` and discards a line it never finished reading
-    /// (`ingest: EOF before newline`), so the event is genuinely lost.
+    /// The payload did not fully reach the daemon, so the event is lost, with
+    /// one boundary case noted below.
+    ///
+    /// The daemon frames on a trailing `\n`. A truncated payload leaves it
+    /// parsing an incomplete JSON object, which fails and is logged as
+    /// `ingest: invalid JSON` while the daemon replies `400`. (It is *not*
+    /// `ingest: EOF before newline`, which only fires when zero bytes arrived.)
+    ///
+    /// **The one case where "not sent" is too strong:** if the write stopped with
+    /// only the final `\n` unsent, the daemon reads a complete JSON object,
+    /// `trim_end_matches('\n')` is a no-op, validation passes, and the event IS
+    /// recorded. That is one byte out of N, and no other prefix of a real payload
+    /// parses as valid JSON, so the `Display` string keeps the simpler wording.
     Write,
     /// The payload landed and only the acknowledgement was lost. The daemon
     /// enqueues via `try_send` *before* it writes `200\n`
@@ -80,10 +90,13 @@ pub enum Error {
     /// consequences. Deliberately does not restate the errno, which is the
     /// least informative part; see `socket::classify`.
     ///
-    /// `budget_ms` is the **aggregate** budget for the operation, which
-    /// `socket::write_all_within` enforces across a partial-write loop. It is
-    /// not a per-syscall figure, so the number here is honest even when the
-    /// payload takes several `write(2)` calls.
+    /// **`budget_ms` is the per-wait socket timeout, not a bound on the
+    /// operation.** The elapsed time when this fires can be far larger, because
+    /// neither `write_all`/`read_line` nor even a single `write(2)` is bounded by
+    /// `SO_*TIMEO` once the peer is draining slowly. See
+    /// `socket::WRITE_BUDGET_MS` for measurements and Story 5.17 for the fix. So
+    /// this number tells the operator which budget was configured, not how long
+    /// the shim actually blocked.
     ///
     /// Both fields are `Copy`, no allocation, per the shim's hot-path
     /// discipline.
@@ -140,17 +153,19 @@ impl Error {
             // Mid-write / daemon-responding-with-error class → 0
             // (fire-and-forget per NFR20: the daemon is up and answering)
             //
-            // `Timeout` belongs here and NOT with the exit-1 class: the ingest
-            // socket exists and the payload was handed to the kernel, so this is
-            // the fire-and-forget class rather than the daemon-unreachable one.
+            // `Timeout` belongs here and NOT with the exit-1 class, and the
+            // reason is NFR20 alone: the shim is fire-and-forget, so a hook that
+            // could not record its event must still let Claude proceed.
             //
-            // Note what is deliberately NOT claimed: a successful connect does
-            // not prove the daemon is alive or scheduled, only that a listener
-            // FD exists (see the connect discussion in `socket::send`). Story
-            // 5.16 Task 1 traced these timeouts to the daemon's runtime thread
-            // being starved by the OS scheduler, which is exactly a case where
-            // the listener is healthy and the daemon is not running. Claude must
-            // still see success either way, per NFR20.
+            // Two things are deliberately NOT claimed, because both are false.
+            // A successful connect does not prove the daemon is alive or
+            // scheduled, only that a listener FD exists (see the connect
+            // discussion in `socket::send`) - Story 5.16 traced these timeouts to
+            // the daemon's thread being starved, which is exactly a healthy
+            // listener with nothing running behind it. And the payload is not
+            // necessarily "handed over": on a WRITE timeout it is truncated and
+            // the daemon rejects it (see `TimeoutOp::Write`). Exit-0 is right
+            // regardless, but it rests on NFR20, not on either of those.
             Error::SocketIo(_)
             | Error::Timeout { .. }
             | Error::BadResponse(_)

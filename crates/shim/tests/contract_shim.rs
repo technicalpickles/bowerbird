@@ -94,7 +94,16 @@ fn start_mock_ingest_silent(tmp: &TempDir) -> MockIngest {
         while !stop_clone.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    let _ = stream.set_nonblocking(false);
+                    stream.set_nonblocking(false).expect("set_nonblocking");
+                    // Hang guard, not a latency assertion: `stop` is only checked
+                    // between accepts, so without this a client that connects and
+                    // never sends a newline parks this thread forever while
+                    // `MockIngest::drop` pulls the TempDir out from under it. The
+                    // obvious next reuse of this helper is a write-timeout test,
+                    // where no newline arrives by construction.
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(30)))
+                        .expect("set_read_timeout");
                     let mut reader = BufReader::new(stream.try_clone().expect("clone"));
                     let mut line = Vec::new();
                     let _ = reader.read_until(b'\n', &mut line);
@@ -442,7 +451,8 @@ fn shim_names_socket_timeout_in_log_and_stays_silent() {
         None,
     );
 
-    // The daemon answered the connect and the event was handed over; per NFR20
+    // Exit-0 rests on NFR20 (fire-and-forget), not on anything the connect
+    // proved: a live listener FD does not mean the daemon is running. Per NFR20
     // this is fire-and-forget, so Claude must still see success.
     assert_eq!(
         out.status.code(),
