@@ -209,7 +209,17 @@ jobs:
             triple: x86_64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
     steps:
+      # `fetch-depth: 0` is load-bearing for THIS job specifically, and it is
+      # the whole reason the rc2 run of this job was a no-op. `actions/checkout`
+      # defaults to a shallow fetch that brings NO tags, so `git tag` below saw
+      # only the tag being built, `grep -v` stripped it, and PRIOR_TAG resolved
+      # empty. The job then took the "no prior tag" branch and reported green,
+      # so the gate looked healthy while testing nothing. Full history is also
+      # required by the `cargo install --git . --tag` step, which needs the prior
+      # tag's objects present locally, not just its ref.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Resolve prior tag (one minor below the current release)
@@ -240,8 +250,27 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo install --git . --tag "${{ steps.prior.outputs.prior }}" \
-            --root target/cross-version-installs/${{ steps.prior.outputs.prior }} \
+          # Two corrections here, both found by running this step for the first
+          # time (it had always been skipped, so none of it was ever exercised):
+          #
+          #   1. `--git .` is not a URL. Cargo rejects it outright with
+          #      "invalid url `.`: relative URL without a base". It needs an
+          #      absolute file:// URL, hence $GITHUB_WORKSPACE.
+          #   2. The package must be named. This is a workspace with three
+          #      binary-bearing packages, so `--bin bowerbird-daemon` alone gets
+          #      "multiple packages with binaries found: bowerbird,
+          #      bowerbird-daemon, bowerbird-shim".
+          #
+          # Verified locally against v0.1.0-rc1 before this landed: installs the
+          # prior daemon, and the upgrade test then passes in ~60ms (fast because
+          # daemon startup is milliseconds; confirmed non-vacuous by pointing the
+          # env var at a non-daemon binary and watching it fail on the 10s
+          # socket-bind guard).
+          cargo install \
+            --git "file://${GITHUB_WORKSPACE}" \
+            --tag "${{ steps.prior.outputs.prior }}" \
+            bowerbird-daemon \
+            --root "target/cross-version-installs/${{ steps.prior.outputs.prior }}" \
             --bin bowerbird-daemon --locked
 
       - name: Run cross-version upgrade test
@@ -256,7 +285,13 @@ jobs:
       - name: SKIP message (no prior tag)
         if: steps.prior.outputs.prior == ''
         run: |
-          echo "::notice::No prior v* tag found — cross-version test SKIPs. This is expected for v0.1.0 (first release); it becomes load-bearing on v0.1.1 and beyond."
+          # Deliberately a WARNING, not a notice, and deliberately does not
+          # assert why. A prior tag exists from v0.1.0-rc2 onward, so from here
+          # on an empty PRIOR_TAG means something is wrong with tag resolution
+          # rather than "first release". The rc2 run printed the old reassuring
+          # "expected for v0.1.0" notice while silently testing nothing, which is
+          # exactly the failure this wording is meant to stop repeating.
+          echo "::warning::cross-version test SKIPPED: no prior v* tag was resolved. If any v* tag other than the current one exists, this is a BUG in tag resolution (check that checkout fetched tags, i.e. fetch-depth: 0) and NOT a clean skip. Only genuinely expected before the first release exists."
 
   release:
     name: Create GitHub Release
