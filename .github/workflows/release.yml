@@ -273,6 +273,24 @@ jobs:
             --root "target/cross-version-installs/${{ steps.prior.outputs.prior }}" \
             --bin bowerbird-daemon --locked
 
+      - name: Build current-tree daemon binary (the vN+1 side)
+        if: steps.prior.outputs.prior != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Required, and the fourth bug this job hid. The test resolves the
+          # current daemon via `assert_cmd::cargo::cargo_bin("bowerbird-daemon")`,
+          # which falls back to `target/debug/bowerbird-daemon` and panics with
+          # "`CARGO_BIN_EXE_bowerbird-daemon` is unset" when that file is absent.
+          # `cargo test --test cross_version_upgrade` does NOT build it: the test
+          # is an integration test of the ROOT `bowerbird` package, and cargo only
+          # sets CARGO_BIN_EXE_* / builds bins for the package owning the test.
+          # `bowerbird-daemon` lives in `crates/daemon`, a different package, so
+          # nothing in the test invocation produces it. Confirmed by reproducing
+          # the exact panic locally: it appears the moment the binary is moved
+          # aside and disappears when it is restored.
+          cargo build -p bowerbird-daemon --locked
+
       - name: Run cross-version upgrade test
         if: steps.prior.outputs.prior != ''
         shell: bash
