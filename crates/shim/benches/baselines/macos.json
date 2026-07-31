@@ -1,8 +1,9 @@
 {
   "schema_version": 1,
-  "p99_nanos": 2663542,
-  "mean_nanos": 2537216,
+  "p99_nanos": 7724875,
+  "mean_nanos": 4769858,
   "samples": 200,
-  "absolute_budget_nanos": 15000000,
-  "regression_max_ratio": null
+  "absolute_budget_nanos": 20000000,
+  "regression_max_ratio": 2.0,
+  "_seeding_note": "Reseeded 2026-07-30 (Story 5.18) from run 5 of the 5-run no-change calibration protocol on the story branch (runs 30599853185, 30600064861, 30600097130, 30600129141, 30600163266; final-attempt p99 range 3.686-7.725ms, single-run spread 2.10x, 4.10x counting run 5's 15.130ms attempt-1). Run 5 is the worst best-of-2 observation, so the ratio is anchored to the top of the healthy band, not its floor. regression_max_ratio 2.0 restored (was null since ADR 0003): a red now needs BOTH best-of-2 attempts above baseline*2.0 = 15.45ms. absolute_budget_nanos 15ms -> 20ms: worst observed single attempt is now 15.130ms ON A GREEN RUN, and 20ms keeps ADR 0003's ~1.32x headroom-over-worst-observed formula. Full evidence and policy rationale: ADR 0003 update 2026-07-30."
 }
