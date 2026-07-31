@@ -10,9 +10,9 @@
 //!   - **burst**: one presenter, eight events clumped within 50ms (mimicking
 //!     Claude Code's tool-call boundary clump). Measures the WORST latency
 //!     within the burst — uniform-throughput tests miss this shape.
-//!   - **steady**: one presenter, one event/sec for 30 seconds. Catches
-//!     sustained-load regressions (slow leaks, accumulating mutex contention,
-//!     periodic-task overruns).
+//!   - **steady**: one presenter, paced at 5 events/sec for 40 seconds
+//!     (~200 samples). Catches sustained-load regressions (slow leaks,
+//!     accumulating mutex contention, periodic-task overruns).
 //!
 //! `harness = false` because Criterion's `SamplingMode::Flat` would batch
 //! samples in our ~1-10ms range and average spikes into invisibility — the
@@ -20,6 +20,20 @@
 //! computation are the load-bearing pattern. Same JSON schema as the shim
 //! bench so `scripts/check-daemon-bench-p99.py` can mirror
 //! `scripts/check-shim-bench-p99.py`.
+//!
+//! ## Sample counts (Story 5.18, AC #3)
+//!
+//! Every shape targets 200 samples so the reported p99 is a real 99th
+//! percentile with two samples strictly above it (`ceil(n * 0.99) - 1 <=
+//! n - 3` requires n >= 200). Below n=100 the index degenerates to n-1 —
+//! p99 IS the max — and one scheduler hiccup on a hosted runner defines the
+//! gate; that is exactly the 2026-07-30 false positive (solo p99 = max =
+//! 11.401ms at 39x the median). The summary JSON's `samples` field is
+//! accurate for solo, fanout3 (full `samples` since 5.18, not `samples/2`),
+//! and burst; `steady` derives its count from duration x rate
+//! (DAEMON_BENCH_STEADY_SECS x 5/sec = 200 at the 40s default) rather than
+//! from `samples`, so it tracks the `samples` field only while the defaults
+//! line up — the actual n is printed per-run on stderr.
 //!
 //! ## Helper-promotion choice
 //!
@@ -46,7 +60,10 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header;
 
 const SCHEMA_VERSION: u32 = 1;
-const DEFAULT_SAMPLES: usize = 50; // smaller than shim's 200 — daemon roundtrips are slower
+// Matches the shim harness. 200 is the smallest n where the p99 index
+// (`ceil(n * 0.99) - 1`) leaves two samples strictly above it; the previous
+// 50 made p99 the max (Story 5.18, AC #3).
+const DEFAULT_SAMPLES: usize = 200;
 const TEST_BEARER: &str = "daemon-bench-token";
 
 #[derive(Debug, Deserialize)]
@@ -308,17 +325,20 @@ async fn bench_burst(d: &Daemon, burst_count: usize) -> Duration {
 }
 
 async fn bench_steady(d: &Daemon, duration_secs: u64) -> Duration {
-    // One event per `target_period`, for `duration_secs` total. Lower volume
-    // than the AC's "30 seconds at 1/sec" so the bench fits inside CI budget;
-    // configurable via env for full runs.
+    // One event per `target_period`, for ~`duration_secs` total. Paced by
+    // COUNT (duration_secs x 5 sends at the 200ms period) rather than a
+    // wall-clock cutoff: the pacing still makes elapsed duration the thing
+    // this shape buys (~40s of sustained load at the default), while the
+    // sample count is deterministic — a clock-bounded loop lost 1-2 samples
+    // to connect/settle overhead and could dip below the n >= 200 that
+    // AC #3's two-samples-above-p99 requirement needs.
     let target_period = Duration::from_millis(200); // 5 events/sec
-    let end = Instant::now() + Duration::from_secs(duration_secs);
+    let target_count = (duration_secs as usize) * 5;
     let mut ws = connect_subscriber(&d.bind_addr).await;
     sleep(Duration::from_millis(50)).await;
 
-    let mut timings: Vec<Duration> = Vec::new();
-    let mut i: u64 = 0;
-    while Instant::now() < end {
+    let mut timings: Vec<Duration> = Vec::with_capacity(target_count);
+    for i in 0..target_count {
         let payload = format!(
             r#"{{"hook_kind":"PreToolUse","session_id":"sess-steady","tool_name":"Bash","tool_input":{{"i":{i}}}}}"#,
         );
@@ -326,10 +346,11 @@ async fn bench_steady(d: &Daemon, duration_secs: u64) -> Duration {
         send_ingest_line(&d.sock_path, &payload).expect("ingest");
         let elapsed = drain_until_event(&mut ws, t0).await;
         timings.push(elapsed);
-        i += 1;
-        let next = t0 + target_period;
-        if let Some(wait) = next.checked_duration_since(Instant::now()) {
-            sleep(wait).await;
+        if i + 1 < target_count {
+            let next = t0 + target_period;
+            if let Some(wait) = next.checked_duration_since(Instant::now()) {
+                sleep(wait).await;
+            }
         }
     }
     timings.sort();
@@ -350,11 +371,16 @@ fn main() {
     let burst_count: usize = std::env::var("DAEMON_BENCH_BURST_COUNT")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(20);
+        .unwrap_or(DEFAULT_SAMPLES);
+    // 40s at the existing 5/sec pacing yields ~200 samples. The count is
+    // grown by duration, NOT by rate: this shape exists to catch slow leaks
+    // and accumulating contention, which only elapsed time buys (5/sec is
+    // already a reduction from the original AC's 1/sec-for-30s intent).
+    // Maintainer decision 2026-07-30, weighed against 20s at 10/sec.
     let steady_secs: u64 = std::env::var("DAEMON_BENCH_STEADY_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(5);
+        .unwrap_or(40);
 
     eprintln!(
         "hook_to_presenter: samples={samples} burst_count={burst_count} steady_secs={steady_secs}"
@@ -369,7 +395,10 @@ fn main() {
 
     let (solo_p99, fanout3_p99, burst_p99, steady_p99) = rt.block_on(async {
         let solo = bench_solo(&daemon, samples).await;
-        let fanout3 = bench_fanout3(&daemon, samples / 2).await;
+        // Full `samples`, not `samples / 2`: the halving was a CI-budget
+        // concession that silently made fanout3 the weakest shape (its p99
+        // was the max of 25 samples). Story 5.18, AC #3.
+        let fanout3 = bench_fanout3(&daemon, samples).await;
         let burst = bench_burst(&daemon, burst_count).await;
         let steady = bench_steady(&daemon, steady_secs).await;
         (solo, fanout3, burst, steady)

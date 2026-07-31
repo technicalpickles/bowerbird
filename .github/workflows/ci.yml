@@ -28,6 +28,9 @@ jobs:
       - name: Lint - inline SQL ban
         shell: bash
         run: ./scripts/lint-inline-sql.sh
+      - name: Test the bench-gate wrapper (scripts/run-bench-gate.py)
+        shell: bash
+        run: python3 -m unittest discover scripts/tests
       # Parallel (libtest default threads) since 2026-07-29. The Epic 2 retro
       # AI-3 `--test-threads=1` serialization is retired: the env-mutating
       # auth tests now inject a TokenEnv snapshot instead of set_var, daemons
@@ -70,7 +73,12 @@ jobs:
           done
 
   shim-bench-gate:
-    name: Shim hot-path bench (p99 ≤ 5ms, +15% regression fails)
+    # Per-platform policy (absolute budget + regression ratio) lives in the
+    # committed baseline files (crates/shim/benches/baselines/<platform>.json,
+    # ADR 0003) — the job name deliberately does not restate numbers that
+    # drift. Best-of-2: a policy failure earns exactly one re-measure
+    # (Story 5.18); tooling failures and bench crashes do not retry.
+    name: Shim hot-path bench gate (per-platform policy in baselines + ADR 0003)
     strategy:
       fail-fast: false
       matrix:
@@ -86,33 +94,31 @@ jobs:
       - name: Build shim under release-shim profile
         run: cargo build --profile release-shim -p bowerbird-shim
 
-      - name: Run hot-path bench (per-invocation timings → summary JSON)
-        run: cargo bench --profile release-shim -p bowerbird-shim --bench hot_path
-
-      - name: Gate current p99 (absolute 5ms + 15% vs committed baseline)
+      - name: Bench + gate (best-of-2 re-measure on policy failure)
         shell: bash
         run: |
-          python3 scripts/check-shim-bench-p99.py \
-            target/shim-bench-summary.json \
-            crates/shim/benches/baselines/${{ matrix.baseline }}
+          python3 scripts/run-bench-gate.py \
+            --bench "cargo bench --profile release-shim -p bowerbird-shim --bench hot_path" \
+            --gate "python3 scripts/check-shim-bench-p99.py target/shim-bench-summary.json crates/shim/benches/baselines/${{ matrix.baseline }}" \
+            --summary target/shim-bench-summary.json
 
-      - name: Upload bench summary (for baseline seeding)
+      - name: Upload bench summaries (final + attempt-1 on retry, for baseline seeding)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: shim-bench-${{ matrix.os }}
-          path: target/shim-bench-summary.json
+          path: target/*bench-summary*.json
           if-no-files-found: warn
 
   daemon-bench-gate:
-    name: Daemon hook→presenter bench (p99 ≤ 100ms, +30% regression fails)
     # Story 4.4 / AC #7. End-to-end p99 hook→presenter (Unix ingest → broadcast
-    # hub → WS frame) gated against per-platform baselines + the NFR2 absolute
-    # 100ms ceiling. Four shapes: solo, fanout3, burst, steady-state.
-    # Structurally identical to shim-bench-gate; same artifact-upload pattern
-    # for baseline seeding. The 30% regression ratio is looser than the shim's
-    # 15% per Axiom 3 (daemon-internal perf is soft) but tight enough to be a
-    # real signal.
+    # hub → WS frame) gated per shape (solo, fanout3, burst, steady) against
+    # per-platform policy committed in the baseline files
+    # (crates/daemon/benches/baselines/<platform>.json) — the job name
+    # deliberately does not restate numbers that drift. Structurally identical
+    # to shim-bench-gate: same wrapper, same best-of-2 retry contract, same
+    # artifact-upload pattern for baseline seeding (Story 5.18).
+    name: Daemon hook→presenter bench gate (per-platform policy in baselines)
     strategy:
       fail-fast: false
       matrix:
@@ -128,20 +134,18 @@ jobs:
       - name: Build daemon under release profile
         run: cargo build --release -p bowerbird-daemon
 
-      - name: Run hook→presenter bench (subprocess daemon, 4 shapes)
-        run: cargo bench -p bowerbird-daemon --bench hook_to_presenter
-
-      - name: Gate current p99 across all four shapes
+      - name: Bench + gate (best-of-2 re-measure on policy failure)
         shell: bash
         run: |
-          python3 scripts/check-daemon-bench-p99.py \
-            target/daemon-bench-summary.json \
-            crates/daemon/benches/baselines/${{ matrix.baseline }}
+          python3 scripts/run-bench-gate.py \
+            --bench "cargo bench -p bowerbird-daemon --bench hook_to_presenter" \
+            --gate "python3 scripts/check-daemon-bench-p99.py target/daemon-bench-summary.json crates/daemon/benches/baselines/${{ matrix.baseline }}" \
+            --summary target/daemon-bench-summary.json
 
-      - name: Upload bench summary (for baseline seeding)
+      - name: Upload bench summaries (final + attempt-1 on retry, for baseline seeding)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: daemon-bench-${{ matrix.os }}
-          path: target/daemon-bench-summary.json
+          path: target/*bench-summary*.json
           if-no-files-found: warn
