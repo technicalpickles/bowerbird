@@ -1,6 +1,6 @@
 # Story 5.18: The bench gates fire on runner noise, so a red build carries no information
 
-Status: ready-for-dev
+Status: review
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -149,12 +149,12 @@ Job wall clock is dominated by an uncached `cargo build`: the daemon macOS job i
   - [x] Both gate scripts' module docstrings hardcode the pre-ADR-0003 defaults in prose (`check-shim-bench-p99.py` says "Absolute: ≤ 5,000,000 ns" and "Regression: ≤ committed_p99 * 1.15"). The code already reads per-platform policy from the baseline; make the prose say that.
   - [x] Strike through `deferred-work.md` item 6 under "Deferred from: code review of 5-16-hotfix-shim-timeout-drops-events" with a backlink to this story.
 
-- [ ] **Task 8: Verification + File List (AC: all)**
+- [x] **Task 8: Verification + File List (AC: all)**
   - [x] `cargo fmt --check` and `cargo clippy --all-targets --workspace -- -D warnings` clean.
   - [x] `scripts/test.sh` green (638 passed / 0 failed, log `target/test-logs/20260730-224233-80525`). Never raw `cargo test`; see the project CLAUDE.md.
   - [x] `python3 -m unittest discover scripts/tests` green (7 tests).
   - [x] Run the daemon bench locally at the new sample counts and confirm no shape reports a p99 equal to its max. (solo n=200 p99 0.242ms max 0.602ms; fanout3 n=200; burst n=200; steady n=200 p99 0.907ms.)
-  - [ ] `git status --porcelain` reconciled against the File List before declaring review (epic-4-retro Discovery #6 / AI-6: File-List-vs-git drift has bitten four prior stories).
+  - [x] `git status --porcelain` reconciled against the File List before declaring review (epic-4-retro Discovery #6 / AI-6: File-List-vs-git drift has bitten four prior stories). (Clean tree; `git diff main...HEAD --name-only` is exactly the 16 files in the File List. Final post-calibration regression re-run: 638 passed / 0 failed, log `target/test-logs/20260731-074152-90222`. CI run 6 `30627715867` green against the reseeded baselines — the armed macOS shim regression gate passing is the reseed's live verification.)
 
 ## Dev Notes
 
