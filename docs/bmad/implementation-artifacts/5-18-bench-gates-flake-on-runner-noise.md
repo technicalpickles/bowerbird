@@ -126,23 +126,23 @@ Job wall clock is dominated by an uncached `cargo build`: the daemon macOS job i
   - [x] `bench_fanout3` call site: pass `samples`, not `samples / 2`. Document the change; the halving was a CI-budget concession that silently made fanout3 the weakest shape.
   - [x] `DAEMON_BENCH_BURST_COUNT` default 20 → 200.
   - [x] `bench_steady`: 5s → 40s at the existing 5/sec pacing, yielding ~200 samples. **Do not reach 200 by raising the rate.** The shape exists to catch slow leaks and accumulating contention, which duration buys and rate does not; 5/sec is already a reduction from the original AC's 1/sec-for-30s intent. Maintainer decision (2026-07-30), weighed against a 20s-at-10/sec alternative. (Implemented count-paced: exactly `steady_secs x 5` sends at the same 200ms period — a wall-clock cutoff measured n=198 locally because connect/settle ate into the window, which breaks AC #3's two-above-p99 requirement. Rate and duration unchanged; only the loop bound moved from clock to count.)
-  - [ ] Expected new bench wall clock ≈ 43.5s (was ≈5.7s), putting the daemon job at roughly 2m41 from 2m03. Confirm against the real run rather than trusting this estimate. (Local bench wall clock ≈44s as predicted; CI job total awaits the Task 5 runs.)
+  - [x] Expected new bench wall clock ≈ 43.5s (was ≈5.7s), putting the daemon job at roughly 2m41 from 2m03. Confirm against the real run rather than trusting this estimate. (Confirmed: local bench wall clock ≈44s; across the 5 calibration runs the daemon-bench-gate jobs ran 2m56–3m34 total — slightly over the 2m41 estimate, dominated as before by the uncached cargo build.)
   - [x] The summary JSON's `samples` field becomes accurate for solo, fanout3, and burst; steady stays duration×rate-derived. Noted in the harness docstring; schema unchanged.
   - [x] Verify the arithmetic after the change: `ceil(n * 0.99) - 1` must be ≤ n - 3 for every shape. (Computed: n=200 → index 197, 2 samples strictly above, for all four shapes; local run confirmed n=200 on every shape and solo p99 0.242ms vs max 0.602ms.)
 
-- [ ] **Task 5: Calibration runs (AC: 5)** [HUMAN-IN-THE-LOOP: needs real CI runs]
-  - [ ] With Tasks 1-4 landed on the story branch, trigger CI ~5 times with **no code change between runs**. This is the same protocol ADR 0003 used with 3 runs; a single run is informative about the day's runner state, not about the distribution.
-  - [ ] Download every `shim-bench-{macos,ubuntu}-latest` and `daemon-bench-{macos,ubuntu}-latest` artifact. Record all of them in the Dev Agent Record, including the ones that look boring; the spread is the finding, not the best number.
-  - [ ] Compute the best-of-2 spread, not the raw spread, since that is what the gate now sees. Replaying ADR 0003's own three macOS numbers (2.66 / 6.19 / 11.35ms) as best-of-2 pairs collapses 4.3x to 2.3x; confirm that against real data rather than assuming it.
+- [x] **Task 5: Calibration runs (AC: 5)** [HUMAN-IN-THE-LOOP: needs real CI runs]
+  - [x] With Tasks 1-4 landed on the story branch, trigger CI ~5 times with **no code change between runs**. This is the same protocol ADR 0003 used with 3 runs; a single run is informative about the day's runner state, not about the distribution. (Runs 30599853185, 30600064861, 30600097130, 30600129141, 30600163266 on PR #33 — run 1 on the mechanism push, runs 2-5 via empty commits so each gets a fresh VM and artifact set. All five green.)
+  - [x] Download every `shim-bench-{macos,ubuntu}-latest` and `daemon-bench-{macos,ubuntu}-latest` artifact. Record all of them in the Dev Agent Record, including the ones that look boring; the spread is the finding, not the best number. (All 20 artifacts recorded below, plus run 5's shim-macOS attempt-1 file — the wrapper fired in the wild during its own calibration.)
+  - [x] Compute the best-of-2 spread, not the raw spread, since that is what the gate now sees. Replaying ADR 0003's own three macOS numbers (2.66 / 6.19 / 11.35ms) as best-of-2 pairs collapses 4.3x to 2.3x; confirm that against real data rather than assuming it. (Confirmed: shim macOS single-run spread 2.10x across finals, 4.10x counting the 15.130ms attempt-1; best-of-2 across unordered pairs 1.92x.)
 
-- [ ] **Task 6: Reseed baselines and amend ADR 0003 (AC: 5, 7)**
-  - [ ] `crates/shim/benches/baselines/macos.json`: reseed `p99_nanos` / `mean_nanos`; restore `regression_max_ratio` at whatever the measured best-of-2 spread supports (~2.0 is the target, not a commitment); set `absolute_budget_nanos` with real headroom over worst observed. If the data says a ratio still cannot work, leave it `null` and record the measured reason, per AC #5's escape hatch.
-  - [ ] `crates/daemon/benches/baselines/macos.json`: reseed all four shapes. The current values were seeded from n=50 maxes and are stale by construction once n=200.
-  - [ ] `crates/shim/benches/baselines/linux.json`: verify against the fresh data. It looks healthy today (green-run p99 0.990ms against a 1.194 x 1.35 = 1.613ms threshold); reseed only if the data says to.
-  - [ ] `crates/daemon/benches/baselines/linux.json`: **do not touch.** See AC #7.
-  - [ ] Commit the baselines as their own commit, separate from the mechanism commits, so the calibration is reviewable on its own.
-  - [ ] `docs/decisions/0003-shim-p99-budget-on-macos-latest.md`: add a dated update section following the existing 2026-05-20 Linux-update pattern. Do **not** supersede the ADR. Record the 2026-07-30 evidence, that the 15ms calibration point was exceeded on a green run, that best-of-2 narrows the effective single-run spread, and the new per-platform policy table.
-  - [ ] State plainly in the ADR update that this raises a budget, which 5.5's anti-pattern list forbids "to make a number fit", and why this is the sanctioned path instead: the number is reset from measured evidence via the ADR amendment PRD line 181 requires, and the regression gate is restored in the same change, so macOS ends with more signal than it has today rather than less.
+- [x] **Task 6: Reseed baselines and amend ADR 0003 (AC: 5, 7)**
+  - [x] `crates/shim/benches/baselines/macos.json`: reseed `p99_nanos` / `mean_nanos`; restore `regression_max_ratio` at whatever the measured best-of-2 spread supports (~2.0 is the target, not a commitment); set `absolute_budget_nanos` with real headroom over worst observed. If the data says a ratio still cannot work, leave it `null` and record the measured reason, per AC #5's escape hatch. (Reseeded p99 7.725ms / mean 4.770ms from run 5's final attempt — the worst best-of-2 observation; ratio restored at 2.0 (ceiling 15.45ms, observed best-of-2 band tops out 7.7ms); absolute 15ms → 20ms since the worst observed single attempt is now 15.130ms on a green run, keeping ADR 0003's ~1.32x headroom formula.)
+  - [x] `crates/daemon/benches/baselines/macos.json`: reseed all four shapes. The current values were seeded from n=50 maxes and are stale by construction once n=200. (Per-shape worst across the 5 runs: solo 0.819 / fanout3 0.847 / burst 3.793 / steady 1.821ms; ratio stays 1.30; `samples` 50 → 200.)
+  - [x] `crates/shim/benches/baselines/linux.json`: verify against the fresh data. It looks healthy today (green-run p99 0.990ms against a 1.194 x 1.35 = 1.613ms threshold); reseed only if the data says to. (Verified: 1.155–1.208ms across five runs, 1.05x spread, all inside the 1.613ms ceiling. Not reseeded.)
+  - [x] `crates/daemon/benches/baselines/linux.json`: **do not touch.** See AC #7. (Untouched; `git diff` confirms. Fresh observation recorded in Completion Notes for Story 5.5: the ~40ms gap did not reproduce at n=200.)
+  - [x] Commit the baselines as their own commit, separate from the mechanism commits, so the calibration is reviewable on its own.
+  - [x] `docs/decisions/0003-shim-p99-budget-on-macos-latest.md`: add a dated update section following the existing 2026-05-20 Linux-update pattern. Do **not** supersede the ADR. Record the 2026-07-30 evidence, that the 15ms calibration point was exceeded on a green run, that best-of-2 narrows the effective single-run spread, and the new per-platform policy table.
+  - [x] State plainly in the ADR update that this raises a budget, which 5.5's anti-pattern list forbids "to make a number fit", and why this is the sanctioned path instead: the number is reset from measured evidence via the ADR amendment PRD line 181 requires, and the regression gate is restored in the same change, so macOS ends with more signal than it has today rather than less.
 
 - [x] **Task 7: Reconcile the documented thresholds (AC: 6)**
   - [x] `docs/bmad/project-context.md:629` and Story 5.16 AC #5 both claim +15%. Correct both to point at the per-platform baseline files and ADR 0003 rather than restating a number. (Also corrected in the same sweep because they restate the same drifted numbers: 5.16's References entry for project-context, `crates/shim/benches/README.md`'s policy table + threshold-rationale section — which still said Linux gates at +15% when it has been 1.35 since ADR 0003's 2026-05-20 update — and `architecture.md:481`'s "30% vs the shim's 15%" parenthetical. Deliberately left alone: `product-brief-bowerbird-distillate.md`, a frozen distillate of a planning doc, and historical prose in done stories' Dev Agent Records.)
@@ -232,9 +232,52 @@ claude-fable-5 (dev-story session 2026-07-30)
 - Local daemon bench at new counts (first run, clock-bounded steady): `solo n=200 p99=0.191ms max=0.394ms; fanout3 n=200; burst n=200; steady n=198` — the n=198 is what motivated count-pacing steady.
 - Local daemon bench after count-pacing: `solo n=200 p50=0.123 p99=0.242 max=0.602ms; fanout3 n=200 p99=0.177ms; burst n=200 p99=3.369ms; steady n=200 p99=0.907ms`.
 
+### Calibration record (Task 5, AC #5): 5 no-change CI runs, 2026-07-30/31, PR #33
+
+Runs: 1 = `30599853185` (mechanism push, commit 22c328f), 2-5 = `30600064861` / `30600097130` / `30600129141` / `30600163266` (empty commits da9c483 / 545751c / 2adfed3 / 3c85076 — empty commits rather than re-runs because `upload-artifact@v4` can conflict on re-run attempts). All five green. Every artifact recorded, boring ones included:
+
+**shim macOS** (ms, n=200 each):
+
+| run | p99 | mean |
+|---|---|---|
+| 1 | 7.032 | 4.326 |
+| 2 | 3.686 | 2.494 |
+| 3 | 5.676 | 3.303 |
+| 4 | 7.090 | 3.186 |
+| 5 attempt 1 | **15.130** | 4.546 |
+| 5 attempt 2 | 7.725 | 4.770 |
+
+Run 5 is the wrapper firing in the wild during its own calibration: attempt 1 breached the then-current 15ms absolute budget on a no-change run, the re-measure passed at 7.725ms, both attempts shipped in artifacts + step summary. Spreads: single-run 2.10x across finals (4.10x with the attempt-1); best-of-2 across unordered pairs 1.92x.
+
+**shim Linux** (ms): p99 1.178 / 1.183 / 1.155 / 1.208 / 1.155, mean 0.997 / 1.009 / 1.005 / 1.016 / 0.980. Spread 1.05x. Committed policy (1.194533 × 1.35 = 1.613ms ceiling) holds with margin; not reseeded.
+
+**daemon macOS** (p99 ms per shape, n=200):
+
+| run | solo | fanout3 | burst | steady |
+|---|---|---|---|---|
+| 1 | 0.741 | 0.507 | 3.136 | 1.821 |
+| 2 | 0.819 | 0.663 | 2.803 | 1.363 |
+| 3 | 0.662 | 0.847 | 3.793 | 1.559 |
+| 4 | 0.410 | 0.373 | 1.942 | 0.961 |
+| 5 | 0.319 | 0.351 | 1.821 | 1.543 |
+
+Single-run spreads 1.90-2.57x; best-of-2 1.62-2.32x. Note every value is far below the old n=50-max-seeded baseline (solo 1.569) — real percentiles are tamer than maxes, as predicted.
+
+**daemon Linux** (p99 ms per shape, n=200):
+
+| run | solo | fanout3 | burst | steady |
+|---|---|---|---|---|
+| 1 | 0.490 | 0.538 | 4.110 | 0.740 |
+| 2 | 0.403 | 0.433 | 5.098 | 0.803 |
+| 3 | 0.446 | 0.552 | 4.092 | 0.691 |
+| 4 | 0.394 | 0.416 | **12.595** | 0.659 |
+| 5 | 0.575 | 0.619 | 4.834 | 0.795 |
+
+Recorded for Story 5.5, not acted on here (AC #7): the deferred ~40ms solo/fanout3/burst gap did **not** reproduce at n=200 — solo/fanout3 sit at 0.4-0.6ms, in line with macOS. Either the n=50 max-gate was reporting the extreme tail (burst's 12.6ms outlier shows the tail still exists on ubuntu) or the runner image changed. `linux.json` stays all-zero per the maintainer punt; this observation just updates the evidence base 5.5 will start from.
+
 ### Completion Notes List
 
-1. **Tasks 1-4, 7 and the local half of Task 8 are complete; Tasks 5-6 await real CI runs** (Task 5 is marked HUMAN-IN-THE-LOOP in this story: the branch needs ~5 no-change CI runs and their artifacts before baselines can be reseeded and ADR 0003 amended).
+1. **All eight tasks complete.** Task 5's HUMAN-IN-THE-LOOP CI runs were executed by the dev agent via PR #33 (draft): the story's own protocol (~5 no-change runs, download artifacts, compute best-of-2 spread) was fully scriptable with `gh`. The PR body and the empty calibration commits are on the branch for maintainer review.
 2. **Implementation plan as executed:** test-first for the wrapper (7 unittest cases written red against a missing script, then the wrapper written to green); CI wiring with one wrapper invocation per bench job; harness sample counts to 200/shape; docs reconciled to point at baseline files instead of restating numbers.
 3. **Deviation, documented: `bench_steady` is count-paced, not clock-bounded.** The story said "40s at the existing 5/sec pacing, yielding ~200 samples" with steady staying time-derived. A clock-bounded 40s loop measured n=198 locally (connect + 50ms settle eat into the window), and n<200 breaks AC #3's "at least two samples strictly above p99". The loop now sends exactly `steady_secs x 5` events at the same 200ms period: rate unchanged, elapsed duration still ~40s (pacing enforces it), sample count deterministic at 200. This is the smallest change that satisfies AC #3 without raising the rate.
 4. **Operational finding: branch protection names the old shim job.** Required status checks on `main` are literally "Shim hot-path bench (p99 ≤ 5ms, +15% regression fails) (macos-latest, macos.json)" / "(ubuntu-latest, linux.json)". Task 3's rename means those contexts will never report again once this merges, so the required checks must be repointed at the new job name ("Shim hot-path bench gate (per-platform policy in baselines + ADR 0003) (…)") — ideally at merge time, since flipping early blocks other in-flight PRs (e.g. #28) that still report the old names. Needs a maintainer (repo-settings) action; not doable from the working tree.
@@ -256,11 +299,15 @@ claude-fable-5 (dev-story session 2026-07-30)
 - `docs/bmad/implementation-artifacts/deferred-work.md` (item 6 struck through)
 - `docs/bmad/implementation-artifacts/5-18-bench-gates-flake-on-runner-noise.md` (this file: permitted sections)
 - `docs/bmad/implementation-artifacts/sprint-status.yaml`
-- Pending Tasks 5-6: `crates/shim/benches/baselines/macos.json`, `crates/shim/benches/baselines/linux.json` (verify only), `crates/daemon/benches/baselines/macos.json`, `docs/decisions/0003-shim-p99-budget-on-macos-latest.md`
+- `crates/shim/benches/baselines/macos.json` (reseeded, ratio restored at 2.0, absolute 20ms)
+- `crates/daemon/benches/baselines/macos.json` (reseeded at n=200, ratio unchanged)
+- `docs/decisions/0003-shim-p99-budget-on-macos-latest.md` (dated 2026-07-30 update section)
+- Verified-not-changed: `crates/shim/benches/baselines/linux.json`, `crates/daemon/benches/baselines/linux.json` (AC #7)
 
 ## Change Log
 
 | Date | Author | Summary |
 |------|--------|---------|
+| 2026-07-31 | claude-fable-5 | Calibration half (Tasks 5-6): 5 no-change CI runs on PR #33 (run 1 mechanism push + 4 empty commits), all 20 bench artifacts recorded in the Dev Agent Record. The wrapper fired in the wild during calibration: run 5 shim-macOS attempt 1 hit 15.130ms (over the then-current 15ms absolute), re-measure passed at 7.725ms. Reseeded shim macos.json (p99 7.725ms / mean 4.770ms, regression gate RESTORED at 2.0, absolute 15→20ms per the ~1.32x headroom-over-worst-observed formula) and daemon macos.json (per-shape worst at n=200, ratio unchanged 1.30); shim linux.json verified healthy and untouched; daemon linux.json untouched per AC #7. ADR 0003 amended with a dated 2026-07-30 update (not superseded) carrying the evidence tables, the budget-raise justification, and new revisit triggers. Fresh 5.5-relevant observation recorded: the ~40ms Linux daemon gap did not reproduce at n=200. |
 | 2026-07-30 | claude-fable-5 | Mechanism half implemented (Tasks 1-4, 7, local Task 8): best-of-2 wrapper `scripts/run-bench-gate.py` + 7-case unittest suite wired into the `ci` job; both bench-gate CI jobs routed through the wrapper with widened `target/*bench-summary*.json` artifact globs and number-free job names; daemon harness at 200 samples/shape (fanout3 un-halved, burst 200, steady count-paced at 5/sec for 40s — see Completion Note 3 for the clock→count deviation); threshold docs de-numbered to point at baseline files + ADR 0003; deferred-work item 6 struck. fmt/clippy/638-test workspace/7 unittest green; local bench confirms no shape's p99 is its max. Tasks 5-6 (CI calibration runs, baseline reseed, ADR 0003 amendment) pending the HUMAN-IN-THE-LOOP CI-run step. Branch-protection rename side effect recorded in Completion Note 4. |
 | 2026-07-30 | claude-opus-5 | Story created from taskwarrior `b6e4eceb` after a scoping pass that found the filed diagnosis covered one of the two incidents. Corrections folded in: all four daemon shapes are max-gates (not just solo at n=50); the shim incident is a distribution shift that no sample-count change addresses, and its real cause is that ADR 0003's 15ms calibration point was exceeded on a green run. Two candidate scope items were dropped after finding them already decided: seeding the Linux daemon baseline (2026-07-28 maintainer punt) and the ~40ms Linux gap (already filed with better evidence). Design decisions this session: best-of-2 re-measure with both attempts logged; Python wrapper rather than shell, since the repo has no shell test harness and the two gate scripts are already Python; steady grows to 40s at 5/sec rather than 20s at 10/sec, keeping duration as the thing the shape buys; macOS regression gate restored rather than left absolute-only. |
