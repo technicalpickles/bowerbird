@@ -43,13 +43,13 @@ by ADR 0003 — see `docs/decisions/0003-shim-p99-budget-on-macos-latest.md`):
 }
 ```
 
-- `absolute_budget_nanos` — per-platform p99 ceiling. Missing field
+- `absolute_budget_nanos`: per-platform p99 ceiling. Missing field
   falls back to 5 ms.
 - `regression_max_ratio` — multiplier on the committed `p99_nanos`.
   `null` disables the regression gate. Missing field falls back to
   1.15.
 
-The committed baseline files are the source of truth for both values —
+The committed baseline files are the source of truth for both values;
 this README deliberately does not restate them (restated numbers drift;
 Story 5.18 closed exactly that). ADR 0003 and its dated updates record
 why each platform's policy is what it is.
@@ -64,12 +64,15 @@ why each platform's policy is what it is.
 
 Both gates run on every PR via the `shim-bench-gate` job in
 `.github/workflows/ci.yml`, wrapped by `scripts/run-bench-gate.py`
-(Story 5.18): a policy failure earns exactly one re-measure, recorded
-in the step summary; tooling failures and bench crashes never retry.
+(Story 5.18): a policy failure (gate exit 1) earns exactly one
+re-measure; tooling failures and bench crashes never retry. A retry
+that passes is recorded in the step summary with both attempts'
+numbers; a retry that fails again is loud on its own (red job plus
+error annotations, with the attempt-1 JSON in the artifacts).
 
 ## Current per-platform policy
 
-Read it from `baselines/linux.json` and `baselines/macos.json` — the
+Read it from `baselines/linux.json` and `baselines/macos.json`, the
 committed files are the policy. The rationale (macOS runner noise, the
 Linux runner-image drift, and the 2026-07-30 recalibration) lives in
 ADR 0003 and its dated update sections.
@@ -122,12 +125,12 @@ unnoticed (Story 1.5 review finding 1).
 
 The regression ratio is per-platform and lives in the baseline files
 (see "Current per-platform policy" above). Each ratio is calibrated
-from measured multi-run spread on that runner — wide enough to absorb
-runner-to-runner noise without becoming a useless gate — and the
+from measured multi-run spread on that runner, wide enough to absorb
+runner-to-runner noise without becoming a useless gate, and the
 absolute budget backstops it. ADR 0003 records each calibration.
 
 If CI reports a regression past the committed ratio (on both best-of-2
-attempts — a single-attempt failure that passes the re-measure is
+attempts, a single-attempt failure that passes the re-measure is
 counted as runner noise in the step summary):
 
 1. **Identify the offending PR and revert or fix.** Common case.

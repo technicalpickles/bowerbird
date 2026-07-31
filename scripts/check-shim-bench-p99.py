@@ -20,8 +20,11 @@ Usage:
 
 Exit codes:
   0  Both gates passed.
-  1  At least one gate failed, OR the committed baseline is missing.
-  2  Bad arguments / unreadable input (reserved for tooling failure, not policy).
+  1  At least one gate failed (a policy verdict on a measured run).
+  2  Bad arguments / unreadable input / missing committed baseline (tooling
+     or config state, not policy; the best-of-2 wrapper never re-measures
+     on exit 2, so a missing baseline fails the job once instead of
+     burning a spurious retry during seeding).
 
 Schema (both files share it; the current summary is what gets committed as
 the baseline after a clean run on each platform):
@@ -109,7 +112,7 @@ def main() -> int:
             "from this run, copy target/shim-bench-summary.json into "
             f"{args.baseline_json}, and commit. See crates/shim/benches/README.md."
         )
-        return 1
+        return 2
 
     try:
         baseline = load_summary(args.baseline_json, "committed baseline")

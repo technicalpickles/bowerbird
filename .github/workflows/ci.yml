@@ -75,7 +75,7 @@ jobs:
   shim-bench-gate:
     # Per-platform policy (absolute budget + regression ratio) lives in the
     # committed baseline files (crates/shim/benches/baselines/<platform>.json,
-    # ADR 0003) — the job name deliberately does not restate numbers that
+    # ADR 0003), the job name deliberately does not restate numbers that
     # drift. Best-of-2: a policy failure earns exactly one re-measure
     # (Story 5.18); tooling failures and bench crashes do not retry.
     name: Shim hot-path bench gate (per-platform policy in baselines + ADR 0003)
@@ -114,7 +114,7 @@ jobs:
     # Story 4.4 / AC #7. End-to-end p99 hook→presenter (Unix ingest → broadcast
     # hub → WS frame) gated per shape (solo, fanout3, burst, steady) against
     # per-platform policy committed in the baseline files
-    # (crates/daemon/benches/baselines/<platform>.json) — the job name
+    # (crates/daemon/benches/baselines/<platform>.json), the job name
     # deliberately does not restate numbers that drift. Structurally identical
     # to shim-bench-gate: same wrapper, same best-of-2 retry contract, same
     # artifact-upload pattern for baseline seeding (Story 5.18).

@@ -1,6 +1,6 @@
 # 0003. Shim p99 budget on `macos-latest` is unstable
 
-Date: 2026-05-18 (original); 2026-05-20 (Linux update); 2026-07-30 (macOS recalibration + best-of-2 — see bottom)
+Date: 2026-05-18 (original); 2026-05-20 (Linux update); 2026-07-30 (macOS recalibration + best-of-2, see bottom)
 Status: Accepted
 Deciders: @pickles
 Related: PRD line 181 ("If the number can't be met cleanly, the right response is an ADR"); Story 1.5 Task 9 acknowledgment; Story 1.5 Review Findings 1 + 2; Story 1.6 PR #19 bench-gate failure
@@ -154,15 +154,15 @@ Option D in the original ADR proposed rearchitecting the shim away from per-invo
 
 ## Update 2026-07-30: macOS recalibration, regression gate restored, best-of-2 re-measure (Story 5.18)
 
-The original "Revisit when" listed runner-topology change as a trigger. It fired: the **green** run `30546733823` on `main` (2026-07-30) measured macOS p99 11.554ms — past the worst observation (11.345ms) this ADR calibrated the 15ms budget against — and the day before, PR #29 failed the absolute gate at 57.262ms on a diff that touched only `release.yml` and a docs file. The committed baseline (p99 2.664ms, mean 2.537ms) sat 4.3x below current reality, and with `regression_max_ratio: null` nothing was watching that drift. Whether macOS shim spawn got ~2.3x slower because of runner images or because of bowerbird was unanswerable from CI. Story 5.18 owns the fix.
+The original "Revisit when" listed runner-topology change as a trigger. It fired: the **green** run `30546733823` on `main` (2026-07-30) measured macOS p99 11.554ms, past the worst observation (11.345ms) this ADR calibrated the 15ms budget against, and the day before, PR #29 failed the absolute gate at 57.262ms on a diff that touched only `release.yml` and a docs file. The committed baseline (p99 2.664ms, mean 2.537ms) sat 4.3x below current reality, and with `regression_max_ratio: null` nothing was watching that drift. Whether macOS shim spawn got ~2.3x slower because of runner images or because of bowerbird was unanswerable from CI. Story 5.18 owns the fix.
 
 ### What changed structurally before recalibrating
 
-Both bench gates now run through `scripts/run-bench-gate.py`: a **policy** failure (gate exit 1) earns exactly one re-measure, and the job fails only if both attempts fail. Tooling failures (exit 2) and bench crashes never retry. Retries are recorded — the attempt-1 summary ships in the artifacts and both attempts' numbers land in `$GITHUB_STEP_SUMMARY` — so the noise rate stays countable rather than living in reflex re-runs. A deterministic regression fails both attempts, so best-of-2 narrows the *noise* distribution without masking real regressions.
+Both bench gates now run through `scripts/run-bench-gate.py`: a **policy** failure (gate exit 1) earns exactly one re-measure, and the job fails only if both attempts fail. Tooling failures (exit 2) and bench crashes never retry. Retries are recorded, the attempt-1 summary ships in the artifacts and both attempts' numbers land in `$GITHUB_STEP_SUMMARY`, so the noise rate stays countable rather than living in reflex re-runs. A deterministic regression fails both attempts, so best-of-2 narrows the *noise* distribution without masking real regressions.
 
 ### Fresh evidence: 5-run no-change calibration protocol (story branch, 2026-07-30)
 
-Same protocol as the original three-run measurement, now five runs (`30599853185`, `30600064861`, `30600097130`, `30600129141`, `30600163266`), identical code across all five:
+Same protocol as the original three-run measurement, now five runs (`30599853185`, `30600064861`, `30600097130`, `30600129141`, `30600163266`), identical code across all five. Disclosure on what this sample is: the five runs were queued within one ~7-minute window (02:46-02:53 UTC) and ran largely concurrently on separate hosted VMs, so they sample VM-to-VM spread inside one runner-weather moment, not day-to-day drift. (The original ADR's three runs were also same-day back-to-back, so this is the same protocol with the same limitation, at five samples instead of three.) The two incidents this story answers happened on different days; the "Revisit when" triggers below are the guard against a day this window did not see.
 
 | Run | macos p99 | macos mean | linux p99 | linux mean |
 |---|---|---|---|---|
@@ -174,7 +174,7 @@ Same protocol as the original three-run measurement, now five runs (`30599853185
 
 Run 5 is the mechanism working in the wild on its first day: attempt 1 breached the then-current 15ms absolute budget on a no-change run, the wrapper re-measured, attempt 2 passed, and both attempts' numbers are in the run's step summary and artifacts. Without the wrapper that would have been a third spurious red in three days.
 
-The spreads: single-run macOS p99 spread is 2.10x across final attempts (4.10x counting the 15.130ms attempt-1 — consistent with the original ADR's 4.3x). The best-of-2 view the gate now sees spans 1.92x across all unordered pairs. The original ADR's own three numbers (2.66 / 6.19 / 11.35ms) replayed as best-of-2 pairs collapse from 4.3x to 2.3x; the fresh data confirms the same shape with more samples.
+The spreads: single-run macOS p99 spread is 2.10x across final attempts (4.10x counting the 15.130ms attempt-1, consistent with the original ADR's 4.3x). The best-of-2 view the gate now sees spans 1.92x across all unordered pairs. The original ADR's own three numbers (2.66 / 6.19 / 11.35ms) replayed as best-of-2 pairs collapse from 4.3x to 2.3x; the fresh data confirms the same shape with more samples.
 
 Linux: p99 1.155–1.208ms across five runs (1.05x spread), against a committed 1.195ms baseline with a 1.35 ratio (ceiling 1.613ms). Healthy; `linux.json` is deliberately unchanged.
 
@@ -182,20 +182,22 @@ Linux: p99 1.155–1.208ms across five runs (1.05x spread), against a committed 
 
 | Field | Old value | New value | Rationale |
 |---|---|---|---|
-| `p99_nanos` | 2,663,542 (2.664 ms) | 7,724,875 (7.725 ms) | Reseeded from run 5's final attempt — the worst best-of-2 observation of the protocol, anchoring the ratio to the top of the healthy band rather than its floor. |
+| `p99_nanos` | 2,663,542 (2.664 ms) | 7,724,875 (7.725 ms) | Reseeded from run 5's final attempt, the worst best-of-2 observation of the protocol, anchoring the ratio to the top of the healthy band rather than its floor. |
 | `mean_nanos` | 2,537,216 | 4,769,858 | Same source. |
 | `absolute_budget_nanos` | 15,000,000 (15 ms) | 20,000,000 (20 ms) | Worst observed single attempt is now 15.130ms **on a green no-change run**; 15ms no longer has headroom over worst-observed. 20ms keeps this ADR's original ~1.32x formula, and a red now requires BOTH attempts past it. |
 | `regression_max_ratio` | `null` (disabled) | `2.0` | Restored. The original disable reasoned that no percentage gate is meaningful against a 4.3x single-run spread; best-of-2 narrows the enforced spread to ~1.9x observed, so a 2.0 ratio (ceiling 15.45ms) sits above the healthy band with real margin while catching a shim that genuinely doubles. Was the drift-watcher this update exists because we lacked. |
+
+**On stacking the raised budget on top of best-of-2:** these are two slackenings, and the evidence (run 5 went green under the old 15ms budget once the wrapper absorbed its 15.130ms attempt) would arguably support best-of-2 alone. They serve different jobs. Best-of-2 protects the *verdict*: a red requires two failing attempts. The absolute budget's post-wrapper job is bounding the *retry rate*: with the ceiling at 15ms, the observed distribution puts single attempts over it often enough (1 of 6 attempts in this five-run window) that re-measures, each a full bench run and a step-summary note, become routine, and routine notes stop being read. Keeping the original ~1.32x headroom-over-worst-observed formula, now applied to the worst observed *attempt*, keeps single-attempt breaches rare so that a re-measure note stays a signal. The same logic covers the regression ceiling (7.725 x 2.0 = 15.45ms) sitting 2% above the observed 15.130ms attempt: attempts near 15ms will trip it occasionally and burn a re-measure, which is the designed behavior, and the "more than ~once a week" revisit trigger below is the tripwire if occasionally turns into regularly.
 
 **This raises a budget, which the project forbids doing "to make a number fit" (Story 5.5's anti-pattern list, PRD line 181).** Why this is the sanctioned path instead: the number is reset from measured multi-run evidence via exactly the ADR amendment PRD line 181 requires, on no-change runs that isolate runner drift from shim changes; and the same change *restores* the regression gate that has been disabled since May, so macOS ends with strictly more signal than it had (a drift-watcher plus an absolute ceiling, versus an absolute ceiling alone that had silently gone stale). The 5ms Axiom 3 target is unchanged and remains the shim's real-hardware contract; this budget describes `macos-latest`'s noise floor, as it always has.
 
 ### What best-of-2 gives up
 
-A *probabilistic* regression — one manifesting on only some runs — is now half as likely to be caught per CI run. Nothing in the bench suite targets that class, and the alternative (single-shot gating) produced false positives at 3.8x and 5.6x over threshold in one session. Accepted deliberately; Story 5.5's chaos-injection work is unaffected because injected sleeps are deterministic and fail both attempts.
+A *probabilistic* regression, one manifesting on only some runs, is now half as likely to be caught per CI run. Nothing in the bench suite targets that class, and the alternative (single-shot gating) produced false positives at 3.8x and 5.6x over threshold in one session. Accepted deliberately; Story 5.5's chaos-injection work is unaffected because injected sleeps are deterministic and fail both attempts.
 
 ### Revisit when (2026-07-30 additions)
 
-- A re-measure note appears in step summaries more than ~once a week across PRs — the noise rate is drifting and the calibration (or the runner) needs another look.
-- Both attempts of a no-change run fail the 20ms absolute — the noise floor has moved past this calibration; recalibrate or escalate to Option D.
-- The 2.0 ratio fires on a diff that cannot affect the shim — same protocol as this update: gather ~5 no-change runs, reseed from evidence, amend here.
+- A re-measure note appears in step summaries more than ~once a week across PRs, the noise rate is drifting and the calibration (or the runner) needs another look.
+- Both attempts of a no-change run fail the 20ms absolute, the noise floor has moved past this calibration; recalibrate or escalate to Option D.
+- The 2.0 ratio fires on a diff that cannot affect the shim, same protocol as this update: gather ~5 no-change runs, reseed from evidence, amend here.
 - GitHub rolls the `macos-latest` image generation again (the mean has climbed 2.54 → ~4.5ms across image generations; a third jump deserves a trend line, not another point reseed).

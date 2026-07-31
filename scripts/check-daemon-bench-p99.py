@@ -25,8 +25,10 @@ Usage:
 
 Exit codes:
   0  All four shapes pass both gates.
-  1  At least one shape failed, OR the committed baseline is missing.
-  2  Bad arguments / unreadable input (tooling failure, not policy).
+  1  At least one shape failed (a policy verdict on a measured run).
+  2  Bad arguments / unreadable input / missing committed baseline (tooling
+     or config state, not policy; the best-of-2 wrapper never re-measures
+     on exit 2).
 
 Schema (current summary is what gets committed as the baseline after a clean
 run on each platform — baselines add per-platform policy fields):
@@ -122,7 +124,7 @@ def main() -> int:
             "from this run, copy target/daemon-bench-summary.json into "
             f"{args.baseline_json}, and commit. See crates/daemon/benches/README.md."
         )
-        return 1
+        return 2
 
     try:
         baseline = load_summary(args.baseline_json, "committed baseline")

@@ -634,7 +634,7 @@ Bench rule: **a bench that prints numbers but doesn't fail the build doesn't gat
 
 For the two implemented gates (shim hot-path, hook → presenter) the
 committed baseline files are the single source of truth for both the
-absolute budget and the regression ratio — this table deliberately does
+absolute budget and the regression ratio, this table deliberately does
 not restate their numbers, because restated numbers drift (Story 5.18
 closed exactly that drift: this row said "+15%" while the committed
 config was `null` on macOS and `1.35` on Linux). Both gates run through
