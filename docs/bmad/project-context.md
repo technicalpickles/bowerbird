@@ -626,11 +626,20 @@ Bench rule: **a bench that prints numbers but doesn't fail the build doesn't gat
 
 | Bench | Tail metric | Fail threshold | Warn threshold |
 |---|---|---|---|
-| Shim hot-path | p99 | +15% regression | +5% |
+| Shim hot-path | p99 | per-platform policy in `crates/shim/benches/baselines/*.json` (ADR 0003 + its dated updates) | n/a |
 | Hook → projection | p99 | +20% | +10% |
-| Hook → presenter | p99 | +20% | +10% |
+| Hook → presenter | p99 | per-platform policy in `crates/daemon/benches/baselines/*.json` (+ NFR2 100ms absolute) | n/a |
 | Burst-load throughput | sustained ops/sec | -10% | -5% |
 | Daemon RSS | peak | +25% | +10% |
+
+For the two implemented gates (shim hot-path, hook → presenter) the
+committed baseline files are the single source of truth for both the
+absolute budget and the regression ratio — this table deliberately does
+not restate their numbers, because restated numbers drift (Story 5.18
+closed exactly that drift: this row said "+15%" while the committed
+config was `null` on macOS and `1.35` on Linux). Both gates run through
+`scripts/run-bench-gate.py`, which re-measures once on a policy failure
+and records the retry in the step summary (best-of-2, Story 5.18).
 
 **p99, not p95** for the shim — the tail is what users feel as "Claude feels slow today."
 

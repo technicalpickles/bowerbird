@@ -3,10 +3,17 @@
 Shim hot-path p99 gate (Story 1.5, AC #1).
 
 Reads the canonical bench summary produced by `cargo bench --bench hot_path`
-(see `crates/shim/benches/hot_path.rs`) and enforces two gates:
+(see `crates/shim/benches/hot_path.rs`) and enforces two gates whose policy
+is read from the committed per-platform baseline file (ADR 0003):
 
-  1. Absolute: current p99 must be <= 5,000,000 ns (5 ms).
-  2. Regression: current p99 must be <= committed_p99 * 1.15.
+  1. Absolute: current p99 must be <= the baseline's `absolute_budget_nanos`.
+  2. Regression: current p99 must be <= committed_p99 * the baseline's
+     `regression_max_ratio`; `null` disables this gate for the platform.
+
+The Story 1.5 AC #1 defaults (5 ms absolute, 1.15 ratio) apply only to
+baselines committed before the policy fields existed. Do not read numbers
+out of this docstring; `crates/shim/benches/baselines/<platform>.json` is
+the source of truth (Story 5.18 closed exactly that prose drift).
 
 Usage:
   check-shim-bench-p99.py <current-summary.json> <committed-baseline.json>

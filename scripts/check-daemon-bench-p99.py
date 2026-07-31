@@ -4,10 +4,17 @@ Hook→presenter daemon-bench p99 gate (Story 4.4 / AC #7).
 
 Reads the bench summary produced by `cargo bench -p bowerbird-daemon --bench
 hook_to_presenter` (see `crates/daemon/benches/hook_to_presenter.rs`) and
-enforces two gates per shape (solo, fanout3, burst, steady):
+enforces two gates per shape (solo, fanout3, burst, steady), with policy
+read from the committed per-platform baseline file:
 
-  1. Absolute: current p99 must be <= absolute_budget_nanos (NFR2: 100ms).
-  2. Regression: current p99 must be <= committed_p99 * regression_max_ratio.
+  1. Absolute: current p99 must be <= the baseline's `absolute_budget_nanos`
+     (the default backstop is NFR2's 100ms).
+  2. Regression: current p99 must be <= committed_p99 * the baseline's
+     `regression_max_ratio`; `null` disables it, and a zero committed p99
+     skips it per shape (uninitialized baseline).
+
+Do not read numbers out of this docstring;
+`crates/daemon/benches/baselines/<platform>.json` is the source of truth.
 
 Mirrors `scripts/check-shim-bench-p99.py` (same CLI shape, same JSON schema
 floor, same per-platform policy in the baseline file) so reviewers don't have
@@ -44,7 +51,7 @@ from pathlib import Path
 
 SCHEMA_VERSION = 1
 DEFAULT_ABSOLUTE_BUDGET_NS = 100_000_000  # NFR2: hook→presenter ≤100ms
-DEFAULT_REGRESSION_THRESHOLD = 1.30  # +30% over committed baseline (looser than shim's 1.15 per Axiom 3)
+DEFAULT_REGRESSION_THRESHOLD = 1.30  # fallback only; committed baselines carry the real per-platform ratio
 
 SHAPES = ("solo", "fanout3", "burst", "steady")
 

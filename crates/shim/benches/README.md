@@ -43,13 +43,16 @@ by ADR 0003 — see `docs/decisions/0003-shim-p99-budget-on-macos-latest.md`):
 }
 ```
 
-- `absolute_budget_nanos` — per-platform p99 ceiling (5 ms for
-  `linux.json`, 15 ms for `macos.json`). Missing field falls back to
-  5 ms.
+- `absolute_budget_nanos` — per-platform p99 ceiling. Missing field
+  falls back to 5 ms.
 - `regression_max_ratio` — multiplier on the committed `p99_nanos`.
-  `null` disables the regression gate (currently set on `macos.json`
-  per ADR 0003; the runner's documented 4.3× noise floor makes no
-  percentage threshold meaningful). Missing field falls back to 1.15.
+  `null` disables the regression gate. Missing field falls back to
+  1.15.
+
+The committed baseline files are the source of truth for both values —
+this README deliberately does not restate them (restated numbers drift;
+Story 5.18 closed exactly that). ADR 0003 and its dated updates record
+why each platform's policy is what it is.
 
 `scripts/check-shim-bench-p99.py` reads both files and enforces:
 
@@ -60,20 +63,16 @@ by ADR 0003 — see `docs/decisions/0003-shim-p99-budget-on-macos-latest.md`):
    baseline is committed.
 
 Both gates run on every PR via the `shim-bench-gate` job in
-`.github/workflows/ci.yml`.
+`.github/workflows/ci.yml`, wrapped by `scripts/run-bench-gate.py`
+(Story 5.18): a policy failure earns exactly one re-measure, recorded
+in the step summary; tooling failures and bench crashes never retry.
 
 ## Current per-platform policy
 
-| Platform | Absolute budget | Regression gate | Source |
-|---|---|---|---|
-| `linux.json` | 5 ms | +15 % | AC #1 |
-| `macos.json` | 15 ms | disabled | ADR 0003 |
-
-`macos-latest` noise is documented in ADR 0003. The 15 ms ceiling
-absorbs the runner's measured spread (2.66 → 11.35 ms across three
-no-op runs). Regression detection on macOS is deferred to Option D
-follow-up work (rearchitect the shim away from per-invocation
-fork-exec).
+Read it from `baselines/linux.json` and `baselines/macos.json` — the
+committed files are the policy. The rationale (macOS runner noise, the
+Linux runner-image drift, and the 2026-07-30 recalibration) lives in
+ADR 0003 and its dated update sections.
 
 ## Bench configuration
 
@@ -97,7 +96,7 @@ The bench prints results to stderr and writes the canonical summary to
 Baselines MUST come from CI runner hardware, not local machines. Local
 hardware (especially macOS dev laptops and Docker-on-Mac Linux VMs) can
 be 20–40% off from the GitHub Actions runner on this workload, easily
-exceeding the +15% gate threshold. A locally-seeded baseline fails its
+exceeding the committed regression ratio. A locally-seeded baseline fails its
 own first CI verification.
 
 For each platform (`linux.json` and `macos.json`):
@@ -119,16 +118,17 @@ the baseline is committed. The fail makes the seed step impossible to
 forget — soft-fail-on-missing would let an unarmed gate ship to main
 unnoticed (Story 1.5 review finding 1).
 
-## Threshold rationale (+15%)
+## Threshold rationale
 
-Per `docs/bmad/project-context.md` "Bench thresholds": 15% is the
-hard-fail threshold for shim p99. Smaller regressions (5%–15%) are
-visible in CI logs but do not fail the build. The 15% number is wide
-enough to absorb runner-to-runner noise without becoming a useless
-gate; the AC target is `p99 ≤ 5ms`, and committed baselines encode the
-actual runner numbers.
+The regression ratio is per-platform and lives in the baseline files
+(see "Current per-platform policy" above). Each ratio is calibrated
+from measured multi-run spread on that runner — wide enough to absorb
+runner-to-runner noise without becoming a useless gate — and the
+absolute budget backstops it. ADR 0003 records each calibration.
 
-If CI reports a regression at or above 15%:
+If CI reports a regression past the committed ratio (on both best-of-2
+attempts — a single-attempt failure that passes the re-measure is
+counted as runner noise in the step summary):
 
 1. **Identify the offending PR and revert or fix.** Common case.
 2. **If the regression is from a deliberate architectural change**

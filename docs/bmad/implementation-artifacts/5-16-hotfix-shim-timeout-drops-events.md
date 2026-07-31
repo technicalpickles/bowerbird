@@ -31,7 +31,7 @@ The first fired during `bowerbird install`; the second ~4.5 minutes later in ste
 
 4. **Given** `UnixStream::connect` happens at [socket.rs:19](../../crates/shim/src/socket.rs) **before** both `set_*_timeout` calls **When** the connect itself is slow **Then** it is bounded by nothing. The code comment at [socket.rs:24-25](../../crates/shim/src/socket.rs) claims "Total = write + read ≤ 5ms in the worst case", which **excludes connect time and is therefore not a total**. Either bound the connect (e.g. `UnixStream::connect_timeout`-equivalent for Unix sockets) or correct the comment to state what the 5ms actually covers. No silent no-op.
 
-5. **Given** the shim must never block Claude (Axiom 3, NFR20) **When** any change to retry or budget behavior is proposed **Then** the shim's p95 hot-path bench (`shim/benches/hot_path.rs`, gated in CI at +15% p99 regression) still passes, and any added retry is bounded such that the worst-case total stays inside the shim's budget. **A retry loop that can exceed the budget is a regression, not a fix** — if measurement shows the budget cannot be met without stalling Claude, dropping the event remains the correct outcome and this story ends at diagnosability.
+5. **Given** the shim must never block Claude (Axiom 3, NFR20) **When** any change to retry or budget behavior is proposed **Then** the shim's hot-path bench (`shim/benches/hot_path.rs`, gated in CI per the per-platform policy committed in `crates/shim/benches/baselines/*.json` — ADR 0003; this AC originally said "+15% p99 regression", corrected by Story 5.18 because no platform gated at that number) still passes, and any added retry is bounded such that the worst-case total stays inside the shim's budget. **A retry loop that can exceed the budget is a regression, not a fix** — if measurement shows the budget cannot be met without stalling Claude, dropping the event remains the correct outcome and this story ends at diagnosability.
 
 6. **Given** the shim log is the only place a dropped event surfaces **When** a timeout drop occurs **Then** a contract test asserts the log line distinguishes timeout from generic socket I/O. Note the testing constraint: a real `EAGAIN`-from-timeout is awkward to provoke deterministically, so prefer testing the **classification function** (io::Error → Error variant) directly over trying to race a real socket.
 
@@ -385,7 +385,7 @@ This story is the shim's timeout classification and the budget *question*. It is
 - [Source: crates/daemon/src/ingest/handler.rs] — non-blocking `try_send` + reply 121-135, debug log 126.
 - [Source: docs/bmad/implementation-artifacts/5-12-release-pipeline-end-to-end-verification.md] — Task 6 rc1 dogfood evidence and the AC #5 escalation that produced this story.
 - [Source: docs/bmad/project-context.md] — Axiom 3 (trust-boundary perf), Shim hot-path discipline, NFR20 fire-and-forget, Deterministic test discipline.
-- [Source: docs/bmad/project-context.md#Performance bars] — shim hot-path bench gates p99 at +15%.
+- [Source: docs/bmad/project-context.md#Performance bars] — shim hot-path bench gate; per-platform policy lives in `crates/shim/benches/baselines/*.json` (ADR 0003). (This entry originally restated "+15%"; corrected by Story 5.18.)
 
 ## Dev Agent Record
 
