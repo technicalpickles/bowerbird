@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
-  "solo_p99_nanos": 1569000,
-  "fanout3_p99_nanos": 1587000,
-  "burst_p99_nanos": 3120000,
-  "steady_p99_nanos": 2838000,
-  "samples": 50,
+  "solo_p99_nanos": 819208,
+  "fanout3_p99_nanos": 847458,
+  "burst_p99_nanos": 3792792,
+  "steady_p99_nanos": 1821250,
+  "samples": 200,
   "absolute_budget_nanos": 100000000,
   "regression_max_ratio": 1.30,
-  "_seeding_note": "Reseeded 2026-07-29 from the per-shape MAX across 7 macos-latest CI runs (#116, #118-#123; ranges: solo 0.841-1.569ms, fanout3 0.652-1.587ms, burst 1.729-3.120ms, steady 1.218-2.838ms). The original seed sat at/below the observed MINIMUM, so the +30% ratio could not absorb normal runner variance and the gate flaked on healthy runs. Seeding at worst-observed-normal means the regression gate fires only when a run exceeds the slowest healthy runner by another 30%; the 100ms absolute gate (NFR2) is unaffected and stays 25-60x away."
+  "_seeding_note": "Reseeded 2026-07-30 (Story 5.18) from the per-shape worst across the 5-run no-change calibration protocol on the story branch (runs 30599853185, 30600064861, 30600097130, 30600129141, 30600163266), the first data at n=200 per shape: solo 0.319-0.819ms, fanout3 0.351-0.847ms, burst 1.821-3.793ms, steady 0.961-1.821ms. The previous values were n=50-era maxes (p99 WAS the max below n=100), stale by construction once every shape reports a real percentile. Worst-observed seeding is sound again now that (a) p99 has two samples strictly above it, so one scheduler hiccup cannot define the gate, and (b) the best-of-2 wrapper absorbs single-attempt noise; the 2026-07-29 reseed failed because neither held. The +30% ratio stays; the 100ms absolute gate (NFR2) is unaffected."
 }
