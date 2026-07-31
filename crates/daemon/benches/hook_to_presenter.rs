@@ -24,16 +24,19 @@
 //! ## Sample counts (Story 5.18, AC #3)
 //!
 //! Every shape targets 200 samples so the reported p99 is a real 99th
-//! percentile with two samples strictly above it (`ceil(n * 0.99) - 1 <=
-//! n - 3` requires n >= 200). Below n=100 the index degenerates to n-1 —
-//! p99 IS the max — and one scheduler hiccup on a hosted runner defines the
-//! gate; that is exactly the 2026-07-30 false positive (solo p99 = max =
-//! 11.401ms at 39x the median). The summary JSON's `samples` field is
-//! accurate for solo, fanout3 (full `samples` since 5.18, not `samples/2`),
-//! and burst; `steady` derives its count from duration x rate
-//! (DAEMON_BENCH_STEADY_SECS x 5/sec = 200 at the 40s default) rather than
-//! from `samples`, so it tracks the `samples` field only while the defaults
-//! line up — the actual n is printed per-run on stderr.
+//! percentile with two higher-ranked samples above it (`ceil(n * 0.99) - 1
+//! <= n - 3` requires n >= 200; "above" is by sorted rank, so nanosecond
+//! ties could in principle equal the p99 value). Below n=100 the index
+//! degenerates to n-1, p99 IS the max, and one scheduler hiccup on a hosted
+//! runner defines the gate; that is exactly the 2026-07-30 false positive
+//! (solo p99 = max = 11.401ms at 39x the median). The summary JSON's
+//! `samples` field is accurate for solo, fanout3 (full `samples` since
+//! 5.18, not `samples/2`), and burst (whose count defaults to `samples`
+//! and diverges only under an explicit DAEMON_BENCH_BURST_COUNT override);
+//! `steady` derives its count from duration x rate (DAEMON_BENCH_STEADY_SECS
+//! x 5/sec = 200 at the 40s default) rather than from `samples`, so it
+//! tracks the `samples` field only while the defaults line up. Each shape's
+//! actual n is printed per-run on stderr.
 //!
 //! ## Helper-promotion choice
 //!
@@ -327,11 +330,13 @@ async fn bench_burst(d: &Daemon, burst_count: usize) -> Duration {
 async fn bench_steady(d: &Daemon, duration_secs: u64) -> Duration {
     // One event per `target_period`, for ~`duration_secs` total. Paced by
     // COUNT (duration_secs x 5 sends at the 200ms period) rather than a
-    // wall-clock cutoff: the pacing still makes elapsed duration the thing
-    // this shape buys (~40s of sustained load at the default), while the
-    // sample count is deterministic — a clock-bounded loop lost 1-2 samples
-    // to connect/settle overhead and could dip below the n >= 200 that
-    // AC #3's two-samples-above-p99 requirement needs.
+    // wall-clock cutoff: on a healthy daemon the pacing still makes elapsed
+    // duration the thing this shape buys (~40s of sustained load at the
+    // default), while the sample count is deterministic (a clock-bounded
+    // loop lost 1-2 samples to connect/settle overhead and could dip below
+    // the n >= 200 that AC #3 needs). The trade: on a degraded daemon the
+    // wall clock stretches with per-event latency, bounded by
+    // drain_until_event's 2s guard (worst ~2s x count before it panics).
     let target_period = Duration::from_millis(200); // 5 events/sec
     let target_count = (duration_secs as usize) * 5;
     let mut ws = connect_subscriber(&d.bind_addr).await;
@@ -368,10 +373,14 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_SAMPLES);
+    // Defaults to the runtime `samples` (not the const) so the summary
+    // JSON's `samples` field stays accurate for burst under a
+    // DAEMON_BENCH_SAMPLES override; it diverges only when this shape is
+    // overridden explicitly.
     let burst_count: usize = std::env::var("DAEMON_BENCH_BURST_COUNT")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_SAMPLES);
+        .unwrap_or(samples);
     // 40s at the existing 5/sec pacing yields ~200 samples. The count is
     // grown by duration, NOT by rate: this shape exists to catch slow leaks
     // and accumulating contention, which only elapsed time buys (5/sec is
@@ -381,6 +390,12 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(40);
+
+    // A zero anywhere would feed percentile() an empty slice and panic with
+    // an unhelpful index error; fail with the cause named instead.
+    assert!(samples > 0, "DAEMON_BENCH_SAMPLES must be >= 1");
+    assert!(burst_count > 0, "DAEMON_BENCH_BURST_COUNT must be >= 1");
+    assert!(steady_secs > 0, "DAEMON_BENCH_STEADY_SECS must be >= 1");
 
     eprintln!(
         "hook_to_presenter: samples={samples} burst_count={burst_count} steady_secs={steady_secs}"

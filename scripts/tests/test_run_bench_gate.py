@@ -13,6 +13,12 @@ matrix:
   (e) bench crashes                    -> its code propagates, gate never ran
   (f) gate exits 2 on attempt 2        -> exit 2
 
+Plus the review-hardened branches: a gate exit outside {0, 1, 2}
+(including a signal death) is tooling breakage with NO retry (AC #1 says
+only exit 1 earns the re-measure), a command that cannot be spawned or a
+bench that "succeeds" without writing the summary exits 2, and a stale
+attempt-1 file is removed on a clean run.
+
 Every case asserts on BOTH the exit code and the number of bench
 invocations: case (d) is the one that silently degrades into "retry
 everything" if the exit-code branch is wrong, and only the invocation
@@ -31,8 +37,12 @@ WRAPPER = Path(__file__).resolve().parent.parent / "run-bench-gate.py"
 # Stub for both the bench and the gate command. Counts its invocations in a
 # counter file, optionally writes a summary JSON recording which attempt
 # produced it (bench behavior), and exits with the code scripted for this
-# invocation (last code repeats if invoked more often than scripted).
+# invocation (last code repeats if invoked more often than scripted). The
+# scripted token "kill" makes the stub die by SIGKILL instead of exiting,
+# which subprocess reports as a negative returncode.
 STUB_SOURCE = """\
+import os
+import signal
 import sys
 from pathlib import Path
 
@@ -44,8 +54,11 @@ summary = sys.argv[2]
 if summary != "-":
     Path(summary).write_text('{"attempt": %d}' % count)
 
-codes = [int(c) for c in sys.argv[3:]]
-sys.exit(codes[min(count, len(codes)) - 1])
+codes = sys.argv[3:]
+code = codes[min(count, len(codes)) - 1]
+if code == "kill":
+    os.kill(os.getpid(), signal.SIGKILL)
+sys.exit(int(code))
 """
 
 
@@ -63,11 +76,12 @@ class RunBenchGateTest(unittest.TestCase):
         self.attempt1 = self.tmp / "bench-summary.attempt1.json"
         self.step_summary = self.tmp / "step-summary.md"
 
-    def bench_cmd(self, *codes):
+    def bench_cmd(self, *codes, write_summary=True):
         codes = codes or (0,)
+        target = self.summary if write_summary else "-"
         return (
             f"{sys.executable} {self.stub} {self.bench_counter} "
-            f"{self.summary} " + " ".join(str(c) for c in codes)
+            f"{target} " + " ".join(str(c) for c in codes)
         )
 
     def gate_cmd(self, *codes):
@@ -99,6 +113,9 @@ class RunBenchGateTest(unittest.TestCase):
         )
 
     def test_a_gate_passes_first_try(self):
+        # A stale attempt-1 file from a previous (possibly cached) run must
+        # not survive into this run's artifacts.
+        self.attempt1.write_text('{"attempt": "stale"}')
         result = self.run_wrapper(self.bench_cmd(), self.gate_cmd(0))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.invocations(self.bench_counter), 1)
@@ -149,14 +166,58 @@ class RunBenchGateTest(unittest.TestCase):
         self.assertEqual(self.invocations(self.gate_counter), 2)
 
     def test_bench_crash_on_attempt_2_propagates(self):
-        # Not in the story's lettered list, but the same "breakage, not
-        # noise" rule applies on the retry path: a bench that crashes on
-        # attempt 2 must propagate its code, not be reported as a gate
-        # verdict.
+        # The same "breakage, not noise" rule applies on the retry path: a
+        # bench that crashes on attempt 2 must propagate its code, not be
+        # reported as a gate verdict.
         result = self.run_wrapper(self.bench_cmd(0, 4), self.gate_cmd(1, 0))
         self.assertEqual(result.returncode, 4)
         self.assertEqual(self.invocations(self.bench_counter), 2)
         self.assertEqual(self.invocations(self.gate_counter), 1)
+
+    def test_gate_unknown_exit_code_is_tooling_not_policy(self):
+        # AC #1: ONLY gate exit 1 earns the re-measure. Exit 3 (or 127, or a
+        # traceback that Python turns into a nonstandard code) is breakage.
+        result = self.run_wrapper(self.bench_cmd(), self.gate_cmd(3))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(self.invocations(self.bench_counter), 1)
+        self.assertEqual(self.invocations(self.gate_counter), 1)
+        self.assertIn("::error::", result.stderr)
+
+    def test_gate_signal_death_is_tooling_not_policy(self):
+        # A signal-killed gate reports a NEGATIVE returncode to subprocess;
+        # it must land in the tooling branch, never the retry branch.
+        result = self.run_wrapper(self.bench_cmd(), self.gate_cmd("kill"))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(self.invocations(self.bench_counter), 1)
+        self.assertEqual(self.invocations(self.gate_counter), 1)
+
+    def test_gate_unknown_exit_on_attempt_2_is_tooling(self):
+        result = self.run_wrapper(self.bench_cmd(), self.gate_cmd(1, 3))
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(self.invocations(self.bench_counter), 2)
+        self.assertEqual(self.invocations(self.gate_counter), 2)
+
+    def test_unspawnable_bench_exits_2(self):
+        result = self.run_wrapper(
+            f"{self.tmp}/no-such-binary --flag", self.gate_cmd(0)
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(self.invocations(self.gate_counter), 0)
+        self.assertIn("::error::", result.stderr)
+
+    def test_empty_gate_command_exits_2(self):
+        result = self.run_wrapper(self.bench_cmd(), "")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(self.invocations(self.bench_counter), 0)
+
+    def test_bench_success_without_summary_exits_2(self):
+        result = self.run_wrapper(
+            self.bench_cmd(write_summary=False), self.gate_cmd(0)
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(self.invocations(self.bench_counter), 1)
+        self.assertEqual(self.invocations(self.gate_counter), 0)
+        self.assertIn("::error::", result.stderr)
 
 
 if __name__ == "__main__":
