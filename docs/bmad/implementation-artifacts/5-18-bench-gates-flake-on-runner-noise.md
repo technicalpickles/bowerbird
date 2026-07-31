@@ -101,34 +101,34 @@ Job wall clock is dominated by an uncached `cargo build`: the daemon macOS job i
 
 ## Tasks / Subtasks
 
-- [ ] **Task 1: Build `scripts/run-bench-gate.py` (AC: 1, 2)**
-  - [ ] CLI: `--bench <command>` `--gate <command>` `--summary <path>`. Commands are split with `shlex.split` and run without a shell (no shell metacharacters are needed by either call site).
-  - [ ] Attempt 1: run bench. Non-zero exit propagates immediately and the gate never runs. A bench crash is breakage, not noise.
-  - [ ] Run gate. Exit 0 ends the run at 0. Exit 2 propagates immediately with no retry. Any other non-zero is treated as a policy failure.
-  - [ ] On policy failure: copy `--summary` to a sibling `*.attempt1.json`, emit a `::warning::` naming the retry, then re-run bench and gate once.
-  - [ ] Attempt 2 exit 0: exit 0, and append a re-measure note to `$GITHUB_STEP_SUMMARY` carrying both attempts' summary contents. Attempt 2 exit 1: emit `::error::` stating the gate failed on both attempts, exit 1. Attempt 2 exit 2: exit 2.
-  - [ ] Fixed at two attempts. Do not add a configurable retry count; a knob here is a knob for making red builds go away.
-  - [ ] Mirror the two existing gate scripts' idiom: module docstring stating contract and exit codes, `gh_error`/`gh_notice` helpers, `argparse`. Do not diverge the three scripts' shape.
+- [x] **Task 1: Build `scripts/run-bench-gate.py` (AC: 1, 2)**
+  - [x] CLI: `--bench <command>` `--gate <command>` `--summary <path>`. Commands are split with `shlex.split` and run without a shell (no shell metacharacters are needed by either call site).
+  - [x] Attempt 1: run bench. Non-zero exit propagates immediately and the gate never runs. A bench crash is breakage, not noise.
+  - [x] Run gate. Exit 0 ends the run at 0. Exit 2 propagates immediately with no retry. Any other non-zero is treated as a policy failure.
+  - [x] On policy failure: copy `--summary` to a sibling `*.attempt1.json`, emit a `::warning::` naming the retry, then re-run bench and gate once.
+  - [x] Attempt 2 exit 0: exit 0, and append a re-measure note to `$GITHUB_STEP_SUMMARY` carrying both attempts' summary contents. Attempt 2 exit 1: emit `::error::` stating the gate failed on both attempts, exit 1. Attempt 2 exit 2: exit 2.
+  - [x] Fixed at two attempts. Do not add a configurable retry count; a knob here is a knob for making red builds go away.
+  - [x] Mirror the two existing gate scripts' idiom: module docstring stating contract and exit codes, `gh_error`/`gh_notice` helpers, `argparse`. Do not diverge the three scripts' shape.
 
-- [ ] **Task 2: Test the wrapper (AC: 4)**
-  - [ ] `scripts/tests/test_run_bench_gate.py`, driving the wrapper with stub bench/gate commands whose exit sequence is scripted through a counter file.
-  - [ ] Cases: (a) gate passes first try, bench ran once; (b) gate fails then passes, bench ran twice, attempt1 JSON preserved, step-summary note written; (c) gate fails twice, exit 1, bench ran twice; (d) gate exits 2, exit 2, bench ran **once**; (e) bench exits non-zero, that code propagates and the gate never ran; (f) gate exits 2 on attempt 2, exit 2.
-  - [ ] Assert on **both** the exit code and the number of bench invocations. Case (d) is the one that silently degrades into "retry everything" if the exit-code branch is wrong, and only the invocation count catches it.
-  - [ ] Wire into the existing `ci` job. There is no Python test runner in CI today; `python3 -m unittest` over `scripts/tests/` keeps the dependency at zero.
+- [x] **Task 2: Test the wrapper (AC: 4)**
+  - [x] `scripts/tests/test_run_bench_gate.py`, driving the wrapper with stub bench/gate commands whose exit sequence is scripted through a counter file.
+  - [x] Cases: (a) gate passes first try, bench ran once; (b) gate fails then passes, bench ran twice, attempt1 JSON preserved, step-summary note written; (c) gate fails twice, exit 1, bench ran twice; (d) gate exits 2, exit 2, bench ran **once**; (e) bench exits non-zero, that code propagates and the gate never ran; (f) gate exits 2 on attempt 2, exit 2. (Plus a seventh case beyond the letter of the story: bench crash on attempt 2 propagates its code, gate not re-run.)
+  - [x] Assert on **both** the exit code and the number of bench invocations. Case (d) is the one that silently degrades into "retry everything" if the exit-code branch is wrong, and only the invocation count catches it.
+  - [x] Wire into the existing `ci` job. There is no Python test runner in CI today; `python3 -m unittest` over `scripts/tests/` keeps the dependency at zero.
 
-- [ ] **Task 3: Wire both gates through the wrapper (AC: 1, 2)**
-  - [ ] `.github/workflows/ci.yml`: replace the separate bench and gate steps in `shim-bench-gate` and `daemon-bench-gate` with one `run-bench-gate.py` invocation each.
-  - [ ] Widen both artifact upload paths to `target/*bench-summary*.json` so the attempt-1 file ships alongside the final one.
-  - [ ] Rename both job names to stop stating numbers that do not match the committed config (they currently read "p99 ≤ 5ms, +15% regression fails" and "p99 ≤ 100ms, +30% regression fails"). Per-platform policy lives in the baseline files; the job name should say so rather than restate a number that drifts.
+- [x] **Task 3: Wire both gates through the wrapper (AC: 1, 2)**
+  - [x] `.github/workflows/ci.yml`: replace the separate bench and gate steps in `shim-bench-gate` and `daemon-bench-gate` with one `run-bench-gate.py` invocation each.
+  - [x] Widen both artifact upload paths to `target/*bench-summary*.json` so the attempt-1 file ships alongside the final one.
+  - [x] Rename both job names to stop stating numbers that do not match the committed config (they currently read "p99 ≤ 5ms, +15% regression fails" and "p99 ≤ 100ms, +30% regression fails"). Per-platform policy lives in the baseline files; the job name should say so rather than restate a number that drifts. **Operational side effect found while doing this:** branch protection's required status checks name the old shim job string; they must be updated to the new contexts when this story merges (see Completion Notes).
 
-- [ ] **Task 4: Make the daemon p99 a real percentile (AC: 3)**
-  - [ ] `DEFAULT_SAMPLES` 50 → 200, matching the shim harness.
-  - [ ] `bench_fanout3` call site: pass `samples`, not `samples / 2`. Document the change; the halving was a CI-budget concession that silently made fanout3 the weakest shape.
-  - [ ] `DAEMON_BENCH_BURST_COUNT` default 20 → 200.
-  - [ ] `bench_steady`: 5s → 40s at the existing 5/sec pacing, yielding ~200 samples. **Do not reach 200 by raising the rate.** The shape exists to catch slow leaks and accumulating contention, which duration buys and rate does not; 5/sec is already a reduction from the original AC's 1/sec-for-30s intent. Maintainer decision (2026-07-30), weighed against a 20s-at-10/sec alternative.
-  - [ ] Expected new bench wall clock ≈ 43.5s (was ≈5.7s), putting the daemon job at roughly 2m41 from 2m03. Confirm against the real run rather than trusting this estimate.
-  - [ ] The summary JSON's `samples` field becomes accurate for solo, fanout3, and burst; steady stays time-derived. Note that in the harness docstring rather than changing the schema.
-  - [ ] Verify the arithmetic after the change: `ceil(n * 0.99) - 1` must be ≤ n - 3 for every shape.
+- [x] **Task 4: Make the daemon p99 a real percentile (AC: 3)**
+  - [x] `DEFAULT_SAMPLES` 50 → 200, matching the shim harness.
+  - [x] `bench_fanout3` call site: pass `samples`, not `samples / 2`. Document the change; the halving was a CI-budget concession that silently made fanout3 the weakest shape.
+  - [x] `DAEMON_BENCH_BURST_COUNT` default 20 → 200.
+  - [x] `bench_steady`: 5s → 40s at the existing 5/sec pacing, yielding ~200 samples. **Do not reach 200 by raising the rate.** The shape exists to catch slow leaks and accumulating contention, which duration buys and rate does not; 5/sec is already a reduction from the original AC's 1/sec-for-30s intent. Maintainer decision (2026-07-30), weighed against a 20s-at-10/sec alternative. (Implemented count-paced: exactly `steady_secs x 5` sends at the same 200ms period — a wall-clock cutoff measured n=198 locally because connect/settle ate into the window, which breaks AC #3's two-above-p99 requirement. Rate and duration unchanged; only the loop bound moved from clock to count.)
+  - [ ] Expected new bench wall clock ≈ 43.5s (was ≈5.7s), putting the daemon job at roughly 2m41 from 2m03. Confirm against the real run rather than trusting this estimate. (Local bench wall clock ≈44s as predicted; CI job total awaits the Task 5 runs.)
+  - [x] The summary JSON's `samples` field becomes accurate for solo, fanout3, and burst; steady stays duration×rate-derived. Noted in the harness docstring; schema unchanged.
+  - [x] Verify the arithmetic after the change: `ceil(n * 0.99) - 1` must be ≤ n - 3 for every shape. (Computed: n=200 → index 197, 2 samples strictly above, for all four shapes; local run confirmed n=200 on every shape and solo p99 0.242ms vs max 0.602ms.)
 
 - [ ] **Task 5: Calibration runs (AC: 5)** [HUMAN-IN-THE-LOOP: needs real CI runs]
   - [ ] With Tasks 1-4 landed on the story branch, trigger CI ~5 times with **no code change between runs**. This is the same protocol ADR 0003 used with 3 runs; a single run is informative about the day's runner state, not about the distribution.
@@ -144,16 +144,16 @@ Job wall clock is dominated by an uncached `cargo build`: the daemon macOS job i
   - [ ] `docs/decisions/0003-shim-p99-budget-on-macos-latest.md`: add a dated update section following the existing 2026-05-20 Linux-update pattern. Do **not** supersede the ADR. Record the 2026-07-30 evidence, that the 15ms calibration point was exceeded on a green run, that best-of-2 narrows the effective single-run spread, and the new per-platform policy table.
   - [ ] State plainly in the ADR update that this raises a budget, which 5.5's anti-pattern list forbids "to make a number fit", and why this is the sanctioned path instead: the number is reset from measured evidence via the ADR amendment PRD line 181 requires, and the regression gate is restored in the same change, so macOS ends with more signal than it has today rather than less.
 
-- [ ] **Task 7: Reconcile the documented thresholds (AC: 6)**
-  - [ ] `docs/bmad/project-context.md:629` and Story 5.16 AC #5 both claim +15%. Correct both to point at the per-platform baseline files and ADR 0003 rather than restating a number.
-  - [ ] Both gate scripts' module docstrings hardcode the pre-ADR-0003 defaults in prose (`check-shim-bench-p99.py` says "Absolute: ≤ 5,000,000 ns" and "Regression: ≤ committed_p99 * 1.15"). The code already reads per-platform policy from the baseline; make the prose say that.
-  - [ ] Strike through `deferred-work.md` item 6 under "Deferred from: code review of 5-16-hotfix-shim-timeout-drops-events" with a backlink to this story.
+- [x] **Task 7: Reconcile the documented thresholds (AC: 6)**
+  - [x] `docs/bmad/project-context.md:629` and Story 5.16 AC #5 both claim +15%. Correct both to point at the per-platform baseline files and ADR 0003 rather than restating a number. (Also corrected in the same sweep because they restate the same drifted numbers: 5.16's References entry for project-context, `crates/shim/benches/README.md`'s policy table + threshold-rationale section — which still said Linux gates at +15% when it has been 1.35 since ADR 0003's 2026-05-20 update — and `architecture.md:481`'s "30% vs the shim's 15%" parenthetical. Deliberately left alone: `product-brief-bowerbird-distillate.md`, a frozen distillate of a planning doc, and historical prose in done stories' Dev Agent Records.)
+  - [x] Both gate scripts' module docstrings hardcode the pre-ADR-0003 defaults in prose (`check-shim-bench-p99.py` says "Absolute: ≤ 5,000,000 ns" and "Regression: ≤ committed_p99 * 1.15"). The code already reads per-platform policy from the baseline; make the prose say that.
+  - [x] Strike through `deferred-work.md` item 6 under "Deferred from: code review of 5-16-hotfix-shim-timeout-drops-events" with a backlink to this story.
 
 - [ ] **Task 8: Verification + File List (AC: all)**
-  - [ ] `cargo fmt --check` and `cargo clippy --all-targets --workspace -- -D warnings` clean.
-  - [ ] `scripts/test.sh` green. Never raw `cargo test`; see the project CLAUDE.md.
-  - [ ] `python3 -m unittest discover scripts/tests` green.
-  - [ ] Run the daemon bench locally at the new sample counts and confirm no shape reports a p99 equal to its max.
+  - [x] `cargo fmt --check` and `cargo clippy --all-targets --workspace -- -D warnings` clean.
+  - [x] `scripts/test.sh` green (638 passed / 0 failed, log `target/test-logs/20260730-224233-80525`). Never raw `cargo test`; see the project CLAUDE.md.
+  - [x] `python3 -m unittest discover scripts/tests` green (7 tests).
+  - [x] Run the daemon bench locally at the new sample counts and confirm no shape reports a p99 equal to its max. (solo n=200 p99 0.242ms max 0.602ms; fanout3 n=200; burst n=200; steady n=200 p99 0.907ms.)
   - [ ] `git status --porcelain` reconciled against the File List before declaring review (epic-4-retro Discovery #6 / AI-6: File-List-vs-git drift has bitten four prior stories).
 
 ## Dev Notes
@@ -224,14 +224,43 @@ So n=100 is the smallest n where p99 stops being the max, and n=200 is the small
 
 ### Agent Model Used
 
+claude-fable-5 (dev-story session 2026-07-30)
+
 ### Debug Log References
+
+- `target/test-logs/20260730-224233-80525/run.log` — full-workspace `scripts/test.sh` run, 638 passed / 0 failed.
+- Local daemon bench at new counts (first run, clock-bounded steady): `solo n=200 p99=0.191ms max=0.394ms; fanout3 n=200; burst n=200; steady n=198` — the n=198 is what motivated count-pacing steady.
+- Local daemon bench after count-pacing: `solo n=200 p50=0.123 p99=0.242 max=0.602ms; fanout3 n=200 p99=0.177ms; burst n=200 p99=3.369ms; steady n=200 p99=0.907ms`.
 
 ### Completion Notes List
 
+1. **Tasks 1-4, 7 and the local half of Task 8 are complete; Tasks 5-6 await real CI runs** (Task 5 is marked HUMAN-IN-THE-LOOP in this story: the branch needs ~5 no-change CI runs and their artifacts before baselines can be reseeded and ADR 0003 amended).
+2. **Implementation plan as executed:** test-first for the wrapper (7 unittest cases written red against a missing script, then the wrapper written to green); CI wiring with one wrapper invocation per bench job; harness sample counts to 200/shape; docs reconciled to point at baseline files instead of restating numbers.
+3. **Deviation, documented: `bench_steady` is count-paced, not clock-bounded.** The story said "40s at the existing 5/sec pacing, yielding ~200 samples" with steady staying time-derived. A clock-bounded 40s loop measured n=198 locally (connect + 50ms settle eat into the window), and n<200 breaks AC #3's "at least two samples strictly above p99". The loop now sends exactly `steady_secs x 5` events at the same 200ms period: rate unchanged, elapsed duration still ~40s (pacing enforces it), sample count deterministic at 200. This is the smallest change that satisfies AC #3 without raising the rate.
+4. **Operational finding: branch protection names the old shim job.** Required status checks on `main` are literally "Shim hot-path bench (p99 ≤ 5ms, +15% regression fails) (macos-latest, macos.json)" / "(ubuntu-latest, linux.json)". Task 3's rename means those contexts will never report again once this merges, so the required checks must be repointed at the new job name ("Shim hot-path bench gate (per-platform policy in baselines + ADR 0003) (…)") — ideally at merge time, since flipping early blocks other in-flight PRs (e.g. #28) that still report the old names. Needs a maintainer (repo-settings) action; not doable from the working tree.
+5. **Wrapper never writes baselines** (Dev Notes constraint): it only copies the attempt-1 summary to `*.attempt1.json` and appends to the step summary. The seventh test case (bench crash on attempt 2 propagates) pins the "breakage, not noise" rule on the retry path too.
+6. **Doc sweep scope:** beyond the two named sites, the same drifted numbers were restated in `crates/shim/benches/README.md` (still claimed Linux +15%) and `architecture.md:481`; both now point at the committed baseline files. `product-brief-bowerbird-distillate.md` was left untouched (frozen distillate, not living documentation).
+
 ### File List
+
+- `scripts/run-bench-gate.py` (new)
+- `scripts/tests/test_run_bench_gate.py` (new)
+- `scripts/check-shim-bench-p99.py` (docstring only)
+- `scripts/check-daemon-bench-p99.py` (docstring + one comment)
+- `.github/workflows/ci.yml`
+- `crates/daemon/benches/hook_to_presenter.rs`
+- `crates/shim/benches/README.md`
+- `docs/bmad/project-context.md`
+- `docs/bmad/planning-artifacts/architecture.md`
+- `docs/bmad/implementation-artifacts/5-16-hotfix-shim-timeout-drops-events.md` (AC #5 + one References entry, threshold wording only)
+- `docs/bmad/implementation-artifacts/deferred-work.md` (item 6 struck through)
+- `docs/bmad/implementation-artifacts/5-18-bench-gates-flake-on-runner-noise.md` (this file: permitted sections)
+- `docs/bmad/implementation-artifacts/sprint-status.yaml`
+- Pending Tasks 5-6: `crates/shim/benches/baselines/macos.json`, `crates/shim/benches/baselines/linux.json` (verify only), `crates/daemon/benches/baselines/macos.json`, `docs/decisions/0003-shim-p99-budget-on-macos-latest.md`
 
 ## Change Log
 
 | Date | Author | Summary |
 |------|--------|---------|
+| 2026-07-30 | claude-fable-5 | Mechanism half implemented (Tasks 1-4, 7, local Task 8): best-of-2 wrapper `scripts/run-bench-gate.py` + 7-case unittest suite wired into the `ci` job; both bench-gate CI jobs routed through the wrapper with widened `target/*bench-summary*.json` artifact globs and number-free job names; daemon harness at 200 samples/shape (fanout3 un-halved, burst 200, steady count-paced at 5/sec for 40s — see Completion Note 3 for the clock→count deviation); threshold docs de-numbered to point at baseline files + ADR 0003; deferred-work item 6 struck. fmt/clippy/638-test workspace/7 unittest green; local bench confirms no shape's p99 is its max. Tasks 5-6 (CI calibration runs, baseline reseed, ADR 0003 amendment) pending the HUMAN-IN-THE-LOOP CI-run step. Branch-protection rename side effect recorded in Completion Note 4. |
 | 2026-07-30 | claude-opus-5 | Story created from taskwarrior `b6e4eceb` after a scoping pass that found the filed diagnosis covered one of the two incidents. Corrections folded in: all four daemon shapes are max-gates (not just solo at n=50); the shim incident is a distribution shift that no sample-count change addresses, and its real cause is that ADR 0003's 15ms calibration point was exceeded on a green run. Two candidate scope items were dropped after finding them already decided: seeding the Linux daemon baseline (2026-07-28 maintainer punt) and the ~40ms Linux gap (already filed with better evidence). Design decisions this session: best-of-2 re-measure with both attempts logged; Python wrapper rather than shell, since the repo has no shell test harness and the two gate scripts are already Python; steady grows to 40s at 5/sec rather than 20s at 10/sec, keeping duration as the thing the shape buys; macOS regression gate restored rather than left absolute-only. |
