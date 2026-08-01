@@ -19,11 +19,11 @@ use std::path::Path;
 /// Fake `launchctl` script body (POSIX sh). `$1` is the subcommand.
 ///
 /// `print` models the real `launchctl print` for an absent service: a non-zero
-/// exit carries a "Could not find ..." stderr by default so the CLI classifies
-/// it as genuinely-absent (Ok(false)). `FAKE_LAUNCHCTL_PRINT_STDERR` overrides
-/// the message so a test can simulate an *unverifiable* failure (non-absent
-/// stderr), which the CLI must surface as "cannot verify" rather than "not
-/// loaded" (Story 5.9 review pass-3 F1).
+/// exit carries a "Could not find …" stderr by default so the CLI classifies it
+/// as genuinely-absent (Ok(false)). `FAKE_LAUNCHCTL_PRINT_STDERR` overrides the
+/// message so a test can simulate an *unverifiable* failure (non-absent stderr),
+/// which the CLI must surface as "cannot verify" rather than "not loaded"
+/// (Story 5.9 review pass-3 F1).
 pub const FAKE_LAUNCHCTL: &str = r#"#!/bin/sh
 echo "$@" >> "$FAKE_LAUNCHCTL_LOG"
 case "$1" in
