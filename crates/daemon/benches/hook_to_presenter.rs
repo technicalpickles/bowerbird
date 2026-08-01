@@ -185,7 +185,19 @@ fn send_ingest_line(sock: &Path, payload: &str) -> std::io::Result<()> {
     s.write_all(payload.as_bytes())?;
     s.write_all(b"\n")?;
     s.flush()?;
-    s.shutdown(std::net::Shutdown::Write)?;
+    // The daemon reads the full line, replies "200 ...", and can close its
+    // end before this shutdown lands; macOS then fails shutdown(2) with
+    // ENOTCONN (errno 57), and a torn-down peer can surface EPIPE. That early
+    // close is not a failed ingest: the reply is already buffered and the
+    // read below still verifies the 200. Anything else propagates, and the
+    // gate wrapper keeps treating a bench crash as breakage, not noise
+    // (taskwarrior 88099d39; crashed main runs 30703564941 and 30712457763).
+    if let Err(e) = s.shutdown(std::net::Shutdown::Write) {
+        match e.kind() {
+            std::io::ErrorKind::NotConnected | std::io::ErrorKind::BrokenPipe => {}
+            _ => return Err(e),
+        }
+    }
     let mut resp = String::new();
     s.read_to_string(&mut resp)?;
     if !resp.starts_with("200") {
