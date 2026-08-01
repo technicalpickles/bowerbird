@@ -22,6 +22,17 @@ jobs:
         run: node --version | grep -E '^v22\.[6-9]|^v22\.[1-9][0-9]+|^v2[3-9]|^v[3-9]'
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --workspace -- -D warnings
+      # taskwarrior 21fa8e4f / Story 5.12 rc1: x86_64-apple-darwin only ever
+      # built at tag time and failed with E0463 (target not added to the
+      # pinned toolchain). Check it per-PR so cross-compile breakage cannot
+      # hide until release. `rustup target add` run in the repo dir applies to
+      # the rust-toolchain.toml pin, same as release.yml's load-bearing step.
+      - name: Add x86_64-apple-darwin to the pinned toolchain
+        if: matrix.os == 'macos-latest'
+        run: rustup target add x86_64-apple-darwin
+      - name: Cross-target check (x86_64-apple-darwin)
+        if: matrix.os == 'macos-latest'
+        run: cargo check --workspace --target x86_64-apple-darwin
       - name: Lint - connection factory enforcement
         shell: bash
         run: ./scripts/lint-connection-factory.sh
