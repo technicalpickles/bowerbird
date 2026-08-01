@@ -33,6 +33,7 @@ Task headers are stable slugs (cite these in commits, not ordinals).
 - [ ] **`readme-rewrite` (AC: 1, 4)**
   - [ ] Restructure `README.md` (199 lines today) so the first screen carries: one-sentence what (local daemon that captures Claude Code session events and re-broadcasts them as a typed real-time stream), one-sentence why (your agent sessions are observable by any tool you care to write, not locked in one UI), and the five-minute CTA linking `docs/quickstart.md`. Motivation section moves ABOVE the Install section.
   - [ ] Replace the "Status: V1 in development" framing with the emdash-free, pre-tag status line per AC 4.
+  - [ ] Reorganize the doc-index section by reader need per Dev Notes §Diátaxis lens (learn / solve / look up / understand), one line per doc.
   - [ ] Preserve every pinned string byte-for-byte while moving sections (the full pin list is in Dev Notes §Test-pin map; the a-g install walkthrough markers, the musl/NFR9 sentence, `cargo install --git`, and the `](docs/quickstart.md)` / `](docs/protocol.md)` link forms all live in README).
   - [ ] Run `scripts/test.sh --test release_pipeline_docs --test cli_docs_drift` immediately after the README edit, not just at the end.
 - [ ] **`quickstart-pass` (AC: 2)**
@@ -55,10 +56,21 @@ Task headers are stable slugs (cite these in commits, not ordinals).
   - [ ] `scripts/test.sh` (never raw `cargo test`), `cargo fmt --check`, `cargo clippy --all-targets --workspace -- -D warnings` all green. The suite carries the doc guards: `release_pipeline_docs.rs` (README/INSTALL pins), `cli_docs_drift.rs` (existence, quickstart pins, presenter-authoring headings, no-list lead phrases, link resolution across the whole funnel), `cli_examples.rs` (the quickstart command path, live).
   - [ ] `git diff | grep $'^+.*—'` is empty (no emdashes in added lines; rewritten reader prose is exactly where they creep in; the — escape keeps this file itself sweep-clean).
   - [ ] Final grep sweeps: no `V1 in development` anywhere reader-facing; no `Story 4.4 will` in docs/; prd.md carries the pattern names.
-  - [ ] File a followup (taskwarrior) for the two survey items deliberately left out of scope: a public configuration reference for `config.toml` (schema currently only in architecture.md, outside the funnel), and the README/INSTALL a-g contract redundancy (consolidation blocked by dual test pins; decide post-tag whether it is worth the churn).
+  - [ ] File a followup (taskwarrior) for the three items deliberately left out of scope: a public configuration reference for `config.toml` (schema currently only in architecture.md, outside the funnel; in Diátaxis terms a missing reference doc), the README/INSTALL a-g contract redundancy (consolidation blocked by dual test pins; decide post-tag whether it is worth the churn), and the presenter-authoring.md hybrid split (its explanation / how-to / variant-listing modes could separate cleanly post-tag; the variant listing duplicates protocol.md's reference job).
   - [ ] File List in Dev Agent Record matches `git status --porcelain` (recurring review finding).
 
 ## Dev Notes
+
+### Diátaxis lens (maintainer directive, 2026-08-01)
+
+Apply [Diátaxis](https://diataxis.fr) as the editing compass for every rewrite in this story: tutorials (learning-oriented) / how-to guides (task-oriented) / reference (information-oriented) / explanation (understanding-oriented). The funnel already lands mostly in the right quadrants; the pass's job is to sharpen each doc's mode, not re-bucket files.
+
+- **quickstart.md is a tutorial.** Enforce tutorial discipline during the pass: every step produces a visible result the doc names; no explanation mid-flow (one link out is fine, a paragraph of why is not); never offer the learner a choice (one path, no "alternatively"). The existing "state what the reader should see" bullet in `quickstart-pass` is this rule.
+- **cookbook entries are how-to guides.** Already the right mode (and shape-guarded); not touched by this story.
+- **protocol.md is reference.** Keep the one staleness fix in reference register: name the enforcing tests, no narrative.
+- **presenter-authoring.md is a deliberate hybrid** (explanation up front, how-to middle, some variant listing that overlaps protocol.md's reference job). Out of scope to restructure; the AC 3 first-paragraph rewrite IS the Diátaxis transition sentence (tutorial's learning-by-doing hands off to working docs), write it as such. The hybrid split goes in the `verify` followup filing.
+- **README is the router, not a quadrant.** Organize its doc-index section by reader need: learn it (quickstart), solve a problem (cookbook), look it up (protocol/protocol-changelog), understand it (presenter-authoring's model, no-list, ADRs). One line each; the pinned link forms `](docs/quickstart.md)` and `](docs/protocol.md)` must survive the reshuffle.
+- **Mode-bleed is a review finding.** When the editorial-review task runs, "explanation crept into the tutorial" and "reference re-listed outside protocol.md" are priority-worthy findings, same standing as prose issues.
 
 ### The funnel today (verified at `cd6e536`, 2026-08-01)
 
