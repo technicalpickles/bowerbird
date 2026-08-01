@@ -94,6 +94,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      # taskwarrior 092e0a44: without a cache every run rebuilds the full dep
+      # graph from scratch for a bench measured in seconds. rust-cache's
+      # default key includes the job id and Cargo.lock hash, so the two bench
+      # jobs (different profiles) and the test job never share entries. The
+      # bench binaries themselves still rebuild; only deps are cached, so the
+      # measured numbers are unaffected.
+      - uses: Swatinem/rust-cache@v2
 
       - name: Build shim under release-shim profile
         run: cargo build --profile release-shim -p bowerbird-shim
@@ -134,6 +141,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      # taskwarrior 092e0a44: without a cache every run rebuilds the full dep
+      # graph from scratch for a bench measured in seconds. rust-cache's
+      # default key includes the job id and Cargo.lock hash, so the two bench
+      # jobs (different profiles) and the test job never share entries. The
+      # bench binaries themselves still rebuild; only deps are cached, so the
+      # measured numbers are unaffected.
+      - uses: Swatinem/rust-cache@v2
 
       - name: Build daemon under release profile
         run: cargo build --release -p bowerbird-daemon
