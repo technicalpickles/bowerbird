@@ -451,9 +451,9 @@ Reference examples live in `docs/cookbook/<name>/`, CI smoke-tested against a li
 
 **V1 reference examples:**
 
-1. **Multi-session event router** — subscribes to `state.session.*` (wildcard), routes events to per-session state, handles new sessions appearing mid-subscription. Demonstrates the core fan-out pattern every non-trivial tool needs.
-2. **Session event log viewer** — reads `events.*`, renders tool-call history. Shows cursor-based pagination via REST.
-3. **Reconnect with snapshot recovery** — demonstrates snapshot-on-connect + `dropped`-frame detection + REST re-fetch. The resilience pattern every tool that runs for more than a few minutes needs.
+1. **`state-session-fanout`** (`docs/cookbook/state-session-fanout/`): subscribes to `state.session.*` (wildcard), routes events to per-session state, handles new sessions appearing mid-subscription. Demonstrates the core fan-out pattern every non-trivial tool needs.
+2. **`rest-cursor-pagination`** (`docs/cookbook/rest-cursor-pagination/`): reads `events.*`, renders tool-call history. Shows cursor-based pagination via REST.
+3. **`dropped-frame-recovery`** (`docs/cookbook/dropped-frame-recovery/`): demonstrates snapshot-on-connect + `dropped`-frame detection + REST re-fetch. The resilience pattern every tool that runs for more than a few minutes needs.
 
 All three examples must run against `bowerbird replay` with bundled fixture files.
 

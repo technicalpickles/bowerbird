@@ -172,3 +172,19 @@ Once `v0.1.0-rc1` has shipped, a prior tag exists. From `v0.1.0-rc2` onward:
   running the cross-version test locally against an rc lineage, either set
   `BOWERBIRD_PRIOR_VERSION_BINARY` explicitly or update that hardcoded
   segment (see the file's module doc comment).
+
+## At the final v0.1.0 tag: flip the reader-doc status artifacts (Story 5.14 handoff)
+
+Story 5.14 deliberately left two pre-tag artifacts in the reader docs because
+the tag did not exist yet. The same change that pushes the final
+non-prerelease `v0.1.0` tag (Story 5.15's scope) must:
+
+- Flip `README.md`'s status line from `Status: v0.1.0 release candidate.`
+  (plus its rc3 link) to the released wording, an emdash-free form of the
+  epic's "first stable release" framing, e.g.
+  `Status: v0.1.0, the first stable release.`
+- Retarget the rc3-pinned download URL in `docs/quickstart.md` step 0 to the
+  final tag's assets. Once a non-prerelease release exists, the
+  `releases/latest/download/...` URL form also starts resolving and is the
+  better long-term target (asset names stay version-prefixed either way, so
+  the extracted-directory paths in the same step must match the tag).

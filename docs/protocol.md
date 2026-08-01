@@ -442,7 +442,7 @@ The phrasing from NFR19 and FR36: **No breaking changes to the REST or WebSocket
 
 A `2.0` release would imply at least one of the above breaking. There is no such release planned; the policy is the contract.
 
-For the change history — what shipped when, what was deferred, what motivated each addition — see [`docs/protocol-changelog.md`](protocol-changelog.md). Story 4.4 will land the mechanical contract test suite that enforces these constraints in CI; until then the discipline is documented + reviewer-enforced.
+For the change history (what shipped when, what was deferred, what motivated each addition) see [`docs/protocol-changelog.md`](protocol-changelog.md). These constraints are enforced mechanically in CI: `tests/protocol_v1_compat.rs` decodes the committed v1.0 wire corpus against the current protocol crate (a fixture that stops decoding is a v1.x compatibility break), and `tests/contract_test_inventory.rs` pins the required contract tests by name so a rename or deletion fails loudly.
 
 ## Further reading
 

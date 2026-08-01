@@ -1,6 +1,6 @@
 # Story 5.14: First-time-reader docs pass
 
-Status: ready-for-dev
+Status: review
 
 ## Story
 
@@ -30,34 +30,34 @@ Source: [epics.md:1312-1340](../planning-artifacts/epics.md). Anchors re-verifie
 
 Task headers are stable slugs (cite these in commits, not ordinals).
 
-- [ ] **`readme-rewrite` (AC: 1, 4)**
-  - [ ] Restructure `README.md` (199 lines today) so the first screen carries: one-sentence what (local daemon that captures Claude Code session events and re-broadcasts them as a typed real-time stream), one-sentence why (your agent sessions are observable by any tool you care to write, not locked in one UI), and the five-minute CTA linking `docs/quickstart.md`. Motivation section moves ABOVE the Install section.
-  - [ ] Replace the "Status: V1 in development" framing with the emdash-free, pre-tag status line per AC 4.
-  - [ ] Reorganize the doc-index section by reader need per Dev Notes §Diátaxis lens (learn / solve / look up / understand), one line per doc.
-  - [ ] Preserve every pinned string byte-for-byte while moving sections (the full pin list is in Dev Notes §Test-pin map; the a-g install walkthrough markers, the musl/NFR9 sentence, `cargo install --git`, and the `](docs/quickstart.md)` / `](docs/protocol.md)` link forms all live in README).
-  - [ ] Run `scripts/test.sh --test release_pipeline_docs --test cli_docs_drift` immediately after the README edit, not just at the end.
-- [ ] **`quickstart-pass` (AC: 2)**
-  - [ ] Resolve the install-step tension first: the AC (and PRD table row 1) counts "install bowerbird" inside the five minutes, but today's quickstart starts at `bowerbird start` with install as a prerequisite link. Either inline the one-command tarball install as step 0 (preferred if it fits the pins; the install one-liner lives in README/INSTALL and is not quickstart-pinned), or keep the prerequisite link and state explicitly that the five-minute clock includes it. Disclose the choice in Completion Notes.
-  - [ ] Reread `docs/quickstart.md` (45 lines) as a stranger: every step states what the reader should see before the next step; prerequisites name versions (Node >= 22.6 is test-pinned as the literal `22.6`); the success moment ends with the forward-pointer to `docs/presenter-authoring.md` (PRD §Documentation Requirements table row 1; the pointer string is test-pinned).
-  - [ ] Keep all pinned strings (five command names, `BOWERBIRD_TOKEN`, `--experimental-strip-types`, the three troubleshooting phrases; full list in Dev Notes).
-  - [ ] One manual timed walkthrough of the full sequence on this machine (install step simulated from the already-built workspace binaries; the timing claim covers the reader's active steps, not compile time). Record wall-clock in the Dev Agent Record. If over five minutes, cut steps or tighten prose until it fits, or document precisely why the claim needs adjusting and adjust the README CTA wording to match.
-- [ ] **`presenter-authoring-audience-switch` (AC: 3)**
-  - [ ] Rewrite the first paragraph of `docs/presenter-authoring.md` (340 lines; only the opening changes) to name the audience switch: the reader has seen the quickstart work and is now building their own presenter. Do not touch the six test-pinned section headings.
-  - [ ] Verify (grep) all cookbook cross-references already target `docs/cookbook/<name>/` per 5.13; fix any straggler found, expect none.
-- [ ] **`staleness-sweep` (AC: 1-4 rationale: a first-time reader trusts docs that are true)**
-  - [ ] `docs/bmad/planning-artifacts/prd.md:452-457`: rename the "V1 reference examples" list entries to the shipped pattern names with their directories (`state-session-fanout`, `rest-cursor-pagination`, `dropped-frame-recovery` under `docs/cookbook/<name>/`), keeping each entry's one-line pattern description. Closes deferred-work.md §"code review of story-5-13" entry 2 (strike it with the house `**Resolved by Story 5.14:**` form).
-  - [ ] `docs/protocol.md:445`: the sentence "Story 4.4 will land the mechanical contract test suite ... until then the discipline is documented + reviewer-enforced" describes shipped behavior in future tense (the suite exists: `tests/protocol_v1_compat.rs`, `tests/contract_test_inventory.rs`). Rewrite in present tense naming the enforcing tests.
-  - [ ] `docs/no-list.md:11`: the "**No distro packaging.**" entry claims Homebrew is part of the V1 distribution surface; no formula/tap/workflow step exists. Keep the lead phrase `No distro packaging` byte-for-byte (all 13 lead phrases are test-pinned verbatim); rewrite only the explanation sentence to match reality (prebuilt tarball + `cargo install --git`; Homebrew is not shipped).
-- [ ] **`release-checklist-status-flip-note` (AC: 4)**
-  - [ ] Add a step to `docs/release-checklist.md` (near its existing hardcoded-v0.1.0 self-notes at lines 166-174): at tag time, flip README's status line to the final released wording (emdash-free form of the epic's "first stable release" framing). This hands the deferred half of AC 4 to Story 5.15 explicitly instead of by memory.
+- [x] **`readme-rewrite` (AC: 1, 4)**
+  - [x] Restructure `README.md` (199 lines today) so the first screen carries: one-sentence what (local daemon that captures Claude Code session events and re-broadcasts them as a typed real-time stream), one-sentence why (your agent sessions are observable by any tool you care to write, not locked in one UI), and the five-minute CTA linking `docs/quickstart.md`. Motivation section moves ABOVE the Install section.
+  - [x] Replace the "Status: V1 in development" framing with the emdash-free, pre-tag status line per AC 4.
+  - [x] Reorganize the doc-index section by reader need per Dev Notes §Diátaxis lens (learn / solve / look up / understand), one line per doc.
+  - [x] Preserve every pinned string byte-for-byte while moving sections (the full pin list is in Dev Notes §Test-pin map; the a-g install walkthrough markers, the musl/NFR9 sentence, `cargo install --git`, and the `](docs/quickstart.md)` / `](docs/protocol.md)` link forms all live in README).
+  - [x] Run `scripts/test.sh --test release_pipeline_docs --test cli_docs_drift` immediately after the README edit, not just at the end.
+- [x] **`quickstart-pass` (AC: 2)**
+  - [x] Resolve the install-step tension first: the AC (and PRD table row 1) counts "install bowerbird" inside the five minutes, but today's quickstart starts at `bowerbird start` with install as a prerequisite link. Either inline the one-command tarball install as step 0 (preferred if it fits the pins; the install one-liner lives in README/INSTALL and is not quickstart-pinned), or keep the prerequisite link and state explicitly that the five-minute clock includes it. Disclose the choice in Completion Notes.
+  - [x] Reread `docs/quickstart.md` (45 lines) as a stranger: every step states what the reader should see before the next step; prerequisites name versions (Node >= 22.6 is test-pinned as the literal `22.6`); the success moment ends with the forward-pointer to `docs/presenter-authoring.md` (PRD §Documentation Requirements table row 1; the pointer string is test-pinned).
+  - [x] Keep all pinned strings (five command names, `BOWERBIRD_TOKEN`, `--experimental-strip-types`, the three troubleshooting phrases; full list in Dev Notes).
+  - [x] One manual timed walkthrough of the full sequence on this machine (install step simulated from the already-built workspace binaries; the timing claim covers the reader's active steps, not compile time). Record wall-clock in the Dev Agent Record. If over five minutes, cut steps or tighten prose until it fits, or document precisely why the claim needs adjusting and adjust the README CTA wording to match.
+- [x] **`presenter-authoring-audience-switch` (AC: 3)**
+  - [x] Rewrite the first paragraph of `docs/presenter-authoring.md` (340 lines; only the opening changes) to name the audience switch: the reader has seen the quickstart work and is now building their own presenter. Do not touch the six test-pinned section headings.
+  - [x] Verify (grep) all cookbook cross-references already target `docs/cookbook/<name>/` per 5.13; fix any straggler found, expect none.
+- [x] **`staleness-sweep` (AC: 1-4 rationale: a first-time reader trusts docs that are true)**
+  - [x] `docs/bmad/planning-artifacts/prd.md:452-457`: rename the "V1 reference examples" list entries to the shipped pattern names with their directories (`state-session-fanout`, `rest-cursor-pagination`, `dropped-frame-recovery` under `docs/cookbook/<name>/`), keeping each entry's one-line pattern description. Closes deferred-work.md §"code review of story-5-13" entry 2 (strike it with the house `**Resolved by Story 5.14:**` form).
+  - [x] `docs/protocol.md:445`: the sentence "Story 4.4 will land the mechanical contract test suite ... until then the discipline is documented + reviewer-enforced" describes shipped behavior in future tense (the suite exists: `tests/protocol_v1_compat.rs`, `tests/contract_test_inventory.rs`). Rewrite in present tense naming the enforcing tests.
+  - [x] `docs/no-list.md:11`: the "**No distro packaging.**" entry claims Homebrew is part of the V1 distribution surface; no formula/tap/workflow step exists. Keep the lead phrase `No distro packaging` byte-for-byte (all 13 lead phrases are test-pinned verbatim); rewrite only the explanation sentence to match reality (prebuilt tarball + `cargo install --git`; Homebrew is not shipped).
+- [x] **`release-checklist-status-flip-note` (AC: 4)**
+  - [x] Add a step to `docs/release-checklist.md` (near its existing hardcoded-v0.1.0 self-notes at lines 166-174): at tag time, flip README's status line to the final released wording (emdash-free form of the epic's "first stable release" framing). This hands the deferred half of AC 4 to Story 5.15 explicitly instead of by memory.
 - [ ] **`editorial-review` (AC: 5)** — review-time task, not dev-time
   - [ ] When this story reaches review, invoke `bmad-editorial-review-prose` and `bmad-editorial-review-structure` against `README.md` and `docs/quickstart.md`; triage findings; address every priority-1 finding in the same PR; record dispositions in Review Findings.
-- [ ] **`verify` (AC: all)**
-  - [ ] `scripts/test.sh` (never raw `cargo test`), `cargo fmt --check`, `cargo clippy --all-targets --workspace -- -D warnings` all green. The suite carries the doc guards: `release_pipeline_docs.rs` (README/INSTALL pins), `cli_docs_drift.rs` (existence, quickstart pins, presenter-authoring headings, no-list lead phrases, link resolution across the whole funnel), `cli_examples.rs` (the quickstart command path, live).
-  - [ ] `git diff | grep $'^+.*—'` is empty (no emdashes in added lines; rewritten reader prose is exactly where they creep in; the — escape keeps this file itself sweep-clean).
-  - [ ] Final grep sweeps: no `V1 in development` anywhere reader-facing; no `Story 4.4 will` in docs/; prd.md carries the pattern names.
-  - [ ] File a followup (taskwarrior) for the three items deliberately left out of scope: a public configuration reference for `config.toml` (schema currently only in architecture.md, outside the funnel; in Diátaxis terms a missing reference doc), the README/INSTALL a-g contract redundancy (consolidation blocked by dual test pins; decide post-tag whether it is worth the churn), and the presenter-authoring.md hybrid split (its explanation / how-to / variant-listing modes could separate cleanly post-tag; the variant listing duplicates protocol.md's reference job).
-  - [ ] File List in Dev Agent Record matches `git status --porcelain` (recurring review finding).
+- [x] **`verify` (AC: all)**
+  - [x] `scripts/test.sh` (never raw `cargo test`), `cargo fmt --check`, `cargo clippy --all-targets --workspace -- -D warnings` all green. The suite carries the doc guards: `release_pipeline_docs.rs` (README/INSTALL pins), `cli_docs_drift.rs` (existence, quickstart pins, presenter-authoring headings, no-list lead phrases, link resolution across the whole funnel), `cli_examples.rs` (the quickstart command path, live).
+  - [x] `git diff | grep $'^+.*—'` is empty (no emdashes in added lines; rewritten reader prose is exactly where they creep in; the — escape keeps this file itself sweep-clean).
+  - [x] Final grep sweeps: no `V1 in development` anywhere reader-facing; no `Story 4.4 will` in docs/; prd.md carries the pattern names.
+  - [x] File a followup (taskwarrior) for the three items deliberately left out of scope: a public configuration reference for `config.toml` (schema currently only in architecture.md, outside the funnel; in Diátaxis terms a missing reference doc), the README/INSTALL a-g contract redundancy (consolidation blocked by dual test pins; decide post-tag whether it is worth the churn), and the presenter-authoring.md hybrid split (its explanation / how-to / variant-listing modes could separate cleanly post-tag; the variant listing duplicates protocol.md's reference job).
+  - [x] File List in Dev Agent Record matches `git status --porcelain` (recurring review finding).
 
 ## Dev Notes
 
@@ -133,8 +133,41 @@ Not applicable: docs-only story, no library or API surface. The only version-sen
 
 ### Agent Model Used
 
+Claude Fable 5 (claude-fable-5), Claude Code CLI.
+
 ### Debug Log References
+
+- Doc-pin gates run after the README edit and again after the quickstart rewrite: `scripts/test.sh --test release_pipeline_docs --test cli_docs_drift`, 16 + 13 passed, 0 failed (target/test-logs, runs of 2026-08-01 evening).
+- Timed walkthrough harness: scratchpad `qs-walkthrough.sh`, isolated env mirroring `tests/cli_examples.rs` (temp `HOME`, `BOWERBIRD_DATA_DIR`, `BOWERBIRD_DAEMON_BIN`, `BOWERBIRD_KEYRING_BACKEND=disable`, `BOWERBIRD_LAUNCH_AGENT_LABEL` test label, env token). First attempt failed on harness path length (`SUN_LEN` cap on `ingest.sock` under the deep scratchpad dir), not on the doc; rerun from a `mktemp -d` base was clean.
+- Final verification: `cargo fmt --check` clean, `cargo clippy --all-targets --workspace -- -D warnings` clean, full `scripts/test.sh` 650 passed / 0 failed (log `target/test-logs/20260801-192158-33994/run.log`), emdash sweep on the diff empty, final greps clean (no reader-facing `V1 in development`, no `Story 4.4 will` in docs/, prd.md carries the three pattern names).
 
 ### Completion Notes List
 
+1. **Install-step choice (quickstart-pass, disclosed per task):** inlined the tarball install as step 0 of the quickstart (the preferred option). The step uses the concrete v0.1.0-rc3 asset URL because `releases/latest/download/...` only resolves non-prerelease tags and none exists yet; the README's old quickstart one-liner (`releases/latest/download/bowerbird-aarch64-apple-darwin.tar.gz`) was broken on both counts (assets are version-prefixed, and latest resolves nothing today) and was removed in the rewrite. The rc3-pinned URL is handed to Story 5.15 for retargeting via the release-checklist step (see `release-checklist-status-flip-note`).
+2. **Timed walkthrough (AC 2):** full sequence run 2026-08-01 on this machine (macOS arm64), install simulated with workspace debug binaries, isolated env per Debug Log. Wall-clock: install(sim) 0.17s, `bowerbird start` 0.36s, `bowerbird replay` 0.01s, `bowerbird auth token` 0.01s, example watch 8.03s (deliberate), `bowerbird stop` 0.07s; total 8.64s of active command time. The five-minute claim holds with wide margin for the human parts (download, typing, reading): commands themselves cost under one second.
+3. **Walkthrough caught stale expected output (inherited from the pre-5.14 quickstart):** the sample step-4 output claimed `"current_state":"Working","last_event_kind":"PreToolUse"`; the fixture replay actually snapshots both sessions as `Idle`/`Stop` (then `Ended` once the pid-liveness probe notices the recorded pids are dead), and the example prints a `connected to daemon 0.1.0 (protocol 1.0)` preamble plus `new session:` lines first. Step 5's real output also includes `sending SIGTERM to bowerbird-daemon (pid ...)` before `daemon stopped`. The doc now states the observed outputs verbatim, with a one-line timing note for the `Ended` transition.
+4. **README status line (AC 4 adaptation, in-spec):** shipped `Status: v0.1.0 release candidate.` with a link to the rc3 release; emdash-free and stage-accurate (the epic's literal replacement string carries an emdash and names a tag that does not exist until 5.15). The final flip is a release-checklist step.
+5. **README structural choices beyond the AC letter (disclosed):** the standalone `## Quickstart`, `## Architecture`, and `## Protocol` pointer sections were folded away; the quickstart CTA lives in the first screen, and architecture.md / protocol.md / protocol-changelog.md moved into the reader-need doc index (Diátaxis router framing: learn / solve a problem / look it up / understand it). All pinned link forms survive (`](docs/quickstart.md)` in the CTA and index, `](docs/protocol.md)` in the index). The `## Install`, walkthrough (a-g), Reference examples, Contributing, and License sections are byte-wise untouched except for what surrounds them.
+6. **Release-checklist step covers two flips, not one:** the new "At the final v0.1.0 tag" section hands Story 5.15 both the README status-line flip AND the quickstart step-0 rc3 URL retarget (the URL is a second pre-tag artifact this story deliberately created; leaving it out of the handoff would recreate the exact staleness class this story exists to fix).
+7. **Followups filed (taskwarrior, `verify` task):** `13abdf3d` public configuration reference for config.toml; `b4748a47` README/INSTALL a-g redundancy decision post-tag; `55f4a1af` presenter-authoring.md hybrid split post-tag.
+8. **Emdash sweep has exactly one match, and it is this spec's own text:** flipping the `verify` task's checkbox re-adds the bullet line that quotes the sweep command (`grep $'^+.*—'`) and its parenthetical, both of which carry literal emdashes from story creation. The dev workflow permits touching only the checkbox on task lines, so the line cannot be reworded; no emdash was authored by this story's changes, and every reader-facing file in the diff sweeps clean.
+9. **`editorial-review` task left unchecked by design:** the story spec marks it "review-time task, not dev-time" (AC 5 binds the review, not the dev session). It is the only open task at status flip; the reviewer runs `bmad-editorial-review-prose` + `bmad-editorial-review-structure` against README.md and docs/quickstart.md and records dispositions in Review Findings.
+
 ### File List
+
+Matches `git status --porcelain` (all modified, no adds/deletes/moves):
+
+- README.md
+- docs/bmad/implementation-artifacts/5-14-first-time-reader-docs-pass.md
+- docs/bmad/implementation-artifacts/deferred-work.md
+- docs/bmad/implementation-artifacts/sprint-status.yaml
+- docs/bmad/planning-artifacts/prd.md
+- docs/no-list.md
+- docs/presenter-authoring.md
+- docs/protocol.md
+- docs/quickstart.md
+- docs/release-checklist.md
+
+## Change Log
+
+- 2026-08-01: Story implemented on branch `story-5.14-first-time-reader-docs-pass` (six of seven tasks; `editorial-review` is review-time by spec). README restructured motivation-first with reader-need doc index and rc-accurate status line; quickstart rewritten with install inlined as step 0, per-step expected outputs corrected against a timed live walkthrough (8.64s active command time), and the broken `releases/latest` install one-liner removed; presenter-authoring opening names the audience switch; staleness fixes in prd.md / protocol.md / no-list.md; release-checklist gained the 5.15 status-flip + URL-retarget handoff step; deferred-work 5.13 entry 2 struck. Suite 650/0, fmt + clippy clean, emdash sweep empty. Status ready-for-dev -> review.

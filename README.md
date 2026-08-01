@@ -1,33 +1,38 @@
 # bowerbird
 
-bowerbird is a local-only substrate that captures Claude Code activity over
-Unix-socket hook events, normalizes them via the `adapter-claude` crate,
-persists them in WAL-mode SQLite, and broadcasts them to subscribed tools over
-an authenticated WebSocket. Three self-contained TypeScript cookbook entries
-under [`docs/cookbook/`](docs/cookbook/) demonstrate the canonical patterns
-(live state fan-out, REST cursor-pagination, Close/Dropped recovery).
+bowerbird is a local daemon that captures Claude Code session events and
+re-broadcasts them as a typed real-time stream. It exists so your agent
+sessions are observable by any tool you care to write, not locked inside
+one UI.
 
-Status: V1 in development. See
-[`docs/bmad/planning-artifacts/epics.md`](docs/bmad/planning-artifacts/epics.md)
-for the live scope and progress.
+**Try it in five minutes:** the [quickstart](docs/quickstart.md) takes you
+from install to live JSON state streaming out of a reference tool, against
+a bundled fixture. No Claude Code session required.
 
-## Quickstart
+Status: v0.1.0 release candidate.
+[v0.1.0-rc3](https://github.com/technicalpickles/bowerbird/releases/tag/v0.1.0-rc3)
+is the current prerelease.
 
-See [docs/quickstart.md](docs/quickstart.md) for the 5-minute walkthrough — start
-the daemon, replay a bundled fixture, run a reference example, see live JSON state.
-No Claude Code session required.
+## Why this exists
 
-To install, grab the macOS arm64 prebuilt tarball:
+Claude Code emits detailed hook events about what your agent is doing:
+tool calls starting and finishing, sessions going idle, the moments where
+the agent waits on your input. Out of the box, that signal is locked
+inside one terminal UI. bowerbird captures it at the hook boundary,
+persists it in a local SQLite event log, and re-broadcasts it as typed
+JSON over an authenticated WebSocket and REST surface.
 
-```sh
-curl -fsSL https://github.com/technicalpickles/bowerbird/releases/latest/download/bowerbird-aarch64-apple-darwin.tar.gz | tar -xz
-sudo install bowerbird-*-aarch64-apple-darwin/bin/* /usr/local/bin/
-```
+That changes what it costs to see your agent working. A status-bar lamp,
+a multi-session dashboard, a session log viewer: each is a small
+standalone program that subscribes to a stream, not a fork of anyone's
+UI. Three such tools ship as self-contained TypeScript reference entries
+under [`docs/cookbook/`](docs/cookbook/) (live state fan-out, REST
+cursor-pagination, Close/Dropped recovery).
 
-Substitute the appropriate tarball name for your platform from the [Install](#install)
-section; the `releases/latest/download/...` URL always resolves to the most recent
-non-prerelease tag. Or to try it without setting up Claude Code, the bundled fixture
-demonstrates the pub/sub path — see the linked quickstart.
+The daemon observes; it never interprets. Which sessions matter, what an
+event means, when to alert: those judgments belong to the tools you
+write, and keeping them out of the daemon is what keeps the substrate
+small enough to trust.
 
 ## Install
 
@@ -167,24 +172,27 @@ See [`docs/cookbook/README.md`](docs/cookbook/README.md) for the full walkthroug
 
 ## Documentation
 
-- [docs/quickstart.md](docs/quickstart.md) — five-minute walkthrough, no Claude Code session required
-- [docs/presenter-authoring.md](docs/presenter-authoring.md) — conceptual guide to building tools against the bowerbird substrate
-- [docs/protocol.md](docs/protocol.md) — REST + WebSocket + ingest-socket wire reference
-- [docs/cookbook/](docs/cookbook/): self-contained recipes, prose README + runnable reference code per pattern
-- [docs/no-list.md](docs/no-list.md) — explicit V1 scope cuts
+Routed by what you need right now:
 
-## Architecture
+**Learn it**
 
-See [`docs/bmad/planning-artifacts/architecture.md`](docs/bmad/planning-artifacts/architecture.md)
-for the full system shape: crate boundaries, async runtime configuration,
-WebSocket subsystem config knobs, and the daemon's startup sequence.
+- [docs/quickstart.md](docs/quickstart.md) is the five-minute tutorial: daemon up, fixture replayed, live state on your terminal.
 
-## Protocol
+**Solve a problem**
 
-See [`docs/protocol.md`](docs/protocol.md) for the consolidated wire-surface
-reference, and [`docs/protocol-changelog.md`](docs/protocol-changelog.md) for the
-change history (additive forward-compat policy for outbound messages;
-`deny_unknown_fields` strict on inbound).
+- [docs/cookbook/](docs/cookbook/) is the recipe collection: each entry pairs a prose README with runnable reference code.
+
+**Look it up**
+
+- [docs/protocol.md](docs/protocol.md) is the wire reference: REST routes, WebSocket frames, topic grammar, auth, ingest socket.
+- [docs/protocol-changelog.md](docs/protocol-changelog.md) is the protocol change history (additive forward-compat policy for outbound messages; `deny_unknown_fields` strict on inbound).
+
+**Understand it**
+
+- [docs/presenter-authoring.md](docs/presenter-authoring.md) explains the substrate model on the way to building your own tool.
+- [docs/no-list.md](docs/no-list.md) records the explicit V1 scope cuts, with reasons.
+- [docs/decisions/](docs/decisions/) holds the ADRs behind load-bearing choices.
+- [docs/bmad/planning-artifacts/architecture.md](docs/bmad/planning-artifacts/architecture.md) covers the full system shape: crate boundaries, async runtime configuration, WebSocket subsystem config knobs, the daemon's startup sequence.
 
 ## Contributing
 
