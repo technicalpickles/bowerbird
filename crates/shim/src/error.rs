@@ -85,23 +85,29 @@ pub enum Error {
     /// genuinely failed", which the shared `Error::SocketIo` bucket made
     /// impossible.
     ///
-    /// Names the operation, the budget it blew, and **what that means for the
-    /// event**, see [`TimeoutOp`], and note the two halves have opposite
-    /// consequences. Deliberately does not restate the errno, which is the
-    /// least informative part; see `socket::classify`.
+    /// Names the operation, the time actually spent, the budget it blew, and
+    /// **what that means for the event**, see [`TimeoutOp`], and note the two
+    /// halves have opposite consequences. Deliberately does not restate the
+    /// errno, which is the least informative part; see `socket::classify`.
     ///
-    /// **`budget_ms` is the per-wait socket timeout, not a bound on the
-    /// operation.** The elapsed time when this fires can be far larger, because
-    /// neither `write_all`/`read_line` nor even a single `write(2)` is bounded by
-    /// `SO_*TIMEO` once the peer is draining slowly. See
-    /// `socket::WRITE_BUDGET_MS` for measurements and Story 5.17 for the fix. So
-    /// this number tells the operator which budget was configured, not how long
-    /// the shim actually blocked.
+    /// **`elapsed_ms` is measured wall time; `budget_ms` is the configured
+    /// aggregate budget for that half** (Story 5.17). The two are logged
+    /// side by side because they legitimately differ: the deadline is checked
+    /// between syscalls, so elapsed can overshoot the budget by one trailing
+    /// wait or chunk (see `socket::WRITE_BUDGET_MS` for the bound's exact
+    /// shape). Story 5.16's single `budget_ms` under-reported elapsed time by
+    /// up to 100x because the budget then bounded each socket *wait* rather
+    /// than the operation; reporting measured elapsed time is AC #3 of the
+    /// story that fixed that.
     ///
-    /// Both fields are `Copy`, no allocation, per the shim's hot-path
+    /// All fields are `Copy`, no allocation, per the shim's hot-path
     /// discipline.
-    #[error("socket {} timed out after {budget_ms}ms; {}", .op.name(), .op.consequence())]
-    Timeout { op: TimeoutOp, budget_ms: u64 },
+    #[error("socket {} timed out after {elapsed_ms}ms (budget {budget_ms}ms); {}", .op.name(), .op.consequence())]
+    Timeout {
+        op: TimeoutOp,
+        budget_ms: u64,
+        elapsed_ms: u64,
+    },
 
     #[error("log file I/O failed: {0}")]
     LogIo(#[source] std::io::Error),
@@ -267,10 +273,12 @@ mod tests {
             Error::Timeout {
                 op: TimeoutOp::Write,
                 budget_ms: 2,
+                elapsed_ms: 2,
             },
             Error::Timeout {
                 op: TimeoutOp::Read,
                 budget_ms: 3,
+                elapsed_ms: 5,
             },
             Error::LogIo(dummy_io()),
             Error::BadResponse("x".into()),
@@ -334,11 +342,13 @@ mod tests {
         let write = Error::Timeout {
             op: TimeoutOp::Write,
             budget_ms: 2,
+            elapsed_ms: 2,
         }
         .to_string();
         let read = Error::Timeout {
             op: TimeoutOp::Read,
             budget_ms: 3,
+            elapsed_ms: 5,
         }
         .to_string();
 
@@ -367,6 +377,29 @@ mod tests {
 
         // And the two must not read identically, or the distinction is lost.
         assert_ne!(write, read);
+    }
+
+    /// Story 5.17 AC #3: the reported figure must be consistent with the time
+    /// actually spent. The message carries BOTH numbers, measured elapsed and
+    /// configured budget, labelled so neither can be mistaken for the other.
+    /// Story 5.16's message printed only the configured value, which
+    /// under-reported a 48ms stall as "timed out after 2ms".
+    #[test]
+    fn timeout_message_reports_elapsed_and_budget_separately() {
+        let msg = Error::Timeout {
+            op: TimeoutOp::Write,
+            budget_ms: 2,
+            elapsed_ms: 48,
+        }
+        .to_string();
+        assert!(
+            msg.contains("after 48ms"),
+            "must report measured elapsed time: {msg:?}"
+        );
+        assert!(
+            msg.contains("(budget 2ms)"),
+            "must label the configured budget as the budget: {msg:?}"
+        );
     }
 
     /// The phrase `event dropped` stays reserved for the one case where the
