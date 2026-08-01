@@ -198,7 +198,7 @@ TOML for `adapters/<source>/*.toml` (capabilities, tool-reactions, settings-merg
 - TOML is dtolnay-maintained, has a stricter grammar, and matches the Rust ecosystem (it's what `Cargo.toml` already is).
 - Adapter configs are small, flat-ish, human-edited — TOML's sweet spot.
 
-### Example presenters: TypeScript on Node — Proposed
+### Example presenters: TypeScript on Node (Accepted: shipped by Story 4.2; cookbook location per Story 5.13, ADR 0010)
 
 TypeScript, runs on Node. Lives in `docs/cookbook/<name>/`, colocated with each cookbook entry's README (Story 5.13 consolidation, ADR 0010). No build step beyond `tsc`.
 
@@ -550,7 +550,7 @@ What keeps entries honest, on every PR:
 4. **How to apply it**: one or two notes on adapting the pattern.
 5. **Files**: relative links to `src/index.ts` and any sidecar code files.
 
-**Length target: ~80-150 lines of README.** The number is a smell, not a rule. The actual test is "one entry = one question the reader had." If you can't name the question in a sentence, it's two entries.
+**Length target: ~50-150 lines of README.** The number is a smell, not a rule (the three 5.13-era READMEs land between 46 and 70). The actual test is "one entry = one question the reader had." If you can't name the question in a sentence, it's two entries.
 
 **Reader-path through the docs** (added per party review — separate from the reference triangle):
 

@@ -1,5 +1,5 @@
 {
-  "name": "bowerbird-example-event-log-viewer",
+  "name": "bowerbird-cookbook-rest-cursor-pagination",
   "private": true,
   "type": "module",
   "engines": { "node": ">=22.6.0" },

@@ -789,6 +789,7 @@ bowerbird/
 │   │   ├── state-session-fanout/       # representative entry; rest-cursor-pagination/ and dropped-frame-recovery/ follow the same shape
 │   │   │   ├── README.md               # what this is / how to run it / how it works / how to apply it
 │   │   │   ├── package.json            # engines.node >= 22.6.0; type: module
+│   │   │   ├── package-lock.json       # committed; npm ci in the CI typecheck job depends on it
 │   │   │   ├── tsconfig.json           # strict, noEmit (Node strips types at runtime)
 │   │   │   └── src/
 │   │   │       └── index.ts            # canonical runnable pattern code, smoke-tested in CI

@@ -14,7 +14,7 @@ The patterns are orthogonal; read the one matching your use case.
 
 Most presenter authors reach for Node first when consuming WebSocket + REST surfaces, so that's where the reference code lands. The substrate doesn't care what speaks WebSocket + JSON; any language with a JSON parser and a WebSocket client works the same way.
 
-No SDK is shipped. The protocol is small enough that each entry self-contains its ~30 lines of interface declarations; duplication is the right cost for read-and-run reference code. (See project-context.md §Example presenters for the authoritative decision.)
+No SDK is shipped. The protocol is small enough that each entry self-contains its ~30 lines of interface declarations; duplication is the right cost for read-and-run reference code. (See project-context.md §Example presenters for the authoritative decision.) There are no runtime npm dependencies; each entry's dev-deps exist only for the optional `npm run typecheck`, and the runtime path is plain `node --experimental-strip-types`.
 
 ## Node version requirement
 
@@ -42,6 +42,12 @@ kill %1
 ```
 
 See each entry's `README.md` for expected output, how the pattern works, and adaptation hints.
+
+## If it didn't work
+
+- **`BOWERBIRD_TOKEN env var not set`**: step 3 of the quick run didn't happen in this shell. Re-run `export BOWERBIRD_TOKEN="$(bowerbird auth token | tr -d '\n')"` in the same shell as the entry.
+- **`cannot read ~/.bowerbird/server.json`**: the daemon isn't running. Run `bowerbird start` first.
+- **`node: bad option: --experimental-strip-types`**: your Node is older than 22.6; see the version section above.
 
 ## Not a Cargo zone
 

@@ -3,9 +3,9 @@
 Date: 2026-08-01
 Status: Accepted
 Deciders: @pickles
-Related: sprint-change-proposal-2026-05-26-cookbook-consolidation.md (operationalizes this decision; note its story/ADR numbers predate two renumberings, the story landed as 5.13 and this ADR as 0010); Story 4.2 (`docs/bmad/implementation-artifacts/4-2-reference-example-tools.md`, shipped the examples + anchor markers); Story 4.3 (`docs/bmad/implementation-artifacts/4-3-documentation-suite.md`, shipped the duplicated-prose cookbook shape this ADR removes); Story 5.13 (`docs/bmad/implementation-artifacts/5-13-cookbook-consolidation.md`, the implementation); deferred-work.md entry #4 ("Cookbook inlining mechanism", resolved here)
+Related: `docs/bmad/planning-artifacts/sprint-change-proposal-2026-05-26-cookbook-consolidation.md` (operationalizes this decision; note its story/ADR numbers predate two renumberings, the story landed as 5.13 and this ADR as 0010); Story 4.2 (`docs/bmad/implementation-artifacts/4-2-reference-example-tools.md`, shipped the examples + anchor markers); Story 4.3 (`docs/bmad/implementation-artifacts/4-3-documentation-suite.md`, shipped the duplicated-prose cookbook shape this ADR removes); Story 5.13 (`docs/bmad/implementation-artifacts/5-13-cookbook-consolidation.md`, the implementation); deferred-work.md entry #4 ("Cookbook inlining mechanism", resolved here)
 Implementation: `docs/cookbook/<name>/` (three entries, moved from `examples/<old-name>/` via `git mv`); `docs/cookbook/README.md` (index); `tests/cli_docs_drift.rs` (drift-check deleted, five-section README guard added); `tests/cli_examples_drift.rs` (anchor guard deleted, remaining guards retargeted); `tests/cli_examples.rs` (smoke paths retargeted); `.github/workflows/ci.yml` (typecheck loop retargeted)
-Affects context.md sections: Repository layout, Cookbook discipline
+Affects context.md sections: Repository layout, Cookbook discipline, Example presenters, Examples-as-tests (plus mechanical path retargets in the CI list, test-pyramid table, and required-jobs checklist)
 
 ## Context
 

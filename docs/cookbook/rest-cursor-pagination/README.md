@@ -18,13 +18,15 @@ node --experimental-strip-types docs/cookbook/rest-cursor-pagination/src/index.t
 Without a session-id argument, defaults to `session-alpha` (the first session in the bundled fixture). Requires Node 22.6+ for `--experimental-strip-types`. Expected output: tab-separated lines, one per event:
 
 ```
-1	PreToolUse	Read	Continue
-3	PostToolUse	Read	Continue
-5	PreToolUse	Edit	Continue
-7	PostToolUse	Edit	Continue
-9	Notification	-	-
-11	Stop	-	-
+2	PreToolUse	Read	Continue
+4	PostToolUse	Read	Continue
+6	PreToolUse	Edit	Continue
+8	PostToolUse	Edit	Continue
+10	Notification	-	-
+12	Stop	-	-
 ```
+
+The exact event ids depend on your daemon's history: on a fresh daemon the startup `RecordingStarted` sentinel takes event_id 1, so the replayed events land on 2, 4, 6, and so on. The kind/tool/reaction columns are what's stable (the smoke test asserts on those, not the ids).
 
 Pipe through `column -t -s$'\t'` for a pretty table.
 

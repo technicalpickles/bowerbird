@@ -7,6 +7,10 @@
 //! Parallel-safe: each daemon binds an ephemeral port the entry reads
 //! from its own server.json, and all state is TempDir-scoped per test.
 //!
+//! The FILE name stays `cli_examples.rs` (pinned by
+//! `tests/release_pipeline_docs.rs`); internal helpers use cookbook-entry
+//! naming where it aids the reader.
+//!
 //! Tests gracefully skip when Node 22.6+ is unavailable. CI's `ubuntu-latest`
 //! and `macos-latest` runners ship Node 22+ natively; the skip path covers
 //! contributors on stale local environments.
@@ -189,7 +193,7 @@ fn node_22_6_available() -> bool {
     true
 }
 
-fn examples_dir() -> PathBuf {
+fn cookbook_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/cookbook")
 }
 
@@ -204,7 +208,7 @@ fn spawn_example(
     extra_env: &[(&str, &str)],
 ) -> Child {
     let node = node_bin().expect("node binary already gated by node_22_6_available");
-    let entry = examples_dir().join(example_name).join("src/index.ts");
+    let entry = cookbook_dir().join(example_name).join("src/index.ts");
     let mut cmd = std::process::Command::new(node);
     cmd.arg("--experimental-strip-types")
         .arg(&entry)
@@ -477,7 +481,7 @@ fn rest_cursor_pagination_paginates_session_history_and_renders_tool_calls() {
 // ---------------------------------------------------------------------------
 // AC #2: rest-cursor-pagination defaults to session-alpha when no CLI arg given.
 // Exercises the `process.argv[2] ?? "session-alpha"` default in rest-cursor-pagination
-// (src/index.ts:139). The primary smoke test always passes `session-alpha`
+// (src/index.ts). The primary smoke test always passes `session-alpha`
 // explicitly, so the default-arg branch would otherwise be untested.
 // ---------------------------------------------------------------------------
 
@@ -709,7 +713,7 @@ fn dropped_frame_recovery_recovers_after_close_frame_and_resumes() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn examples_fail_clearly_when_daemon_down() {
+fn cookbook_entries_fail_clearly_when_daemon_down() {
     if !node_22_6_available() {
         return;
     }

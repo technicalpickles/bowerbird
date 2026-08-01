@@ -69,6 +69,10 @@ jobs:
         run: |
           set -euxo pipefail
           for d in docs/cookbook/*/; do
+            # Non-npm subdirs (images/, shared/, drafts/) are legitimate in a
+            # docs tree; only Node entry dirs get typechecked. The structural
+            # guards (tests/cli_examples_drift.rs) keep real entries honest.
+            [ -f "$d/package.json" ] || continue
             (cd "$d" && npm ci && npm run typecheck)
           done
 

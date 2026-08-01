@@ -4,7 +4,7 @@
 
 Subscribe to every session as it appears (no enumeration, no polling) and route each session's state changes to a per-session object you own. This is the canonical first pattern for any live presenter: a `state.session.*` subscription feeding a per-`(source, session_id)` map, where first sighting of a key means "new session appeared."
 
-The runnable code in [`src/index.ts`](src/index.ts) exercises Story 2.3's snapshot-on-subscribe semantics (existing sessions arrive as a burst of state frames before any live frame) and Story 2.2's live state-frame fan-out. It also illustrates Axiom 1 from project-context.md: the substrate emits mechanical facts (`state.session.*` frames); the presenter interprets them ("a new key means a new session").
+The runnable code in [`src/index.ts`](src/index.ts) exercises Story 2.3's snapshot-on-subscribe semantics (existing sessions arrive as a burst of state frames before any live frame) and Story 2.2's live state-frame fan-out. It also illustrates Axiom 4 from project-context.md: mechanical facts live in the protocol (`state.session.*` frames); semantics live in the presenter ("a new key means a new session" is your interpretation, not the wire's).
 
 ## Run it
 

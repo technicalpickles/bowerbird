@@ -53,11 +53,51 @@ fn required_docs_exist() {
     }
 }
 
+/// Walk a markdown body with fence awareness: opening-fence info strings are
+/// checked against the prose-safe allowlist, fenced content is skipped for
+/// heading matching, and level-2 headings are matched against `sections` in
+/// order. Returns how many of `sections` were seen in order.
+///
+/// The allowlist (not a code-language blacklist) is the load-bearing choice:
+/// the pre-review guard banned only the literal ```ts / ```typescript
+/// spellings, so ```js, ```tsx, tilde fences, and bare fences all smuggled
+/// code back into prose (review 2026-08-01, Blind Hunter finding 1).
+fn scan_prose_only_markdown(rel: &str, body: &str, sections: &[&str]) -> usize {
+    const ALLOWED_FENCE_LANGS: &[&str] = &["", "sh"];
+
+    let mut seen = 0usize;
+    let mut in_fence = false;
+    for line in body.lines() {
+        let t = line.trim_start();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            if !in_fence {
+                let info = t.trim_start_matches(['`', '~']).trim().to_ascii_lowercase();
+                assert!(
+                    ALLOWED_FENCE_LANGS.contains(&info.as_str()),
+                    "{rel} opens a fenced block with language `{info}`; cookbook \
+                     prose allows only plain or `sh` fences. Code lives in the \
+                     colocated src/index.ts, never embedded in the README \
+                     (Story 5.13 AC 3, consolidation contract)"
+                );
+            }
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        if seen < sections.len() && line.trim_end() == sections[seen] {
+            seen += 1;
+        }
+    }
+    seen
+}
+
 #[test]
 fn every_cookbook_entry_has_canonical_five_sections() {
     // The post-5.13 project-context.md §Cookbook discipline shape: five
-    // level-2 headings in this order, prose only. The index README.md is
-    // exempt (it has its own table shape, not a recipe shape).
+    // level-2 headings in this order, prose only. Headings inside fences do
+    // not count (a shell comment reading `## Run it` cannot spoof the scan).
     const SECTIONS: &[&str] = &[
         "## What this is",
         "## Run it",
@@ -68,12 +108,7 @@ fn every_cookbook_entry_has_canonical_five_sections() {
 
     for rel in REQUIRED_COOKBOOK_ENTRIES {
         let body = read_workspace_file(rel);
-        let mut seen = 0usize;
-        for line in body.lines() {
-            if seen < SECTIONS.len() && line.trim_end() == SECTIONS[seen] {
-                seen += 1;
-            }
-        }
+        let seen = scan_prose_only_markdown(rel, &body, SECTIONS);
         assert_eq!(
             seen,
             SECTIONS.len(),
@@ -83,19 +118,52 @@ fn every_cookbook_entry_has_canonical_five_sections() {
             SECTIONS.len(),
             SECTIONS.get(seen).copied().unwrap_or("(none)"),
         );
-
-        // Prose-only invariant: the runnable code lives in the colocated
-        // src/index.ts, never embedded in the README. A ```ts fence here is
-        // the Story 4.3 copy-paste shape sneaking back in (Story 5.13 AC 3).
-        for fence in ["```ts", "```typescript"] {
-            assert!(
-                !body.contains(fence),
-                "{rel} embeds a TypeScript fenced block (`{fence}`); cookbook \
-                 READMEs are prose-only, readers open src/index.ts for code \
-                 (Story 5.13 consolidation contract)"
-            );
-        }
     }
+}
+
+#[test]
+fn cookbook_index_readme_is_prose_only() {
+    // The index is exempt from the five-section recipe shape (it has a table
+    // shape) but NOT from the prose-only fence rule: the landing page is the
+    // most likely place an illustrative code block sneaks back in.
+    let body = read_workspace_file("docs/cookbook/README.md");
+    scan_prose_only_markdown("docs/cookbook/README.md", &body, &[]);
+}
+
+#[test]
+fn cookbook_entry_consts_match_directory_listing() {
+    // The directory IS the surface (Story 5.13): CI's typecheck loop globs
+    // docs/cookbook/*/, so a new entry directory gets typechecked while the
+    // hardcoded guard lists here and in cli_examples_drift.rs silently skip
+    // it. This sync check turns that gap into a red build.
+    let cookbook = workspace_root().join("docs/cookbook");
+    let mut dirs: Vec<String> = fs::read_dir(&cookbook)
+        .unwrap_or_else(|e| panic!("read_dir {}: {e}", cookbook.display()))
+        .filter_map(|entry| {
+            let entry = entry.expect("dir entry");
+            let is_dir = entry.file_type().expect("file type").is_dir();
+            is_dir.then(|| entry.file_name().to_string_lossy().into_owned())
+        })
+        .collect();
+    dirs.sort();
+
+    let mut expected: Vec<String> = REQUIRED_COOKBOOK_ENTRIES
+        .iter()
+        .map(|rel| {
+            rel.trim_start_matches("docs/cookbook/")
+                .trim_end_matches("/README.md")
+                .to_string()
+        })
+        .collect();
+    expected.sort();
+
+    assert_eq!(
+        dirs, expected,
+        "docs/cookbook/ entry directories and REQUIRED_COOKBOOK_ENTRIES \
+         disagree. Every entry directory must be listed here (and in \
+         cli_examples_drift.rs::ENTRIES) so the shape guards and the smoke \
+         cover it; CI's typecheck glob alone is not structural coverage."
+    );
 }
 
 #[test]
@@ -106,6 +174,8 @@ fn quickstart_internal_links_resolve() {
     // Anchor fragments (`path#fragment`) are split — verifying the
     // fragment resolves to an actual heading is over-engineering for V1.
     const DOCS_TO_CHECK: &[&str] = &[
+        "README.md",
+        "INSTALL.md",
         "docs/quickstart.md",
         "docs/presenter-authoring.md",
         "docs/protocol.md",
@@ -216,7 +286,7 @@ fn architecture_md_docs_tree_matches_shipped_surface() {
 
 // ---------------------------------------------------------------------------
 // Story 4.3 content-drift guardrails. The tests above pin structural shape
-// (files exist, sections exist, cookbook anchors match). The tests below
+// (files exist, sections exist, prose-only fences hold). The tests below
 // pin LOAD-BEARING SUBSTANCE — the specific commands, route names, frame
 // variants, scope-cut labels that an AC mandated. Pattern matches
 // `release_pipeline_docs.rs::assert_contains_all` (Story 3.4).
@@ -276,7 +346,7 @@ fn presenter_authoring_carries_load_bearing_markers() {
     let body = read_workspace_file("docs/presenter-authoring.md");
 
     // Six sections in order — same state-machine pattern as
-    // `every_cookbook_entry_has_canonical_four_sections`.
+    // `every_cookbook_entry_has_canonical_five_sections`.
     const SECTIONS: &[&str] = &[
         "## The substrate model",
         "## Establishing a WebSocket connection",
@@ -454,13 +524,15 @@ fn cookbook_readme_lists_three_required_entries() {
     // here = silent loss of discoverability for one of the three patterns.
     let body = read_workspace_file("docs/cookbook/README.md");
     assert_contains_all(
-        "docs/cookbook/README.md index markers; three entry directories",
+        "docs/cookbook/README.md index markers; three entry directory LINKS \
+         (the `](name/)` form, so the quick-run command paths cannot satisfy \
+         this test if the index table is deleted)",
         &body,
         &[
-            // Three entry directories (markdown link targets).
-            "state-session-fanout/",
-            "rest-cursor-pagination/",
-            "dropped-frame-recovery/",
+            // Three entry directories as markdown link targets.
+            "](state-session-fanout/)",
+            "](rest-cursor-pagination/)",
+            "](dropped-frame-recovery/)",
         ],
     );
 }
