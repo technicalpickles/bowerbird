@@ -17,6 +17,10 @@ use std::time::{Duration, Instant};
 use assert_cmd::Command;
 use tempfile::TempDir;
 
+#[cfg(target_os = "macos")]
+#[path = "support/fake_launchctl.rs"]
+mod fake_launchctl;
+
 fn bowerbird_bin() -> Command {
     let mut cmd = Command::cargo_bin("bowerbird").expect("bowerbird binary built");
     cmd.env_remove("BOWERBIRD_CLAUDE_SETTINGS");
@@ -397,5 +401,83 @@ fn status_with_stale_pid_file_reports_stopped_stale() {
     assert!(
         stdout.contains(&dead_marker),
         "expected stale pid {dead_pid} in stdout; got:\n{stdout}"
+    );
+}
+
+/// taskwarrior 2e9cfda3 (product half): a Loaded launchd probe must not END
+/// the stop. The booted-out agent is not necessarily the daemon owning
+/// BOWERBIRD_DATA_DIR; without the pid-file sweep, `stop` strands the data
+/// dir's own daemon. This is exactly how cli_auth's isolated stops killed
+/// the developer's real rc3 agent while leaking their TempDir daemons
+/// (2026-08-01 incident, story 5-13 Debug Log).
+#[cfg(target_os = "macos")]
+#[test]
+fn stop_after_bootout_still_sweeps_the_pid_file_daemon() {
+    let tmp = TempDir::new().expect("tempdir");
+
+    // Start a real daemon manually. The isolated TEST_LAUNCH_AGENT_LABEL makes
+    // start's launchd probe NotLoaded, so this is a plain manual spawn.
+    bowerbird_cmd_in(&tmp).arg("start").assert().success();
+    assert!(
+        wait_for_daemon_up(&tmp, Instant::now() + Duration::from_secs(30)),
+        "daemon must come up before the stop-under-test"
+    );
+    let pid = read_pid_file(&tmp).expect("pid file after start");
+
+    // Stop with a fake launchctl reporting the agent Loaded (print exit 0)
+    // and booting out successfully: the machine-with-real-agent-loaded shape,
+    // with launchd effects stubbed out.
+    let bin_dir = tmp.path().join("fakebin");
+    std::fs::create_dir_all(&bin_dir).expect("fakebin dir");
+    fake_launchctl::write_executable(&bin_dir.join("launchctl"), fake_launchctl::FAKE_LAUNCHCTL);
+    let log = tmp.path().join("launchctl.log");
+    let mut cmd = bowerbird_cmd_in(&tmp);
+    fake_launchctl::with_fake_launchctl(&mut cmd, &bin_dir, &log);
+    cmd.env("FAKE_LAUNCHCTL_PRINT_EXIT", "0");
+    let assertion = cmd.arg("stop").assert().success();
+
+    let stdout = String::from_utf8_lossy(&assertion.get_output().stdout).into_owned();
+    assert!(
+        stdout.contains("daemon stopped (launchd supervision paused"),
+        "the bootout must still be announced; stdout={stdout}"
+    );
+
+    // The load-bearing assertion: the pid-file daemon dies too. Clean up
+    // before asserting so a red run does not leak the daemon.
+    let dead = wait_for_pid_dead(pid, Instant::now() + Duration::from_secs(30));
+    if !dead {
+        force_stop(&tmp);
+    }
+    assert!(
+        dead,
+        "stop must sweep the pid-file daemon after bootout, not leak it (pid {pid})"
+    );
+}
+
+/// taskwarrior 2e9cfda3 (seam half, observed end to end): the launchd probe
+/// must address the OVERRIDDEN label, never the real one.
+#[cfg(target_os = "macos")]
+#[test]
+fn stop_probes_launchd_by_the_overridden_label() {
+    let tmp = TempDir::new().expect("tempdir");
+    let bin_dir = tmp.path().join("fakebin");
+    std::fs::create_dir_all(&bin_dir).expect("fakebin dir");
+    fake_launchctl::write_executable(&bin_dir.join("launchctl"), fake_launchctl::FAKE_LAUNCHCTL);
+    let log = tmp.path().join("launchctl.log");
+
+    // No daemon, default fake print exit 1 (absent): NotLoaded, pid-file path,
+    // clean noop. The interesting artifact is the probe target in the log.
+    let mut cmd = bowerbird_cmd_in(&tmp);
+    fake_launchctl::with_fake_launchctl(&mut cmd, &bin_dir, &log);
+    cmd.arg("stop").assert().success();
+
+    let logged = std::fs::read_to_string(&log).expect("fake launchctl log");
+    assert!(
+        logged.contains(TEST_LAUNCH_AGENT_LABEL),
+        "probe must use the overridden label; log={logged}"
+    );
+    assert!(
+        !logged.contains("com.technicalpickles.bowerbird.daemon"),
+        "the real label must never be addressed under an override; log={logged}"
     );
 }

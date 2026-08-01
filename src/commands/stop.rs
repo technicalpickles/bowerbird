@@ -49,7 +49,19 @@ fn stop_daemon() -> anyhow::Result<()> {
                 "daemon stopped (launchd supervision paused until next login; \
                  run `bowerbird start` to resume now)"
             );
-            return Ok(());
+            // Do NOT return here (taskwarrior 2e9cfda3): the booted-out
+            // launchd job is not necessarily the daemon that owns the
+            // resolved data dir. With BOWERBIRD_DATA_DIR pointing elsewhere
+            // (tests, custom setups), a manual daemon can hold that dir's
+            // singleton while the LaunchAgent supervised another; the old
+            // early return stranded it. Sweep the pid-file path too, quietly
+            // when it finds nothing (the bootout already covered the common
+            // same-daemon case, and a contradictory "daemon not running"
+            // line after "daemon stopped" would just confuse). When the
+            // booted-out daemon IS the pid-file daemon and is still
+            // draining, the sweep's SIGTERM is a no-op and the wait makes
+            // `stop` return only after the process is actually gone.
+            return stop_via_pid_file(false);
         }
         // Not loaded (a clean prior stop, or never bootstrapped): nothing for
         // launchd to stop. Fall through to the PID-file path, which still catches a
@@ -75,22 +87,26 @@ fn stop_daemon() -> anyhow::Result<()> {
         }
     }
 
-    stop_via_pid_file()
+    stop_via_pid_file(true)
 }
 
 #[cfg(not(target_os = "macos"))]
 fn stop_daemon() -> anyhow::Result<()> {
-    stop_via_pid_file()
+    stop_via_pid_file(true)
 }
 
-/// PID-file SIGTERM → SIGKILL stop. The lifecycle owner on Linux, and the macOS
-/// fallback when no LaunchAgent is loaded (manual / pre-5.9 daemon).
-fn stop_via_pid_file() -> anyhow::Result<()> {
+/// PID-file SIGTERM then SIGKILL stop. The lifecycle owner on Linux, and the
+/// macOS fallback/sweep. `announce_not_running` is false only for the
+/// post-bootout sweep, where "nothing further to stop" is the expected quiet
+/// outcome rather than user-facing news.
+fn stop_via_pid_file(announce_not_running: bool) -> anyhow::Result<()> {
     let bowerbird_dir = super::resolve_bowerbird_dir()?;
     match daemon::stop_daemon_via_pid_file(&bowerbird_dir)? {
         StopOutcome::NotRunning => {
-            // Exact wording is contracted with `tests/cli_lifecycle.rs`.
-            println!("daemon not running (no pid file); nothing to stop");
+            if announce_not_running {
+                // Exact wording is contracted with `tests/cli_lifecycle.rs`.
+                println!("daemon not running (no pid file); nothing to stop");
+            }
         }
         StopOutcome::Stopped => {
             println!("daemon stopped");
