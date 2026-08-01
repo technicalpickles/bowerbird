@@ -129,7 +129,7 @@ fn teardown_supervision(no_stop: bool) -> anyhow::Result<()> {
             "note: --no-stop removed the plist without booting the LaunchAgent out; if it was \
              already loaded this login session, launchd keeps supervising the daemon until you \
              log out or run `launchctl bootout gui/$(id -u)/{}`",
-            launch_agent::LAUNCH_AGENT_LABEL
+            launch_agent::launch_agent_label()
         );
     }
 

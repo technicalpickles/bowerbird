@@ -128,7 +128,7 @@ fn start_daemon(bowerbird_dir: &std::path::Path) -> anyhow::Result<()> {
                          in place — it may not be under launchd supervision (check `launchctl \
                          print gui/$(id -u)/{}`)",
                         ingest_sock.display(),
-                        launch_agent::LAUNCH_AGENT_LABEL
+                        launch_agent::launch_agent_label()
                     );
                     println!("daemon already running");
                     return Ok(());
@@ -145,7 +145,7 @@ fn start_daemon(bowerbird_dir: &std::path::Path) -> anyhow::Result<()> {
                      place — it may not be under launchd supervision (check `launchctl print \
                      gui/$(id -u)/{}`)",
                     ingest_sock.display(),
-                    launch_agent::LAUNCH_AGENT_LABEL
+                    launch_agent::launch_agent_label()
                 );
                 println!("daemon already running");
                 return Ok(());

@@ -25,6 +25,12 @@ use tempfile::TempDir;
 
 const EXAMPLES_TEST_TOKEN: &str = "examples-smoke-token";
 
+/// taskwarrior 2e9cfda3: an isolated label so `stop`/`start` launchd probes
+/// address a service that never exists, instead of the developer's real
+/// agent. Real `launchctl print` on this label exits 113 ("Could not find"),
+/// which the CLI classifies NotLoaded, falling to the pid-file path.
+const TEST_LAUNCH_AGENT_LABEL: &str = "com.technicalpickles.bowerbird.test-isolation";
+
 // ---------------------------------------------------------------------------
 // Daemon orchestration helpers — mirror tests/cli_replay.rs.
 // ---------------------------------------------------------------------------
@@ -37,6 +43,7 @@ fn bowerbird_bin() -> Command {
     cmd.env_remove("BOWERBIRD_INGEST_SOCK");
     cmd.env("BOWERBIRD_TOKEN", EXAMPLES_TEST_TOKEN);
     cmd.env("BOWERBIRD_KEYRING_BACKEND", "disable");
+    cmd.env("BOWERBIRD_LAUNCH_AGENT_LABEL", TEST_LAUNCH_AGENT_LABEL);
     cmd
 }
 

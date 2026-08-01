@@ -32,6 +32,7 @@ fn bowerbird_bin() -> Command {
     // both via `spawn_detached`'s env passthrough.
     cmd.env("BOWERBIRD_TOKEN", LIFECYCLE_TEST_TOKEN);
     cmd.env("BOWERBIRD_KEYRING_BACKEND", "disable");
+    cmd.env("BOWERBIRD_LAUNCH_AGENT_LABEL", TEST_LAUNCH_AGENT_LABEL);
     cmd
 }
 
@@ -39,6 +40,12 @@ fn bowerbird_bin() -> Command {
 /// `BOWERBIRD_TOKEN`. Lifts the pre-Story-3.3 "daemon mints ephemeral, CLI
 /// shows degraded status" pattern to "both sides agree on a known value."
 const LIFECYCLE_TEST_TOKEN: &str = "lifecycle-default-test-token";
+
+/// taskwarrior 2e9cfda3: an isolated label so `stop`/`start` launchd probes
+/// address a service that never exists, instead of the developer's real
+/// agent. Real `launchctl print` on this label exits 113 ("Could not find"),
+/// which the CLI classifies NotLoaded, falling to the pid-file path.
+const TEST_LAUNCH_AGENT_LABEL: &str = "com.technicalpickles.bowerbird.test-isolation";
 
 fn data_dir(tmp: &TempDir) -> PathBuf {
     tmp.path().join(".bowerbird")

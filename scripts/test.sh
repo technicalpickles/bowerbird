@@ -295,6 +295,12 @@ if [ "$#" -eq 0 ]; then
   args=(--workspace)
 fi
 
+# taskwarrior 2e9cfda3: a suite whose helper forgets the label override must
+# still never probe/bootout the developer's real LaunchAgent. Suites set the
+# var per-Command themselves; this export only covers future suites that
+# forget. Respect a caller-provided value.
+export BOWERBIRD_LAUNCH_AGENT_LABEL="${BOWERBIRD_LAUNCH_AGENT_LABEL:-com.technicalpickles.bowerbird.test-isolation}"
+
 echo "test.sh: cargo test ${args[*]}" >&2
 echo "test.sh: logging to ${RUN_LOG}" >&2
 

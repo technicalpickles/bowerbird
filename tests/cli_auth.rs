@@ -26,6 +26,12 @@ fn data_dir(tmp: &TempDir) -> PathBuf {
     tmp.path().join(".bowerbird")
 }
 
+/// taskwarrior 2e9cfda3: an isolated label so `stop`/`start` launchd probes
+/// address a service that never exists, instead of the developer's real
+/// agent. Real `launchctl print` on this label exits 113 ("Could not find"),
+/// which the CLI classifies NotLoaded, falling to the pid-file path.
+const TEST_LAUNCH_AGENT_LABEL: &str = "com.technicalpickles.bowerbird.test-isolation";
+
 /// Build a `bowerbird` CLI invocation with the standard test-isolation env.
 /// Defaults to `BOWERBIRD_KEYRING_BACKEND=disable` so the test never reaches
 /// the developer's real keychain; tests override per-invocation as needed.
@@ -38,6 +44,7 @@ fn bowerbird_auth_command(tmp: &TempDir) -> Command {
     cmd.env("HOME", tmp.path());
     cmd.env("BOWERBIRD_DATA_DIR", data_dir(tmp));
     cmd.env("BOWERBIRD_KEYRING_BACKEND", "disable");
+    cmd.env("BOWERBIRD_LAUNCH_AGENT_LABEL", TEST_LAUNCH_AGENT_LABEL);
     cmd
 }
 
