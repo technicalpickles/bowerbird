@@ -2089,7 +2089,18 @@ fn stop_ignores_stale_pid_file_without_flock_on_macos() {
     let dir = TempDir::new().expect("tempdir");
     let data_dir = dir.path().join("data");
     fs::create_dir_all(&data_dir).expect("data dir");
-    // No plist under HOME => stop uses the PID-file path directly.
+    // Since Story 5.9 pass-7, `stop` probes launchd BY LABEL, not by plist
+    // presence, so the absence of a plist under HOME does not stop it from
+    // asking launchctl about the real label. This test has no fake launchctl
+    // on PATH, so a real-label probe would hit the developer's actual
+    // LaunchAgent. Override `bowerbird_bin()`'s real-label pin with the
+    // suite's isolated label here so the probe targets a label that never
+    // exists, guaranteeing NotLoaded and forcing the pid-file path below.
+    let mut cmd = bowerbird_bin();
+    cmd.env(
+        "BOWERBIRD_LAUNCH_AGENT_LABEL",
+        "com.technicalpickles.bowerbird.test-isolation",
+    );
 
     // A live, unrelated process whose pid we plant as a stale pid file (no flock).
     let mut victim = std::process::Command::new("sleep")
@@ -2099,7 +2110,6 @@ fn stop_ignores_stale_pid_file_without_flock_on_macos() {
     let victim_pid = victim.id() as i32;
     fs::write(data_dir.join("bowerbird.pid"), victim_pid.to_string()).expect("write stale pid");
 
-    let mut cmd = bowerbird_bin();
     cmd.arg("stop")
         .env("HOME", dir.path())
         .env("BOWERBIRD_DATA_DIR", &data_dir);
