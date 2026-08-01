@@ -1,6 +1,6 @@
 # Presenter authoring
 
-A *presenter* is any tool that connects to the bowerbird daemon and consumes its outbound surface: REST for history and snapshots, WebSocket for live events and state. This guide explains the pieces and how they compose. It's the second stop after the [Quickstart](quickstart.md) and the prerequisite for reading [`docs/cookbook/`](cookbook/), which gives end-to-end recipes.
+In the [Quickstart](quickstart.md) you watched a reference tool print live session state; now you're going to build a tool of your own. A *presenter* is any tool that connects to the bowerbird daemon and consumes its outbound surface: REST for history and snapshots, WebSocket for live events and state. This guide explains the pieces and how they compose, and is the prerequisite for reading [`docs/cookbook/`](cookbook/), which gives end-to-end recipes.
 
 The examples here use TypeScript on Node 22.6+, mirroring the three [cookbook entries](cookbook/) under `docs/cookbook/`. The substrate doesn't care what speaks WebSocket and JSON; any language with a JSON parser and a WebSocket client works the same way.
 

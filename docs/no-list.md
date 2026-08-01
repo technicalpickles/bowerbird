@@ -8,7 +8,7 @@ If you're proposing a new daemon responsibility, read this before opening the is
 
 **No Windows support.** No way to test it locally; better to scope-cut than ship something broken. Don't gratuitously write Windows-hostile code (path separators, line endings) but don't pay for it either. ([`project-context.md` §Scope cuts](bmad/project-context.md))
 
-**No distro packaging.** Homebrew (macOS) + prebuilt tarball + `cargo install --git` is the V1 distribution surface. Debian/Arch/nixpkgs are community-driven if they happen at all; the V1 maintainer does not have the bandwidth to chase distro-specific packaging conventions. ([`project-context.md` §Scope cuts](bmad/project-context.md))
+**No distro packaging.** Prebuilt tarball + `cargo install --git` is the V1 distribution surface. Homebrew, Debian, Arch, and nixpkgs are community-driven if they happen at all; the V1 maintainer does not have the bandwidth to chase distro-specific packaging conventions. ([`project-context.md` §Scope cuts](bmad/project-context.md))
 
 **No HITL (Human-In-The-Loop) backflow.** bowerbird is read-only from the agent's perspective. There is no inbound channel from tools to Claude Code — no way for a presenter to send a message, prompt, or intervention back. ([`project-context.md` §Scope cuts](bmad/project-context.md))
 
