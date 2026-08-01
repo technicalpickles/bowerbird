@@ -593,6 +593,11 @@ async fn write_inner(
         };
     let event_id = EventId(event_id_raw);
 
+    // CHAOS: revert before merge (Story 5.5 Task 2). Injected between commit
+    // and publish to prove the daemon bench regression gate fires; must
+    // never reach main.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
     // Post-commit publish. Event BEFORE State so a presenter consuming both
     // topics sees the triggering event before the resulting projection
     // update. `tokio::sync::broadcast` preserves per-channel order across
