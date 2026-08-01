@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
-  "solo_p99_nanos": 0,
-  "fanout3_p99_nanos": 0,
-  "burst_p99_nanos": 0,
-  "steady_p99_nanos": 0,
-  "samples": 50,
+  "solo_p99_nanos": 645682,
+  "fanout3_p99_nanos": 742273,
+  "burst_p99_nanos": 12594608,
+  "steady_p99_nanos": 830509,
+  "samples": 200,
   "absolute_budget_nanos": 100000000,
-  "regression_max_ratio": 1.30,
-  "_seeding_note": "p99 values are 0 (uninitialized) — the regression gate is auto-skipped per-shape until real values land. The absolute gate still enforces NFR2 (100ms). Seed by downloading the daemon-bench-ubuntu-latest artifact from the first green CI run and committing it here."
+  "regression_max_ratio": 2.0,
+  "_seeding_note": "Seeded 2026-07-31 (Story 5.5, lifting the 2026-07-28 punt) from the per-shape worst across EIGHT green n=200 ubuntu-latest runs spanning three windows: the five Story 5.18 no-change calibration runs (30599853185, 30600064861, 30600097130, 30600129141, 30600163266; 2026-07-30) plus three organic runs (30637058391 main 2026-07-31, 30680431096 PR #34 branch, 30680620908 post-merge main). Observed ranges: solo 0.394-0.646ms, fanout3 0.416-0.742ms, burst 4.092-12.595ms, steady 0.659-0.831ms. The ~40ms solo/fanout3/burst band that justified the punt (two independent runs, n=50-era harness) did NOT reproduce in any of the eight n=200 runs; either the old max-as-p99 gate was reporting the extreme tail or the runner image changed underneath (deferred-work.md evidence note, 2026-07-31). burst is seeded at its worst healthy observation (12.595ms, run 30600129141, a single cross-window tail outlier over a 4.1-5.1ms typical band) per the 5.18 policy: anchor seeds to the top of the healthy band so the ratio covers every healthy observation with margin. Ratio 2.0 matches the macOS post-incident calibration (burst cross-window spread here is 3.1x min-to-max, the same shape macOS measured): thresholds solo 1.29 / fanout3 1.48 / burst 25.19 / steady 1.66ms; a genuine 2x-over-worst regression still reds while the measured healthy spread passes. Do NOT chase a future red by bumping these p99 seeds upward (documented 2026-07-29 anti-pattern); recalibrate the ratio from fresh multi-window spread instead. The 100ms absolute gate (NFR2) is unaffected."
 }
