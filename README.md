@@ -6,7 +6,7 @@ sessions are observable by any tool you care to write, not locked inside
 one UI.
 
 **Try it in five minutes:** the [quickstart](docs/quickstart.md) takes you
-from install to live JSON state streaming out of a reference tool, against
+from install to live JSON state streaming out of a reference tool, using
 a bundled fixture. No Claude Code session required.
 
 Status: v0.1.0 release candidate.
@@ -27,7 +27,7 @@ a multi-session dashboard, a session log viewer: each is a small
 standalone program that subscribes to a stream, not a fork of anyone's
 UI. Three such tools ship as self-contained TypeScript reference entries
 under [`docs/cookbook/`](docs/cookbook/) (live state fan-out, REST
-cursor-pagination, Close/Dropped recovery).
+cursor-pagination, dropped-frame recovery).
 
 The daemon observes; it never interprets. Which sessions matter, what an
 event means, when to alert: those judgments belong to the tools you
@@ -160,16 +160,6 @@ macOS users see a one-time Keychain prompt; subsequent reads from the same
 binary path do not re-prompt. Retrieve the token with `bowerbird auth
 token` for tool configuration.
 
-## Reference examples
-
-Three TypeScript reference tools demonstrate the canonical patterns (Node 22.6+ required):
-
-```sh
-node --experimental-strip-types docs/cookbook/state-session-fanout/src/index.ts
-```
-
-See [`docs/cookbook/README.md`](docs/cookbook/README.md) for the full walkthrough: `state-session-fanout` (live state fan-out), `rest-cursor-pagination` (REST cursor-pagination + gap-detection), and `dropped-frame-recovery` (Close/Dropped → REST catch-up resilience).
-
 ## Documentation
 
 Routed by what you need right now:
@@ -180,7 +170,7 @@ Routed by what you need right now:
 
 **Solve a problem**
 
-- [docs/cookbook/](docs/cookbook/) is the recipe collection: each entry pairs a prose README with runnable reference code.
+- [docs/cookbook/](docs/cookbook/) is the recipe collection: each entry pairs a prose README with runnable reference code (TypeScript on Node 22.6+; the [cookbook index](docs/cookbook/README.md) walks all three entries).
 
 **Look it up**
 
@@ -197,9 +187,7 @@ Routed by what you need right now:
 ## Contributing
 
 V1 is solo-developed by pickles. Open issues at
-<https://github.com/technicalpickles/bowerbird/issues>. The Story-Automator
-under `docs/bmad/story-automator/` is how stories move from Epic →
-ready-for-dev → done.
+<https://github.com/technicalpickles/bowerbird/issues>.
 
 ## License
 

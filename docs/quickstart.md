@@ -2,7 +2,7 @@
 
 Install bowerbird, start the daemon, replay a bundled fixture, run a reference example, watch live JSON state. About five minutes end to end, install included. No Claude Code session required.
 
-The bundled fixture exists so you can exercise the pub/sub path without configuring Claude Code first. Once you have seen it work, [`bowerbird install`](../README.md#install) wires it into Claude Code's real hooks.
+The bundled fixture exists so you can exercise the pub/sub path without configuring Claude Code first. Once you have seen it work, [`bowerbird install`](../README.md#install) wires bowerbird into Claude Code's real hooks.
 
 ## Before you start
 
@@ -61,7 +61,7 @@ replayed 12 events from bundled-fixture
 export BOWERBIRD_TOKEN="$(bowerbird auth token | tr -d '\n')"
 ```
 
-The token lands in the variable, so the only visible output is a hint line such as `bowerbird: loaded token from system keychain` (macOS may show a one-time Keychain prompt; click Allow). Confirm the variable is set:
+The token lands in the variable, so the only visible output is a hint line such as `bowerbird: loaded token from system keychain`. macOS may show a one-time Keychain prompt; click Allow. Confirm the variable is set:
 
 ```sh
 echo $BOWERBIRD_TOKEN
@@ -77,7 +77,7 @@ In the same shell that ran step 3:
 node --experimental-strip-types docs/cookbook/state-session-fanout/src/index.ts
 ```
 
-The terminal prints a connect line, then one JSON object per line as the fixture's sessions get fanned out through the substrate:
+The terminal prints a connect line, then one JSON object per line as the fixture's session state gets fanned out through the substrate:
 
 ```
 connected to daemon 0.1.0 (protocol 1.0)
@@ -87,7 +87,7 @@ new session: claude/session-beta
 {"event":"state","source":"claude","session_id":"session-beta","current_state":"Idle","last_event_kind":"Stop"}
 ```
 
-You should now see `{event:"state",source:...,session_id:...}` JSON objects scrolling on stdout. If that line is missing, jump to the troubleshooting section at the bottom. Depending on timing you may also see both sessions move to `"current_state":"Ended"`: the fixture's recorded processes are long gone, and the daemon notices. Ctrl-C when you have seen enough.
+You should now see `{event:"state",source:...,session_id:...}` JSON objects scrolling on stdout. If no such line appears, jump to the troubleshooting section at the bottom. Depending on timing you may also see both sessions move to `"current_state":"Ended"`: the fixture's recorded processes are long gone, and the daemon notices. Ctrl-C when you have seen enough.
 
 ## Step 5: stop the daemon
 

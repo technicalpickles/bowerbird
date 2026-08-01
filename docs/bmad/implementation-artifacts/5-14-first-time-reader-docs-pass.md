@@ -129,6 +129,29 @@ Not applicable: docs-only story, no library or API surface. The only version-sen
 - [Source: docs/bmad/project-context.md#Documentation discipline] reader-path and doc-shape conventions.
 - Funnel survey 2026-08-01 (session artifact): reading-path inventory, staleness findings, test-pin map, friction list; findings folded into tasks above.
 
+## Review Findings
+
+### Editorial review (AC 5), 2026-08-01
+
+Skill invocations: `bmad-editorial-review-prose` and `bmad-editorial-review-structure`, both run against `README.md` + `docs/quickstart.md` with the story's Diátaxis lens and test-pin map as the effective style guide. Dispositions:
+
+**Prose (6 findings, all applied, none touched a pin):**
+
+1. README CTA "against a bundled fixture" -> "using a bundled fixture" (relationship was misreadable). APPLIED.
+2. README §Why "Close/Dropped recovery" -> "dropped-frame recovery" (names two wire frames the reader has not met; the shipped entry name is parseable without protocol knowledge). APPLIED (flagged as query; accepted).
+3. quickstart line 5 double-"it" -> second referent named ("wires bowerbird into"). APPLIED.
+4. quickstart step 3: "click Allow" action promoted out of a parenthetical into its own sentence. APPLIED.
+5. quickstart step 4 "If that line is missing" -> "If no such line appears" (ambiguous referent; pinned phrases in the preceding sentence untouched). APPLIED.
+6. quickstart step 4 "sessions get fanned out" -> "session state gets fanned out" (precision). APPLIED.
+
+**Structure (3 actionable findings):**
+
+1. CONDENSE README §Reference examples into §Documentation: mode-bleed in the router (runnable how-to command; three-pattern list appeared three times in one file). APPLIED: section removed, Node 22.6+ floor and the cookbook-index link folded into the §Documentation cookbook line; anchor check confirmed nothing links `#reference-examples`. Priority-1 by the story's own lens (Dev Notes: mode-bleed is a review finding).
+2. PRESERVE README §walkthrough (a-g): reference-mode in the router but doubly test-pinned; consolidation deferred post-tag (taskwarrior b4748a47). HONORED, no change.
+3. QUESTION README §Contributing Story-Automator sentence: maintainer-process detail a first-time reader cannot act on. APPLIED as a trim (sentence removed; issues link stays).
+
+Quickstart: no structural changes recommended (tutorial model holds). Doc-pin suites re-run green after all patches (16 + 13 passed); emdash sweep still clean.
+
 ## Dev Agent Record
 
 ### Agent Model Used
