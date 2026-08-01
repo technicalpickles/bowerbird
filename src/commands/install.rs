@@ -170,7 +170,7 @@ fn supervise_or_start(no_start: bool) -> anyhow::Result<()> {
     }
 
     let xml = launch_agent::render_launch_agent_plist(
-        launch_agent::LAUNCH_AGENT_LABEL,
+        &launch_agent::launch_agent_label(),
         &daemon_path,
         &data_dir_abs,
         &env,

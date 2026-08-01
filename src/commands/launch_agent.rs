@@ -24,6 +24,30 @@ use std::path::{Path, PathBuf};
 /// owner namespace (ADR 0007).
 pub const LAUNCH_AGENT_LABEL: &str = "com.technicalpickles.bowerbird.daemon";
 
+/// Resolve the effective LaunchAgent label: `BOWERBIRD_LAUNCH_AGENT_LABEL`
+/// env override (test isolation, mirrors `BOWERBIRD_LAUNCH_AGENTS_DIR`) or
+/// [`LAUNCH_AGENT_LABEL`]. Every launchd-addressing call site (plist path,
+/// bootout/kickstart/print targets, the rendered plist label) resolves
+/// through here, so a test running with an isolated label can never probe or
+/// boot out the developer's real agent (taskwarrior 2e9cfda3: cli_auth's
+/// isolated-HOME stop found the real rc3 agent Loaded, booted it out, and
+/// leaked its own TempDir daemon).
+#[cfg(target_os = "macos")]
+pub fn launch_agent_label() -> String {
+    launch_agent_label_with_override(std::env::var_os("BOWERBIRD_LAUNCH_AGENT_LABEL"))
+}
+
+/// [`launch_agent_label`] with the env override passed explicitly, so unit
+/// tests never mutate process env (same seam shape as
+/// `resolve_daemon_bin_absolute_with_override`). Cross-platform for Linux CI.
+#[cfg(any(target_os = "macos", test))]
+fn launch_agent_label_with_override(override_label: Option<std::ffi::OsString>) -> String {
+    match override_label {
+        Some(l) if !l.is_empty() => l.to_string_lossy().into_owned(),
+        _ => LAUNCH_AGENT_LABEL.to_string(),
+    }
+}
+
 /// Resolve the directory that holds per-user LaunchAgent plists.
 ///
 /// Order: `BOWERBIRD_LAUNCH_AGENTS_DIR` env override (test isolation, mirrors
@@ -42,7 +66,7 @@ pub fn launch_agents_dir() -> anyhow::Result<PathBuf> {
 /// Absolute path of the LaunchAgent plist (`<dir>/<label>.plist`).
 #[cfg(target_os = "macos")]
 pub fn plist_path() -> anyhow::Result<PathBuf> {
-    Ok(launch_agents_dir()?.join(format!("{LAUNCH_AGENT_LABEL}.plist")))
+    Ok(launch_agents_dir()?.join(format!("{}.plist", launch_agent_label())))
 }
 
 /// Resolve an **absolute** path to the `bowerbird-daemon` binary for the plist.
@@ -402,7 +426,7 @@ pub fn bootstrap_launch_agent(plist_path: &Path) -> anyhow::Result<()> {
 #[cfg(target_os = "macos")]
 pub fn bootout_launch_agent(plist_path: &Path) -> anyhow::Result<()> {
     let uid = current_uid();
-    let target = format!("gui/{uid}/{LAUNCH_AGENT_LABEL}");
+    let target = format!("gui/{uid}/{}", launch_agent_label());
 
     let modern = run_launchctl(&["bootout", &target])?;
     if modern.success {
@@ -453,7 +477,7 @@ pub fn bootout_launch_agent(plist_path: &Path) -> anyhow::Result<()> {
 #[cfg(target_os = "macos")]
 pub fn kickstart_launch_agent() -> anyhow::Result<()> {
     let uid = current_uid();
-    let target = format!("gui/{uid}/{LAUNCH_AGENT_LABEL}");
+    let target = format!("gui/{uid}/{}", launch_agent_label());
     let out = run_launchctl(&["kickstart", "-k", &target])?;
     if out.success {
         return Ok(());
@@ -542,7 +566,7 @@ pub fn launch_agent_load_state() -> LoadState {
 #[cfg(target_os = "macos")]
 pub fn launch_agent_running_pid() -> anyhow::Result<Option<i32>> {
     let uid = current_uid();
-    let target = format!("gui/{uid}/{LAUNCH_AGENT_LABEL}");
+    let target = format!("gui/{uid}/{}", launch_agent_label());
     let out = run_launchctl(&["print", &target])?;
     if out.success {
         return Ok(parse_launchctl_print_pid(&out.stdout));
@@ -561,7 +585,7 @@ pub fn launch_agent_running_pid() -> anyhow::Result<Option<i32>> {
 
 #[cfg(target_os = "macos")]
 fn agent_loaded(uid: u32) -> anyhow::Result<bool> {
-    let target = format!("gui/{uid}/{LAUNCH_AGENT_LABEL}");
+    let target = format!("gui/{uid}/{}", launch_agent_label());
     // A spawn failure propagates as Err ("cannot verify"). Exit 0 = loaded.
     let out = run_launchctl(&["print", &target])?;
     if out.success {
@@ -842,6 +866,23 @@ fn xml_unescape(s: &str) -> String {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    // taskwarrior 2e9cfda3: the label must be test-overridable or every
+    // integration suite that shells `bowerbird stop` probes (and boots out)
+    // the developer's REAL LaunchAgent. Same snapshot-injection seam shape as
+    // `resolve_daemon_bin_absolute_with_override` / `token::TokenEnv`.
+    #[test]
+    fn launch_agent_label_override_wins_only_when_nonempty() {
+        assert_eq!(
+            launch_agent_label_with_override(Some("com.example.test.label".into())),
+            "com.example.test.label"
+        );
+        assert_eq!(
+            launch_agent_label_with_override(Some("".into())),
+            LAUNCH_AGENT_LABEL
+        );
+        assert_eq!(launch_agent_label_with_override(None), LAUNCH_AGENT_LABEL);
+    }
 
     #[test]
     fn plist_is_well_formed_and_carries_required_keys() {
