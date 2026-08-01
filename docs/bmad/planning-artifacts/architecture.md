@@ -54,8 +54,9 @@ _This document builds collaboratively through step-by-step discovery. Sections a
 - **Installation & Configuration (FR27–FR30):** Prebuilt binaries +
   `cargo install`; daemon lifecycle commands; status/version CLI.
 - **Developer Tools & Experience (FR31–FR35):** `bowerbird replay` and
-  `bowerbird export`; three reference examples (multi-session router, event
-  log viewer, reconnect recovery); bundled fixtures; full documentation path.
+  `bowerbird export`; three self-contained cookbook entries (state-session
+  fan-out, REST cursor-pagination, dropped-frame recovery); bundled
+  fixtures; full documentation path.
 - **Protocol & Compatibility (FR36–FR39):** Additive-only guarantee within
   v1.x; Unix socket with filesystem auth; UUID4 bearer token for TCP surface;
   structured changelog CI-enforced.
@@ -769,7 +770,7 @@ session_id in their own logic if needed.
 
 ```
 bowerbird/
-├── Cargo.toml                          # workspace manifest; members = ["crates/*"] only; examples/ is a Node project zone, not a Cargo zone (see project-context.md §Example presenters)
+├── Cargo.toml                          # workspace manifest; members = ["crates/*"] only; docs/cookbook/*/ is a Node project zone, not a Cargo zone (see project-context.md §Example presenters)
 ├── Cargo.lock                          # committed; reproducible builds
 ├── rust-toolchain.toml                 # stable channel pin
 ├── .github/
@@ -781,32 +782,18 @@ bowerbird/
 │   ├── hook_post_tool_use.json
 │   ├── hook_stop.json
 │   └── event_log_sample.db             # SQLite fixture for replay/export demos
-├── examples/                           # TypeScript presenters; Node 22.6+; smoke-tested in CI
-│   ├── .gitignore                      # node_modules/, *.log
-│   ├── README.md                       # overview; reconciliation note vs prior arch draft
-│   ├── multi-session-router/
-│   │   ├── package.json                # engines.node >= 22.6.0; type: module
-│   │   ├── tsconfig.json               # strict, noEmit (Node strips types at runtime)
-│   │   ├── README.md
-│   │   └── src/
-│   │       └── index.ts                # cookbook-begin:state-session-fanout
-│   ├── event-log-viewer/
-│   │   ├── package.json
-│   │   ├── tsconfig.json
-│   │   ├── README.md
-│   │   └── src/
-│   │       └── index.ts                # cookbook-begin:rest-cursor-pagination
-│   └── reconnect-recovery/
-│       ├── package.json
-│       ├── tsconfig.json
-│       ├── README.md
-│       ├── src/
-│       │   └── index.ts                # cookbook-begin:dropped-frame-recovery
-│       └── tests/
-│           └── recover.test.ts         # node --test; covers the Dropped branch
 ├── docs/
 │   ├── decisions/                      # ADRs (0001, 0002, 0003, ...)
-│   ├── cookbook/                       # recipes paired with examples
+│   ├── cookbook/                       # self-contained pattern directories; prose README colocated with runnable code
+│   │   ├── README.md                   # index of cookbook entries
+│   │   ├── state-session-fanout/       # representative entry; rest-cursor-pagination/ and dropped-frame-recovery/ follow the same shape
+│   │   │   ├── README.md               # what this is / how to run it / how it works / how to apply it
+│   │   │   ├── package.json            # engines.node >= 22.6.0; type: module
+│   │   │   ├── tsconfig.json           # strict, noEmit (Node strips types at runtime)
+│   │   │   └── src/
+│   │   │       └── index.ts            # canonical runnable pattern code, smoke-tested in CI
+│   │   ├── rest-cursor-pagination/      # same shape as state-session-fanout/
+│   │   └── dropped-frame-recovery/      # same shape, plus tests/recover.test.ts
 │   ├── quickstart.md                   # 5-minute walkthrough
 │   ├── presenter-authoring.md          # conceptual tool-building guide
 │   ├── protocol.md                     # wire-surface reference (REST + WS + ingest)
@@ -923,7 +910,7 @@ Workspace-root tests for the CLI:
 
 | Location | Contains | Used by |
 |---|---|---|
-| `fixtures/` (workspace root) | Shared hook payloads + demo SQLite | `examples/*/` (runtime read by Node via fs.readFile when needed; primary path is `bowerbird replay` which embeds the fixture compile-time), `bowerbird/tests/integration/` |
+| `fixtures/` (workspace root) | Shared hook payloads + demo SQLite | `docs/cookbook/*/` (runtime read by Node via fs.readFile when needed; primary path is `bowerbird replay` which embeds the fixture compile-time), `bowerbird/tests/integration/` |
 | `crates/adapter-claude/tests/fixtures/` | Adapter-specific raw payloads | `contract_adapter.rs` only; loaded via `include_str!` |
 
 No overlap. No symlinks. Workspace root fixtures are the single authoritative source for anything shared across crates.
@@ -954,8 +941,8 @@ No overlap. No symlinks. Workspace root fixtures are the single authoritative so
 - `crates/protocol/src/constants.rs` owns `SHIM_BINARY_NAME` — single authoritative string used by `adapter-claude/src/install.rs`. No duplication across crates.
 
 **Examples boundary:**
-- `examples/*/` are TypeScript projects on Node 22.6+; the workspace root's `[workspace] members = ["crates/*"]` deliberately excludes them — `examples/` is a Node project zone, not a Cargo zone
-- Hand-write the ~30 lines of TypeScript interface declarations they need per example (no shared SDK, per project-context.md §Example presenters)
+- `docs/cookbook/*/` are TypeScript projects on Node 22.6+; the workspace root's `[workspace] members = ["crates/*"]` deliberately excludes them: `docs/cookbook/*/` is a Node project zone, not a Cargo zone
+- Hand-write the ~30 lines of TypeScript interface declarations they need per entry (no shared SDK, per project-context.md §Example presenters)
 - Consume the WS + REST surfaces via Node's built-in `WebSocket` and `fetch`; no runtime npm dependencies
 - Smoke-tested in CI via `tests/cli_examples.rs` (Rust orchestrates daemon + Node subprocess); break loudly on protocol-shape changes via the smoke's stdout-shape assertions
 
@@ -969,7 +956,7 @@ No overlap. No symlinks. Workspace root fixtures are the single authoritative so
 | FR18–FR23: REST + history | `crates/daemon/src/api/sessions.rs`, `events.rs`, `health.rs` |
 | FR24–FR26: Session tracking | `crates/daemon/src/projection/session.rs` (UPSERT) |
 | FR27–FR30: Install + lifecycle | `src/commands/{install,uninstall,start,stop,status,daemon}.rs`, `crates/adapter-claude/src/install.rs`, `crates/daemon/src/{singleton,server_file,config_file}.rs` |
-| FR31–FR35: Developer tools + examples | `src/commands/{replay,export}.rs` (Story 4.1); `examples/*/` (Story 4.2, TypeScript on Node 22.6+); `docs/{quickstart,presenter-authoring,protocol,no-list}.md` + `docs/cookbook/` (Story 4.3) |
+| FR31–FR35: Developer tools + examples | `src/commands/{replay,export}.rs` (Story 4.1); `docs/cookbook/*/` (Story 4.2, TypeScript on Node 22.6+; consolidated into `docs/cookbook/` by Story 5.13); `docs/{quickstart,presenter-authoring,protocol,no-list}.md` (Story 4.3) |
 | FR36–FR39: Protocol compat | `crates/protocol/` (wire types + constants) |
 
 ### Data Flow
@@ -1036,7 +1023,7 @@ on a single OS thread. All SQLite access goes through the deadpool-sqlite pool
 | FR18–FR23: REST history | api/sessions.rs + events.rs + health.rs; EventListResponse ✅ |
 | FR24–FR26: Session tracking | projection/session.rs UPSERT; no stuck state on missing PostToolUse or Stop (5-min stale-Working fallback); **Story 5.3**: daemon-observed liveness via 5s `kill(pid, 0)` probe → `SessionEnded`; `Notification → WaitingInput` is typed-`notification_type`-driven; `PostToolUse → Working` unconditionally ✅ |
 | FR27–FR30: Install/lifecycle | commands/daemon.rs + adapter-claude/install.rs + config.rs ✅ |
-| FR31–FR35: Developer tools | replay.rs + export.rs + examples/ TypeScript projects + fixtures/ ✅ |
+| FR31–FR35: Developer tools | replay.rs + export.rs + docs/cookbook/*/ TypeScript projects + fixtures/ ✅ |
 | FR36–FR39: Protocol compat | protocol/ wire types + additive serde + CHANGELOG CI gate ✅ |
 
 **NFR coverage:** Shim p95 <5ms → criterion benchmark gate. Daemon 2s readiness
@@ -1085,7 +1072,7 @@ Ratified by [ADR-0002](../../decisions/0002-ingest-wire-framing-and-hook-kind.md
 - [x] Process patterns documented (transaction invariant; exit codes; tracing skip_all; bearer token type)
 
 **Project Structure**
-- [x] Complete directory structure defined (file-level for all 5 crates + examples + fixtures)
+- [x] Complete directory structure defined (file-level for all 5 crates + docs/cookbook/ entries + fixtures)
 - [x] Component boundaries established (ingest; normalization; persistence; API; broadcast)
 - [x] Integration points mapped (data flow diagram; boundary descriptions)
 - [x] Requirements to structure mapping complete (FR group → file table)

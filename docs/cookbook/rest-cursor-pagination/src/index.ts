@@ -10,7 +10,7 @@
 //
 //     bowerbird start
 //     bowerbird replay
-//     node --experimental-strip-types examples/event-log-viewer/src/index.ts [session-id]
+//     node --experimental-strip-types docs/cookbook/rest-cursor-pagination/src/index.ts [session-id]
 //
 // Default session id is `session-alpha` (matches the bundled fixture).
 //
@@ -90,7 +90,6 @@ async function main(sessionId: string): Promise<void> {
   const token = resolveToken();
   const auth = `Bearer ${token}`;
 
-  // cookbook-begin:rest-cursor-pagination
   let since = 0;
   let firstResponse = true;
   while (true) {
@@ -145,7 +144,6 @@ async function main(sessionId: string): Promise<void> {
     }
     since = body.cursor;
   }
-  // cookbook-end:rest-cursor-pagination
 }
 
 const sessionId = process.argv[2] ?? "session-alpha";

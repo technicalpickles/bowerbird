@@ -1,19 +1,19 @@
-//! Hermetic doc-drift guardrails for the Story 4.3 documentation suite.
+//! Hermetic doc-drift guardrails for the Story 4.3 documentation suite,
+//! updated for Story 5.13's cookbook consolidation.
 //!
-//! No daemon, no Node, no network. Asserts the five required docs exist,
-//! cookbook entries follow the canonical four-section shape, cookbook code
-//! blocks are byte-identical to their anchored example regions, the
-//! cookbook-anchor consumption is bidirectional (every anchor in
-//! `examples/*` is consumed by exactly one cookbook entry; every directive
-//! resolves to an anchor), internal markdown links in the docs resolve to
-//! files on disk, and architecture.md's `docs/` tree matches the shipped
-//! surface (not the stale `docs/architecture/` + `docs/api/` placeholders).
+//! No daemon, no Node, no network. Asserts the required docs exist,
+//! cookbook entry READMEs follow the canonical five-section shape (prose
+//! only: code lives in the colocated `src/index.ts`, so a TypeScript
+//! fenced block in a README is drift), internal markdown links in the
+//! docs resolve to files on disk, and architecture.md's `docs/` tree
+//! matches the shipped surface (not the stale `docs/architecture/` +
+//! `docs/api/` placeholders).
 //!
-//! Mirrors `tests/cli_examples_drift.rs` shape (Story 4.2). The
-//! example-side anchor-existence test lives there; this crate is the
-//! consumer-side counterpart.
+//! The pre-5.13 byte-identity drift-check between cookbook code blocks and
+//! example anchor regions is gone: there is no duplicated code to check
+//! anymore. `tests/cli_examples_drift.rs` remains the entry-side
+//! counterpart (required files, engines floor, Cargo-zone boundary).
 
-use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -35,37 +35,10 @@ const REQUIRED_DOCS: &[&str] = &[
 ];
 
 const REQUIRED_COOKBOOK_ENTRIES: &[&str] = &[
-    "docs/cookbook/state-session-fanout.md",
-    "docs/cookbook/rest-cursor-pagination.md",
-    "docs/cookbook/dropped-frame-recovery.md",
+    "docs/cookbook/state-session-fanout/README.md",
+    "docs/cookbook/rest-cursor-pagination/README.md",
+    "docs/cookbook/dropped-frame-recovery/README.md",
 ];
-
-const EXAMPLE_SOURCES: &[&str] = &[
-    "examples/multi-session-router/src/index.ts",
-    "examples/event-log-viewer/src/index.ts",
-    "examples/reconnect-recovery/src/index.ts",
-];
-
-/// The set of markdown files allowed to consume cookbook anchors. The
-/// presenter-authoring guide is included so future Task 2.9-style usage
-/// works without a test-side change.
-fn cookbook_consumer_files() -> Vec<PathBuf> {
-    let root = workspace_root();
-    let mut files: Vec<PathBuf> = Vec::new();
-    let cookbook_dir = root.join("docs/cookbook");
-    for entry in fs::read_dir(&cookbook_dir)
-        .unwrap_or_else(|e| panic!("read_dir {}: {e}", cookbook_dir.display()))
-    {
-        let path = entry.expect("dir entry").path();
-        if path.extension().and_then(|s| s.to_str()) == Some("md")
-            && path.file_name().and_then(|s| s.to_str()) != Some("README.md")
-        {
-            files.push(path);
-        }
-    }
-    files.push(root.join("docs/presenter-authoring.md"));
-    files
-}
 
 #[test]
 fn required_docs_exist() {
@@ -73,20 +46,25 @@ fn required_docs_exist() {
         let p = workspace_root().join(rel);
         assert!(
             p.is_file(),
-            "Story 4.3 required doc missing: {} — Task 1-5 must land all \
-             five top-level docs plus the three cookbook entries before \
-             this test passes",
+            "Story 4.3/5.13 required doc missing: {}; the five top-level \
+             docs plus the three per-entry cookbook READMEs must all exist",
             p.display(),
         );
     }
 }
 
 #[test]
-fn every_cookbook_entry_has_canonical_four_sections() {
-    // The project-context.md §Cookbook discipline shape: four level-2
-    // headings in this order. README.md is exempt — it has its own table
-    // shape, not a recipe shape.
-    const SECTIONS: &[&str] = &["## Problem", "## Approach", "## Code", "## Variants"];
+fn every_cookbook_entry_has_canonical_five_sections() {
+    // The post-5.13 project-context.md §Cookbook discipline shape: five
+    // level-2 headings in this order, prose only. The index README.md is
+    // exempt (it has its own table shape, not a recipe shape).
+    const SECTIONS: &[&str] = &[
+        "## What this is",
+        "## Run it",
+        "## How it works",
+        "## How to apply it",
+        "## Files",
+    ];
 
     for rel in REQUIRED_COOKBOOK_ENTRIES {
         let body = read_workspace_file(rel);
@@ -100,281 +78,24 @@ fn every_cookbook_entry_has_canonical_four_sections() {
             seen,
             SECTIONS.len(),
             "{rel} missing canonical section ordering. Expected (in order): \
-             {SECTIONS:?}. Found {seen} of {} sections in the right order — \
+             {SECTIONS:?}. Found {seen} of {} sections in the right order; \
              the next missing one is `{}`.",
             SECTIONS.len(),
             SECTIONS.get(seen).copied().unwrap_or("(none)"),
         );
-    }
-}
 
-/// A cookbook-include directive found in a markdown file. The owning file
-/// is tracked by the caller (the directive is meaningful only relative to
-/// that file's parent dir).
-#[derive(Debug, Clone)]
-struct Directive {
-    /// Relative path the directive references (verbatim, as written).
-    referenced_path: String,
-    /// Anchor name (the `<anchor>` in `cookbook-begin:<anchor>`).
-    anchor: String,
-    /// Byte offset in the markdown body immediately after the directive line.
-    after_directive_offset: usize,
-}
-
-/// Find every `<!-- cookbook-include: <path> cookbook-begin:<anchor> -->`
-/// directive in the markdown body. Hand-rolled scan; no regex dep.
-fn find_directives(body: &str) -> Vec<Directive> {
-    const START: &str = "<!-- cookbook-include: ";
-    const MID: &str = " cookbook-begin:";
-    const END: &str = " -->";
-
-    let mut directives = Vec::new();
-    let mut cursor = 0usize;
-    while let Some(start_rel) = body[cursor..].find(START) {
-        let start = cursor + start_rel;
-        let after_start = start + START.len();
-        let Some(mid_rel) = body[after_start..].find(MID) else {
-            cursor = after_start;
-            continue;
-        };
-        let mid = after_start + mid_rel;
-        let referenced_path = body[after_start..mid].trim().to_string();
-
-        let after_mid = mid + MID.len();
-        let Some(end_rel) = body[after_mid..].find(END) else {
-            cursor = after_mid;
-            continue;
-        };
-        let end = after_mid + end_rel;
-        let anchor = body[after_mid..end].trim().to_string();
-
-        // Advance to the end of the directive line so the next-fenced-block
-        // search starts after the directive.
-        let after_directive = end + END.len();
-        let after_directive_offset = body[after_directive..]
-            .find('\n')
-            .map(|i| after_directive + i + 1)
-            .unwrap_or(body.len());
-
-        directives.push(Directive {
-            referenced_path,
-            anchor,
-            after_directive_offset,
-        });
-
-        cursor = after_directive_offset;
-    }
-    directives
-}
-
-/// Extract the body of the next fenced code block starting at or after
-/// `from_offset`. Permissive about the language tag — accepts ```ts or ```
-/// or anything else (the directive identifies the snippet, not the lang
-/// hint). Returns the inner body trimmed of leading/trailing blank lines,
-/// or None if no fence is found.
-fn next_fenced_block_body(body: &str, from_offset: usize) -> Option<String> {
-    let tail = &body[from_offset..];
-    // Find an opening fence on its own line (allow whitespace prefix).
-    let mut search_from = 0usize;
-    loop {
-        let fence_rel = tail[search_from..].find("```")?;
-        let fence_pos = search_from + fence_rel;
-        // Confirm the fence is at line start (or only whitespace before it
-        // on the line).
-        let line_start = tail[..fence_pos].rfind('\n').map_or(0, |i| i + 1);
-        let pre_fence = &tail[line_start..fence_pos];
-        if !pre_fence.chars().all(char::is_whitespace) {
-            search_from = fence_pos + 3;
-            continue;
-        }
-        // Skip to end of opening-fence line (consumes the language tag).
-        let after_open_line = tail[fence_pos..].find('\n').map(|i| fence_pos + i + 1)?;
-        // Find the closing ``` on its own line.
-        let mut close_search_from = after_open_line;
-        loop {
-            let close_rel = tail[close_search_from..].find("```")?;
-            let close_pos = close_search_from + close_rel;
-            let close_line_start = tail[..close_pos].rfind('\n').map_or(0, |i| i + 1);
-            let close_pre_fence = &tail[close_line_start..close_pos];
-            if !close_pre_fence.chars().all(char::is_whitespace) {
-                close_search_from = close_pos + 3;
-                continue;
-            }
-            return Some(tail[after_open_line..close_line_start].to_string());
-        }
-    }
-}
-
-/// Extract the body between `// cookbook-begin:<anchor>` and
-/// `// cookbook-end:<anchor>` in a TypeScript source file. Returns None if
-/// either marker is missing or the begin marker is after the end marker.
-fn extract_anchored_region(ts_body: &str, anchor: &str) -> Option<String> {
-    let begin_marker = format!("// cookbook-begin:{anchor}");
-    let end_marker = format!("// cookbook-end:{anchor}");
-    let begin_line_start = ts_body.find(&begin_marker)?;
-    let after_begin_line = ts_body[begin_line_start..]
-        .find('\n')
-        .map(|i| begin_line_start + i + 1)?;
-    let end_line_start = ts_body[after_begin_line..].find(&end_marker)? + after_begin_line;
-    let end_line_real_start = ts_body[..end_line_start].rfind('\n').map_or(0, |i| i + 1);
-    if end_line_real_start <= after_begin_line {
-        return None;
-    }
-    Some(ts_body[after_begin_line..end_line_real_start].to_string())
-}
-
-#[test]
-fn cookbook_include_directives_match_example_anchors() {
-    use pretty_assertions::assert_eq;
-
-    let mut total_directives = 0usize;
-    for md_path in cookbook_consumer_files() {
-        let md_body = match fs::read_to_string(&md_path) {
-            Ok(s) => s,
-            Err(_) => continue, // presenter-authoring.md may not exist in early dev; skip silently
-        };
-        for directive in find_directives(&md_body) {
-            total_directives += 1;
-            let ts_path = md_path
-                .parent()
-                .expect("markdown parent")
-                .join(&directive.referenced_path);
-            let ts_canon = ts_path.canonicalize().unwrap_or_else(|e| {
-                panic!(
-                    "directive in {} references {} which cannot be resolved: {e}",
-                    md_path.display(),
-                    ts_path.display(),
-                )
-            });
-            let ts_body = fs::read_to_string(&ts_canon)
-                .unwrap_or_else(|e| panic!("read {}: {e}", ts_canon.display()));
-            let anchored = extract_anchored_region(&ts_body, &directive.anchor)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "no `cookbook-begin:{}` / `cookbook-end:{}` pair in {} (directive lives in {})",
-                        directive.anchor,
-                        directive.anchor,
-                        ts_canon.display(),
-                        md_path.display(),
-                    )
-                });
-            let fenced = next_fenced_block_body(&md_body, directive.after_directive_offset)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "no fenced code block found after `cookbook-include` directive for \
-                         anchor `{}` in {} — every cookbook-include must be followed by a \
-                         ```ts (or ```) fenced block",
-                        directive.anchor,
-                        md_path.display(),
-                    )
-                });
-
-            // Normalize leading/trailing whitespace per AC #6c. Internal
-            // whitespace and newlines are preserved.
-            let lhs = anchored.trim();
-            let rhs = fenced.trim();
-            assert_eq!(
-                lhs,
-                rhs,
-                "cookbook drift detected: anchor `{}` in {} disagrees with fenced block in {}. \
-                 The fenced block MUST be byte-identical to the example's anchored region \
-                 (leading/trailing whitespace normalized). Either update the cookbook entry \
-                 to match the example, or update the example's anchored region and re-run \
-                 this test.",
-                directive.anchor,
-                ts_canon.display(),
-                md_path.display(),
+        // Prose-only invariant: the runnable code lives in the colocated
+        // src/index.ts, never embedded in the README. A ```ts fence here is
+        // the Story 4.3 copy-paste shape sneaking back in (Story 5.13 AC 3).
+        for fence in ["```ts", "```typescript"] {
+            assert!(
+                !body.contains(fence),
+                "{rel} embeds a TypeScript fenced block (`{fence}`); cookbook \
+                 READMEs are prose-only, readers open src/index.ts for code \
+                 (Story 5.13 consolidation contract)"
             );
         }
     }
-    assert!(
-        total_directives > 0,
-        "no cookbook-include directives found across any consumer file — \
-         the cookbook entries must use the directive to enforce drift-detection",
-    );
-}
-
-#[test]
-fn every_cookbook_anchor_in_examples_has_a_cookbook_entry() {
-    // Bidirectional integrity. Pairs with
-    // tests/cli_examples_drift.rs::each_example_source_carries_cookbook_anchors
-    // — that test asserts the markers EXIST; this asserts they are CONSUMED.
-
-    // 1. Collect every anchor name from every example src/index.ts.
-    let mut example_anchors: Vec<(String, PathBuf)> = Vec::new();
-    for ex in EXAMPLE_SOURCES {
-        let path = workspace_root().join(ex);
-        let body =
-            fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        for line in body.lines() {
-            const BEGIN: &str = "// cookbook-begin:";
-            if let Some(idx) = line.find(BEGIN) {
-                let anchor = line[idx + BEGIN.len()..].trim().to_string();
-                example_anchors.push((anchor, path.clone()));
-            }
-        }
-    }
-
-    // 2. Collect every directive across the consumer files (cookbook
-    //    entries + presenter-authoring.md).
-    let mut consumers: HashMap<String, Vec<PathBuf>> = HashMap::new();
-    for md_path in cookbook_consumer_files() {
-        let body = match fs::read_to_string(&md_path) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        for directive in find_directives(&body) {
-            consumers
-                .entry(directive.anchor)
-                .or_default()
-                .push(md_path.clone());
-        }
-    }
-
-    // 3. Assert each example anchor has EXACTLY ONE consumer.
-    let mut orphan_msgs: Vec<String> = Vec::new();
-    for (anchor, ex_path) in &example_anchors {
-        match consumers.get(anchor).map(Vec::as_slice).unwrap_or(&[]) {
-            [] => orphan_msgs.push(format!(
-                "anchor `{anchor}` in {} is not referenced by any cookbook entry \
-                 (or `docs/presenter-authoring.md`) — either consume it via a \
-                 `<!-- cookbook-include: ... cookbook-begin:{anchor} -->` directive \
-                 or remove the anchor markers from the example",
-                ex_path.display(),
-            )),
-            [_] => { /* exactly one consumer — good */ }
-            many => orphan_msgs.push(format!(
-                "anchor `{anchor}` in {} is consumed by {} files (expected exactly 1): {:?}",
-                ex_path.display(),
-                many.len(),
-                many.iter()
-                    .map(|p| p.display().to_string())
-                    .collect::<Vec<_>>(),
-            )),
-        }
-    }
-
-    // 4. Assert no directive references an anchor that doesn't exist in
-    //    examples (catches typos in directive anchor names).
-    let example_anchor_names: HashSet<&str> =
-        example_anchors.iter().map(|(a, _)| a.as_str()).collect();
-    for (anchor, md_paths) in &consumers {
-        if !example_anchor_names.contains(anchor.as_str()) {
-            for md_path in md_paths {
-                orphan_msgs.push(format!(
-                    "directive in {} references anchor `{anchor}` which does NOT exist in \
-                     any example src/index.ts — typo, or the anchor was removed",
-                    md_path.display(),
-                ));
-            }
-        }
-    }
-
-    assert!(
-        orphan_msgs.is_empty(),
-        "cookbook-anchor bidirectional integrity violations:\n  - {}",
-        orphan_msgs.join("\n  - "),
-    );
 }
 
 #[test]
@@ -390,9 +111,9 @@ fn quickstart_internal_links_resolve() {
         "docs/protocol.md",
         "docs/cookbook/README.md",
         "docs/no-list.md",
-        "docs/cookbook/state-session-fanout.md",
-        "docs/cookbook/rest-cursor-pagination.md",
-        "docs/cookbook/dropped-frame-recovery.md",
+        "docs/cookbook/state-session-fanout/README.md",
+        "docs/cookbook/rest-cursor-pagination/README.md",
+        "docs/cookbook/dropped-frame-recovery/README.md",
     ];
 
     let mut failures: Vec<String> = Vec::new();
@@ -726,24 +447,20 @@ fn no_list_enumerates_thirteen_scope_cuts_with_intentional_framing() {
 }
 
 #[test]
-fn cookbook_readme_lists_three_required_entries_paired_with_examples() {
-    // AC #4: the cookbook's README is the entry-surface index. It must
-    // table-list the three V1 entries paired with their example tools so a
-    // reader sees the surface area at a glance. Drift here = silent loss
-    // of discoverability for one of the three patterns.
+fn cookbook_readme_lists_three_required_entries() {
+    // AC #4 (Story 4.3), reshaped by Story 5.13: the cookbook's README is
+    // the entry-surface index. It must link the three self-contained entry
+    // directories so a reader sees the surface area at a glance. Drift
+    // here = silent loss of discoverability for one of the three patterns.
     let body = read_workspace_file("docs/cookbook/README.md");
     assert_contains_all(
-        "docs/cookbook/README.md AC #4 — three entries paired with examples",
+        "docs/cookbook/README.md index markers; three entry directories",
         &body,
         &[
-            // Three cookbook entries (markdown link targets).
-            "state-session-fanout.md",
-            "rest-cursor-pagination.md",
-            "dropped-frame-recovery.md",
-            // Three paired example directories.
-            "multi-session-router",
-            "event-log-viewer",
-            "reconnect-recovery",
+            // Three entry directories (markdown link targets).
+            "state-session-fanout/",
+            "rest-cursor-pagination/",
+            "dropped-frame-recovery/",
         ],
     );
 }

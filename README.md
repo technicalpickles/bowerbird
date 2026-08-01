@@ -3,9 +3,9 @@
 bowerbird is a local-only substrate that captures Claude Code activity over
 Unix-socket hook events, normalizes them via the `adapter-claude` crate,
 persists them in WAL-mode SQLite, and broadcasts them to subscribed tools over
-an authenticated WebSocket. Three TypeScript reference examples under
-[`examples/`](examples/) demonstrate the canonical patterns (live state
-fan-out, REST cursor-pagination, Close/Dropped recovery).
+an authenticated WebSocket. Three self-contained TypeScript cookbook entries
+under [`docs/cookbook/`](docs/cookbook/) demonstrate the canonical patterns
+(live state fan-out, REST cursor-pagination, Close/Dropped recovery).
 
 Status: V1 in development. See
 [`docs/bmad/planning-artifacts/epics.md`](docs/bmad/planning-artifacts/epics.md)
@@ -160,10 +160,10 @@ token` for tool configuration.
 Three TypeScript reference tools demonstrate the canonical patterns (Node 22.6+ required):
 
 ```sh
-node --experimental-strip-types examples/multi-session-router/src/index.ts
+node --experimental-strip-types docs/cookbook/state-session-fanout/src/index.ts
 ```
 
-See [`examples/README.md`](examples/README.md) for the full walkthrough — `multi-session-router` (live state fan-out), `event-log-viewer` (REST cursor-pagination + gap-detection), and `reconnect-recovery` (Close/Dropped → REST catch-up resilience).
+See [`docs/cookbook/README.md`](docs/cookbook/README.md) for the full walkthrough: `state-session-fanout` (live state fan-out), `rest-cursor-pagination` (REST cursor-pagination + gap-detection), and `dropped-frame-recovery` (Close/Dropped → REST catch-up resilience).
 
 ## Documentation
 

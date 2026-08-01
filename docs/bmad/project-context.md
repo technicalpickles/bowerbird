@@ -200,7 +200,7 @@ TOML for `adapters/<source>/*.toml` (capabilities, tool-reactions, settings-merg
 
 ### Example presenters: TypeScript on Node — Proposed
 
-TypeScript, runs on Node. Lives in `examples/`. No build step beyond `tsc`.
+TypeScript, runs on Node. Lives in `docs/cookbook/<name>/`, colocated with each cookbook entry's README (Story 5.13 consolidation, ADR 0010). No build step beyond `tsc`.
 
 **Why:** Most presenter authors reach for Node first; that's where the docs land. The substrate doesn't care what speaks WebSocket+JSON, so this is purely an *example-language* choice, not a protocol constraint. (Earlier draft said "Bun-compatible" — that's a deployment detail; Node is the actual target.)
 
@@ -255,15 +255,15 @@ bowerbird/
 │   └── adapter-claude/     # reference adapter
 ├── adapters/
 │   └── claude/             # TOML data files (capabilities, tool-reactions)
-├── examples/               # tested in CI; cookbook entries reference these
 └── docs/
     ├── design/             # design rationale (currently in docs/research/)
     ├── decisions/          # ADRs for load-bearing choices
-    ├── cookbook/           # how-to recipes for presenter authors
+    ├── cookbook/           # self-contained recipes; per-entry prose README + runnable code
+    │   └── <name>/         # README.md + src/index.ts + package.json + tsconfig.json; CI-tested
     └── no-list.md          # what we deliberately don't do
 ```
 
-**Why this shape:** The protocol crate is the stable surface — anything in it is part of the public API and changes need an ADR. The shim is isolated because its rules are radically different from the daemon. One adapter per crate keeps adapter-specific logic contained.
+**Why this shape:** The protocol crate is the stable surface: anything in it is part of the public API and changes need an ADR. The shim is isolated because its rules are radically different from the daemon. One adapter per crate keeps adapter-specific logic contained. The cookbook colocates each pattern's prose and runnable code in one directory (Story 5.13, ADR 0010), so there is no separate examples surface to keep in sync.
 
 ---
 
@@ -320,7 +320,7 @@ CI must:
 - Run `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --workspace`.
 - Compile all benches (`cargo bench --no-run`).
 - Run the shim hot-path bench and fail on p95 regression.
-- Run the end-to-end smoke test for every example presenter in `examples/`.
+- Run the end-to-end smoke test for every cookbook entry presenter in `docs/cookbook/*/`.
 - Run `shellcheck` on every committed shell script.
 
 **Platform divergence hazards to watch:** process spawn timing differs across macOS and Linux runners (report perf separately, don't average them); APFS is case-insensitive by default, ext4 isn't; signal/process-group behavior differs; WAL breaks on network filesystems (`~/.bowerbird` on SMB — detect and refuse, or document loudly).
@@ -531,28 +531,26 @@ crates/adapter-<source>/
 
 Each adapter's README documents the source-specific oddities (Codex uses TOML for its own settings; OpenCode requires a plugin instead of a hook shim). The adapter-authoring guide (`docs/adapter-authoring.md`) is the entry point.
 
-#### Cookbook discipline — Proposed
+#### Cookbook discipline (Accepted: Story 5.13, ADR 0010)
 
-Examples in `examples/` are the source of truth. Cookbook entries explain them. **Do not hand-copy snippets** — they rot.
+Each cookbook entry is one self-contained directory under `docs/cookbook/<name>/`, containing both the prose `README.md` and the runnable code (`src/index.ts`, `package.json`, `tsconfig.json`, plus sidecar files like `tests/`). The README explains what the pattern is and how to apply it; the code under `src/` is the canonical executable form. There is no separate examples surface and no duplicated snippets, so there is nothing to inline and no drift to check: readers who want code open `src/index.ts` directly.
 
-But: a bare hyperlink ("see `examples/lamp-pulse/`") is the wrong execution. Readers want code on the page, not a tab they have to open. Use one of:
+What keeps entries honest, on every PR:
 
-- **mdBook-style include directives** with line anchors: `{{#include examples/lamp-pulse/src/main.rs:13:38}}`.
-- **Marked regions**: `// cookbook-begin: signal-subscribe` … `// cookbook-end` plus a tiny build step that inlines them at doc-build time.
+- CI typechecks each entry (`tsc --noEmit`, the `typecheck-examples` job).
+- The workspace-root smoke crate `tests/cli_examples.rs` runs each entry against a real daemon end to end.
+- `tests/cli_docs_drift.rs` pins the README shape (five sections, below) and rejects embedded TypeScript fences, so the copy-paste shape cannot sneak back in.
 
-Either way: examples are still the canonical code, cookbook entries still get inlined snippets, drift breaks the build (CI fails if any anchor goes missing).
+**Reference by function name, not line number.** `see recover() in docs/cookbook/dropped-frame-recovery/src/index.ts`. Line numbers drift; function names don't. This is the cross-reference rule between docs (presenter-authoring.md citing entry code, entries citing each other).
 
-**Reference by function name, not line number.** `see fan_out_with_backpressure() in examples/ws-fanout.rs`. Line numbers drift; function names don't (and renames fail the build via include anchors).
+**Cookbook entry README shape** (prose only; pinned by CI):
+1. **What this is**: the problem plus what the entry demonstrates.
+2. **Run it**: commands, expected output, troubleshooting.
+3. **How it works**: which substrate signals and why; how the code is organized.
+4. **How to apply it**: one or two notes on adapting the pattern.
+5. **Files**: relative links to `src/index.ts` and any sidecar code files.
 
-**`cargo build --examples` runs in CI on every PR.** This is what keeps `examples/` from quietly desyncing. `cargo test --examples` if examples carry test-style assertions.
-
-**Cookbook entry shape:**
-1. **Problem**: one paragraph stating what the presenter wants to do.
-2. **Approach**: which substrate signals and why.
-3. **Code**: inlined snippets via include/anchor — anchored on functions, not line numbers.
-4. **Variants**: one or two notes on adapting the pattern.
-
-**Length target: ~80-150 lines.** The number is a smell, not a rule. The actual test is "one entry = one question the reader had." If you can't name the question in a sentence, it's two entries.
+**Length target: ~80-150 lines of README.** The number is a smell, not a rule. The actual test is "one entry = one question the reader had." If you can't name the question in a sentence, it's two entries.
 
 **Reader-path through the docs** (added per party review — separate from the reference triangle):
 
@@ -581,7 +579,7 @@ The Quickstart works against a *recorded or faked* signal stream so the reader d
 |---|---|---|
 | Unit | `mod tests` alongside the code | Pure functions, type-level invariants, parsing |
 | Integration | `crates/<crate>/tests/` | One crate at a time, against its public surface |
-| End-to-end | `examples/` smoke tests in CI | Full daemon + shim + presenter, real WS |
+| End-to-end | `docs/cookbook/*/` smoke tests in CI (`tests/cli_examples.rs`) | Full daemon + shim + presenter, real WS |
 | Bench | `crates/<crate>/benches/` (Criterion) | Performance regression gating |
 | Doc | `///` examples | Cheap, runs as part of `cargo test`; use where the example is the explanation |
 
@@ -689,17 +687,17 @@ If we don't write those tests, drop the lane and save the CI minutes.
 
 Per-platform perf bars: don't average across runners. macOS M-series and Linux x86_64 are far enough apart on process-spawn that one bar would either be wrong on one or unenforceable on the other.
 
-#### Examples-as-tests — Proposed
+#### Examples-as-tests (Accepted shape as of Story 5.13)
 
-`cargo build --examples` runs on every PR. If an example doesn't compile, the build fails. `cargo test --examples` if examples carry test-style assertions.
+CI typechecks every cookbook entry on every PR (`tsc --noEmit` per `docs/cookbook/*/`). If an entry stops typechecking, the build fails.
 
-Every example presenter has a smoke test in CI:
+Every cookbook entry presenter has a smoke test in CI (`tests/cli_examples.rs`):
 1. Spawn a fresh daemon (via the test harness).
-2. Run the example as a subprocess.
-3. Feed synthetic events through the shim path.
-4. Assert the example produced the expected output (e.g. "lamp received state.session.X.current_state = working").
+2. Run the entry as a Node subprocess.
+3. Feed synthetic events through the replay path.
+4. Assert the entry produced the expected output (e.g. "lamp received state.session.X.current_state = working").
 
-The smoke test is what keeps cookbook entries honest. If `cargo build --examples` passes but the example doesn't actually work end-to-end, the smoke test is the catch.
+The smoke test is what keeps cookbook entries honest. If the typecheck passes but the entry doesn't actually work end-to-end, the smoke test is the catch.
 
 #### Coverage philosophy — Proposed
 
@@ -908,7 +906,7 @@ CI must pass before merge. Required jobs:
 - `cargo fmt --check`
 - `cargo clippy --all-targets --workspace -- -D warnings`
 - `cargo test --workspace`
-- `cargo build --examples` (and `cargo test --examples` if examples carry assertions)
+- Per-entry cookbook typecheck (`tsc --noEmit` for each `docs/cookbook/*/`)
 - `cargo bench --no-run`
 - `shim/benches/hot_path.rs` with regression-alarm
 - `shellcheck` strict mode on every committed shell script
