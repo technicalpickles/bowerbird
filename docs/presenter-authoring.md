@@ -2,7 +2,7 @@
 
 A *presenter* is any tool that connects to the bowerbird daemon and consumes its outbound surface: REST for history and snapshots, WebSocket for live events and state. This guide explains the pieces and how they compose. It's the second stop after the [Quickstart](quickstart.md) and the prerequisite for reading [`docs/cookbook/`](cookbook/), which gives end-to-end recipes.
 
-The examples here use TypeScript on Node 22.6+, mirroring the three [reference tools](../examples/) under `examples/`. The substrate doesn't care what speaks WebSocket and JSON; any language with a JSON parser and a WebSocket client works the same way.
+The examples here use TypeScript on Node 22.6+, mirroring the three [cookbook entries](cookbook/) under `docs/cookbook/`. The substrate doesn't care what speaks WebSocket and JSON; any language with a JSON parser and a WebSocket client works the same way.
 
 ## The substrate model
 
@@ -207,7 +207,7 @@ const label = state.cwd ? state.cwd.split("/").filter(Boolean).pop() : msg.sessi
 
 Caveats: **`cwd != repo`** — the daemon stores the path verbatim and does NOT resolve git roots, expand `~`, or follow symlinks; deriving repo/branch/project from `cwd` is the presenter's job (Axiom 4). A session's `cwd` may be `null` (rows projected before Story 5.7, non-Claude sources, or a producer that omits it) — always render a fallback (the `session_id` prefix above). `started_at` (epoch ms) gives you session age directly — render "started N minutes ago" from `state.started_at` without tracking the earliest `last_event_at_ms` yourself or making a side fetch; it is `null` for pre-5.7 rows (render a fallback). A pre-5.7 session that keeps receiving events shows an approximate start time (the first post-upgrade event's clock); since bowerbird is pre-release, the clean fix on upgrade is to remove the daemon's db and restart, after which every session has an exact `started_at`.
 
-For the canonical per-session fan-out pattern (subscribe to `state.session.*`, route by `(source, session_id)`), see [`cookbook/state-session-fanout.md`](cookbook/state-session-fanout.md). It pairs with [`examples/multi-session-router/`](../examples/multi-session-router/).
+For the canonical per-session fan-out pattern (subscribe to `state.session.*`, route by `(source, session_id)`), see [`cookbook/state-session-fanout/`](cookbook/state-session-fanout/). The runnable code is colocated at [`cookbook/state-session-fanout/src/index.ts`](cookbook/state-session-fanout/src/index.ts).
 
 ### `sync`
 
@@ -237,7 +237,7 @@ if (msg.op === "dropped") {
 
 Source: [`crates/protocol/src/ws.rs:122`](../crates/protocol/src/ws.rs) `DroppedFrame`. The `count` is in envelopes (not bytes). The first/last event ids are best-estimate — the broadcast channel does not expose the post-lag cursor synchronously, so the daemon reports an upper bound. Always recover from the cursor you tracked from `event` frames, never from the ids inside `dropped`. The socket stays open after a `dropped` emission; the recovery is your job, not the daemon's.
 
-The full recovery flow lives in [`cookbook/dropped-frame-recovery.md`](cookbook/dropped-frame-recovery.md). It pairs with [`examples/reconnect-recovery/`](../examples/reconnect-recovery/).
+The full recovery flow lives in [`cookbook/dropped-frame-recovery/`](cookbook/dropped-frame-recovery/). The runnable code is colocated at [`cookbook/dropped-frame-recovery/src/index.ts`](cookbook/dropped-frame-recovery/src/index.ts).
 
 ### `close`
 
@@ -282,7 +282,7 @@ The shape of the recovery:
 3. **Detect unrecoverable gaps.** Before consuming events from a response, check `since < oldest_available_event_id`. If your cursor predates the oldest available event, history was truncated and the events in `(since, oldest_available)` are gone for good. Log the gap range and continue with what survived.
 4. **Reconnect.** Open a new WebSocket, subscribe again. Live frames resume from the daemon's current position; your local cursor is now consistent with the live stream.
 
-See [`cookbook/dropped-frame-recovery.md`](cookbook/dropped-frame-recovery.md) for the full implementation, pinned to [`examples/reconnect-recovery/`](../examples/reconnect-recovery/) via a cookbook-include directive that fails CI on drift.
+See [`cookbook/dropped-frame-recovery/`](cookbook/dropped-frame-recovery/) for the full implementation; the recovery function lives in its [`src/index.ts`](cookbook/dropped-frame-recovery/src/index.ts), and CI smoke-tests it on every PR.
 
 ## Fetching a REST snapshot
 
@@ -302,7 +302,7 @@ All three require `Authorization: Bearer <token>`. The error story:
 
 The full per-endpoint reference, including response field-by-field shapes copied from the source-of-truth structs, lives in [`docs/protocol.md`](protocol.md).
 
-For the canonical REST cursor-pagination + gap-detection pattern, see [`cookbook/rest-cursor-pagination.md`](cookbook/rest-cursor-pagination.md). It pairs with [`examples/event-log-viewer/`](../examples/event-log-viewer/).
+For the canonical REST cursor-pagination + gap-detection pattern, see [`cookbook/rest-cursor-pagination/`](cookbook/rest-cursor-pagination/). The runnable code is colocated at [`cookbook/rest-cursor-pagination/src/index.ts`](cookbook/rest-cursor-pagination/src/index.ts).
 
 ## Putting it together
 
@@ -324,11 +324,11 @@ on startup:
     open WS, subscribe again                         # resume live stream
 ```
 
-The three reference examples under [`examples/`](../examples/) implement different slices of this:
+The three cookbook entries under [`docs/cookbook/`](cookbook/) implement different slices of this:
 
-- [`multi-session-router/`](../examples/multi-session-router/) — `state.session.*` fan-out with snapshot-on-subscribe. No recovery loop; demonstrates Story 2.3's snapshot semantics.
-- [`event-log-viewer/`](../examples/event-log-viewer/) — pure REST cursor-pagination with gap-detection. No WebSocket; demonstrates Story 1.7's history surface plus the truncation-tolerance pattern.
-- [`reconnect-recovery/`](../examples/reconnect-recovery/) — long-running WebSocket with `close` / `dropped` → REST catch-up → re-subscribe. Demonstrates Stories 2.4 + 2.5 end-to-end.
+- [`state-session-fanout/`](cookbook/state-session-fanout/): `state.session.*` fan-out with snapshot-on-subscribe. No recovery loop; demonstrates Story 2.3's snapshot semantics.
+- [`rest-cursor-pagination/`](cookbook/rest-cursor-pagination/): pure REST cursor-pagination with gap-detection. No WebSocket; demonstrates Story 1.7's history surface plus the truncation-tolerance pattern.
+- [`dropped-frame-recovery/`](cookbook/dropped-frame-recovery/): long-running WebSocket with `close` / `dropped` → REST catch-up → re-subscribe. Demonstrates Stories 2.4 + 2.5 end-to-end.
 
 Pick the one closest to your use case and adapt — that's exactly what the cookbook entries are for.
 

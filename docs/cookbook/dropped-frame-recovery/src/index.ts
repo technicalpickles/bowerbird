@@ -17,7 +17,7 @@
 //
 //     bowerbird start
 //     bowerbird replay
-//     node --experimental-strip-types examples/reconnect-recovery/src/index.ts
+//     node --experimental-strip-types docs/cookbook/dropped-frame-recovery/src/index.ts
 //     # then in another shell: bowerbird stop && bowerbird start && bowerbird replay
 //
 // Stdout: one `{event:"recovered",recovered_count:N}` JSON per catch-up.
@@ -115,7 +115,6 @@ function resolveToken(): string {
   return t;
 }
 
-// cookbook-begin:dropped-frame-recovery
 /**
  * Catch up missed events after a Close, Dropped, or unsolicited socket close.
  *
@@ -190,7 +189,6 @@ export async function recover(
   }
   return recovered;
 }
-// cookbook-end:dropped-frame-recovery
 
 async function runConnectionLoop(
   initialBindAddr: string,

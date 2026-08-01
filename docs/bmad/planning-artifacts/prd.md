@@ -324,7 +324,7 @@ The deliberate restraint bet is validated by what *doesn't* appear in issues and
 | Shim binary | Rust | Static binary; no async runtime; < 5ms p95 hot path |
 | Daemon binary | Rust | Tokio single-thread; axum; rusqlite |
 | Reference adapter | Rust | `adapter-claude` — Claude Code hook normalization |
-| Reference example tools | TypeScript / Node | Lives in `examples/`; CI smoke-tested |
+| Reference example tools | TypeScript / Node | Lives in `docs/cookbook/<name>/`; CI smoke-tested |
 | Install/CI scripts | Shell | < 200 line budget; `shellcheck` strict mode in CI |
 
 ### Installation Methods
@@ -442,12 +442,12 @@ The reader path through docs must exist at launch:
 | Quickstart | Works against `bowerbird replay` with bundled demo fixture — no Claude Code required. Covers install → replay → run reference example → see output. Forward-pointer to `presenter-authoring.md` at the success moment. |
 | `docs/presenter-authoring.md` | How to build a tool that consumes the WebSocket stream: connect, subscribe, handle state/event/dropped frames, snapshot on reconnect. Language-agnostic with TypeScript examples. |
 | `docs/protocol.md` | Wire format reference: all endpoints, frame types, topic syntax, auth contract, ingest socket. Machine-readable enough to generate client stubs from. |
-| `docs/cookbook/` | v1 ships at least three entries paired with reference examples. Must exist at launch — not a post-launch deliverable. |
+| `docs/cookbook/` | v1 ships at least three entries, each a self-contained directory under `docs/cookbook/<name>/` containing prose README + runnable code. Must exist at launch (not a post-launch deliverable). |
 | `docs/protocol-changelog.md` | Structured changelog; CI-enforced; required entry for any `crates/protocol/src/*.rs` change. |
 
 ### Code Examples
 
-Reference examples in `examples/`, CI smoke-tested against a live daemon. Each example is paired with a cookbook entry. The coupling invariant: a developer changes a function in the reference example, runs the doc build, and the cookbook entry reflects the change without manual editing. Toolchain choice is left to the implementer; the invariant is what the PRD requires.
+Reference examples live in `docs/cookbook/<name>/`, CI smoke-tested against a live daemon. Each cookbook entry is a self-contained directory: the README explains what it is and how to apply the pattern; the colocated `src/`, `package.json`, and `tsconfig.json` are the runnable canonical code. There is no separate cookbook surface to keep in sync: the prose and code share the same directory, so a developer changing the code and updating the README is one PR, not a coupling problem.
 
 **V1 reference examples:**
 

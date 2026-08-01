@@ -7,7 +7,7 @@ The bundled fixture exists so you can exercise the pub/sub path without configur
 ## Prerequisites
 
 - **`bowerbird --version` works.** If not, install via the [prebuilt tarball](../README.md#install) or [`cargo install --git`](../README.md#2-from-source-via-cargo-install). The detailed walkthrough is in [`INSTALL.md`](../INSTALL.md).
-- **Node 22.6 or newer** for the `--experimental-strip-types` flag (lets `.ts` files run directly with no build step). Check with `node --version`; upgrade via [nodejs.org/en/download](https://nodejs.org/en/download/) or a version manager like `mise`, `nvm`, `fnm`, `volta`, or `asdf`. This mirrors the floor [`examples/README.md`](../examples/README.md) names.
+- **Node 22.6 or newer** for the `--experimental-strip-types` flag (lets `.ts` files run directly with no build step). Check with `node --version`; upgrade via [nodejs.org/en/download](https://nodejs.org/en/download/) or a version manager like `mise`, `nvm`, `fnm`, `volta`, or `asdf`. This mirrors the floor [`docs/cookbook/README.md`](cookbook/README.md) names.
 - **A source clone.** The prebuilt tarball ships binaries only; the TypeScript reference examples live in the repo. Grab them with `git clone https://github.com/technicalpickles/bowerbird && cd bowerbird` if you don't already have a checkout.
 
 ## Five steps
@@ -16,7 +16,7 @@ The bundled fixture exists so you can exercise the pub/sub path without configur
 bowerbird start                                                    # 1. start daemon
 bowerbird replay                                                   # 2. populate pub/sub from bundled fixture
 export BOWERBIRD_TOKEN="$(bowerbird auth token | tr -d '\n')"      # 3. get bearer token
-node --experimental-strip-types examples/multi-session-router/src/index.ts   # 4. run a reference example
+node --experimental-strip-types docs/cookbook/state-session-fanout/src/index.ts   # 4. run a reference example
 # Ctrl-C when you've seen enough.  Then:
 bowerbird stop                                                     # 5. clean up
 ```
@@ -42,4 +42,4 @@ You should now see `{event:"state",source:...,session_id:...}` JSON objects scro
 
 - [`docs/presenter-authoring.md`](presenter-authoring.md) — understand the pieces: WebSocket frame handling, REST snapshots, dropped-frame recovery.
 - [`docs/protocol.md`](protocol.md) — look up wire details when you need them.
-- [`docs/cookbook/`](cookbook/) — recipes for specific patterns, paired with the reference examples under [`examples/`](../examples/).
+- [`docs/cookbook/`](cookbook/): self-contained recipes for specific patterns, each colocating its prose README with the runnable reference code.

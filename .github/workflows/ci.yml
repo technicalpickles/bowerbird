@@ -68,7 +68,7 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          for d in examples/*/; do
+          for d in docs/cookbook/*/; do
             (cd "$d" && npm ci && npm run typecheck)
           done
 

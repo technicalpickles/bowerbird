@@ -10,7 +10,7 @@
 //
 //     bowerbird start
 //     bowerbird replay
-//     node --experimental-strip-types examples/multi-session-router/src/index.ts
+//     node --experimental-strip-types docs/cookbook/state-session-fanout/src/index.ts
 //
 // Stdout: one canonical JSON object per state update.
 // Stderr: `new session: <source>/<session_id>` log lines + diagnostics.
@@ -101,7 +101,6 @@ async function main(): Promise<void> {
     headers: { Authorization: `Bearer ${token}` },
   });
 
-  // cookbook-begin:state-session-fanout
   const seen = new Map<string, StateFrame["state"]>();
 
   ws.addEventListener("open", () => {
@@ -154,7 +153,6 @@ async function main(): Promise<void> {
       console.error(`ignoring unhandled op: ${msg.op}`);
     }
   });
-  // cookbook-end:state-session-fanout
 
   ws.addEventListener("error", (ev: Event) => {
     const detail = (ev as ErrorEvent).message ?? "(no detail)";

@@ -1,9 +1,10 @@
-//! End-to-end smoke tests for the three reference examples (Story 4.2).
+//! End-to-end smoke tests for the three cookbook reference entries (Story
+//! 4.2; relocated into `docs/cookbook/` by Story 5.13's consolidation).
 //!
 //! Each test orchestrates a real daemon subprocess + a Node subprocess
-//! running one of the TypeScript examples, then asserts the example's
+//! running one of the TypeScript cookbook entries, then asserts the entry's
 //! canonical stdout/stderr shape. Mirrors the `tests/cli_replay.rs` shape.
-//! Parallel-safe: each daemon binds an ephemeral port the example reads
+//! Parallel-safe: each daemon binds an ephemeral port the entry reads
 //! from its own server.json, and all state is TempDir-scoped per test.
 //!
 //! Tests gracefully skip when Node 22.6+ is unavailable. CI's `ubuntu-latest`
@@ -189,13 +190,13 @@ fn node_22_6_available() -> bool {
 }
 
 fn examples_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/cookbook")
 }
 
-/// Spawn a Node subprocess running an example. The child's stdout and stderr
-/// are piped so the test can read them line-by-line; the daemon's bind_addr
-/// lives in `<tmp>/.bowerbird/server.json`, which the example reads via
-/// `homedir()`-relative path resolution.
+/// Spawn a Node subprocess running a cookbook entry. The child's stdout and
+/// stderr are piped so the test can read them line-by-line; the daemon's
+/// bind_addr lives in `<tmp>/.bowerbird/server.json`, which the entry reads
+/// via `homedir()`-relative path resolution.
 fn spawn_example(
     tmp: &TempDir,
     example_name: &str,
@@ -272,11 +273,11 @@ fn dump_child_diagnostics(label: &str, child: &mut Child) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// AC #1: multi-session-router routes state.session.* for both fixture sessions.
+// AC #1: state-session-fanout routes state.session.* for both fixture sessions.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn multi_session_router_routes_state_frames_for_both_fixture_sessions() {
+fn state_session_fanout_routes_state_frames_for_both_fixture_sessions() {
     if !node_22_6_available() {
         return;
     }
@@ -287,7 +288,7 @@ fn multi_session_router_routes_state_frames_for_both_fixture_sessions() {
     // frames for both fixture sessions on connect.
     bowerbird_cmd_in(&tmp).arg("replay").assert().success();
 
-    let mut child = spawn_example(&tmp, "multi-session-router", &[], &[]);
+    let mut child = spawn_example(&tmp, "state-session-fanout", &[], &[]);
 
     // Drain stderr in a background thread. Two reasons:
     //   1) Story 4.2 Task 7.4 requires asserting the example logs
@@ -302,7 +303,7 @@ fn multi_session_router_routes_state_frames_for_both_fixture_sessions() {
     let stderr = child
         .stderr
         .take()
-        .expect("multi-session-router: stderr not piped");
+        .expect("state-session-fanout: stderr not piped");
     let stderr_buf = Arc::new(Mutex::new(String::new()));
     let stderr_buf_thread = Arc::clone(&stderr_buf);
     let stderr_drainer = thread::spawn(move || {
@@ -339,12 +340,12 @@ fn multi_session_router_routes_state_frames_for_both_fixture_sessions() {
             }
             saw_alpha && saw_beta
         },
-        "multi-session-router",
+        "state-session-fanout",
     );
 
     // Trigger graceful close so the example exits 0.
     stop_daemon(&tmp);
-    let status = child.wait().expect("multi-session-router subprocess wait");
+    let status = child.wait().expect("state-session-fanout subprocess wait");
     let _ = stderr_drainer.join();
     let drained_stderr = stderr_buf
         .lock()
@@ -379,11 +380,11 @@ fn multi_session_router_routes_state_frames_for_both_fixture_sessions() {
 }
 
 // ---------------------------------------------------------------------------
-// AC #2: event-log-viewer paginates session history and renders tool calls.
+// AC #2: rest-cursor-pagination paginates session history and renders tool calls.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn event_log_viewer_paginates_session_history_and_renders_tool_calls() {
+fn rest_cursor_pagination_paginates_session_history_and_renders_tool_calls() {
     if !node_22_6_available() {
         return;
     }
@@ -391,13 +392,15 @@ fn event_log_viewer_paginates_session_history_and_renders_tool_calls() {
     start_daemon(&tmp);
     bowerbird_cmd_in(&tmp).arg("replay").assert().success();
 
-    let mut child = spawn_example(&tmp, "event-log-viewer", &["session-alpha"], &[]);
+    let mut child = spawn_example(&tmp, "rest-cursor-pagination", &["session-alpha"], &[]);
 
-    let status = child.wait().expect("event-log-viewer subprocess wait");
+    let status = child
+        .wait()
+        .expect("rest-cursor-pagination subprocess wait");
     if !status.success() {
-        let diag = dump_child_diagnostics("event-log-viewer", &mut child);
+        let diag = dump_child_diagnostics("rest-cursor-pagination", &mut child);
         force_stop(&tmp);
-        panic!("event-log-viewer exited non-zero: {status:?}\n{diag}");
+        panic!("rest-cursor-pagination exited non-zero: {status:?}\n{diag}");
     }
 
     // Collect stdout now that the subprocess has exited cleanly.
@@ -472,14 +475,14 @@ fn event_log_viewer_paginates_session_history_and_renders_tool_calls() {
 }
 
 // ---------------------------------------------------------------------------
-// AC #2: event-log-viewer defaults to session-alpha when no CLI arg given.
-// Exercises the `process.argv[2] ?? "session-alpha"` default in event-log-viewer
+// AC #2: rest-cursor-pagination defaults to session-alpha when no CLI arg given.
+// Exercises the `process.argv[2] ?? "session-alpha"` default in rest-cursor-pagination
 // (src/index.ts:139). The primary smoke test always passes `session-alpha`
 // explicitly, so the default-arg branch would otherwise be untested.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn event_log_viewer_defaults_to_session_alpha_when_no_arg() {
+fn rest_cursor_pagination_defaults_to_session_alpha_when_no_arg() {
     if !node_22_6_available() {
         return;
     }
@@ -488,13 +491,13 @@ fn event_log_viewer_defaults_to_session_alpha_when_no_arg() {
     bowerbird_cmd_in(&tmp).arg("replay").assert().success();
 
     // No CLI args — example should pick session-alpha by default.
-    let mut child = spawn_example(&tmp, "event-log-viewer", &[], &[]);
+    let mut child = spawn_example(&tmp, "rest-cursor-pagination", &[], &[]);
 
-    let status = child.wait().expect("event-log-viewer (default) wait");
+    let status = child.wait().expect("rest-cursor-pagination (default) wait");
     if !status.success() {
-        let diag = dump_child_diagnostics("event-log-viewer-default", &mut child);
+        let diag = dump_child_diagnostics("rest-cursor-pagination-default", &mut child);
         force_stop(&tmp);
-        panic!("event-log-viewer exited non-zero with default arg: {status:?}\n{diag}");
+        panic!("rest-cursor-pagination exited non-zero with default arg: {status:?}\n{diag}");
     }
 
     use std::io::Read;
@@ -517,7 +520,7 @@ fn event_log_viewer_defaults_to_session_alpha_when_no_arg() {
 }
 
 // ---------------------------------------------------------------------------
-// AC #2: event-log-viewer renders gracefully when the requested session has
+// AC #2: rest-cursor-pagination renders gracefully when the requested session has
 // no events. The daemon returns HTTP 200 with an empty `events` array and a
 // null `cursor` for unknown sessions (not HTTP 404), so the example's loop
 // exits its first iteration without printing any rows and returns exit 0.
@@ -525,14 +528,14 @@ fn event_log_viewer_defaults_to_session_alpha_when_no_arg() {
 // Story 5.4 update: `GET /sessions/{id}/events` now returns `404 Not Found`
 // for an id with no `session_projections` row — see protocol-changelog.md
 // v1.0 → v1.1. The example's `if (res.status === 404)` branch in
-// `examples/event-log-viewer/src/index.ts:100-103` (previously structurally
+// `docs/cookbook/rest-cursor-pagination/src/index.ts` (previously structurally
 // dead against the 200-empty quirk) is now load-bearing. This test pins the
 // 404 contract: the example exits non-zero with a `session ... not found`
 // stderr instead of silently rendering an empty stream.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn event_log_viewer_surfaces_404_for_unknown_session() {
+fn rest_cursor_pagination_surfaces_404_for_unknown_session() {
     if !node_22_6_available() {
         return;
     }
@@ -542,13 +545,13 @@ fn event_log_viewer_surfaces_404_for_unknown_session() {
 
     let mut child = spawn_example(
         &tmp,
-        "event-log-viewer",
+        "rest-cursor-pagination",
         &["definitely-not-a-real-session"],
         &[],
     );
 
-    let status = child.wait().expect("event-log-viewer (unknown) wait");
-    let diag = dump_child_diagnostics("event-log-viewer-unknown", &mut child);
+    let status = child.wait().expect("rest-cursor-pagination (unknown) wait");
+    let diag = dump_child_diagnostics("rest-cursor-pagination-unknown", &mut child);
 
     // Tear the daemon down BEFORE asserting so a failing assertion can't leave
     // the test daemon running (Story 5.4 review). Both calls are the standard
@@ -558,7 +561,7 @@ fn event_log_viewer_surfaces_404_for_unknown_session() {
 
     assert!(
         !status.success(),
-        "event-log-viewer should exit non-zero when the daemon returns 404 \
+        "rest-cursor-pagination should exit non-zero when the daemon returns 404 \
          for an unknown session; got: {status:?}\n{diag}"
     );
     assert!(
@@ -568,11 +571,11 @@ fn event_log_viewer_surfaces_404_for_unknown_session() {
 }
 
 // ---------------------------------------------------------------------------
-// AC #3: reconnect-recovery handles Close and recovers via REST catch-up.
+// AC #3: dropped-frame-recovery handles Close and recovers via REST catch-up.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn reconnect_recovery_recovers_after_close_frame_and_resumes() {
+fn dropped_frame_recovery_recovers_after_close_frame_and_resumes() {
     if !node_22_6_available() {
         return;
     }
@@ -587,7 +590,7 @@ fn reconnect_recovery_recovers_after_close_frame_and_resumes() {
     // done" message into the example.
     let mut child = spawn_example(
         &tmp,
-        "reconnect-recovery",
+        "dropped-frame-recovery",
         &[],
         &[("BOWERBIRD_EXAMPLE_MAX_IDLE_MS", "2000")],
     );
@@ -604,7 +607,7 @@ fn reconnect_recovery_recovers_after_close_frame_and_resumes() {
     let stderr = child
         .stderr
         .take()
-        .expect("reconnect-recovery: stderr not piped");
+        .expect("dropped-frame-recovery: stderr not piped");
     let stderr_buf = Arc::new(Mutex::new(String::new()));
     let stderr_buf_thread = Arc::clone(&stderr_buf);
     let stderr_drainer = thread::spawn(move || {
@@ -652,7 +655,7 @@ fn reconnect_recovery_recovers_after_close_frame_and_resumes() {
     let stdout = child
         .stdout
         .take()
-        .expect("reconnect-recovery: stdout not piped");
+        .expect("dropped-frame-recovery: stdout not piped");
     let mut sreader = BufReader::new(stdout);
     let mut stdout_lines = Vec::new();
     let mut saw_recovered = false;
@@ -676,7 +679,7 @@ fn reconnect_recovery_recovers_after_close_frame_and_resumes() {
     }
 
     // Wait for the example to exit (via BOWERBIRD_EXAMPLE_MAX_IDLE_MS).
-    let status = child.wait().expect("reconnect-recovery wait");
+    let status = child.wait().expect("dropped-frame-recovery wait");
     let _ = stderr_drainer.join();
     let drained_stderr = stderr_buf
         .lock()
@@ -686,14 +689,14 @@ fn reconnect_recovery_recovers_after_close_frame_and_resumes() {
     if !saw_recovered {
         force_stop(&tmp);
         panic!(
-            "reconnect-recovery did not print recovered JSON within 15s; stdout:\n{}\nstderr:\n{drained_stderr}",
+            "dropped-frame-recovery did not print recovered JSON within 15s; stdout:\n{}\nstderr:\n{drained_stderr}",
             stdout_lines.join("\n")
         );
     }
     if !status.success() {
         force_stop(&tmp);
         panic!(
-            "reconnect-recovery exited non-zero: {status:?}; stdout:\n{}\nstderr:\n{drained_stderr}",
+            "dropped-frame-recovery exited non-zero: {status:?}; stdout:\n{}\nstderr:\n{drained_stderr}",
             stdout_lines.join("\n")
         );
     }
@@ -714,9 +717,9 @@ fn examples_fail_clearly_when_daemon_down() {
     let tmp = TempDir::new().expect("tempdir");
 
     for example in [
-        "multi-session-router",
-        "event-log-viewer",
-        "reconnect-recovery",
+        "state-session-fanout",
+        "rest-cursor-pagination",
+        "dropped-frame-recovery",
     ] {
         let mut child = spawn_example(&tmp, example, &[], &[]);
         let status = child.wait().expect("daemon-down subprocess wait");
