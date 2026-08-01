@@ -280,6 +280,8 @@ Targets, not contracts. Willing to ease any of these if the relaxation makes the
 | Daemon RSS | <50MB | Easy at v1; sample in bench harness from day one so future regressions are visible. |
 | Core LOC | 5K-7K | Alarm at 10K. |
 
+**Shim ingest bounds are aggregate, not per-wait (Story 5.17).** Inside the shim-exit bar, the ingest socket's write and read halves are each bounded in *total* elapsed time (2ms and 3ms budgets, enforced by capping each `write(2)` at the 8 KiB send buffer plus a deadline checked between syscalls). The residual past the budget differs by half: the read overshoots by at most one wait (≤ its 3ms arm), while the write overshoots by one trailing *chunk's drain time*, which depends on the peer's refill quantum (measured in-tree at 2.17-3.03ms total for full-chunk drains and 23.37ms at a pathological 256-byte quantum; `crates/shim/src/socket.rs::WRITE_BUDGET_MS` carries the honest statement and the tables). Multi-chunk payloads (over 8 KiB) are consequently best-effort: a healthy idle daemon takes the full 1 MiB cap in under 1ms, a busy machine drops ~100 KiB payloads at the budget, an accepted Axiom 3 trade (Story 5.17 review decision). `connect` sits outside both bounds on measured grounds. This distinction is load-bearing: before 5.17 the `SO_*TIMEO` socket options bounded each kernel *wait* only, and a slow-draining daemon held a single `write(2)` open for 189ms while returning success. Do not restate the budgets as a round-trip total anywhere without noting the connect exclusion and the write's quantum-dependent residual.
+
 **Measurement infrastructure to build before perf claims are made:**
 
 1. `shim/benches/hot_path.rs` with Criterion, gating CI on p95 regression (not just printing numbers).
