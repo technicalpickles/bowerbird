@@ -43,9 +43,12 @@ fn bowerbird_bin() -> Command {
     // never invoked and the placeholder path is never exec'd.
     cmd.env_remove("BOWERBIRD_LAUNCH_AGENTS_DIR");
     cmd.env("BOWERBIRD_DAEMON_BIN", "/usr/local/bin/bowerbird-daemon");
-    // Pin the real label: these tests assert plist filenames and never run
+    // Pin the real label: most tests assert plist filenames and never run
     // real launchctl (--no-start/--no-stop/fake-launchctl PATH seam), so the
     // scripts/test.sh isolation backstop must not rename the plist under them.
+    // The exception is stop_ignores_stale_pid_file_without_flock_on_macos,
+    // which does reach real launchctl and overrides this pin with an isolated
+    // label to protect the developer's real agent.
     cmd.env(
         "BOWERBIRD_LAUNCH_AGENT_LABEL",
         "com.technicalpickles.bowerbird.daemon",
