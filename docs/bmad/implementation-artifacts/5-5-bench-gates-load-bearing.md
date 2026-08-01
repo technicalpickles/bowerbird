@@ -1,6 +1,6 @@
 # Story 5.5: Bench gates converted to load-bearing
 
-Status: in-progress
+Status: review
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -41,12 +41,12 @@ so that the bench infrastructure is producing signal -- not just running.
   - [x] Sanity check applied to the macOS numbers: all four well under 100ms and same order of magnitude as the Story 4.4 reference (solo 1.713ms / fanout3 1.608ms / burst 1.928ms / steady 1.242ms). The Linux numbers *did* trip the ">10ms is noisy, pick a cleaner run" heuristic -- except a second independent run reproduced the same ~40ms band, so it reads as a real platform characteristic rather than noise (see Debug Log). Investigating root cause and picking a genuinely clean run is exactly the punted work.
   - [x] Verified locally (macOS only -- this dev session ran on macOS): `python3 scripts/check-daemon-bench-p99.py <macos summary> crates/daemon/benches/baselines/macos.json` → all four shapes report `regression gate OK`, none `skipped`.
 
-- [ ] **Task 2: Daemon-bench chaos-injection sanity PRs (AC #2)** [HUMAN-IN-THE-LOOP -- requires real draft PRs + CI]
-  - [ ] Prepare the chaos patch: in `crates/daemon/src/projection/session.rs::write_inner`, after `interact_res?` resolves (~`session.rs:262`) and before `broadcaster.publish(BroadcastEnvelope::Event(event))` (~`session.rs:289`), insert `tokio::time::sleep(std::time::Duration::from_millis(50)).await;` with a `// CHAOS: revert before merge` comment.
-  - [ ] Open one draft PR targeting the chaos against a branch CI runs (the gate runs on PRs per `ci.yml`). Because the matrix runs both OSes, a single draft PR exercises both -- but the AC asks the record to attribute the burst-shape failure per platform, so capture both matrix legs' logs.
-  - [ ] Observe `daemon-bench-gate` fail with `::error::burst: p99 regression gate FAILED: ...` on each platform. 50ms vs a ~1.9ms baseline × 1.30 ≈ 2.5ms threshold → fails by ~20×, comfortably. (50ms is also under the 100ms absolute ceiling, so it's the *regression* gate that fires, which is exactly the gate Task 1 just armed.)
-  - [ ] Revert the chaos commit; confirm the draft PR's gate goes green again, then close/abandon the PR. The chaos NEVER merges to `main`.
-  - [ ] Record both CI run URLs + the failing `::error::` lines in the Dev Agent Record.
+- [x] **Task 2: Daemon-bench chaos-injection sanity PRs (AC #2)** [HUMAN-IN-THE-LOOP -- requires real draft PRs + CI] -- **done 2026-07-31/08-01 (PR #35); the post-revert run also surfaced the burst/stall finding, see Debug Log**
+  - [x] Prepare the chaos patch: in `crates/daemon/src/projection/session.rs::write_inner`, after `interact_res?` resolves (~`session.rs:262`) and before `broadcaster.publish(BroadcastEnvelope::Event(event))` (~`session.rs:289`), insert `tokio::time::sleep(std::time::Duration::from_millis(50)).await;` with a `// CHAOS: revert before merge` comment. (Site line numbers had drifted to ~594/613; the described site is where it went.)
+  - [x] Open one draft PR targeting the chaos against a branch CI runs (the gate runs on PRs per `ci.yml`). Because the matrix runs both OSes, a single draft PR exercises both -- but the AC asks the record to attribute the burst-shape failure per platform, so capture both matrix legs' logs. (PR #35, base = the story branch so the armed Linux baseline was in-tree.)
+  - [x] Observe `daemon-bench-gate` fail with `::error::burst: p99 regression gate FAILED: ...` on each platform. ~~50ms vs a ~1.9ms baseline × 1.30 ≈ 2.5ms threshold~~ (stale arithmetic; post-5.18 thresholds in Debug Log) -- observed on both platforms, both best-of-2 attempts; burst also exceeded the 100ms absolute (8-event clump serializes through the delayed writer, ~8 x 50ms + stall = 414-488ms), so BOTH burst gates fired, regression included.
+  - [x] Revert the chaos commit; confirm the draft PR's gate goes green again, then close/abandon the PR. The chaos NEVER merges to `main`. (Revert `8fc46db`; the first confirmation run went red on the ORGANIC stall -> burst-skip decision -> rebased onto the amended story branch, confirmation run [30699890076](https://github.com/technicalpickles/bowerbird/actions/runs/30699890076) fully green, all 8 checks. PR closed unmerged.)
+  - [x] Record both CI run URLs + the failing `::error::` lines in the Dev Agent Record. (Debug Log 2026-07-31 Task 2 section + 2026-08-01 addendum.)
 
 - [x] **Task 3: Shim hot-path chaos-injection sanity PRs (AC #3)** [HUMAN-IN-THE-LOOP -- requires real draft PRs + CI] -- **done 2026-07-31 (PRs #36, #37); predictions superseded by post-5.18 policy + measured macOS sleep overshoot, see Debug Log**
   - [x] **Linux PR:** inject `std::thread::sleep(std::time::Duration::from_millis(2));` into `crates/shim/src/main.rs::run` (e.g. just before `socket::send` at `main.rs:69`). Expect `shim-bench-gate` (ubuntu-latest leg) to fail the regression gate (~3.2ms > 1.19ms × 1.35 = 1.61ms). The macOS leg of THIS PR will NOT fail (2ms < 15ms absolute, regression disabled) -- that's expected; document it. **Outcome: ubuntu leg failed exactly as prescribed (p99 2.925/3.003ms > 1.613ms). The macOS-leg prediction was written against pre-5.18 policy and did not hold: the sleep costs ~9ms on `macos-latest`, tripping the regression gate 5.18 restored. Documented as a finding.**
