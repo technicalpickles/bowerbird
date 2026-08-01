@@ -1,6 +1,6 @@
 # Story 5.13: Cookbook consolidation into self-contained directory entries
 
-Status: review
+Status: done
 
 ## Story
 
@@ -80,6 +80,33 @@ Task headers are stable slugs (cite these in commits, not ordinals).
   - [x] `git diff | grep $'^+.*\u2014'` is empty (no emdashes in added lines; generated prose reliably reintroduces them; the \u2014 escape keeps this file itself sweep-clean).
   - [x] File List in Dev Agent Record matches `git status --porcelain` (recurring review finding).
 
+### Review Findings
+
+Three-layer review 2026-08-01 (Blind Hunter diff-only, Edge Case Hunter with repo access, Acceptance Auditor with spec+context; all Opus, a different model than the Fable implementer). Acceptance Auditor verdict: APPROVE, all 8 ACs verified against the tree. Triage: 0 decision-needed, 20 patch (after cross-layer dedup), 2 defer, 2 dismissed (section-status vocabulary is cosmetic and half-disclosed already; the `tsv`/`tsql` false-positive is mooted by the allowlist fix). Patches applied autonomously per the session goal directive; no finding required a maintainer-only judgment call.
+
+- [x] [Review][Patch] Fence guard evadable (bare/js/tsx/tilde fences) and index README exempt; five-section scan matches headings inside fences [tests/cli_docs_drift.rs]
+- [x] [Review][Patch] Index-table needles collide with quick-run paths; pin the markdown link form [tests/cli_docs_drift.rs]
+- [x] [Review][Patch] Architecture guard dropped its positive package.json/tree assertion (task text substituted silently) [tests/cli_examples_drift.rs]
+- [x] [Review][Patch] state-session-fanout README misattributes the mechanical-facts split to Axiom 1 (it is Axiom 4) [docs/cookbook/state-session-fanout/README.md]
+- [x] [Review][Patch] Three troubleshooting entries + no-runtime-deps note from examples/README.md dropped with no destination [docs/cookbook/README.md]
+- [x] [Review][Patch] project-context §Example presenters still marked Proposed while cited as the authoritative decision [docs/bmad/project-context.md]
+- [x] [Review][Patch] CI npm loop hard-fails on any future non-npm subdir under docs/cookbook/ [.github/workflows/ci.yml]
+- [x] [Review][Patch] Entry enumeration hardcoded in guards but globbed in CI; a fourth entry gets zero structural coverage [tests/cli_examples_drift.rs, tests/cli_docs_drift.rs]
+- [x] [Review][Patch] rest-cursor-pagination README expected-output ids are off by the RecordingStarted sentinel (says 1,3,5..., reality 2,4,6...) [docs/cookbook/rest-cursor-pagination/README.md]
+- [x] [Review][Patch] Link guard skips README.md and INSTALL.md, the files this diff retargeted [tests/cli_docs_drift.rs]
+- [x] [Review][Patch] Stale src/index.ts:139 line-number citation (house rule: function names, not line numbers) [tests/cli_examples.rs]
+- [x] [Review][Patch] package-lock.json required by npm ci but absent from the required-files guard and the architecture subtree [tests/cli_examples_drift.rs, docs/bmad/planning-artifacts/architecture.md]
+- [x] [Review][Patch] Entry package.json name fields still carry the retired example names [docs/cookbook/*/package.json + package-lock.json]
+- [x] [Review][Patch] Story record vs sprint-status contradict on whether the Haiku agent launched [this file, §Agent Model Used]
+- [x] [Review][Patch] ADR Related cites the proposal as a bare filename; Affects sections understates (Example presenters, Examples-as-tests also rewritten) [docs/decisions/0010-cookbook-consolidation.md]
+- [x] [Review][Patch] deferred-work entry-4 strike uses the house story-reference form, not the task text's merge-commit backlink; substitution undisclosed [this file, Completion Notes]
+- [x] [Review][Patch] Half-finished rename in the smoke crate (examples_dir() returns a path with no examples component) [tests/cli_examples.rs]
+- [x] [Review][Patch] Cargo-zone guard scans the whole manifest, so a legitimate workspace exclude would false-fail [tests/cli_examples_drift.rs]
+- [x] [Review][Patch] Stale comments: four_sections reference, README.md:173 still says "paired with the reference examples" [tests/cli_docs_drift.rs, README.md]
+- [x] [Review][Patch] README length target (~80-150) contradicts the three READMEs (46-63 lines) this same diff ships [docs/bmad/project-context.md]
+- [x] [Review][Defer] Link scanner mishandles CommonMark link titles and angle-bracket destinations [tests/cli_docs_drift.rs]: deferred, pre-existing scanner limitation, no current instance in the tree
+- [x] [Review][Defer] prd.md "V1 reference examples" list still uses the retired conceptual names [docs/bmad/planning-artifacts/prd.md:452-454]: deferred, outside AC 6's enumerated lines; natural 5.14 candidate
+
 ## Dev Notes
 
 ### Current shape (verified at `96b996f`, 2026-08-01)
@@ -143,7 +170,7 @@ Run the workspace suite via `scripts/test.sh`, never raw `cargo test` (project r
 
 ### Agent Model Used
 
-Claude Fable 5 (claude-fable-5) driving; per the maintainer's right-sized-model directive, mechanical retarget sweeps were delegated to Sonnet subagents (tests, planning artifacts) and a Haiku subagent (reader docs). All three delegated agents died early on an account session limit; the Sonnet pair landed partial work first (prd.md + most of architecture.md; cli_examples.rs header) which was verified and kept, and the driving agent finished everything else inline. The independent review pass runs on a different model per house convention.
+Claude Fable 5 (claude-fable-5) driving; per the maintainer's right-sized-model directive, mechanical retarget sweeps were delegated to Sonnet subagents (tests, planning artifacts) and a Haiku subagent (reader docs). The two Sonnet agents launched, landed partial work (prd.md + most of architecture.md; cli_examples.rs header), and died early on an account session limit; the Haiku agent never launched at all (its launch failed on a transient classifier error, and the limit hit before the retry). The partial Sonnet work was verified and kept; the driving agent finished everything else inline. The independent review pass ran three Opus subagents per house convention (a different model than the implementer).
 
 ### Debug Log References
 
@@ -160,7 +187,8 @@ Claude Fable 5 (claude-fable-5) driving; per the maintainer's right-sized-model 
 4. `docs/protocol.md:155` was retargeted beyond the AC 8 list (link to the deleted standalone entry file), caught RED by the link checker then fixed; the moved `src/index.ts` usage-comment headers likewise carried stale `examples/` paths and were retargeted (comment-only, typecheck re-verified).
 5. AC 6's deferred-work retargets covered entries 101-107 including struck-through entry 1 (its described CI loop now runs against `docs/cookbook/*/`, noted inline) and entry 103 (discovered at create-story time). Entry 4 struck with the Story 5.13 + ADR 0010 resolution.
 6. Emdash discipline applied per the 5.16/5.17 precedent: every line this diff adds or modifies is emdash-free, including lines whose pre-existing emdashes would otherwise ride along (project-context §Cookbook discipline heading uses `(Accepted: Story 5.13, ADR 0010)` instead of the house emdash-then-Accepted status marker for exactly this reason); untouched prose keeps its emdashes.
-7. The `typecheck-examples` CI job id and display name were deliberately left unchanged (only the loop glob changed); branch protection does not pin the job (verified at create-story time), and keeping the id avoids any check-name churn.
+7. The `typecheck-examples` CI job id and display name were deliberately left unchanged (only the loop glob changed, plus a review-added `package.json` guard for non-npm subdirs); branch protection does not pin the job (verified at create-story time), and keeping the id avoids any check-name churn.
+8. Two task-text substitutions the review flagged as undisclosed, now on the record: (a) deferred-work entry 4 is struck with the house `**Resolved by Story 5.13 (ADR 0010):**` story-reference form, not the task text's "backlink to this story's merge commit"; a hash cannot exist pre-merge and no other struck entry in that file carries one. (b) The `verify` task's final-sweep parenthetical predicted zero `examples/` survivors; the sweep's five hits are all intentional historical prose inside ADR 0010, which satisfies the actual predicate ("only intentional survivors").
 
 ### File List
 
@@ -179,4 +207,5 @@ Claude Fable 5 (claude-fable-5) driving; per the maintainer's right-sized-model 
 ## Change Log
 
 - 2026-08-01: Story created via bmad-create-story. Ultimate context engine analysis completed: all epic ACs re-verified against the working tree at `96b996f`; drifted anchors corrected (ADR 0008 → 0010, `cli_examples.rs` → `cli_examples_drift.rs` for the anchors test, architecture/project-context line numbers); deferred-work line 103 added to the retarget list; new-shape guard test specified as the successor to the four-section test.
+- 2026-08-01: Three-layer Opus review (Blind Hunter / Edge Case Hunter / Acceptance Auditor) complete; Auditor verdict APPROVE with all 8 ACs verified against the tree. Triage: 0 decision-needed, 20 patch, 2 defer, 2 dismissed; all 20 patches applied same-session (fence-allowlist + fence-aware section scan + index prose guard, entry-list/directory sync tests in both drift files, positive architecture tree assertions, CI loop package.json guard, link checker extended to README.md + INSTALL.md, expected-output ids corrected for the RecordingStarted sentinel, Axiom 4 attribution fix, restored troubleshooting + no-runtime-deps prose, package name renames incl. lockfiles, members-line-scoped Cargo guard, stale comment/citation fixes, record corrections). Defers appended to deferred-work.md. Re-verified: scripts/test.sh 647 passed / 0 failed (644 + 3 review-added guards), fmt + clippy + per-entry npm ci/typecheck green, emdash sweep clean. Status review -> done.
 - 2026-08-01: dev-story complete, all 9 tasks / 8 ACs; status → review. Consolidation implemented as specified (moves, five-section READMEs, guard replacement, ADR 0010, artifact + reader-doc retargets). One beyond-list surface caught by the retargeted link checker (`docs/protocol.md:155`) and fixed. Suite 644/0 green (scripts/test.sh log 20260801-134538-57426), fmt + clippy + per-entry typecheck green, emdash sweep clean. Out-of-scope incident during verification filed as taskwarrior `2e9cfda3` (cli_auth's `bowerbird stop` boots out the real LaunchAgent by hardcoded label and leaks test daemons; pre-existing 5.9 behavior, zero overlap with this diff).

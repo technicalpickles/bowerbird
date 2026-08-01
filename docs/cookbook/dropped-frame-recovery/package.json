@@ -1,5 +1,5 @@
 {
-  "name": "bowerbird-example-reconnect-recovery",
+  "name": "bowerbird-cookbook-dropped-frame-recovery",
   "private": true,
   "type": "module",
   "engines": { "node": ">=22.6.0" },

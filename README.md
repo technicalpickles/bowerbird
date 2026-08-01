@@ -170,7 +170,7 @@ See [`docs/cookbook/README.md`](docs/cookbook/README.md) for the full walkthroug
 - [docs/quickstart.md](docs/quickstart.md) — five-minute walkthrough, no Claude Code session required
 - [docs/presenter-authoring.md](docs/presenter-authoring.md) — conceptual guide to building tools against the bowerbird substrate
 - [docs/protocol.md](docs/protocol.md) — REST + WebSocket + ingest-socket wire reference
-- [docs/cookbook/](docs/cookbook/) — recipes paired with the reference examples
+- [docs/cookbook/](docs/cookbook/): self-contained recipes, prose README + runnable reference code per pattern
 - [docs/no-list.md](docs/no-list.md) — explicit V1 scope cuts
 
 ## Architecture

@@ -30,9 +30,44 @@ const ENTRIES: &[&str] = &[
 ];
 
 #[test]
+fn entries_const_matches_directory_listing() {
+    // CI's typecheck loop globs docs/cookbook/*/, so a new entry directory
+    // gets typechecked while the hardcoded ENTRIES list silently skips it
+    // (no required-files, engines-floor, or smoke coverage). Turn that gap
+    // into a red build (review 2026-08-01).
+    let cookbook = workspace_root().join("docs/cookbook");
+    let mut dirs: Vec<String> = fs::read_dir(&cookbook)
+        .unwrap_or_else(|e| panic!("read_dir {}: {e}", cookbook.display()))
+        .filter_map(|entry| {
+            let entry = entry.expect("dir entry");
+            let is_dir = entry.file_type().expect("file type").is_dir();
+            is_dir.then(|| entry.file_name().to_string_lossy().into_owned())
+        })
+        .collect();
+    dirs.sort();
+
+    let mut expected: Vec<String> = ENTRIES.iter().map(|s| s.to_string()).collect();
+    expected.sort();
+
+    assert_eq!(
+        dirs, expected,
+        "docs/cookbook/ entry directories and ENTRIES disagree. Every entry \
+         directory must be listed here (and in cli_docs_drift.rs) so the \
+         guards and the smoke cover it."
+    );
+}
+
+#[test]
 fn each_entry_has_required_files() {
     for name in ENTRIES {
-        for rel in &["src/index.ts", "README.md", "package.json", "tsconfig.json"] {
+        for rel in &[
+            "src/index.ts",
+            "README.md",
+            "package.json",
+            // npm ci (the CI typecheck loop) hard-fails without a lockfile.
+            "package-lock.json",
+            "tsconfig.json",
+        ] {
             let p = workspace_root().join("docs/cookbook").join(name).join(rel);
             assert!(
                 p.is_file(),
@@ -113,6 +148,17 @@ fn architecture_md_describes_cookbook_as_typescript_not_cargo() {
          zone; the §Project Structure tree describes the consolidated shape \
          Story 5.13 ships"
     );
+    // Positive tree-shape assertions: the diagram must actually show a
+    // representative entry with its Node project files, not just the
+    // workspace-manifest comment (review 2026-08-01, Blind Hunter finding 3).
+    for needle in ["state-session-fanout/", "package.json", "tsconfig.json"] {
+        assert!(
+            arch.contains(needle),
+            "architecture.md no longer mentions `{needle}`; the §Project \
+             Structure tree must show the per-entry cookbook shape \
+             (README.md + package.json + tsconfig.json + src/index.ts)"
+        );
+    }
     assert!(
         !arch.contains("examples/*/Cargo.toml"),
         "architecture.md still references `examples/*/Cargo.toml`; the \
@@ -152,18 +198,24 @@ fn cookbook_not_in_root_cargo_toml_members() {
     let body = read_workspace_file("Cargo.toml");
     // The root manifest's `[workspace] members` array must exclude the
     // cookbook entry directories. Story 4.2 Task 1.2's invariant, carried
-    // forward through the Story 5.13 move.
+    // forward through the Story 5.13 move. Scoped to the members line so a
+    // legitimate `exclude = [...]` or a comment naming the path elsewhere in
+    // the manifest cannot false-fail (review 2026-08-01).
+    let members_line = body
+        .lines()
+        .find(|l| l.trim_start().starts_with("members"))
+        .expect("root Cargo.toml has a [workspace] members line");
     assert!(
-        body.contains("members = [\"crates/*\"]"),
+        members_line.contains("members = [\"crates/*\"]"),
         "root Cargo.toml must keep `members = [\"crates/*\"]` only; adding \
          cookbook entries would make them Cargo workspace members, \
-         contradicting the TypeScript-on-Node decision"
+         contradicting the TypeScript-on-Node decision (got: `{members_line}`)"
     );
-    for banned in ["\"examples/", "\"docs/cookbook"] {
+    for banned in ["examples/", "docs/cookbook"] {
         assert!(
-            !body.contains(banned),
-            "root Cargo.toml references `{banned}` as a workspace member; \
-             the cookbook entries are a Node project zone, not a Cargo zone \
+            !members_line.contains(banned),
+            "root Cargo.toml lists `{banned}` in the workspace members; the \
+             cookbook entries are a Node project zone, not a Cargo zone \
              (Story 4.2 invariant, Story 5.13 location)"
         );
     }
