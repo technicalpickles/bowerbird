@@ -20,12 +20,15 @@ cat crates/daemon/benches/baselines/linux.json
 
 Both files must carry non-zero `*_p99_nanos` values, OR the gap must be an
 explicit, maintainer-approved deferral recorded in
-[`deferred-work.md`](bmad/implementation-artifacts/deferred-work.md) (as of
-Story 5.5, `linux.json` is deliberately still zeroed — a real, unconfirmed
-~40x macOS/Linux p99 gap on rapid-fire ingestion shapes was found and punted
-post-launch rather than silently baselined; `macos.json` is seeded and
-armed). If a baseline is missing with no recorded deferral, stop and seed it
-before continuing — do not tag with a silently-aspirational bench gate.
+[`deferred-work.md`](bmad/implementation-artifacts/deferred-work.md). As of
+Story 5.5 (2026-08-01): `macos.json` fully armed at n=200 (Story 5.18's
+recalibration); `linux.json` armed for solo/fanout3/steady, with **burst
+deliberately 0 on Linux** -- an intermittent per-event ~40ms runner stall
+makes that one lane un-gateable until understood (maintainer-approved,
+recorded in deferred-work's 2026-08-01 Story 5.5 entry; the 100ms absolute
+gate still covers it). If a baseline is missing with no recorded deferral,
+stop and seed it before continuing -- do not tag with a
+silently-aspirational bench gate.
 
 ## 2. Chaos-injection sanity (Epic 4 retro AI-2, AI-3 — optional pre-rc1, recommended before final v0.1.0)
 
@@ -39,6 +42,15 @@ One draft PR per platform per gate, reverted before merge:
   job fails on the p95 regression.
 
 Document the verification (or its deferral) in the release notes.
+
+**Done 2026-07-31 (Story 5.5):** chaos PRs #35 (daemon, 50ms), #36 (shim 2ms)
+and #37 (shim 20ms; the 2ms magnitude no longer isolates macOS post-5.18)
+observed every gate failing on both platforms, then reverted, re-verified
+green, and closed without merging. Evidence in the story's Debug Log. If a
+future release wants to re-run this step, note two measured gotchas from that
+pass: `thread::sleep` overshoots 4-9x on `macos-latest`, and the daemon
+bench's steady lane does NOT fail under a systemic constant delay
+(taskwarrior `76856dda`).
 
 ## 3. Local workspace verification
 
