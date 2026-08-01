@@ -103,6 +103,13 @@ fn run(_log_path: &Path) -> Result<()> {
     let mut wire = serde_json::to_vec(&value).map_err(Error::StdinJson)?;
     wire.push(b'\n');
 
+    // CHAOS: revert before merge (Story 5.5 Task 3, macOS PR). 20ms blocking
+    // sleep on the hot path: deterministically trips BOTH macos-latest gates
+    // (min plausible p99 ~22.7ms > 20ms absolute > 15.45ms regression
+    // threshold). The ubuntu-latest leg will also fail (20ms is far over both
+    // its gates) -- expected, documented in the story. Must never reach main.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
     match socket::send(&sock_path, &wire)? {
         socket::Response::Ok => Ok(()),
         socket::Response::Backpressure => Err(Error::Backpressure503),
