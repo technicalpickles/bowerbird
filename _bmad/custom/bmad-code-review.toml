@@ -1,0 +1,20 @@
+# Team override for bmad-code-review. Committed; applies to everyone.
+#
+# Companion to _bmad/custom/bmad-dev-story.toml (Epic 5 retro AI-3,
+# taskwarrior a9005b7a). Stock bmad-code-review has no File List check at
+# all: the Epic 5 "File List matches git exactly" audit findings happened
+# because individual review prompts asked for it, not because the workflow
+# required it. bmad-story-automator-review is the only skill that encodes the
+# git cross-reference, and it ships without a customize.toml, so this override
+# is what makes the audit run on the review path actually in use since 5.13.
+
+[workflow]
+
+activation_steps_append = [
+  "Run the File-List-vs-git audit for the story under review, from the repo root: `python3 scripts/check-file-list.py <story-file> --base main`. Do this during context gathering, before forming findings, so the result is an input to the review rather than an afterthought. Exit 0 means clean, exit 1 means drift, exit 2 means a tooling problem worth reporting plainly. Carry the output into the review: every discrepancy it reports is a finding under team agreement A9, and a clean result is worth stating in the review notes as verified rather than assumed.",
+]
+
+persistent_facts = [
+  "Team agreement A9 (docs/bmad/implementation-artifacts/epic-3-retro-2026-05-25.md) makes File List drift HIGH severity in BOTH directions: changed in git but absent from the File List, and declared in the File List but unchanged in git. `scripts/check-file-list.py` is the deterministic implementation of that audit; the audit is not satisfied by the dev's claim that the File List is complete.",
+  "Story records are load-bearing prose in this repo: downstream tooling (test-summary generators, review scopers, retro authors) reads the File List as truth, so a wrong File List propagates incorrect coverage claims into the retrospective. The Epic 5 retro's headline finding was that record-vs-reality drift, not code defects, was the dominant finding class and the largest consumer of review budget.",
+]

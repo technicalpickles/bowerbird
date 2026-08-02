@@ -61,5 +61,27 @@ seconds, so timing assumptions that hold on a fast laptop are bugs:
 The full rationale (with the CI failure history that produced each rule)
 is in `docs/bmad/project-context.md` §Deterministic test discipline.
 
+## Story File List audits
+
+A BMAD story's `### File List` is verified against git, never self-attested.
+Before a story goes to `review`, and again when reviewing one:
+
+```sh
+python3 scripts/check-file-list.py <story-file> --base main
+```
+
+Exit 1 is drift, not a script failure. Team agreement A9 makes it HIGH
+severity in both directions: changed in git but undeclared, and declared but
+unchanged (an edit was claimed that never shipped). Fix the record, not the
+audit: `--ignore` is for paths genuinely outside the story's authorship, and
+using it belongs in the Completion Notes.
+
+This runs automatically under `bmad-dev-story` and `bmad-code-review` (wired
+via `_bmad/custom/*.toml`); run it by hand on any other path. The drift it
+catches is side-effect files (sprint-status bumps, planning-doc edits,
+formatter reflows) that the dev's recollection of intentional edits drops.
+That pattern bit eight stories across Epics 3 through 5, which is why the
+check now lives at the point where the record is written.
+
 Full project context (architecture, decisions, conventions) lives in
 `docs/bmad/project-context.md`.
