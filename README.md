@@ -166,7 +166,7 @@ Routed by what you need right now:
 
 **Learn it**
 
-- [docs/quickstart.md](docs/quickstart.md) is the five-minute tutorial: daemon up, fixture replayed, live state on your terminal.
+- [docs/quickstart.md](docs/quickstart.md) is the five-minute tutorial: install, daemon up, fixture replayed, live state on your terminal.
 
 **Solve a problem**
 

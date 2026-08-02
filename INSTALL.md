@@ -202,8 +202,8 @@ Linux) if you want to fully clean up.
 
 ## Further reading
 
-- [`README.md`](README.md) — project overview, Quickstart, architecture and
-  protocol pointers.
+- [`README.md`](README.md): project overview, install paths, and the
+  documentation index.
 - [`docs/protocol.md`](docs/protocol.md) — REST + WebSocket + ingest-socket wire reference.
 - [`docs/quickstart.md`](docs/quickstart.md) — five-minute walkthrough using the bundled replay fixture (no Claude Code session required).
 - `docs/bmad/planning-artifacts/architecture.md` — system architecture.

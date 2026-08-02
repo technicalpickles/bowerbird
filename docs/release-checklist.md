@@ -184,7 +184,8 @@ non-prerelease `v0.1.0` tag (Story 5.15's scope) must:
   epic's "first stable release" framing, e.g.
   `Status: v0.1.0, the first stable release.`
 - Retarget the rc3-pinned download URL in `docs/quickstart.md` step 0 to the
-  final tag's assets. Once a non-prerelease release exists, the
-  `releases/latest/download/...` URL form also starts resolving and is the
-  better long-term target (asset names stay version-prefixed either way, so
-  the extracted-directory paths in the same step must match the tag).
+  final tag's assets: `releases/download/v0.1.0/bowerbird-v0.1.0-<target>.tar.gz`,
+  updating the extracted-directory paths in the same step to match. Do NOT
+  switch to the `releases/latest/download/...` form: asset names are
+  version-prefixed, so a latest-URL naming the v0.1.0 asset 404s the moment
+  a newer release ships, while the direct tag URL keeps working.
