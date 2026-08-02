@@ -1005,4 +1005,4 @@ This file is the **front door** for AI agents (and humans) working on bowerbird.
   - A presenter ships using a protocol field in an unexpected way (Axiom 4 trigger).
   - Pickles returns from a non-Active maintainer-status window.
 
-Last updated: 2026-05-11.
+Last updated: 2026-08-02 (footer refreshed at the Epic 5 retro; section content is maintained per-ADR under the protocol above, and carries updates through ADR 0011 / Story 5.18).
