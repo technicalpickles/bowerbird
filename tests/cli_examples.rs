@@ -1,5 +1,6 @@
-//! End-to-end smoke tests for the three cookbook reference entries (Story
-//! 4.2; relocated into `docs/cookbook/` by Story 5.13's consolidation).
+//! End-to-end smoke tests for the cookbook reference entries (Story 4.2;
+//! relocated into `docs/cookbook/` by Story 5.13's consolidation; joined by
+//! `session-glance` in Story 6-session-glance).
 //!
 //! Each test orchestrates a real daemon subprocess + a Node subprocess
 //! running one of the TypeScript cookbook entries, then asserts the entry's
@@ -719,19 +720,52 @@ fn dropped_frame_recovery_recovers_after_close_frame_and_resumes() {
 // AC #1, #2, #3: examples fail clearly when the daemon is down.
 // ---------------------------------------------------------------------------
 
+/// Every cookbook entry directory, derived from the `docs/cookbook/*/` glob
+/// exactly as `tests/cli_docs_drift.rs` and `tests/cli_examples_drift.rs` do
+/// (Story 6-session-glance, AC 4): a subdir with no `package.json` is not an
+/// entry and is skipped, mirroring CI's own filter.
+///
+/// The daemon-down contract below is cookbook-wide, so the loop is derived
+/// rather than listed. A hardcoded list here would have exactly the failure
+/// mode AC 4 is about: a new entry gets typechecked and smoked but silently
+/// skips the "fails clearly with no daemon" assertion.
+fn cookbook_entry_dirs() -> Vec<String> {
+    let mut dirs: Vec<String> = std::fs::read_dir(cookbook_dir())
+        .expect("read_dir docs/cookbook")
+        .filter_map(|entry| {
+            let entry = entry.expect("dir entry");
+            if !entry.file_type().expect("file type").is_dir() {
+                return None;
+            }
+            if !entry.path().join("package.json").is_file() {
+                return None;
+            }
+            Some(entry.file_name().to_string_lossy().into_owned())
+        })
+        .collect();
+    dirs.sort();
+    // A13 positive companion: an empty derivation would make the loop below
+    // assert nothing while still reporting green.
+    assert!(
+        dirs.len() >= 3 && dirs.iter().any(|d| d == "session-glance"),
+        "docs/cookbook/*/ derivation looks wrong: {dirs:?}"
+    );
+    dirs
+}
+
 #[test]
 fn cookbook_entries_fail_clearly_when_daemon_down() {
     if !node_22_6_available() {
         return;
     }
-    // No daemon started.
+    // No daemon started, so `server.json` is MISSING. That is daemon-down
+    // failure mode (a). Mode (b), `server.json` present but stale and the
+    // connection refused, is a different code path and is covered by
+    // `session_glance_names_the_address_when_server_json_is_stale`.
     let tmp = TempDir::new().expect("tempdir");
 
-    for example in [
-        "state-session-fanout",
-        "rest-cursor-pagination",
-        "dropped-frame-recovery",
-    ] {
+    for example in cookbook_entry_dirs() {
+        let example = example.as_str();
         let mut child = spawn_example(&tmp, example, &[], &[]);
         let status = child.wait().expect("daemon-down subprocess wait");
         assert!(
@@ -748,4 +782,507 @@ fn cookbook_entries_fail_clearly_when_daemon_down() {
             "{example}: stderr should mention server.json on daemon-down; got:\n{stderr}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Story 6-session-glance: the one-shot glance entry.
+//
+// The bundled `bowerbird replay` fixture cannot drive these assertions: every
+// one of its sessions ends on `Stop` (so they all land on `Idle`), none carry
+// a `cwd`, and none carry a `pid`, which means the liveness probe would mark
+// them all `Ended` on its next 5s tick (`projection/liveness.rs`:
+// `last_pid IS NULL` -> `no_pid_at_upgrade`). So these tests replay their own
+// fixture: distinct LIVE pids so the probe leaves the rows alone (distinct
+// because a shared pid triggers Story 5.11 supersession), real directory
+// trees so the repo derivation has something to walk, and one deliberately
+// `Ended` session so "non-Ended only" is an assertion rather than an accident.
+// ---------------------------------------------------------------------------
+
+/// Hang detector for the glance polls, not a latency assertion.
+const GLANCE_HANG_GUARD: Duration = Duration::from_secs(30);
+
+struct GlanceFixture {
+    /// Path to the JSONL file `bowerbird replay` consumes.
+    path: PathBuf,
+    /// Basename of the ordinary repository the derivation should find by
+    /// walking up from a subdirectory.
+    repo: String,
+    /// Basename of the git-worktree directory (its `.git` is a FILE, so the
+    /// derivation must stop there rather than walking to the outer repo).
+    worktree: String,
+}
+
+/// Build the replay fixture plus the directory tree its `cwd` values point at.
+///
+/// `live_pids` must be three DISTINCT pids of processes that are alive: the
+/// liveness probe ends a session whose `last_pid` is null or dead, and the
+/// event-driven supersession path ends the predecessor when two sessions
+/// claim the same pid.
+fn write_glance_fixture(tmp: &TempDir, live_pids: [u32; 3]) -> GlanceFixture {
+    let root = tmp.path().join("work");
+    let repo = root.join("bowerbird-fixture-repo");
+    let repo_subdir = repo.join("crates").join("daemon");
+    // A worktree nested INSIDE the repo, so a derivation that tested
+    // `.git`.isDirectory() would walk past it and report the outer repo.
+    let worktree = repo.join("worktrees").join("wt-feature-branch");
+    std::fs::create_dir_all(repo.join(".git")).expect("mkdir repo/.git");
+    std::fs::create_dir_all(&repo_subdir).expect("mkdir repo subdir");
+    std::fs::create_dir_all(&worktree).expect("mkdir worktree");
+    std::fs::write(
+        worktree.join(".git"),
+        "gitdir: /elsewhere/.git/worktrees/wt-feature-branch\n",
+    )
+    .expect("write worktree .git file");
+
+    let line = |event_id: i64,
+                session_id: &str,
+                kind: &str,
+                payload: serde_json::Value,
+                pid: Option<u32>,
+                cwd: Option<&std::path::Path>| {
+        serde_json::json!({
+            "event_id": event_id,
+            "source": "claude",
+            "session_id": session_id,
+            "kind": kind,
+            "reaction": serde_json::Value::Null,
+            // `payload` rides the wire as a JSON *string*, verbatim.
+            "payload": payload.to_string(),
+            "created_at": 1_700_000_000_000i64,
+            "pid": pid,
+            "cwd": cwd.map(|p| p.to_string_lossy().into_owned()),
+        })
+        .to_string()
+    };
+
+    let body = [
+        // PreToolUse -> Working. cwd is BELOW the repo root, so rule 2 has to
+        // walk up to find `.git`.
+        line(
+            1,
+            "sess-alpha",
+            "PreToolUse",
+            serde_json::json!({ "tool_name": "Read" }),
+            Some(live_pids[0]),
+            Some(&repo_subdir),
+        ),
+        // Notification(permission_prompt) -> WaitingInput. cwd IS the
+        // worktree, whose `.git` is a file.
+        line(
+            2,
+            "sess-beta",
+            "Notification",
+            serde_json::json!({ "notification_type": "permission_prompt" }),
+            Some(live_pids[1]),
+            Some(&worktree),
+        ),
+        // Stop -> Idle, with no cwd at all: the `(unknown repo)` bucket.
+        line(
+            3,
+            "sess-gamma",
+            "Stop",
+            serde_json::json!({}),
+            Some(live_pids[2]),
+            None,
+        ),
+        // SessionEnded -> Ended, which the default filter must exclude. No
+        // pid needed: the probe skips rows that are already Ended.
+        line(
+            4,
+            "sess-delta",
+            "SessionEnded",
+            serde_json::json!({ "reason": "pid_dead" }),
+            None,
+            Some(&repo),
+        ),
+    ]
+    .join("\n");
+
+    let path = tmp.path().join("glance-fixture.jsonl");
+    std::fs::write(&path, format!("{body}\n")).expect("write glance fixture");
+    GlanceFixture {
+        path,
+        repo: repo
+            .file_name()
+            .expect("repo basename")
+            .to_string_lossy()
+            .into_owned(),
+        worktree: worktree
+            .file_name()
+            .expect("worktree basename")
+            .to_string_lossy()
+            .into_owned(),
+    }
+}
+
+/// Three distinct pids that are certainly alive: this test process, the
+/// daemon it just started, and pid 1 (init/launchd, which `kill(1, 0)`
+/// reports as EPERM and the probe therefore treats as alive).
+fn distinct_live_pids(tmp: &TempDir) -> [u32; 3] {
+    let self_pid = std::process::id();
+    let daemon_pid = read_pid_file(tmp).expect("daemon pid file") as u32;
+    assert_ne!(
+        self_pid, daemon_pid,
+        "the fixture needs distinct pids; a shared pid triggers Story 5.11 supersession"
+    );
+    [self_pid, daemon_pid, 1]
+}
+
+/// Run session-glance to completion. Returns `(success, stdout, stderr)`.
+fn run_glance(tmp: &TempDir, args: &[&str]) -> (bool, String, String) {
+    use std::io::Read;
+    let mut child = spawn_example(tmp, "session-glance", args, &[]);
+    let status = child.wait().expect("session-glance wait");
+    let mut stdout = String::new();
+    if let Some(mut s) = child.stdout.take() {
+        let _ = s.read_to_string(&mut stdout);
+    }
+    let mut stderr = String::new();
+    if let Some(mut s) = child.stderr.take() {
+        let _ = s.read_to_string(&mut stderr);
+    }
+    (status.success(), stdout, stderr)
+}
+
+/// Poll `--count` until it reports `expected`, or the hang guard expires.
+///
+/// `POST /replay` returns once the envelopes are queued on the ingest
+/// channel, not once the projection has committed, so the rows land shortly
+/// after `bowerbird replay` exits. This is a probe fence on an observable
+/// (the count the entry itself reports), not a sleep-to-synchronize.
+fn wait_for_glance_count(tmp: &TempDir, expected: usize) {
+    let deadline = Instant::now() + GLANCE_HANG_GUARD;
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        let (ok, stdout, stderr) = run_glance(tmp, &["--count"]);
+        last = format!("ok={ok} stdout={stdout:?} stderr={stderr:?}");
+        if let Some(n) = ok.then(|| stdout.trim().parse::<usize>().ok()).flatten() {
+            if n == expected {
+                return;
+            }
+            // Fail fast rather than burning the hang guard: the count only
+            // rises as rows commit, so OVERSHOOTING it can never be fixed by
+            // waiting. The fixture has exactly `expected` non-Ended sessions,
+            // so a higher count means the `?state=` filter is letting the
+            // Ended one through.
+            if n > expected {
+                force_stop(tmp);
+                panic!(
+                    "session-glance --count reported {n}, more than the {expected} \
+                     non-Ended sessions the fixture defines. The ?state= filter is \
+                     not excluding Ended."
+                );
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    force_stop(tmp);
+    panic!("session-glance --count never reached {expected}; last attempt: {last}");
+}
+
+#[test]
+fn session_glance_groups_live_sessions_by_repo_with_ages() {
+    if !node_22_6_available() {
+        return;
+    }
+    let tmp = TempDir::new().expect("tempdir");
+    start_daemon(&tmp);
+    let fixture = write_glance_fixture(&tmp, distinct_live_pids(&tmp));
+    bowerbird_cmd_in(&tmp)
+        .arg("replay")
+        .arg(&fixture.path)
+        .assert()
+        .success();
+    wait_for_glance_count(&tmp, 3);
+
+    let (ok, stdout, stderr) = run_glance(&tmp, &[]);
+
+    // Positive companion for the "Ended is excluded" assertion below: ask for
+    // Ended explicitly and confirm sess-delta really is in the daemon and
+    // really is Ended. Without this, its absence from the default output
+    // could just mean the fixture row never landed.
+    let (ended_ok, ended_stdout, ended_stderr) = run_glance(&tmp, &["--state=ended"]);
+
+    stop_daemon(&tmp);
+    force_stop(&tmp);
+
+    assert!(ok, "session-glance exited non-zero; stderr:\n{stderr}");
+    assert!(
+        ended_ok,
+        "session-glance --state=ended exited non-zero; stderr:\n{ended_stderr}"
+    );
+    assert!(
+        ended_stdout.contains("claude/sess-delta") && ended_stdout.contains("Ended"),
+        "precondition: sess-delta must exist in the Ended state; got:\n{ended_stdout}"
+    );
+
+    // AC 1: grouped by repository, derived presenter-side from `cwd`.
+    let lines: Vec<&str> = stdout.lines().collect();
+    for heading in [
+        fixture.repo.as_str(),
+        fixture.worktree.as_str(),
+        "(unknown repo)",
+    ] {
+        assert!(
+            lines.contains(&heading),
+            "expected a `{heading}` repo heading; got:\n{stdout}"
+        );
+    }
+    // The worktree's `.git` is a FILE. Grouping it under the outer repo would
+    // mean the derivation tested isDirectory() and walked past it.
+    let worktree_idx = lines
+        .iter()
+        .position(|l| *l == fixture.worktree)
+        .expect("worktree heading");
+    assert!(
+        lines[worktree_idx + 1].contains("claude/sess-beta"),
+        "sess-beta must sit under the worktree heading; got:\n{stdout}"
+    );
+
+    // AC 1: each session carries its state and an age.
+    for (session, state) in [
+        ("sess-alpha", "Working"),
+        ("sess-beta", "WaitingInput"),
+        ("sess-gamma", "Idle"),
+    ] {
+        let line = lines
+            .iter()
+            .find(|l| l.contains(&format!("claude/{session}")))
+            .unwrap_or_else(|| panic!("no line for {session}; got:\n{stdout}"));
+        assert!(
+            line.starts_with("  "),
+            "session lines are indented under their repo heading; got: {line:?}"
+        );
+        assert!(
+            line.contains(state),
+            "{session} should render `{state}` (PascalCase, verbatim from the \
+             wire); got: {line:?}"
+        );
+        let age = line.rsplit("  ").next().unwrap_or("");
+        assert!(
+            age.ends_with('s') || age.ends_with('m') || age.ends_with('h'),
+            "{session} should render an age from started_at, not a raw \
+             timestamp; got: {line:?}"
+        );
+        assert!(
+            !line.contains("NaN") && !line.contains("1970"),
+            "age must never render NaN or a 1970 timestamp; got: {line:?}"
+        );
+    }
+
+    // AC 1: every NON-ENDED session, which means the Ended one is absent.
+    assert!(
+        !stdout.contains("sess-delta"),
+        "sess-delta is Ended and must not appear in the default glance; got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("Ended"),
+        "the default filter is the four non-Ended tokens; got:\n{stdout}"
+    );
+}
+
+#[test]
+fn session_glance_machine_modes_pin_the_output_contract() {
+    if !node_22_6_available() {
+        return;
+    }
+    let tmp = TempDir::new().expect("tempdir");
+    start_daemon(&tmp);
+    let fixture = write_glance_fixture(&tmp, distinct_live_pids(&tmp));
+    bowerbird_cmd_in(&tmp)
+        .arg("replay")
+        .arg(&fixture.path)
+        .assert()
+        .success();
+    wait_for_glance_count(&tmp, 3);
+
+    let count = run_glance(&tmp, &["--count"]);
+    let blocked = run_glance(&tmp, &["--count", "--state=waitinginput"]);
+    let json = run_glance(&tmp, &["--format=json"]);
+    let bad_flag = run_glance(&tmp, &["--fromat=json"]);
+    let bad_state = run_glance(&tmp, &["--state=running"]);
+
+    stop_daemon(&tmp);
+    force_stop(&tmp);
+
+    // AC 2: `--count` is a single integer on stdout and nothing else. This is
+    // the entirety of the tmux status line's data path, so it is asserted as
+    // a contract, not spot-checked.
+    assert!(count.0, "--count exited non-zero; stderr:\n{}", count.2);
+    assert_eq!(
+        count.1.lines().count(),
+        1,
+        "--count must print exactly one line; got:\n{}",
+        count.1
+    );
+    assert_eq!(
+        count
+            .1
+            .trim()
+            .parse::<usize>()
+            .expect("--count is an integer"),
+        3
+    );
+    assert!(
+        blocked.0 && blocked.1.trim() == "1",
+        "--count --state=waitinginput should report the one blocked session; \
+         got stdout={:?} stderr={:?}",
+        blocked.1,
+        blocked.2
+    );
+
+    // AC 2: `--format=json` is NDJSON, one object per session, fixed field set.
+    assert!(json.0, "--format=json exited non-zero; stderr:\n{}", json.2);
+    let rows: Vec<serde_json::Value> = json
+        .1
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("NDJSON line {l:?}: {e}")))
+        .collect();
+    assert_eq!(rows.len(), 3, "one object per session; got:\n{}", json.1);
+    const CONTRACT_FIELDS: &[&str] = &[
+        "repo",
+        "source",
+        "session_id",
+        "current_state",
+        "age",
+        "age_seconds",
+        "started_at",
+        "cwd",
+    ];
+    for row in &rows {
+        let obj = row.as_object().expect("NDJSON row is an object");
+        let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+        keys.sort();
+        let mut expected: Vec<&str> = CONTRACT_FIELDS.to_vec();
+        expected.sort();
+        assert_eq!(
+            keys, expected,
+            "the --format=json field set is the documented contract \
+             (README.md 'Run it'); adding or removing a key breaks every \
+             consumer. Row: {row}"
+        );
+    }
+    // The repo derivation is present in machine mode too, and the null-cwd
+    // session is bucketed rather than dropped.
+    let repos: Vec<&str> = rows
+        .iter()
+        .map(|r| r["repo"].as_str().expect("repo is a string"))
+        .collect();
+    assert!(
+        repos.contains(&"(unknown repo)"),
+        "a null cwd must land in the named bucket, not be dropped; got {repos:?}"
+    );
+    assert!(
+        repos.contains(&fixture.worktree.as_str()),
+        "the worktree must group by its own basename; got {repos:?}"
+    );
+
+    // AC 2 / `machine-output-contract`: bad input is a one-line failure that
+    // names the input and the accepted set, never a stack trace.
+    for (label, (ok, stdout, stderr), needle, accepted) in [
+        ("--fromat=json", bad_flag, "--fromat=json", "--count"),
+        (
+            "--state=running",
+            bad_state,
+            "running",
+            "idle, working, waitinginput, ended, unknown",
+        ),
+    ] {
+        assert!(!ok, "{label}: expected a non-zero exit; stdout:\n{stdout}");
+        assert_eq!(
+            stderr.lines().count(),
+            1,
+            "{label}: expected exactly one stderr line, not a stack trace; got:\n{stderr}"
+        );
+        assert!(
+            stderr.contains(needle),
+            "{label}: stderr must name the bad input; got:\n{stderr}"
+        );
+        assert!(
+            stderr.contains(accepted),
+            "{label}: stderr must list the accepted set; got:\n{stderr}"
+        );
+    }
+}
+
+/// Daemon-down failure mode (b), and the CI-side counterpart of AC 6's
+/// provoked adversity ("daemon stopped mid-day").
+///
+/// `cookbook_entries_fail_clearly_when_daemon_down` covers mode (a) only: no
+/// daemon ever ran, so `server.json` is missing and the read fails. The
+/// interesting case is different. The daemon removes `server.json` on a CLEAN
+/// shutdown, so a crash, an OOM kill, or a `kill -9` leaves the file behind
+/// pointing at an address nothing is listening on. Node reports that as a
+/// bare `TypeError: fetch failed`, which names neither the address nor the
+/// fix and is precisely the stack-trace-shaped failure AC 6 forbids.
+#[test]
+fn session_glance_names_the_address_when_server_json_is_stale() {
+    if !node_22_6_available() {
+        return;
+    }
+    let tmp = TempDir::new().expect("tempdir");
+    start_daemon(&tmp);
+
+    let server_json = data_dir(&tmp).join("server.json");
+    let before = std::fs::read_to_string(&server_json).expect("server.json while daemon is up");
+    let bind_addr = serde_json::from_str::<serde_json::Value>(&before).expect("server.json parses")
+        ["bind_addr"]
+        .as_str()
+        .expect("bind_addr is a string")
+        .to_string();
+
+    // SIGKILL, not `bowerbird stop`: a graceful stop deletes server.json and
+    // would put us back on mode (a).
+    let pid = read_pid_file(&tmp).expect("daemon pid file");
+    #[allow(unsafe_code)]
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    assert!(
+        wait_for_pid_dead(pid, Instant::now() + GLANCE_HANG_GUARD),
+        "daemon did not die after SIGKILL"
+    );
+
+    // A13 positive companion: the assertions below are only meaningful if the
+    // precondition actually fired, i.e. the file really did survive the kill.
+    // If a future change made shutdown remove it here too, this test would
+    // otherwise keep passing while silently testing mode (a) again.
+    let after = std::fs::read_to_string(&server_json)
+        .expect("server.json must SURVIVE an unclean daemon death; that is mode (b)");
+    assert_eq!(
+        after, before,
+        "the stale server.json should still point at the dead daemon's address"
+    );
+
+    let (ok, stdout, stderr) = run_glance(&tmp, &[]);
+    force_stop(&tmp);
+
+    assert!(!ok, "expected a non-zero exit; stdout:\n{stdout}");
+    assert_eq!(
+        stderr.lines().count(),
+        1,
+        "expected exactly one stderr line, never a stack trace; got:\n{stderr}"
+    );
+    for needle in [
+        "cannot reach the daemon",
+        &format!("http://{bind_addr}"),
+        "server.json",
+        "bowerbird start",
+    ] {
+        assert!(
+            stderr.contains(needle),
+            "stale-server.json message must contain {needle:?}; got:\n{stderr}"
+        );
+    }
+    for banned in ["TypeError", "fetch failed", "    at "] {
+        assert!(
+            !stderr.contains(banned),
+            "AC 6 forbids the raw Node failure shape; stderr contains {banned:?}:\n{stderr}"
+        );
+    }
+    // And it must NOT be the mode-(a) message: the file is right there.
+    assert!(
+        !stderr.contains("cannot read"),
+        "mode (b) must not be reported as a missing server.json; got:\n{stderr}"
+    );
 }
