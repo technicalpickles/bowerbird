@@ -12,7 +12,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, chmodSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -22,6 +22,7 @@ import {
   ageSeconds,
   parseArgs,
   renderText,
+  sanitizeHeading,
   toRow,
   type GlanceRow,
 } from "../src/index.ts";
@@ -57,6 +58,24 @@ function row(overrides: Partial<GlanceRow>): GlanceRow {
 test("deriveRepo rule 1: null cwd lands in the named bucket, never dropped", () => {
   assert.equal(deriveRepo(null), "(unknown repo)");
   assert.equal(deriveRepo(""), "(unknown repo)");
+});
+
+test("deriveRepo rule 1+4: junk off the wire is a bucket, never a crash", () => {
+  // `cwd` reaches deriveRepo through an unchecked `as SessionListItem[]` cast
+  // of the response body, so its declared `string | null` is a claim about the
+  // daemon, not a guarantee about the value. `undefined` in particular is the
+  // one a `=== null` check misses, and a throw here takes down the WHOLE run
+  // (every session, not one row) because the map is not per-item guarded.
+  for (const junk of [undefined, 42, [], {}, true] as unknown[]) {
+    assert.equal(
+      deriveRepo(junk as string | null),
+      "(unknown repo)",
+      `deriveRepo(${JSON.stringify(junk) ?? "undefined"}) must bucket, not throw or leak`,
+    );
+  }
+  // Positive companion: a real string still derives normally, so the bucketing
+  // above is about the junk and not a blanket fallback.
+  assert.equal(deriveRepo("/tmp/some-project"), "some-project");
 });
 
 test("deriveRepo rule 2: cwd below the repo root resolves to the repo", () => {
@@ -96,10 +115,45 @@ test("deriveRepo rule 3: no `.git` ancestor falls back to basename(cwd)", () => 
   });
 });
 
-test("deriveRepo rules 3+4: an unreadable path is a bucket, not a crash", () => {
-  // A cwd recorded on another machine, or on a since-deleted directory.
+test("deriveRepo rule 3: a path that does not exist falls back to basename(cwd)", () => {
+  // A cwd recorded on another machine, or on a since-deleted directory. Note
+  // this is the SAME branch as the test above (no `.git` anywhere up the
+  // walk); it is not the unreadable-directory case, which has its own test.
   assert.equal(deriveRepo("/definitely/not/a/real/path/some-project"), "some-project");
   assert.equal(deriveRepo("/"), "/");
+});
+
+test("deriveRepo rule 3: an UNREADABLE directory is treated as having no `.git`", () => {
+  // The documented behavior, verified rather than assumed: `existsSync`
+  // returns false on EACCES instead of throwing, so the walk does not stop at
+  // an unreadable directory -- it keeps going up and finds the enclosing repo.
+  // (An earlier draft of the rule text claimed the walk aborted to
+  // `basename(cwd)` here. It never did.)
+  withTempTree((root) => {
+    const repo = join(root, "outer-repo");
+    mkdirSync(join(repo, ".git"), { recursive: true });
+    const locked = join(repo, "locked");
+    mkdirSync(locked, { recursive: true });
+    chmodSync(locked, 0o000);
+    try {
+      // Precondition: the directory really is unreadable FOR THIS PROCESS.
+      // Running as root (some CI containers) defeats the mode bits entirely,
+      // and asserting EACCES semantics there would assert a falsehood.
+      let unreadable = true;
+      try {
+        readdirSync(locked);
+        unreadable = false;
+      } catch {
+        // expected
+      }
+      if (!unreadable) {
+        return;
+      }
+      assert.equal(deriveRepo(locked), "outer-repo");
+    } finally {
+      chmodSync(locked, 0o700);
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -117,9 +171,14 @@ test("formatAge renders two units and never NaN", () => {
 
 test("formatAge names the null case instead of printing NaN or 1970", () => {
   const rendered = formatAge(null, 1_000_000_000_000);
+  // The two negatives come FIRST on purpose. Behind an `assert.equal(rendered,
+  // "age unknown")` they can never be the assertion that fires: any break that
+  // makes the output contain `NaN` or `1970` also breaks the equality, so the
+  // negatives would be permanently unobservable-red (A13). In this order a
+  // regression in the placeholder is caught BY them.
+  assert.ok(!rendered.includes("NaN"), `must not render NaN; got: ${rendered}`);
+  assert.ok(!rendered.includes("1970"), `must not render a 1970 timestamp; got: ${rendered}`);
   assert.equal(rendered, "age unknown");
-  assert.ok(!rendered.includes("NaN"), "must not render NaN");
-  assert.ok(!rendered.includes("1970"), "must not render a 1970 timestamp");
   assert.equal(ageSeconds(null, 1_000_000_000_000), null);
 });
 
@@ -127,6 +186,27 @@ test("formatAge clamps a future started_at instead of going negative", () => {
   const now = 1_000_000_000_000;
   assert.equal(formatAge(now + 60_000, now), "0s");
   assert.equal(ageSeconds(now + 60_000, now), 0);
+});
+
+test("formatAge keeps the two-unit shape for absurd started_at values", () => {
+  // A finite-but-insane `started_at` is not a hypothetical: it is one bad
+  // wire value away. `-1e30` passes a `Number.isFinite` guard, and the day
+  // count then formats in SCIENTIFIC NOTATION (`1e+22d`), which escapes the
+  // documented two-unit shape a consumer parses.
+  const now = 1_000_000_000_000;
+  for (const absurd of [-1e30, 1e30, Number.MAX_VALUE, 1.5, Number.NaN, Infinity]) {
+    const rendered = formatAge(absurd, now);
+    assert.ok(
+      !rendered.includes("e+"),
+      `started_at ${absurd} must not render in scientific notation; got: ${rendered}`,
+    );
+    assert.equal(rendered, "age unknown");
+    assert.equal(ageSeconds(absurd, now), null);
+  }
+  // Positive companion: a real epoch-ms value at the same scale of elapsed
+  // time still renders normally, so the rejections above are about the value
+  // being unusable, not about large ages.
+  assert.equal(formatAge(now - 400 * 24 * 3600 * 1000, now), "400d0h");
 });
 
 // ---------------------------------------------------------------------------
@@ -149,6 +229,30 @@ test("renderText groups by repo, sorts deterministically, indents sessions", () 
     "beta",
     "  claude/two  Working  5s",
   ]);
+});
+
+test("renderText headings cannot be mistaken for session rows", () => {
+  // The text format's only structural discriminator is the two-space indent,
+  // and `6-tmux-ambient` parses exactly that. `cwd` is verbatim off the wire,
+  // and both a newline and a leading space are legal POSIX path components:
+  // one would split a heading across two lines and manufacture a phantom
+  // repo, the other would make a heading shape-identical to a session row.
+  const lines = renderText(
+    [row({ repo: "evil\nrepo", session_id: "a" }), row({ repo: "  indented", session_id: "b" })],
+    "idle",
+  );
+  const headings = lines.filter((l) => !l.startsWith("  "));
+  assert.equal(headings.length, 2, `exactly two headings; got ${JSON.stringify(lines)}`);
+  for (const line of lines) {
+    assert.ok(!line.includes("\n"), `no line may embed a newline; got ${JSON.stringify(line)}`);
+  }
+  // Positive companion: an ordinary name passes through untouched, so the
+  // rewriting above is targeted rather than a blanket mangle.
+  assert.equal(sanitizeHeading("bowerbird"), "bowerbird");
+  assert.equal(sanitizeHeading("my.repo-2"), "my.repo-2");
+  // A name that is nothing but whitespace collapses to the named bucket
+  // instead of printing a blank line.
+  assert.equal(sanitizeHeading("   "), "(unknown repo)");
 });
 
 test("renderText prints a clear line for zero live sessions, never blank", () => {
@@ -185,17 +289,26 @@ test("toRow keeps current_state verbatim in its PascalCase wire spelling", () =>
 // ---------------------------------------------------------------------------
 
 test("parseArgs defaults to text mode over the four non-Ended states", () => {
-  const opts = parseArgs([]);
-  assert.deepEqual(opts, {
+  assert.deepEqual(parseArgs([]), {
     count: false,
     format: "text",
     states: "idle,working,waitinginput,unknown",
+    help: false,
   });
-  // `unknown` is in the default set on purpose: it is the decode-only
-  // catch-all for future additive states, and dropping it would make a future
-  // daemon's new state vanish from the glance.
-  assert.ok(opts.states.split(",").includes("unknown"));
-  assert.ok(!opts.states.split(",").includes("ended"));
+});
+
+// Split out of the deepEqual above deliberately. Behind it, neither assertion
+// below could ever be the one that fires: any break to DEFAULT_STATES breaks
+// the deepEqual first, leaving both negatives unobservable-red (A13). On their
+// own they are the failure a widened default set produces.
+test("the default state set carries `unknown` and excludes `ended`", () => {
+  const states = parseArgs([]).states.split(",");
+  // `unknown` is the decode-only catch-all for future additive states;
+  // dropping it would make a future daemon's new state vanish from the glance.
+  assert.ok(states.includes("unknown"), `default set must carry unknown; got ${states}`);
+  // `ended` in the default set would put finished sessions in an attention
+  // surface whose whole premise is "what is live right now".
+  assert.ok(!states.includes("ended"), `default set must exclude ended; got ${states}`);
 });
 
 test("parseArgs accepts the documented flags in any order", () => {
@@ -203,7 +316,50 @@ test("parseArgs accepts the documented flags in any order", () => {
     count: true,
     format: "json",
     states: "working",
+    help: false,
   });
+  // Same flags, reversed. "Order-independent" is a claim the test makes, not
+  // one the doc comment makes alone.
+  assert.deepEqual(parseArgs(["--count", "--state=Working", "--format=json"]), {
+    count: true,
+    format: "json",
+    states: "working",
+    help: false,
+  });
+});
+
+test("parseArgs rejects a repeated --format/--state instead of resolving last-wins", () => {
+  // Last-wins IS order dependence, which is the one property the doc comment
+  // above parseArgs promises the flags do not have.
+  for (const argv of [
+    ["--format=json", "--format=text"],
+    ["--format=text", "--format=json"],
+    ["--state=idle", "--state=working"],
+    ["--state=idle", "--state=idle"],
+  ]) {
+    assert.throws(
+      () => parseArgs(argv),
+      (e: Error) => {
+        assert.ok(e.message.includes("twice"), `must say what went wrong: ${e.message}`);
+        assert.ok(e.message.includes("order"), `must say why it matters: ${e.message}`);
+        return true;
+      },
+      `${argv.join(" ")} must be rejected`,
+    );
+  }
+  // Positive companion: repeating `--count` is fine (a boolean has no second
+  // value to disagree with), so the rejections above are about conflicting
+  // VALUES, not about repetition itself.
+  assert.equal(parseArgs(["--count", "--count"]).count, true);
+});
+
+test("parseArgs answers --help and -h instead of calling them unrecognized", () => {
+  for (const flag of ["--help", "-h"]) {
+    assert.equal(parseArgs([flag]).help, true, `${flag} must set help`);
+  }
+  // Positive companion: `--help` is recognized specifically, not by a blanket
+  // acceptance of anything starting with `-`.
+  assert.throws(() => parseArgs(["--halp"]));
 });
 
 test("parseArgs normalizes state tokens the way the daemon does", () => {

@@ -13,10 +13,23 @@
 //! verification-block grep.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// Is `p` a directory, FOLLOWING symlinks?
+///
+/// `DirEntry::file_type()` does NOT follow symlinks (on Unix it is readdir's
+/// `d_type`), so a symlinked entry directory reads as neither file nor
+/// directory and every listing built on it silently drops the entry. CI's
+/// `for d in docs/cookbook/*/` glob does the opposite: the shell's `*/`
+/// resolves the link and matches, so CI would `npm ci && npm run typecheck`
+/// a directory that no guard in this file has ever seen. `fs::metadata`
+/// resolves, which puts the two back in agreement.
+fn is_dir_following_symlinks(p: &Path) -> bool {
+    fs::metadata(p).map(|m| m.is_dir()).unwrap_or(false)
 }
 
 fn read_workspace_file(rel: &str) -> String {
@@ -59,7 +72,7 @@ fn cookbook_entry_dirs() -> Vec<String> {
         .unwrap_or_else(|e| panic!("read_dir {}: {e}", cookbook.display()))
         .filter_map(|entry| {
             let entry = entry.expect("dir entry");
-            if !entry.file_type().expect("file type").is_dir() {
+            if !is_dir_following_symlinks(&entry.path()) {
                 return None;
             }
             if !entry.path().join("package.json").is_file() {
@@ -91,13 +104,24 @@ fn cookbook_entry_dirs() -> Vec<String> {
 /// of which compared a hardcoded const against this same glob and go
 /// tautological once the const is derived from it.
 ///
-/// The one gap glob-derivation genuinely cannot close: a `docs/cookbook/`
-/// subdirectory with NO `package.json`. Both CI's typecheck loop and
-/// [`cookbook_entry_dirs`] skip those by design (a docs tree is allowed
-/// non-entry subdirs like `images/`), which means such a directory would get
-/// neither typecheck nor shape coverage while still looking like an entry to
-/// a reader. Today there are none, so adding one is a deliberate act that
-/// edits this test rather than a silent coverage hole.
+/// Two gaps glob-derivation cannot close on its own:
+///
+///  1. A `docs/cookbook/` subdirectory with NO `package.json`. Both CI's
+///     typecheck loop and [`cookbook_entry_dirs`] skip those by design (a
+///     docs tree is allowed non-entry subdirs like `images/`), which means
+///     such a directory would get neither typecheck nor shape coverage while
+///     still looking like an entry to a reader.
+///  2. A SYMLINKED entry directory. This one runs the other way: CI's
+///     `for d in docs/cookbook/*/` resolves the link and typechecks it, so
+///     the entry exists as far as CI is concerned. The guards here follow it
+///     too now (see [`is_dir_following_symlinks`]) -- but a symlinked entry
+///     still means the real files live outside `docs/cookbook/`, where
+///     `check-file-list.py`, the prose-only scan, and the required-files
+///     shape all point at a path that is not the source of truth. So it is
+///     rejected outright rather than accommodated.
+///
+/// Today neither exists, so introducing one is a deliberate act that edits
+/// this test rather than a silent coverage hole.
 #[test]
 fn every_cookbook_subdirectory_is_a_typechecked_entry() {
     let cookbook = workspace_root().join("docs/cookbook");
@@ -105,8 +129,8 @@ fn every_cookbook_subdirectory_is_a_typechecked_entry() {
         .unwrap_or_else(|e| panic!("read_dir {}: {e}", cookbook.display()))
         .filter_map(|entry| {
             let entry = entry.expect("dir entry");
-            let is_dir = entry.file_type().expect("file type").is_dir();
-            is_dir.then(|| entry.file_name().to_string_lossy().into_owned())
+            is_dir_following_symlinks(&entry.path())
+                .then(|| entry.file_name().to_string_lossy().into_owned())
         })
         .collect();
     all_dirs.sort();
@@ -118,6 +142,21 @@ fn every_cookbook_subdirectory_is_a_typechecked_entry() {
         "docs/cookbook/ has no subdirectories; the listing is reading the \
          wrong path"
     );
+
+    for name in &all_dirs {
+        let p = cookbook.join(name);
+        let meta = fs::symlink_metadata(&p)
+            .unwrap_or_else(|e| panic!("symlink_metadata {}: {e}", p.display()));
+        assert!(
+            !meta.is_symlink(),
+            "docs/cookbook/{name} is a symlink to a directory. CI's \
+             `for d in docs/cookbook/*/` loop follows it and typechecks it, so it \
+             reads as a real entry -- but its actual files live outside \
+             docs/cookbook/, where the story File List audit, the required-files \
+             shape guard, and the prose-only scan all address the wrong path. \
+             Move the entry into docs/cookbook/ for real, or amend this test."
+        );
+    }
 
     assert_eq!(
         all_dirs,
@@ -149,6 +188,77 @@ fn each_entry_has_required_files() {
             );
         }
     }
+}
+
+/// An entry's `tests/` sidecar and its `scripts.test` must exist together or
+/// not at all.
+///
+/// CI's cookbook loop runs `npm test --if-present`, which is silent when an
+/// entry declares no test script. That is deliberate (two entries genuinely
+/// have no unit tests) and it is also exactly how a test suite becomes dead
+/// weight: `session-glance/tests/glance.test.ts` -- the ONLY executable
+/// statement of the canonical `deriveRepo` contract, and the only coverage of
+/// the worktree-`.git`-as-a-FILE branch -- ran nowhere in CI until the
+/// `--if-present` line landed, because this job used to run typecheck alone
+/// and the Rust smoke never invokes npm.
+///
+/// The biconditional is what closes it in both directions:
+///
+///   - tests without a script: the files exist and CI skips them.
+///   - a script without tests: `npm test` resolves the glob to nothing.
+///
+/// Deliberately NOT a flat "every entry must have tests/": `rest-cursor-
+/// pagination` and `state-session-fanout` ship none, and manufacturing test
+/// files to satisfy a guard is how a suite gets filler. What is enforced is
+/// that tests an entry DOES ship are wired to the command CI runs.
+#[test]
+fn entry_tests_are_wired_to_npm_test() {
+    let mut with_tests = 0usize;
+    for name in cookbook_entry_dirs() {
+        let dir = workspace_root().join("docs/cookbook").join(&name);
+        let tests_dir = dir.join("tests");
+        let has_tests_dir = tests_dir.is_dir();
+        let body = read_workspace_file(&format!("docs/cookbook/{name}/package.json"));
+        let parsed: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("docs/cookbook/{name}/package.json invalid JSON: {e}"));
+        let test_script = parsed
+            .get("scripts")
+            .and_then(|v| v.get("test"))
+            .and_then(|v| v.as_str());
+
+        assert_eq!(
+            has_tests_dir,
+            test_script.is_some(),
+            "docs/cookbook/{name}: tests/ dir present = {has_tests_dir}, package.json \
+             scripts.test present = {}. They must agree. CI runs `npm test --if-present` \
+             per entry, so a tests/ dir with no script is a suite nothing executes, and a \
+             script with no tests/ dir is a command that matches no files.",
+            test_script.is_some(),
+        );
+
+        if has_tests_dir {
+            with_tests += 1;
+            let found = fs::read_dir(&tests_dir)
+                .unwrap_or_else(|e| panic!("read_dir {}: {e}", tests_dir.display()))
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".test.ts"))
+                .count();
+            assert!(
+                found > 0,
+                "docs/cookbook/{name}/tests/ has no *.test.ts files, so `npm test` runs \
+                 an empty suite and reports green"
+            );
+        }
+    }
+    // A13 positive companion: at least one entry actually exercises the
+    // has-tests branch above. If every entry lost its tests/ dir, the
+    // biconditional would hold vacuously for all of them and this guard would
+    // report green over zero coverage.
+    assert!(
+        with_tests > 0,
+        "no cookbook entry has a tests/ directory, so the wiring assertions above all \
+         passed on the empty branch"
+    );
 }
 
 #[test]

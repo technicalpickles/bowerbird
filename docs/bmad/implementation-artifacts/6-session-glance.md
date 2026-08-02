@@ -539,7 +539,7 @@ RED run names the break, and each break was reverted immediately after the obser
 | `20260802-160427-7813` | RED x3 | Four breaks in the new entry's README and the cookbook index at once: a ` ```ts ` fence added (prose-only allowlist red), the index table's `](session-glance/)` row deleted (`cookbook_readme_links_every_entry_directory` red, message names the derived count as 4), a link target pointed at a nonexistent file (`quickstart_internal_links_resolve` red on the new entry's README, which proves `DOCS_TO_CHECK`'s tail is derived). |
 | `20260802-160439-7894` | RED | `## Files` demoted to a level-3 heading. `every_cookbook_entry_has_canonical_five_sections` red naming `docs/cookbook/session-glance/README.md` and the missing section. This is the break AC 4 names by example, run alone so the fence break above could not mask it. |
 | `20260802-160448-7970` | RED | The entry README deleted outright. `required_docs_exist` red, message reads "one README per docs/cookbook/*/ entry (4 entries derived)" so the derivation is visibly what drove it. |
-| `20260802-160459-8051` | RED x4 | **The A13 positive companion.** The `package.json` filter forced to skip everything, so the glob derives an empty list. Rather than four guards passing vacuously, all four fail with "derivation found 0 entries ([]), fewer than the floor of 3". Same in both files. |
+| `20260802-160459-8051` | RED x4 | **The A13 positive companion, PARTIAL.** The `package.json` filter forced to skip everything, so the glob derives an empty list; four `cli_docs_drift.rs` guards fail with "derivation found 0 entries ([]), fewer than the floor of 3". The row originally claimed "same in both files", which the 2026-08-02 review found to be false: cargo aborted at exit 101 after that binary, so `cli_examples_drift.rs` never ran and its twin floor/anchor assertions were never observed. Corrected here and re-observed under `--no-fail-fast` as `20260802-165720-33040` below. |
 | `20260802-160511-8178` | RED | `docs/cookbook/scratch-notes/` created with a README and no `package.json`. `every_cookbook_subdirectory_is_a_typechecked_entry` red. This is the successor guard for the deleted `cookbook_entry_consts_match_directory_listing`, and this run is the proof it guards something. |
 
 **Entry behavior (AC 1, 2, 6), `cli_examples.rs`:**
@@ -560,6 +560,52 @@ comment-only em-dash sweep and the story-record edits: `20260802-161344-12315`, 
 observed red too, against a deliberately broken `src/index.ts`: swapping `existsSync(.git)` for
 `statSync(...).isDirectory()` made the worktree test report `main-repo` instead of `feature-branch`, and disabling the
 `--state` token pre-check made both `assert.throws` cases fail with "Missing expected exception". Both breaks reverted.
+
+#### Review round, 2026-08-02 (code-review fixes)
+
+Every Rust run below was `scripts/test.sh` with `BOWERBIRD_NODE_BIN` pointed at the mise Node **22.6.0** binary, which
+is what CI pins. That is itself a finding: the pre-existing runs above were all taken on the local default (24.17), and
+two of them were green only because 24.17 no longer emits the `ExperimentalWarning` pair that 22.6 does.
+
+| Run id | State | What was done to provoke it |
+|---|---|---|
+| `20260802-165550-32160` | GREEN | Baseline for the round: `cli_examples` + `cli_examples_drift` + `cli_docs_drift`, 28 tests, under Node 22.6. |
+| `20260802-165649-32635` | RED x2 | **C1, the finding itself.** `--disable-warning=ExperimentalWarning` removed from `spawn_example`. Both `session_glance_machine_modes_pin_the_output_contract` and `session_glance_names_the_address_when_server_json_is_stale` fail `left: 3, right: 1` on the stderr line count, with the two `ExperimentalWarning` lines quoted in the failure. This is CI's state as committed. |
+| `20260802-165720-33040` | RED x9 | **M5's re-do**, with `--no-fail-fast` so no binary can abort before the twin runs. Empty derivation (the `package.json` filter forced to skip everything): 4 red in `cli_docs_drift.rs`, 4 red in `cli_examples_drift.rs` (including the new `entry_tests_are_wired_to_npm_test`), 1 red in `cli_examples.rs`'s own loop companion. This is what `20260802-160459-8051` claimed and did not show. |
+| `20260802-165826-33656` | RED | Raw fetch error rethrown AND `console.error(e.stack)`. The `banned` loop fires on `"TypeError"`. |
+| `20260802-165838-33755` | RED | Raw fetch error rethrown, message-only printing kept. One stderr line, `"fetch failed"`. The `banned` loop fires on that needle specifically. |
+| `20260802-165849-33838` | RED | Stack frames printed with the `TypeError: fetch failed` header stripped, so only `"    at "` lines remain. Observing this one is what forced the assertion REORDER: behind `stderr.lines().count() == 1` a multi-line stack could never be reported by the ban, because the count assertion fired first every time. |
+| `20260802-165858-33915` | RED | Mode (b)'s message reworded to start `cannot read the daemon at ...`. `!stderr.contains("cannot read")` fires: "mode (b) must not be reported as a missing server.json". |
+| `20260802-165908-33992` | RED | `formatAge`'s seconds forced to `NaN`, which propagates to `NaNdNaNh` and so still passes the `ends_with('h')` shape check. The NaN ban fires: `"  claude/sess-alpha  Working  NaNdNaNh"`. |
+| `20260802-165919-34098` | RED | `formatAge` returns `new Date(nowMs - startedAt).toISOString()` with `Z` swapped for `s`, the classic "rendered a raw timestamp instead of an age". Passes the suffix check, then the 1970 ban fires: `"  claude/sess-alpha  Working  1970-01-01T00:00:00.189s"`. |
+| `20260802-165929-34197` | RED | `parseArgs` silently ignores an unrecognized argument. `assert!(!ok)` fires on `--fromat=json`: "expected a non-zero exit". |
+| `20260802-165939-34317` | RED | **M9.** A `TcpListener` bound to the freed ephemeral port right after the SIGKILL, simulating a parallel test's daemon grabbing it. The new precondition fires by name instead of the test reporting a plausible-looking product bug. |
+| `20260802-165954-34439` | RED | `docs/cookbook/session-glance-link` created as a symlink to `session-glance`. `every_cookbook_subdirectory_is_a_typechecked_entry` fires on the new `!is_symlink()` assertion. Note the other guards in that file PASSED against the symlinked entry, which is the proof `is_dir_following_symlinks` works: before M11's fix they skipped it entirely. |
+| `20260802-170006-34574` | RED | `scripts.test` deleted from `session-glance/package.json` while `tests/` stayed. `entry_tests_are_wired_to_npm_test` fires: "tests/ dir present = true, package.json scripts.test present = false". |
+| `20260802-170016-34679` | RED | Both `tests/` dirs moved aside and both `scripts.test` entries deleted, so the biconditional holds vacuously for every entry. The `with_tests > 0` companion fires: "no cookbook entry has a tests/ directory, so the wiring assertions above all passed on the empty branch". |
+| `20260802-170110-34942` | GREEN | The new mode-(c) smoke (`session_glance_gives_up_when_the_daemon_accepts_but_never_answers`) passes in 5.28s. |
+| `20260802-170128-35067` | RED | **H5, the finding itself.** `AbortSignal.timeout` removed. The entry never exits; `wait_bounded`'s watchdog kills it at 30s and reports "the entry never exited within 30s and was killed by the hang guard". One break, two observations: the pre-fix hang, and the new hang detector doing its job. |
+| `20260802-170326-39081` | GREEN | The new non-array-body smoke (`session_glance_count_rejects_a_response_body_that_is_not_an_array`) passes. |
+| `20260802-170336-39189` | RED | **M1, the finding itself.** The checked body reverted to the bare `as SessionListItem[]` cast. Against a canned `{"sessions":[]}` the entry prints `undefined` on stdout and exits 0: "must fail on a non-array body; got exit 0 with stdout: undefined". |
+
+**Full workspace, review round:** `20260802-170429-40138`, `scripts/test.sh` (parallel) under Node 22.6,
+**655 passed / 0 failed**. `cargo fmt --check` and `cargo clippy --all-targets --workspace -- -D warnings` clean.
+
+**Entry-local Node tests, review round:** 23/23 under Node 22.6 from a wiped `node_modules`
+(`npm ci && npm run typecheck && npm test`). Nine breaks, each reverted immediately; the Node runner emits no run ids,
+so each is named by its break and the message it produced:
+
+| Break in `src/index.ts` | What went red |
+|---|---|
+| `UNKNOWN_AGE` set to `"NaN"` | `must not render NaN; got: NaN`. Observing this forced the assertion REORDER in that test: behind `assert.equal(rendered, "age unknown")` neither the NaN nor the 1970 ban could ever fire, since any break that trips them trips the equality first. |
+| `UNKNOWN_AGE` set to `"1970-01-01T00:00:00Z"` | `must not render a 1970 timestamp; got: 1970-01-01T00:00:00Z` |
+| `DEFAULT_STATES` widened with `ended` | `default set must exclude ended; got idle,working,waitinginput,unknown,ended`. Observing this forced SPLITTING the two default-set assertions out of the `deepEqual` test, for the same reason. |
+| control-character replace in `sanitizeHeading` disabled | `no line may embed a newline; got "evil\nrepo"` |
+| leading-whitespace strip in `sanitizeHeading` disabled | `exactly two headings; got ["  indented","  claude/b  Idle  1s","evil�repo","  claude/a  Idle  1s"]` |
+| `Number.isSafeInteger` reverted to `Number.isFinite` | `started_at -1e+30 must not render in scientific notation; got: 1.1574074074074075e+22d16h` |
+| `cwd == null \|\| typeof cwd !== "string"` reverted to `cwd === null` | `Cannot read properties of undefined (reading 'length')`. That is H2 verbatim: the throw that takes down the entire run rather than bucketing one session. |
+| the `once("--format", ...)` guard removed | `Missing expected exception: --format=json --format=text must be rejected` |
+| the `--help` / `-h` arm removed | `unrecognized argument "--help"; accepted flags are ...` |
 
 ### Completion Notes List
 
@@ -656,25 +702,164 @@ create-story wrote with literal em-dashes while claiming an escape kept the file
 shell escape, verified to still match under both macOS bash 3.2 and zsh (the `\u2014` form does not: bash 3.2 lacks it), so the sweep is now literally clean across the whole
 diff rather than clean-except-here.
 
+---
+
+## Review round, 2026-08-02
+
+A three-layer code review (Blind Hunter / Edge Case Hunter / Acceptance Auditor) against the branch. Findings applied
+below; triage was done by the review and is not relitigated here. Status stays `review`; the dogfood gate is still the
+open item.
+
+**CI was red as committed, and the reason is a lesson about where the tests run.** `spawn_example` piped a bare
+`node --experimental-strip-types`, and on Node before 22.18 that flag prints a two-line `ExperimentalWarning` pair on
+stderr. Every assertion of the form "stderr is exactly one line" therefore passes on a modern local toolchain (24.17
+emits nothing) and fails on CI, which `.github/workflows/ci.yml` pins to 22.6. Reproduced directly: 3 stderr lines
+under v22.6.0, 1 under v24.17.0. The fix is `--disable-warning=ExperimentalWarning` in `spawn_example`, deliberately
+at the SPAWN site rather than filtered per assertion, so a future assertion on stderr shape inherits the property
+instead of having to remember it. Every run in this round was taken with `BOWERBIRD_NODE_BIN` pointed at 22.6.
+
+**`deriveRepo` could crash the whole run, and the docs described a rule the code has never had.**
+
+- The guard was `cwd === null`, which misses `undefined`, and `cwd.length` sat OUTSIDE the try, so `deriveRepo(undefined)`
+  threw and killed every session's output rather than bucketing one. `cwd` arrives through an unchecked
+  `as SessionListItem[]` cast, so its declared type is a claim about the daemon, not a guarantee. Now
+  `cwd == null || typeof cwd !== "string" || cwd.length === 0`.
+- **Rule 3 was false in both binding texts** (the doc comment and README "How it works"). Both said an unreadable path
+  falls back to `basename(cwd)`. `existsSync` returns `false` on EACCES rather than throwing, so that clause never
+  fired: the walk just continues upward and an unreadable directory inside a real repo resolves to that repo.
+  **Resolved in favor of the code**, because it is the more useful semantics and it is what has always shipped. Both
+  texts now say so, and `tests/glance.test.ts` gained a real EACCES case (a `chmod 000` directory inside a repo,
+  skipped rather than asserted when the process is root and the mode bits do not bind). The old test that claimed to
+  cover this was exercising the no-`.git`-ancestor path; it is renamed to say what it does.
+- The `try`/`catch` was consequently unreachable and is deleted. An unreachable catch reads as coverage it is not.
+- The story's Dev Notes still carry create-story's proposed rule 3 with the same false clause. Dev Notes are the
+  planning record and dev-story does not rewrite them; this note is the supersession, same shape as the AC 4 widening
+  above.
+
+**The README's "Run it" block could not produce the output it printed.** It told the reader to `bowerbird replay` the
+bundled fixture, which carries no `cwd` and no `pid`. The story already documented why that fixture is disqualifying
+(`no_pid_at_upgrade` ends every row within one 5s tick), so the reader was routed down a path this story had already
+proven broken. The block now hands the reader a three-row inline fixture with real `cwd`s and three distinct live pids
+(`$$`, `$PPID`, `1`), and the printed output is what it actually produces, verified end to end under Node 22.6 against
+a real daemon in an isolated `HOME`. The ages read `0s` rather than the illustrative `4m12s` the block used to show,
+because the daemon stamps `started_at` at INGEST (`projection/session.rs` passes `current_unix_millis()` as `now_ms`),
+so a replayed session is newborn no matter what `created_at` says. The README states that rather than showing numbers
+it cannot produce.
+
+**Three failure modes the entry did not have.**
+
+- **No request timeout.** Against a listener that accepts and never answers, the entry hung with no message and no
+  exit (`timeout 12` gave exit 124). That is a third daemon-down mode and it is hostile to `6-tmux-ambient`, which
+  shells out on a status-line interval and would accumulate stuck processes. Now `AbortSignal.timeout(5000)` with a
+  `TimeoutError` branch that names the address, plus a smoke that drives it with a plain non-accepting `TcpListener`.
+- **A non-array response body was silent in the one mode that matters.** Text and JSON blew up on `.map`, but
+  `--count` read `.length` off a non-array, printed the literal `undefined`, and exited 0. Measured against
+  `{"sessions":[]}`, `7`, and `"abcdefgh"` (the last has a `.length` and would print a plausible `8`). The body is now
+  checked, and a smoke serves a canned HTTP 200 to pin it.
+- **A truncated `server.json` gave a bare parse error.** `JSON.parse` sat outside the try wrapping `readFileSync`,
+  even though a `kill -9` mid-write is the same scenario the fetch-error path already documents. Wrapped.
+
+**Two silent no-ops fixed.** Invoking the entry through a symlink printed nothing and exited 0, because
+`pathToFileURL(process.argv[1])` does not resolve symlinks while the ESM loader realpaths the module it loads. The
+README's own status-line guidance implies exactly such a wrapper. `isEntry` now compares realpaths, with the URL
+compare kept as the fallback. Separately, a `cwd` containing a newline would split one text-mode heading across two
+lines, and a leading space would make a heading shape-identical to a session row; both are legal on POSIX, `cwd` is
+verbatim off the wire, and the two-space indent is the ONLY discriminator `6-tmux-ambient` has. Headings are now
+sanitized (control characters to U+FFFD, leading whitespace stripped, all-whitespace collapsed to the named bucket).
+`--format=json` still carries `repo` verbatim.
+
+**The entry's unit tests ran nowhere in CI.** `.github/workflows/ci.yml`'s cookbook job did `npm ci && npm run
+typecheck` and stopped, and no Rust guard required a `tests/` sidecar. So `glance.test.ts` (the only executable
+statement of the `deriveRepo` contract, and the only coverage of the worktree-`.git`-as-a-FILE branch) was dead
+weight. The loop now runs `npm test --if-present`, and `cli_examples_drift.rs::entry_tests_are_wired_to_npm_test`
+makes the sidecar and `scripts.test` a biconditional.
+
+> **Where the review's recommended fix turned out wrong.** It asked for a `tests/` dir (or a `scripts.test`) in
+> `each_entry_has_required_files`. Two of the four entries (`rest-cursor-pagination`, `state-session-fanout`) ship
+> neither, so a flat requirement fails them, and manufacturing test files to satisfy a guard is how a suite fills up
+> with filler. The biconditional closes the actual hole in both directions (tests CI skips, and a script matching no
+> files) without forcing tests into existence. All four entries were then run through the real CI loop
+> (`npm ci && npm run typecheck && npm test --if-present`) under Node 22.6: all exit 0, and
+> `dropped-frame-recovery`'s previously-unrun 4 tests now pass in it.
+
+**Test-harness fixes.** `child.wait()` then `read_to_string` on piped stdout/stderr is the pipe-buffer deadlock shape,
+and it sat in the glob-derived daemon-down loop where a future blocking entry would hang the suite with no diagnostic.
+Both sites now use a `wait_bounded` helper: `wait_with_output` (drains both pipes concurrently) plus a watchdog that
+SIGKILLs at `GLANCE_HANG_GUARD` and fails by name, satisfying CLAUDE.md's rule that timeouts around child-exits are
+hang detectors. `distinct_live_pids` checked only `self != daemon`, leaving the hardcoded `1` unguarded: on a runner
+where the test binary IS pid 1, two fixture sessions collide, Story 5.11 supersession ends one, and both glance tests
+burn the full 30s guard before failing about counts rather than pids. All three pairs are checked now. The stale-
+`server.json` test gained an "the address is really dead" precondition, because SIGKILL frees the ephemeral port and
+every daemon in that file shares `EXAMPLES_TEST_TOKEN`, so a rebind would answer HTTP 200 and the test would report a
+clean-looking product bug.
+
+**A symlinked cookbook entry was invisible to every guard and visible to CI.** `DirEntry::file_type()` does not follow
+symlinks, so both sides of `every_cookbook_subdirectory_is_a_typechecked_entry`'s set-equality skipped one, while
+CI's `for d in docs/cookbook/*/` matched and typechecked it. The listings now resolve through `fs::metadata`, a
+symlinked entry dir is rejected outright by `symlink_metadata`, and the docstring that claimed this gap was closed
+says what is actually closed. Confirmed by run `20260802-165954-34439`: with the symlink in place the OTHER guards in
+that file pass over it, which they could not do before.
+
+**Two assertion orderings were unobservable-red, and the fix was reordering rather than a new break.** A13 requires
+every negative assertion to be watchable failing. Three were not, structurally:
+
+- `!stderr.contains("    at ")` sat behind `stderr.lines().count() == 1`. A stack trace is multi-line by definition,
+  so the count always fired first and the ban could never be the reported failure. The content assertions now run
+  before the shape assertion, which is also the better diagnosis. The count assertion stays observable on its own
+  (two short lines with no banned content trip it and nothing else).
+- `!rendered.includes("NaN")` / `!rendered.includes("1970")` sat behind `assert.equal(rendered, "age unknown")`. Any
+  break that trips them trips the equality first. Reordered.
+- `!states.includes("ended")` sat behind a `deepEqual` on the whole Options object. Split into its own test.
+
+**Smaller fixes, each named because the review named them:** `--format=text` added to the README contract list (AC 2
+requires every flag documented); `--help` / `-h` added (it used to exit 1 as unrecognized, which teaches a reader the
+CLI has no discoverable surface); repeated `--format` / `--state` rejected instead of resolved last-wins, since
+last-wins IS the order dependence the doc comment two lines above disclaims; the symlinked-`cwd` imprecision added to
+both named-imprecisions lists; the filesystem imprecision now states BOTH of its consequences in both texts (not
+purely testable, AND a `cwd` from another machine falls through to rule 3) where each text used to state one; the
+"two runs print identical output" claim corrected (the age column recomputes every run); the "never prints nothing"
+claim scoped to text mode and the machine modes' zero-session answers stated; `formatAge` / `ageSeconds` now guard on
+`Number.isSafeInteger` rather than `Number.isFinite`, because `-1e30` is finite and renders `1.157e+22d16h`, escaping
+the documented two-unit shape a consumer parses; and the Change Log's "eleven RED runs" corrected to ten (the tables
+list ten runs, two of which were RED x3 and RED x4).
+
+**Not fixed, by the review's own triage, filed instead.** Taskwarrior tasks, cited by UUID because integer ids are
+reused:
+
+- `db14068e` -- `process.exit` vs `process.exitCode`. PLAUSIBLE only, and it is the house pattern across all four
+  entries; changing one entry alone manufactures inconsistency.
+- `101914b0` -- no guard enforcing the TS-vs-Rust accepted-state-token identity (`ACCEPTED_STATE_TOKENS` vs
+  `crates/daemon/src/api/filter.rs::parse_state_token`). Real, scope creep for this round.
+- `4238d5ea` -- three near-copies of `cookbook_entry_dirs()` across the three test files. Real; each `tests/*.rs` is
+  its own crate, so it needs a shared path or a tiny helper crate rather than a move.
+
+The comparator that never returns 0 (`renderText`'s sort) was left alone as the review directed: `PRIMARY KEY (source,
+session_id)` makes duplicate sort keys unreachable.
+
 ### File List
 
 - `docs/bmad/implementation-artifacts/6-session-glance.md` (this story file: task checkboxes, Dev Agent Record,
   Dogfood Gate Evidence pending note, File List, Change Log, Status)
 - `docs/bmad/implementation-artifacts/sprint-status.yaml` (story key `6-session-glance` -> `in-progress` -> `review`)
 - `docs/cookbook/README.md` (index table row + Quick run block for the new entry; "the existing three" generalized)
-- `docs/cookbook/session-glance/README.md` (new)
+- `docs/cookbook/session-glance/README.md` (new; review round: reproducible "Run it" block with an inline fixture, rule 3 corrected, symlinked-`cwd` imprecision added, `--format=text` / `--help` documented, heading sanitization stated, troubleshooting split by message)
 - `docs/cookbook/session-glance/package.json` (new)
 - `docs/cookbook/session-glance/package-lock.json` (new)
 - `docs/cookbook/session-glance/tsconfig.json` (new)
-- `docs/cookbook/session-glance/src/index.ts` (new)
-- `docs/cookbook/session-glance/tests/glance.test.ts` (new)
+- `docs/cookbook/session-glance/src/index.ts` (new; review round: `deriveRepo` type guard and dead catch removed, rule 3 doc corrected, request timeout, non-array body check, wrapped `JSON.parse`, realpath `isEntry`, `sanitizeHeading`, `--help`, repeated-flag rejection, `Number.isSafeInteger` age guard)
+- `docs/cookbook/session-glance/tests/glance.test.ts` (new; review round: real EACCES case, junk-off-the-wire case, heading sanitization, absurd `started_at`, `--help` and repeated-flag cases, two assertion reorders and one test split so the negatives are observable-red)
 - `tests/cli_docs_drift.rs` (glob-derived entry lists; `cookbook_entry_consts_match_directory_listing` deleted with a
   named successor; `cookbook_readme_lists_three_required_entries` renamed
   `cookbook_readme_links_every_entry_directory`)
 - `tests/cli_examples_drift.rs` (glob-derived `ENTRIES`; `entries_const_matches_directory_listing` repurposed as
-  `every_cookbook_subdirectory_is_a_typechecked_entry`)
+  `every_cookbook_subdirectory_is_a_typechecked_entry`; review round: `is_dir_following_symlinks` on both listings,
+  symlinked-entry rejection, corrected docstring, new `entry_tests_are_wired_to_npm_test`)
 - `tests/cli_examples.rs` (three session-glance smokes, glob-derived daemon-down loop, fast-failing count fence, doc
-  comment update)
+  comment update; review round: `--disable-warning=ExperimentalWarning` in `spawn_example`, `wait_bounded` helper
+  replacing both `wait()`-then-read sites, all-pairs pid distinctness, address-is-dead precondition, assertion
+  reorder in the stale-`server.json` test, two new smokes for the unanswered-request and non-array-body modes)
+- `.github/workflows/ci.yml` (review round: the cookbook loop runs `npm test --if-present` and the step is renamed to
+  say so; entry unit tests ran nowhere in CI before this)
 
 ## Change Log
 
@@ -694,9 +879,30 @@ diff rather than clean-except-here.
   supersession. `cookbook_entry_consts_match_directory_listing` deleted with a named successor;
   `cookbook_readme_lists_three_required_entries` renamed and de-counted. Daemon-down failure mode (b) (stale
   `server.json`, refused connection, bare `TypeError: fetch failed`) is fixed and covered, not just disclosed. A13
-  honored throughout: eleven RED runs against deliberately broken input, each named in Debug Log References with the
-  break that produced it and each reverted after the observation. `scripts/test.sh` 652 passed / 0 failed
+  honored throughout: ten RED runs against deliberately broken input, each named in Debug Log References with the
+  break that produced it and each reverted after the observation (the tables list ten runs; two of them are RED x3
+  and RED x4, which is where the earlier count of eleven came from). `scripts/test.sh` 652 passed / 0 failed
   (`20260802-160753-9732`; re-confirmed after the comment-only em-dash sweep by `20260802-161344-12315`),
   `cargo fmt --check` and `cargo clippy --all-targets --workspace -- -D warnings` clean, `npm ci && npm run typecheck`
   clean from a wiped `node_modules`, entry-local `npm test` 16/16. File-List audit CLEAN on the first invocation
   (12 changed in git, 12 declared, no `--ignore`).
+
+- 2026-08-02: Code-review round applied on the same branch; Status stays `review` and the dogfood gate stays the one
+  open item. Fifteen findings fixed across CRITICAL, HIGH and MEDIUM, plus the named LOWs. The CRITICAL was that CI
+  was red as committed: `--experimental-strip-types` prints an `ExperimentalWarning` pair on the Node 22.6 that CI
+  pins, and two "stderr is exactly one line" assertions had only ever been run on a local 24.17 that emits none. Every
+  run this round was taken with `BOWERBIRD_NODE_BIN` on 22.6. `deriveRepo` no longer crashes the whole run on a
+  non-string `cwd`; its rule 3 was FALSE in both binding texts (`existsSync` returns false on EACCES rather than
+  throwing, so the walk continues upward) and was resolved in favor of the shipped behavior, with both texts rewritten
+  and a real EACCES test added. The README's "Run it" block now reproduces the output it prints, verified end to end.
+  Three unhandled failure modes closed (no request timeout, non-array response body silent under `--count`, unwrapped
+  `JSON.parse` of `server.json`) and two silent no-ops (invocation through a symlink, a `cwd` whose newline or leading
+  space forged a text-mode heading). The entry's unit tests now run in CI at all. Test-harness fixes: pipe-buffer
+  deadlock shape replaced with a bounded `wait_with_output`, all-pairs pid distinctness, an address-is-dead
+  precondition on the stale-`server.json` test, and symlink-following in the cookbook listings. Three assertion
+  orderings that made negatives unobservable-red were restructured rather than papered over. Fifteen new RED runs and
+  nine Node-side breaks are recorded in Debug Log References, each reverted after the observation. `scripts/test.sh`
+  655 passed / 0 failed (`20260802-170429-40138`) under Node 22.6, `cargo fmt --check` and clippy clean, entry-local
+  `npm ci && npm run typecheck && npm test` 23/23 from a wiped `node_modules` on 22.6, and all four cookbook entries
+  pass the real CI loop. Three findings were filed rather than fixed, per the review's own triage: taskwarrior
+  `db14068e`, `101914b0`, `4238d5ea`.

@@ -24,17 +24,19 @@
 //     (no flags)      grouped text: a repo heading, then one indented line
 //                     per session, `<source>/<session_id>  <state>  <age>`
 //     --count         a single integer on stdout and nothing else
+//     --format=text   the grouped text above, stated explicitly
 //     --format=json   NDJSON, one object per session, fixed field set
 //     --state=<csv>   pass-through to the REST `?state=` filter
+//     --help, -h      the same contract on stdout, exit 0
 //
 // Exit codes: 0 on success (including zero live sessions), 1 on any failure
-// (bad flag, bad state token, daemon unreachable, HTTP error). README.md
-// "Run it" is the authoritative statement of the contract.
+// (bad flag, bad state token, daemon unreachable, daemon unresponsive, HTTP
+// error). README.md "Run it" is the authoritative statement of the contract.
 
 import { homedir } from "node:os";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 /// The five `?state=` tokens the daemon accepts, lowercase and
 /// case-insensitive. Kept identical to
@@ -103,7 +105,17 @@ export interface Options {
   count: boolean;
   format: "text" | "json";
   states: string;
+  help: boolean;
 }
+
+/// How long to wait for the daemon to answer before giving up. A third
+/// daemon-down mode: the address in `server.json` is bound by something that
+/// accepts the connection and never responds (a wedged daemon, a stale port
+/// grabbed by an unrelated listener). Without a deadline the entry hangs
+/// forever with no message and no exit, and the tmux status-line surface
+/// (`6-tmux-ambient`) shells out to it on a repeating interval, so it would
+/// accumulate hung processes rather than print one bad status.
+const REQUEST_TIMEOUT_MS = 5000;
 
 interface ServerInfo {
   bind_addr: string;
@@ -124,7 +136,20 @@ function loadServerInfo(): ServerInfo {
       `cannot read ${path}: ${(e as Error).message}. Is the daemon running? Try \`bowerbird start\`.`,
     );
   }
-  const parsed = JSON.parse(body) as Partial<ServerInfo>;
+  // Inside its own try for the same reason the read is: a daemon killed
+  // mid-write leaves a truncated `server.json` behind, which is the SAME
+  // `kill -9` scenario the fetch-error path below documents. A bare
+  // `SyntaxError: Unexpected end of JSON input` names neither the file nor
+  // the fix.
+  let parsed: Partial<ServerInfo>;
+  try {
+    parsed = JSON.parse(body) as Partial<ServerInfo>;
+  } catch (e) {
+    throw new Error(
+      `${path} is not valid JSON: ${(e as Error).message}. A daemon killed mid-write ` +
+        `leaves a truncated file behind; delete it and run \`bowerbird start\`.`,
+    );
+  }
   if (typeof parsed.bind_addr !== "string" || parsed.bind_addr.length === 0) {
     throw new Error(`${path} missing string field "bind_addr"`);
   }
@@ -159,17 +184,25 @@ function resolveToken(): string {
  *
  * The rule, in order:
  *
- *   1. `cwd` is `null` (or empty) -> the single named bucket `(unknown repo)`.
- *      The session is never dropped.
+ *   1. `cwd` is absent (`null`, `undefined`, empty, or any non-string that
+ *      slipped through the wire cast) -> the single named bucket
+ *      `(unknown repo)`. The session is never dropped.
  *   2. Otherwise walk up from `cwd` itself to the nearest ancestor containing
  *      a `.git` ENTRY, and render that ancestor's basename. Existence, not
  *      `isDirectory()`: in a git worktree `.git` is a FILE, and an
  *      `isDirectory()` check would walk straight past the worktree into the
  *      main repo.
- *   3. No `.git` ancestor found, or the path is not readable (a session on a
- *      since-deleted directory, or a `cwd` recorded on another machine) ->
- *      `basename(cwd)`.
- *   4. Never throws. An unreadable path is a bucket, not a crash.
+ *   3. No `.git` ancestor found -> `basename(cwd)`. A directory that cannot
+ *      be READ counts as "no `.git` here" and the walk CONTINUES upward:
+ *      `existsSync` returns `false` on EACCES rather than throwing, so an
+ *      unreadable directory inside a real repo still resolves to that repo.
+ *      Only a `cwd` with no readable `.git` anywhere above it (a since-
+ *      deleted directory, a `cwd` recorded on another machine) falls back to
+ *      the basename.
+ *   4. Never throws, for any input. Rule 1's guard is what makes that true:
+ *      `cwd` reaches here through an unchecked cast of the REST body, so a
+ *      `null`-vs-`undefined` slip or a non-string would otherwise take down
+ *      the whole run rather than bucket one session.
  *
  * Known imprecisions, named rather than papered over:
  *
@@ -180,31 +213,39 @@ function resolveToken(): string {
  *   - A `cwd` **below the repo root** (an agent launched from a subdirectory)
  *     resolves correctly to the repo. That is why rule 2 exists instead of a
  *     bare `basename(cwd)`.
- *   - This touches the filesystem, which is fine here (the entry runs on the
- *     same host as the sessions) but means the function is not purely
- *     testable. The path walking is kept in this one small helper so the
- *     formatting side stays pure.
+ *   - A **symlinked `cwd`** groups under the link's own path, not the link
+ *     target's. `cwd` is verbatim off the wire and nothing here calls
+ *     `realpath`, so one repo reached through two paths (`/src/app` and a
+ *     `~/app` symlink to it) splits into two headings.
+ *   - This touches the filesystem. Two consequences, both real: the function
+ *     is not purely testable (so the path walking is kept in this one small
+ *     helper and the formatting side stays pure), and a `cwd` recorded on
+ *     ANOTHER machine finds nothing to walk and falls through to rule 3.
  */
 export function deriveRepo(cwd: string | null): string {
-  if (cwd === null || cwd.length === 0) {
+  // `== null` catches `undefined` as well as `null`, and the `typeof` check
+  // catches everything else: `cwd` arrives through an unchecked
+  // `as SessionListItem[]` cast of the response body, so its declared type is
+  // a claim about the daemon, not a guarantee about this value.
+  if (cwd == null || typeof cwd !== "string" || cwd.length === 0) {
     return UNKNOWN_REPO;
   }
-  try {
-    let dir = cwd;
-    // Bounded by the filesystem root: `dirname("/") === "/"`, so the
-    // parent-equals-self check always terminates the walk.
-    for (;;) {
-      if (existsSync(join(dir, ".git"))) {
-        return basename(dir) || dir;
-      }
-      const parent = dirname(dir);
-      if (parent === dir) {
-        break;
-      }
-      dir = parent;
+  let dir = cwd;
+  // Bounded by the filesystem root: `dirname("/") === "/"`, so the
+  // parent-equals-self check always terminates the walk. No try/catch:
+  // `existsSync` swallows every stat error (including EACCES) into `false`,
+  // and `join`/`dirname`/`basename` on a string cannot throw. A catch here
+  // would be unreachable, and an unreachable catch reads as coverage it is
+  // not.
+  for (;;) {
+    if (existsSync(join(dir, ".git"))) {
+      return basename(dir) || dir;
     }
-  } catch {
-    // Rule 4: an unreadable path falls through to the basename bucket.
+    const parent = dirname(dir);
+    if (parent === dir) {
+      break;
+    }
+    dir = parent;
   }
   return basename(cwd) || cwd;
 }
@@ -220,9 +261,15 @@ export function deriveRepo(cwd: string | null): string {
  * A null `started_at` renders as the named `age unknown` placeholder. A
  * future-dated `started_at` (clock skew between the recording host and this
  * one) clamps to `0s` rather than rendering a negative age.
+ *
+ * Anything that is not a SAFE INTEGER is `age unknown` too, not just
+ * non-finite values. A `started_at` of `-1e30` is finite, so a
+ * `Number.isFinite` guard passes it through, and the day count then formats
+ * in scientific notation (`1e+22d`) -- which escapes the documented two-unit
+ * shape a consumer parses. Every real epoch-ms value is a safe integer.
  */
 export function formatAge(startedAt: number | null, nowMs: number): string {
-  if (startedAt === null || !Number.isFinite(startedAt)) {
+  if (startedAt === null || !Number.isSafeInteger(startedAt)) {
     return UNKNOWN_AGE;
   }
   const seconds = Math.max(0, Math.floor((nowMs - startedAt) / 1000));
@@ -240,9 +287,14 @@ export function formatAge(startedAt: number | null, nowMs: number): string {
   return `${Math.floor(hours / 24)}d${hours % 24}h`;
 }
 
-/** Age in whole seconds, or null when `started_at` is null. */
+/**
+ * Age in whole seconds, or null when `started_at` is null or not a usable
+ * epoch-ms value. Same guard as `formatAge`, so the `age` and `age_seconds`
+ * fields of a `--format=json` row can never disagree about whether the age is
+ * known.
+ */
 export function ageSeconds(startedAt: number | null, nowMs: number): number | null {
-  if (startedAt === null || !Number.isFinite(startedAt)) {
+  if (startedAt === null || !Number.isSafeInteger(startedAt)) {
     return null;
   }
   return Math.max(0, Math.floor((nowMs - startedAt) / 1000));
@@ -261,6 +313,33 @@ export function toRow(item: SessionListItem, nowMs: number): GlanceRow {
     started_at: item.started_at,
     cwd: item.cwd,
   };
+}
+
+/**
+ * Make a derived repo name safe to emit as a text-mode heading.
+ *
+ * The text format's ONLY structural discriminator is the two-space indent:
+ * an unindented line is a repo heading, an indented one is a session under
+ * it, and `6-tmux-ambient` parses exactly that. `cwd` is verbatim off the
+ * wire and both of these are legal POSIX path components:
+ *
+ *   - an embedded newline, which would split one heading across two lines and
+ *     manufacture a phantom repo;
+ *   - a leading space, which would make a heading shape-identical to a
+ *     session row.
+ *
+ * So control characters become U+FFFD and leading whitespace is stripped. A
+ * name that is nothing but whitespace collapses to the named unknown bucket
+ * rather than to a blank line.
+ *
+ * Text mode only: `--format=json` carries `repo` verbatim, because JSON
+ * escapes the control characters itself and a machine consumer wants the
+ * unmangled value.
+ */
+export function sanitizeHeading(repo: string): string {
+  const flattened = repo.replace(/[\u0000-\u001f\u007f]/g, "\uFFFD");
+  const deindented = flattened.replace(/^\s+/, "");
+  return deindented.length === 0 ? UNKNOWN_REPO : deindented;
 }
 
 /**
@@ -289,7 +368,7 @@ export function renderText(rows: GlanceRow[], states: string): string[] {
   }
   const lines: string[] = [];
   for (const repo of [...groups.keys()].sort()) {
-    lines.push(repo);
+    lines.push(sanitizeHeading(repo));
     const group = [...(groups.get(repo) ?? [])].sort((a, b) =>
       `${a.source}/${a.session_id}` < `${b.source}/${b.session_id}` ? -1 : 1,
     );
@@ -326,26 +405,77 @@ export function normalizeStates(raw: string): string {
   return tokens.join(",");
 }
 
+/** The accepted set, spelled once so the two error messages cannot drift. */
+const ACCEPTED_FLAGS = "--count, --format=text, --format=json, --state=<csv>, --help";
+
+/**
+ * The `--help` / `-h` text. Same contract the README states, on stdout, exit
+ * 0. A CLI that answers `--help` with "unrecognized argument --help" and exit
+ * 1 teaches the reader that it has no discoverable surface.
+ */
+export const USAGE = [
+  "session-glance: one-shot print of every live session, grouped by repository.",
+  "",
+  "usage: node --experimental-strip-types src/index.ts [flags]",
+  "",
+  "  (no flags)     grouped text: a repo heading, then one indented line per",
+  "                 session, `<source>/<session_id>  <state>  <age>`",
+  "  --count        a single integer on stdout and nothing else",
+  "  --format=text  the grouped text above, stated explicitly",
+  "  --format=json  NDJSON, one object per session, fixed field set",
+  "  --state=<csv>  pass-through to the REST `?state=` filter; tokens are",
+  `                 idle, working, waitinginput, ended, unknown (default: ${DEFAULT_STATES})`,
+  "  --help, -h     this text on stdout, exit 0",
+  "",
+  "`--count` wins over `--format`. Exit 0 on success (including zero live",
+  "sessions), 1 on any failure. Requires BOWERBIRD_TOKEN and a running daemon.",
+];
+
 /**
  * Parse the entry's flags. Order-independent; unknown arguments are a hard
  * error rather than a silent ignore, because a silently-ignored `--format`
  * typo would hand a consumer text where it expected JSON.
+ *
+ * "Order-independent" is enforced, not merely intended: a REPEATED `--format`
+ * or `--state` is rejected rather than resolved last-wins, because last-wins
+ * is precisely a result that depends on argument order. Repeating `--count`
+ * is fine; it is a boolean with no second value to disagree with.
  */
 export function parseArgs(argv: string[]): Options {
-  const options: Options = { count: false, format: "text", states: DEFAULT_STATES };
+  const options: Options = {
+    count: false,
+    format: "text",
+    states: DEFAULT_STATES,
+    help: false,
+  };
+  const seen = new Map<string, string>();
+  const once = (family: string, arg: string): void => {
+    const prior = seen.get(family);
+    if (prior !== undefined) {
+      throw new Error(
+        `${family} given twice (${JSON.stringify(prior)} then ${JSON.stringify(arg)}); ` +
+          `resolving that last-wins would make the result depend on argument order`,
+      );
+    }
+    seen.set(family, arg);
+  };
   for (const arg of argv) {
-    if (arg === "--count") {
+    if (arg === "--help" || arg === "-h") {
+      options.help = true;
+    } else if (arg === "--count") {
       options.count = true;
     } else if (arg === "--format=json") {
+      once("--format", arg);
       options.format = "json";
     } else if (arg === "--format=text") {
+      once("--format", arg);
       options.format = "text";
     } else if (arg.startsWith("--state=")) {
+      once("--state", arg);
       options.states = normalizeStates(arg.slice("--state=".length));
     } else {
       throw new Error(
-        `unrecognized argument ${JSON.stringify(arg)}; accepted flags are ` +
-          `--count, --format=text, --format=json, --state=<csv>`,
+        `unrecognized argument ${JSON.stringify(arg)}; accepted flags are ${ACCEPTED_FLAGS}`,
       );
     }
   }
@@ -364,8 +494,26 @@ async function fetchSessions(
   const url = `http://${bindAddr}/sessions?state=${encodeURIComponent(states)}`;
   let res: Response;
   try {
-    res = await fetch(url, { headers: { Authorization: auth } });
+    res = await fetch(url, {
+      headers: { Authorization: auth },
+      // Without this the entry hangs forever against a listener that accepts
+      // and never answers. See REQUEST_TIMEOUT_MS.
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
   } catch (e) {
+    // Daemon-down failure mode (c): something IS listening on the address, it
+    // accepted the connection, and it never answered. A one-shot glance that
+    // never exits is worse than one that fails, because the status-line
+    // surface that shells out to it on an interval would pile up hung
+    // processes instead of showing one bad status.
+    if ((e as Error).name === "TimeoutError") {
+      throw new Error(
+        `daemon at http://${bindAddr} accepted the connection but did not answer within ` +
+          `${REQUEST_TIMEOUT_MS}ms. ~/.bowerbird/server.json points there; the daemon may be ` +
+          `wedged, or an unrelated process may have taken the address. Try \`bowerbird stop\` ` +
+          `then \`bowerbird start\`.`,
+      );
+    }
     // The second daemon-down failure mode, and the one the "daemon stopped
     // mid-day" adversity actually produces. `server.json` is still on disk
     // (the daemon only removes it on a CLEAN shutdown, so a crash, an OOM
@@ -394,12 +542,32 @@ async function fetchSessions(
     }
     throw new Error(`daemon returned HTTP ${res.status}`);
   }
-  // A bare array, not an envelope.
-  return (await res.json()) as SessionListItem[];
+  // A bare array, not an envelope -- CHECKED, not assumed. The cast below is
+  // the only thing standing between the wire and every downstream `.length` /
+  // `.map`, and the failure it lets through is silent in the one mode that
+  // matters most: `--count` on a non-array body prints the literal string
+  // `undefined` and exits 0, which a tmux status line renders as a plausible
+  // status forever. Text and JSON mode fail loudly on the same input; this
+  // makes all three agree.
+  const body: unknown = await res.json();
+  if (!Array.isArray(body)) {
+    throw new Error(
+      `daemon at http://${bindAddr} returned ${typeof body === "object" && body !== null ? "a JSON object" : JSON.stringify(body)} ` +
+        `where GET /sessions must return a bare JSON array. Something other than a bowerbird ` +
+        `daemon may be listening on that address.`,
+    );
+  }
+  return body as SessionListItem[];
 }
 
 async function main(argv: string[]): Promise<void> {
   const options = parseArgs(argv);
+  if (options.help) {
+    for (const line of USAGE) {
+      console.log(line);
+    }
+    return;
+  }
   const { bind_addr } = loadServerInfo();
   const auth = `Bearer ${resolveToken()}`;
   const sessions = await fetchSessions(bind_addr, auth, options.states);
@@ -427,12 +595,31 @@ async function main(argv: string[]): Promise<void> {
 }
 
 // Only run main() when this file is the process entry point, so the unit
-// tests in tests/ can import the pure helpers without firing a fetch. Same
-// guard as `dropped-frame-recovery`, resolved through `pathToFileURL` so a
-// path needing percent-encoding (a space, a non-ASCII directory name) still
-// compares equal.
-const isEntry =
-  process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
+// tests in tests/ can import the pure helpers without firing a fetch.
+//
+// Compared on REALPATHS, not on URLs. `import.meta.url` is what the ESM
+// loader resolved, and the loader realpaths the module it loads;
+// `process.argv[1]` is the path the user typed, verbatim. Invoke the entry
+// through a symlink -- which is exactly what the README's status-line
+// guidance implies (`ln -s .../src/index.ts ~/bin/session-glance`) -- and the
+// two differ, `isEntry` is false, and the process exits 0 having printed
+// nothing at all. A silent no-op is the worst possible failure for an
+// attention surface. `pathToFileURL` is kept as the fallback so a path
+// needing percent-encoding (a space, a non-ASCII directory name) still
+// compares equal when a realpath cannot be taken.
+function resolveIsEntry(): boolean {
+  const invoked = process.argv[1];
+  if (invoked === undefined) {
+    return false;
+  }
+  try {
+    return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(invoked);
+  } catch {
+    return import.meta.url === pathToFileURL(invoked).href;
+  }
+}
+
+const isEntry = resolveIsEntry();
 
 if (isEntry) {
   // Message only, never the stack. This is what makes "a clear message, not a
