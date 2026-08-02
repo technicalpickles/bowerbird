@@ -7,6 +7,8 @@ stepsCompleted:
 inputDocuments:
   - docs/bmad/planning-artifacts/prd.md
   - docs/bmad/project-context.md
+  - docs/bmad/planning-artifacts/prds/prd-bowerbird-2026-08-02/addendum.md
+  - docs/bmad/planning-artifacts/prds/prd-bowerbird-2026-08-02/.decision-log.md
 revisions:
   - 2026-05-24: Folded Epic 2 retrospective action items AI-1..AI-6 into Story 3.1 (singleton enforcement), Story 3.2 (connected_ws_clients wiring), Story 3.4 (CI --test-threads=1, architecture.md WebSocket subsystem section), Story 4.4 (wire-enum serde(other) sweep, hook-to-presenter p99 Criterion bench, NDJ ingest framing narrative). Source: docs/bmad/implementation-artifacts/epic-2-retro-2026-05-24.md
   - 2026-05-26: Added Epic 5 (V1 Release Readiness) with 6 stories — first-party presenter (sibling repo), bench gates load-bearing, release pipeline E2E, install UX + middleware closure, first-time-reader docs pass, crates.io + v0.1.0 tag. Source: docs/bmad/planning-artifacts/sprint-change-proposal-2026-05-26.md (folds Epic 3 retro AI-3/AI-4, Epic 4 retro AI-1..AI-5, plus 5 deferred-work entries).
@@ -17,6 +19,9 @@ revisions:
   - 2026-05-29: Inserted new Story 5.6 (`idle_prompt` reclassified as transient) into Epic 5 after bench-gates (5.5); old 5.6 (release pipeline E2E) → 5.7, old 5.7 (cookbook consolidation) → 5.8, old 5.8 (first-time-reader docs) → 5.9, old 5.9 (crates.io + v0.1.0 tag) → 5.10. Moves `idle_prompt` from the input-required bucket to the transient (preserve-prior) bucket in `transition()`, narrowing `WaitingInput` to genuine hard blocks (`permission_prompt`/`elicitation_dialog`). Surfaced during 2026-05-29 bowerbird-deck dogfooding (13 of 15 live sessions falsely `WaitingInput`). Amends ADR 0004 §3; recorded as ADR 0005. Source: docs/bmad/planning-artifacts/sprint-change-proposal-2026-05-29-idle-prompt-reclassification.md.
   - 2026-06-01: Inserted four dogfood-triage stories into Epic 5 after Story 5.6 — 5.7 (session cwd + started_at on the wire; +ADR 0006), 5.8 (server-side session filter), 5.9 (daemon start-on-login supervision; +ADR 0007), 5.10 (shim names the cause on daemon-down). Renumbered the release-readiness tail: old 5.7 (release pipeline E2E) → 5.11, old 5.8 (cookbook) → 5.12, old 5.9 (first-time-reader docs) → 5.13, old 5.10 (crates.io + v0.1.0 tag) → 5.14. All four new stories gate the v0.1.0 tag (now Story 5.15). Surfaced during 2026-06-01 deck+web triage-radar dogfooding (presenters can only triage on what the wire carries: no cwd to group by, full Ended graveyard dumped on connect, no daemon supervision across reboot, causeless hook-error wall). Story 5.7 fully specified here and landing first; 5.8–5.10 are stubs to be fleshed out at their own create-story time. Source: docs/bmad/planning-artifacts/sprint-change-proposal-2026-06-01-dogfood-triage.md.
   - 2026-06-11: Inserted new Story 5.11 (Session PID supersession) into Epic 5 after Story 5.10; +ADR 0009 (extends ADR 0004). Renumbered the release-readiness tail: old 5.11 (release pipeline E2E) → 5.12, old 5.12 (cookbook) → 5.13, old 5.13 (first-time-reader docs) → 5.14, old 5.14 (crates.io + v0.1.0 tag) → 5.15. Adds event-driven `SessionEnded { reason: pid_superseded }` for rolled-over predecessor sessions sharing a live PID (the liveness probe only ends on PID death, but one live `claude` PID hosts many session_ids over `/clear`/resume/compaction). Gates the v0.1.0 tag (now Story 5.15). Verify-before-implementing gate PASSED (bean gt-e9dc): subagents do not surface as distinct co-PID session_ids. Story is a stub to be fleshed out at create-story time. Source: docs/bmad/planning-artifacts/sprint-change-proposal-2026-06-11-pid-supersession.md.
+  - 2026-08-02: Phase 3 requirements extracted (create-epics-and-stories incremental run for Epic 6): added FR40–FR44 (attention-surface cookbook entries) and Phase 3 additional requirements (build order, dogfood gate, zero-substrate-change constraint, per-key map pattern, A13 snapshot-suppression test discipline, cookbook integration surface, deck archival, WHERE floor/stretch). Sources: PRD Phase 3 refresh (0c2a752), prds/prd-bowerbird-2026-08-02/addendum.md, prds/prd-bowerbird-2026-08-02/.decision-log.md.
+  - 2026-08-02: Epic 6 (Attention surfaces replace pane-cycling) approved after party-mode review (John/Winston/Murat/Amelia). Maintainer decisions from the review: (1) build order supersedes the PRD's stated order: session-glance → transition-alerts → tmux-ambient → live-board (live-board moved last; only hard code dependency is glance → tmux-ambient, DAG documented in the epic); (2) bowerbird-deck archived once the live-board dogfood gate resolves, pass OR fail (fail = archive with a finding note); (3) tmux-ambient shells out to the session-glance CLI (glance grows a machine-friendly output-mode AC) rather than copying the query. Story keys are slug-first (6-session-glance, not 6.1) per epic-5 retro insight 5. live-board split into port + dogfood stories per review.
+  - 2026-08-02: Epic 6 stories authored (5 stories, slug keys: 6-session-glance, 6-transition-alerts, 6-tmux-ambient, 6-live-board-port, 6-live-board-dogfood) with epic-level conventions section (dogfood gate protocol, A13 extended scope, output-seam convention, FR44 anchoring, integration checklist, carried items). FR40–FR44 coverage complete.
 ---
 
 # bowerbird - Epic Breakdown
@@ -68,6 +73,14 @@ FR36: The protocol guarantees that tools built against v1 continue to work on an
 FR37: The daemon accepts inbound events via a socket accessible only to the current OS user
 FR38: Tool builders can authenticate REST and WebSocket connections using a bearer token
 FR39: Tool builders can access structured changelog information identifying the type and nature of any protocol changes between releases
+
+Phase 3 additions (2026-08-02; all presenter-layer cookbook deliverables, zero substrate changes):
+
+FR40: Tool builders can print a one-shot glance of every live session's state from the command line, grouped by repository (derived from cwd), with per-session age (derived from started_at), via the session-glance cookbook entry consuming REST GET /sessions?state=
+FR41: Tool builders can receive OS notifications when a session transitions into WaitingInput (blocked) or from Working to Idle (turn done), with the triggering reason joined from the events stream (e.g. which tool's permission prompt), via the transition-alerts cookbook entry; the entry documents the per-key map pattern that absorbs the snapshot burst silently and stays correct across reconnects
+FR42: Tool builders can run a long-lived live board showing per-session state and event flow across all sessions, via the live-board cookbook entry (the bowerbird-deck archival that accompanies this is a project task, not part of this capability)
+FR43: Tool builders can surface a session-attention count in the tmux status line via the tmux-ambient cookbook entry, wired from the same query as session-glance
+FR44: Every Phase 3 attention surface names WHERE the session is: at minimum the repository derived from cwd; optionally the tmux pane, derived presenter-side by matching the session's last_pid into tmux pane PIDs (the substrate ships location facts, never location interpretation)
 
 ### NonFunctional Requirements
 
@@ -157,6 +170,19 @@ Architecture requirements from project-context.md that affect story implementati
 9. Outbound envelope additive-compat (extra field round-trips without error)
 10. (source, session_id) collision safety (identical session_id, different source → distinct sessions)
 
+**Phase 3 additional requirements (2026-08-02; from PRD Phase 3 sections + prds/prd-bowerbird-2026-08-02/addendum.md + .decision-log.md):**
+
+- Build order is fixed: session-glance → transition-alerts → live-board → tmux-ambient; each entry is validated by real daily use before it lands (dogfood gate per entry, per Phase 3 measurable outcomes)
+- Zero substrate changes this cycle: live-only subscribe flag DEFERRED with trigger (build transition-alerts on the per-key map pattern first; add the flag only if daily use shows the pattern is clumsy); sync frame stays dormant
+- transition-alerts relies on the Event-before-State ordering guarantee (crates/daemon/src/projection/session.rs post-commit publish): the two-topic join (state for the edge, events for the why) needs no buffering heuristics
+- The per-key map pattern is load-bearing regardless of any future protocol flag (reconnect correctness: a dropped frame clears snapshot coverage, re-subscribes re-snapshot); its first-sighting limitation must be documented in the entry, not papered over (optional refinement: consult started_at)
+- Team agreement A13 applies with force to transition-alerts: the snapshot-suppression test must be observed failing against broken code (make first-sighting alert, watch red, fix, keep)
+- Cookbook integration surface (adding a fourth+ entry): tests/cli_docs_drift.rs hardcodes the three-entry README list and its message string; tests/cli_examples.rs needs a doc-comment update plus a smoke test per new entry; docs/cookbook/README.md table and Quick run block; five-section README shape is machine-enforced (no fenced ts blocks); each entry needs package-lock.json (CI typecheck-examples runs npm ci); CI globs docs/cookbook/*/ so new entries are picked up automatically
+- bowerbird-deck: archive the repo (README pointer + GitHub archive) once live-board lands, project task accompanying FR42
+- WHERE floor/stretch split (FR44): repo-from-cwd is mandatory on every surface; the pid-to-tmux-pane hop (tmux list-panes pane_pid ancestry walk) is stretch, pursued only if cheap
+- Dropped as entries, survive as "How to apply" mentions: stuck-session detection, Reaction::Pause
+- Open question carried in the cycle (not an FR, do not force): Reaction/tool-reactions.toml, sanctioned interpretation hook with a consumer, or deprecation ADR
+
 ### UX Design Requirements
 
 N/A — bowerbird is a headless substrate with CLI and API surfaces only. No UI design document is required or in scope.
@@ -202,6 +228,11 @@ FR36: Epic 4 — v1.x protocol backward compatibility guarantee
 FR37: Epic 1 — Ingest socket accessible only to current OS user (Unix socket 0600)
 FR38: Epic 3 — Bearer token authentication for REST and WebSocket
 FR39: Epic 4 — Structured protocol changelog (CI-enforced)
+FR40: Epic 6, session-glance one-shot CLI (repo-keyed, aged, ?state= consumer)
+FR41: Epic 6, transition-alerts OS notifications (per-key map pattern, events join)
+FR42: Epic 6, live-board long-lived TUI (deck absorbed; archival rides the dogfood story)
+FR43: Epic 6, tmux-ambient status-line count (shells out to session-glance)
+FR44: Epic 6, WHERE floor on every surface (session-glance is the reference implementation of repo-from-cwd; later stories conform to it; pid-to-tmux-pane hop is stretch, excluded from gating ACs)
 
 ## Epic List
 
@@ -224,6 +255,10 @@ Tool builders can learn bowerbird via comprehensive docs and reference examples,
 ### Epic 5: V1 Release Readiness
 The maintainer dogfoods bowerbird daily via a first-party presenter (sibling repo), and the planned stories then harden the substrate for public release: bench gates converted to load-bearing, release pipeline driven end-to-end, install UX polished, README + quickstart rewritten for first-time readers, crates.io namespace decision, v0.1.0 tag. Closes Epic 4 retro AI-1..AI-5 and 5 deferred-work entries.
 **FRs covered:** hardening only — no new FRs.
+
+### Epic 6: Attention surfaces replace pane-cycling
+The maintainer discovers blocked and finished sessions through bowerbird attention surfaces (OS notifications, one-shot glance, tmux ambient count, live board) instead of manually cycling tmux panes, and each proven surface lands as a cookbook entry that doubles as a prototype accelerator for the first outside adopters (Journey C). Entirely presenter-layer: zero substrate changes planned; every story is gated on real daily dogfood use before landing.
+**FRs covered:** FR40, FR41, FR42, FR43, FR44
 
 ---
 
@@ -1364,3 +1399,190 @@ Closes Epic 3 retro AI-3 / Epic 4 retro AI-5.
 **Given** the v0.1.0 release notes
 **When** a first-time reader (Story 5.14's audience) finds them
 **Then** they include the install one-liner, a link to Quickstart, and an honest statement of "what works today and what doesn't" (the deferred-work entries that remain — code-signing, second-adapter, etc.)
+
+---
+
+## Epic 6: Attention surfaces replace pane-cycling
+
+The maintainer discovers blocked and finished sessions through bowerbird attention surfaces (OS notifications, one-shot glance, tmux ambient count, live board) instead of manually cycling tmux panes, and each proven surface lands as a cookbook entry that doubles as a prototype accelerator for the first outside adopters (Journey C). Entirely presenter-layer: zero substrate changes planned (live-only subscribe flag deferred with trigger; sync frame dormant).
+
+### Epic 6 conventions and cross-cutting rules
+
+**Story keys are slug-first, not ordinal.** Keys are `6-session-glance`, `6-transition-alerts`, `6-tmux-ambient`, `6-live-board-port`, `6-live-board-dogfood`. Epic 5's numeric ids rotted four times through dogfood-driven insertions (retro insight 5), and this epic is designed around dogfood cycles, so insertions are expected. Story files and sprint-status keys use the slug form. Build order lives in the list below, not in the key, an inserted story renumbers nothing. Downstream tooling note: do NOT "helpfully" reintroduce `6.1`-style ordinals when creating story files or sprint-status entries.
+
+**Build order (default) and the real dependency DAG.** Order: `6-session-glance` → `6-transition-alerts` → `6-tmux-ambient` → `6-live-board-port` → `6-live-board-dogfood`. This supersedes the PRD Phase 3 Scope order (which listed live-board third): live-board is the riskiest story (a port of the shape that already failed to stick once) and moves last, where it lands with the least pressure and must justify itself as additional, not load-bearing. The only hard code dependency is `6-session-glance` → `6-tmux-ambient` (tmux-ambient invokes glance's CLI). `6-transition-alerts` is self-contained; the live-board pair is independent of the others. Everything else in the order is dogfood-value sequencing, reordering under pressure is a known-safe move as long as the one hard edge holds.
+
+**Dogfood gate protocol (every entry story except `6-live-board-port`).** "Validated by real daily use" is falsifiable or it is theater:
+
+- Minimum exposure: 3–5 working days of real sessions, used unprompted, not one demo run.
+- At least one provoked adversity per entry (named per story): the happy path on a healthy laptop proves nothing about reconnects.
+- A harvest note recorded in the story before it lands: at least one concrete behavior change driven by use, or an explicit "no changes needed, here's what I watched for."
+- The gates serialize: four dogfood windows is roughly a month of wall-clock. That is the plan, not a problem to optimize away by overlapping windows into meaninglessness.
+- Dogfooding happens from the story branch (pre-land build); if running pre-land is annoying, fix that friction first or the gate quietly becomes post-land.
+
+**A13, extended scope.** The snapshot-suppression discipline (test observed failing against broken code before the fix is kept) applies to every negative assertion in this epic, not just the famous one, reconnect re-suppression and first-sighting silence are the same trap. Additionally, every negative test carries a positive companion assertion proving the precondition fired (e.g. assert the snapshot burst contained ≥1 frame before asserting zero alerts). A suppression test that can't prove suppression had something to suppress is a coin flip wearing a green checkmark.
+
+**Output-seam convention (side-effect entries).** Each entry is a testable formatter/emitter; delivery (OS notifier, tmux) is thin glue. Smoke tests assert on text output; the notifier/tmux paths are never CI-exercised, that is exactly what the dogfood gate covers. Do not attempt to assert a macOS notification fired in CI.
+
+**FR44 anchoring.** `session-glance` is the reference implementation of repo-from-`cwd`; later stories' WHERE ACs read "matches glance's repo-keying behavior", not four parallel interpretations. The pid-to-tmux-pane hop is stretch and excluded from all gating ACs; it may appear in "How to apply it" sections. If pursued, it is its own story or an explicit deferral with a trigger.
+
+**Cookbook integration checklist (definition-of-done on every entry story).** "Zero substrate changes" is true at the protocol layer, not the repo layer, each entry touches: `tests/cli_docs_drift.rs` (README list; count derivation made glob-driven by `6-session-glance`), `tests/cli_examples.rs` (doc comment + one smoke test), `docs/cookbook/README.md` (table row + Quick run block), `package-lock.json` (CI runs `npm ci`), five-section README shape (machine-enforced, no fenced ts blocks).
+
+**Carried items (not stories).** (1) The `Reaction`/tool-reactions.toml open question, decide during the cycle (sanctioned interpretation hook with a consumer, or deprecation ADR); do not force a consumer into existence. (2) Epic 5 retro AI-3 (File-List decide-or-retire) is due before this epic's first story, pre-story housekeeping, tracked in taskwarrior, not a story here.
+
+### Story 6-session-glance: One-shot session glance CLI
+
+As the maintainer (and any tool builder copying the entry),
+I want a one-shot CLI print of every live session's state, grouped by repository with per-session ages,
+So that a missed notification has a glanceable fallback and pane-cycling stops being the discovery mechanism (FR40, FR44).
+
+**Acceptance Criteria:**
+
+**Given** a running daemon with sessions in mixed states across multiple repositories
+**When** I run the `session-glance` entry
+**Then** it prints every non-Ended session grouped by repository (derived presenter-side from `cwd`), each with its current state and age (derived from `started_at`), then exits: one-shot, no watch loop
+**And** it consumes REST `GET /sessions?state=` (the Story 5.8 filters' first consumer), not an unfiltered dump
+
+**Given** downstream consumers (`6-tmux-ambient` invokes this CLI)
+**When** the entry is run with a machine-friendly output mode (e.g. a count/format flag)
+**Then** it emits a stable, documented output contract (this CLI's output is a mini-API; the contract is stated in the README, not implied)
+
+**Given** this entry is the FR44 reference implementation
+**When** later stories implement WHERE
+**Then** their repo derivation conforms to this entry's behavior (documented as the canonical repo-from-`cwd` derivation)
+
+**Given** `tests/cli_docs_drift.rs` hardcodes a three-entry README list and message string
+**When** this story lands the fourth entry
+**Then** the guard is refactored to derive the entry list/count from the `docs/cookbook/*/` glob, and, per A13, the refactored guard is observed failing against a deliberately broken README before it is kept
+
+**Given** the cookbook integration checklist (epic conventions above)
+**When** the entry lands
+**Then** every checklist item is satisfied and CI is green
+
+**Given** the dogfood gate protocol
+**When** the story is ready to land
+**Then** the gate evidence is recorded: 3–5 working days of unprompted use, provoked adversity (daemon stopped mid-day: the entry fails with a clear message, not a stack trace), and a harvest note
+
+### Story 6-transition-alerts: OS notifications on blocked and done transitions
+
+As the maintainer,
+I want an OS notification the moment a session blocks on input or finishes a turn, naming the reason and the repo,
+So that blocked and finished sessions interrupt me instead of waiting for my next pane sweep (FR41, FR44).
+
+**Acceptance Criteria:**
+
+**Given** a subscription to `state.session.*` using the per-key map pattern
+**When** a session transitions into `WaitingInput`
+**Then** an alert is emitted naming the state change, the reason joined from the events stream (e.g. which tool's permission prompt, from the event payload's verbatim fields), and the repository (matching glance's repo-keying behavior)
+
+**Given** the same subscription
+**When** a session transitions from `Working` to `Idle`
+**Then** a turn-done alert is emitted with the same WHERE naming
+
+**Given** a fresh subscribe whose snapshot burst contains ≥1 frame (asserted, per A13 positive-companion rule)
+**When** the snapshot frames arrive
+**Then** zero alerts are emitted, and the test proving this was observed failing against broken code (first-sighting alert made, watched red, fixed, kept)
+
+**Given** a `dropped` frame has cleared snapshot coverage and a re-subscribe has actually re-snapshotted (asserted)
+**When** the re-snapshot frames arrive
+**Then** zero alerts are emitted, and unchanged sessions stay quiet through the reconnect
+
+**Given** the first-sighting limitation (a brand-new session blocking within its very first observed frame is recorded silently)
+**When** the README is written
+**Then** the limitation is stated plainly, with the optional `started_at` refinement mentioned as the flagship Axiom 4 example, not papered over
+
+**Given** the output-seam convention
+**When** the smoke test runs in `tests/cli_examples.rs`
+**Then** it asserts on the entry's text output mode; the OS notifier path is thin glue, never CI-exercised
+
+**Given** the entry's two-topic join relies on Event-before-State per-session ordering (`crates/daemon/src/projection/session.rs`, post-commit publish) with zero buffering
+**When** this story is implemented
+**Then** the README cites the guarantee explicitly as load-bearing, and a contract test pinning that publish order exists in the daemon suite (verify `contract_daemon.rs`; if absent, add it, a disclosed test-only substrate-adjacent task)
+
+**Given** the smoke harness may not support deliberately dropping a WS connection
+**When** the reconnect tests are written
+**Then** the harness capability is audited first and extended if needed, so reconnect correctness is CI-verified, not dogfood-only
+
+**Given** the cookbook integration checklist and dogfood gate protocol
+**When** the story is ready to land
+**Then** both are satisfied; provoked adversity: daemon killed and restarted mid-run (alerts resume correctly after reconnect); the harvest note answers John's question, did the alert get me back to the session faster than pane-cycling, and did notification volume stay below the swipe-dismiss-forever threshold (coalescing is a harvest candidate, not a speculative feature)
+
+### Story 6-tmux-ambient: Ambient attention count in the tmux status line
+
+As the maintainer,
+I want a session-attention count in the tmux status line,
+So that ambient awareness of blocked sessions costs zero keystrokes and zero panes (FR43, FR44).
+
+**Acceptance Criteria:**
+
+**Given** `session-glance`'s machine-friendly output mode
+**When** the tmux status line invokes this entry
+**Then** it renders an attention count (e.g. "2 blocked") by invoking the glance CLI, one code path, no reimplemented query (maintainer decision at epic review)
+
+**Given** FR44's WHERE floor
+**When** the count is nonzero
+**Then** the surface provides repo attribution (exact formatting decided in dev/dogfood: inline names when they fit, count-only degradation documented)
+
+**Given** the output-seam convention
+**When** the smoke test runs
+**Then** it asserts on the formatted status-line string; tmux itself is never touched in CI
+
+**Given** the entry wires into tmux via documented configuration
+**When** the README is written
+**Then** the tmux wiring (status-line config, refresh interval) is a documented, copy-pastable snippet, and the refresh cadence respects the daemon (polling interval stated, not left to accident)
+
+**Given** the cookbook integration checklist and dogfood gate protocol
+**When** the story is ready to land
+**Then** both are satisfied; provoked adversity: tmux detach/reattach and daemon-down (status line degrades gracefully, no error spew into the status bar)
+
+### Story 6-live-board-port: Live board ported from bowerbird-deck
+
+As a tool builder,
+I want the long-lived live board available as a cookbook entry,
+So that watching event flow across sessions has a canonical, teachable implementation (FR42 capability; validation is the next story).
+
+**Acceptance Criteria:**
+
+**Given** the bowerbird-deck sibling repo
+**When** the board is ported into `docs/cookbook/live-board/`
+**Then** the port is the minimum board that satisfies FR42, less than all of deck; the rest stays in the archived repo's history (entries are examples, not products)
+
+**Given** deck was not written to cookbook conventions
+**When** the port lands
+**Then** it conforms fully: five-section README (no fenced ts blocks), `src/` layout, `package-lock.json`, smoke test green, and this story is sized as a port, not a move
+
+**Given** TUIs are hostile to CI assertions
+**When** the smoke test is written
+**Then** the entry has a render-once/non-TTY output mode designed in from the start, and the smoke test asserts on that text, no ANSI-soup snapshots
+
+**Given** deck's existing tests
+**When** behavior is absorbed
+**Then** the relevant tests come with it, or the story records why not, no naked behavior absorption
+
+**Given** the per-key map pattern documented by `6-transition-alerts`
+**When** the board handles snapshot vs live frames and reconnects
+**Then** it applies the documented pattern and cites that entry rather than re-deriving it
+
+**Given** FR44 and the cookbook integration checklist
+**When** the port lands
+**Then** board rows name the repo (matching glance's derivation) and every checklist item is satisfied; CI green, this story has NO dogfood gate (that is `6-live-board-dogfood`)
+
+### Story 6-live-board-dogfood: Live board validated in daily use; deck retired
+
+As the maintainer,
+I want the ported live board validated by real daily use and bowerbird-deck retired,
+So that the cookbook entry is harvested from a tool I actually run, and the zombie sibling repo stops existing either way (FR42 validation).
+
+**Acceptance Criteria:**
+
+**Given** the ported board from `6-live-board-port`
+**When** the dogfood gate runs
+**Then** the protocol is satisfied: 3–5+ working days, provoked adversity (laptop sleep with the board open; daemon restart under it), and a harvest note, with the honest framing that by this point the interrupt+glance surfaces may already have replaced pane-cycling, so the board must justify itself as additional, not load-bearing
+
+**Given** fixes harvested from use
+**When** they land
+**Then** they land in this story (the port story's CI-green state is not reopened; use-driven changes are this story's scope)
+
+**Given** the dogfood gate resolves (pass OR fail)
+**When** the outcome is known
+**Then** bowerbird-deck is archived either way: on pass, README pointer to the cookbook entry + GitHub archive; on fail, archived with a finding note recording what the gate surfaced (a failed gate is a finding, not a zombie repo)
