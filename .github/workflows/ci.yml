@@ -39,7 +39,7 @@ jobs:
       - name: Lint - inline SQL ban
         shell: bash
         run: ./scripts/lint-inline-sql.sh
-      - name: Test the bench-gate wrapper (scripts/run-bench-gate.py)
+      - name: Test the scripts/ helpers (bench-gate wrapper, File List audit)
         shell: bash
         run: python3 -m unittest discover scripts/tests
       # Parallel (libtest default threads) since 2026-07-29. The Epic 2 retro
