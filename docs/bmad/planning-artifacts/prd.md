@@ -29,12 +29,15 @@ classification:
   domain: general
   complexity: medium
   projectContext: brownfield
+status: final
+updated: 2026-08-02
 ---
 
 # Product Requirements Document - bowerbird
 
 **Author:** pickles
 **Date:** 2026-05-11
+**Updated:** 2026-08-02 (Phase 3 refresh: post-v0.1.0 cycle, attention surfaces + adoption; see decision log at `prds/prd-bowerbird-2026-08-02/.decision-log.md`)
 
 ## Executive Summary
 
@@ -61,7 +64,7 @@ The separation of concerns is the differentiator: bowerbird owns the collection 
 - **Project type:** Developer tool — multi-crate Rust workspace (protocol library, shim binary, daemon binary, reference adapter) with WebSocket + REST API surface
 - **Domain:** Developer tooling / AI agent activity
 - **Complexity:** Medium — technically nuanced (performance contracts, protocol stability, pub/sub architecture) but no regulatory overhead
-- **Project context:** Brownfield pre-MVP — significant design corpus established; implementation not yet started
+- **Project context:** Brownfield, shipped: v0.1.0 tagged 2026-08-02 (Epics 1 through 5 complete). The original "pre-MVP, implementation not yet started" framing is retained in git history; this document now describes a live substrate entering its Phase 3 cycle.
 
 ## Success Criteria
 
@@ -74,6 +77,8 @@ The two properties that define "working":
 - **Multiple simultaneous tools:** two or more tools can run against the same event stream independently, each unaware of the other
 
 V1 success gate: pickles can build and iterate on local example tools against live Claude Code sessions, with multiple tools running simultaneously, without any instrumentation changes between experiments.
+
+**Phase 3 success gate (2026-08-02):** bowerbird earns a place in the maintainer's actual working day. Concretely: the attention surfaces (notifications, glance, board, ambient) replace manual tmux pane-cycling as the way the maintainer discovers blocked and finished sessions. V1 proved the substrate works; Phase 3 proves it is worth using. The Phase 2 method ("build a presenter, use it daily") produced the tool but not the habit, so Phase 3 inverts the shape: instead of one destination TUI, several small surfaces that meet the maintainer where attention already lives (OS notifications, the tmux status line, a one-shot CLI glance).
 
 ### Business Success
 
@@ -104,6 +109,12 @@ All 10 required contract tests passing before MVP ships (WS drop behavior, PRAGM
 - All performance bars met on macOS + Linux CI: **✓ or ✗** (with per-platform baselines)
 - Post-V1: independent tool author with no prior contact: **✓ or ✗**
 
+**Phase 3 measurable outcomes (added 2026-08-02; the V1 table had no usage metric, which is how the dogfooding stall went unmeasured):**
+
+- Daily-driver signal: across 10 consecutive working days, the maintainer acts on at least one bowerbird attention surface per day (a notification jumped to, a glance invoked, the ambient count checked) instead of discovering session state by pane-cycling: **✓ or ✗**, self-reported honestly
+- Stranger time-to-first-prototype: an ecosystem-versed developer with a specific use case in mind goes from "never heard of bowerbird" to "my own prototype running against live sessions" within one hour, using a cookbook entry as the starting skeleton: **✓ or ✗** (measured when the first such person shows up; the counter-metric is where in the hour they bounced)
+- Cookbook as accelerator: each new cookbook entry is validated by real daily use before it lands (the entry is harvested from a tool the maintainer runs, not authored speculatively): **✓ or ✗** per entry
+
 ## Product Scope
 
 ### MVP — Minimum Viable Product
@@ -117,13 +128,30 @@ All 10 required contract tests passing before MVP ships (WS drop behavior, PRAGM
 - All 10 required contract tests
 - CI matrix: macOS + Linux, performance regression gating
 
-### Growth Features (Post-MVP)
+### Phase 3 Scope (current cycle, 2026-08-02)
+
+Four new cookbook entries, built in order, each dogfooded before it lands (see Phase 3 journeys and FR40 through FR44):
+
+1. **`session-glance`**: one-shot CLI print of session states, repo-keyed via `cwd`, age via `started_at`. First consumer of the Story 5.8 REST `?state=` filters.
+2. **`transition-alerts`**: OS notifications on blocked (`WaitingInput`) and done (`Working` to `Idle`) transitions, with the reason joined from the events stream and the repo named on every alert.
+3. **`live-board`**: the long-lived TUI, absorbed from the bowerbird-deck sibling repo (deck is archived once this lands).
+4. **`tmux-ambient`**: a status-line count (e.g. "2 blocked") wired from the glance query.
+
+Substrate changes this cycle: none planned. All four entries run on the shipped v0.1.0 wire surface. Protocol maturation is a side effect, not a goal (maintainer decision, 2026-08-02).
+
+### Growth Features (Post-MVP backlog)
+
+Consolidated 2026-08-02 (this list previously appeared twice, here and under Project Scoping, with drift between the copies):
 
 - Second agent adapter (Codex, Gemini, or Cursor) — validates the adapter model with a real external contributor
 - `/metrics` endpoint (Prometheus-compatible, path reserved at MVP)
 - `bowerbird gc` for event-log truncation (policy decision deferred)
 - arm64 CI runner
 - `@bowerbird/presenter` SDK if presenter boilerplate ratio justifies it (revisit after first external tool)
+- Homebrew tap (deferred; audience does not justify tap maintenance yet)
+- Promote `session-glance` to a built-in `bowerbird sessions` subcommand: triggered, not scheduled. Only if daily use shows the node-invocation friction of the cookbook entry actually bites.
+- Live-only subscription flag (`subscribe` opting out of the snapshot burst): triggered, not scheduled. Build `transition-alerts` on the per-key map pattern first (the pattern is needed for reconnect correctness regardless); add the protocol flag only if daily use shows the pattern is clumsy. See addendum for the design analysis.
+- `sync` frame activation: the frame is specced and reserved but never emitted; no journey currently demands it. Stays dormant.
 
 ### Vision (Future)
 
@@ -147,6 +175,10 @@ V1 ships when pickles can build and iterate on multiple tools simultaneously aga
 
 **Phase 2 — Release Readiness (Epic 5):** V1 ships in two beats. Phase 1 (Epics 1–4, complete) produced the capture + streaming + install + replay substrate. Phase 2 validates and hardens it: the maintainer installs bowerbird on their main machine, builds a first-party presenter in a sibling repository, uses it daily, and harvests the friction. Bugs found in that loop become hotfix stories folded into the Epic 5 cadence; the planned Epic 5 stories then convert the CI gates from aspirational to load-bearing, exercise the release pipeline end-to-end, polish the install UX, and rewrite the README and quickstart for the first-time reader who has not been in the room while bowerbird was built. The v0.1.0 tag is the closing event of Phase 2.
 
+**Phase 2 outcome, recorded honestly (2026-08-02):** the method half-worked. The dogfood window (five working days in late May) found the epic's realest bugs, and every correctness story in Epic 5 traces to it. But the daily-use habit did not survive past that window: bowerbird-deck did not stick as a daily driver, and by epic close the maintainer was not running bowerbird day to day. The stall was never measured because no success metric counted usage (fixed in Measurable Outcomes, above). Diagnosis from the Phase 3 discovery session: a destination TUI demands a permanent pane it has not yet earned, while the actual attention loop is interrupt-shaped (notifications) and glance-shaped (a one-shot query), not dwell-shaped.
+
+**Phase 3, Attention Surfaces and Adoption (current cycle):** restart the experiment with surfaces that meet attention where it lives, then convert each proven surface into a cookbook entry that doubles as a prototype accelerator for the first outside adopters. Stakes are calibrated as "still an experiment": everything reversible, no substrate changes planned, adoption pursued but not at announcement rigor. Goals in order: (1) the maintainer as genuine daily user, (2) outside adoption via the cookbook, (3) protocol maturation only as a side effect.
+
 ### MVP Feature Set
 
 **All four user journeys supported at v1:**
@@ -169,12 +201,7 @@ V1 ships when pickles can build and iterate on multiple tools simultaneously aga
 
 ### Post-MVP Features
 
-- Second agent adapter (Codex, Gemini, or Cursor) — validates adapter model with external contributor
-- Homebrew tap — deferred; v1 audience is solo, tap maintenance overhead not justified yet
-- `/metrics` endpoint (Prometheus text format; path reserved at v1)
-- `bowerbird gc` for event-log truncation (policy decision deferred)
-- arm64 CI runner
-- `@bowerbird/presenter` SDK if boilerplate ratio justifies it (revisit after first external tool)
+Consolidated into **Growth Features (Post-MVP backlog)** under Product Scope (2026-08-02); this section previously duplicated that list with drift.
 
 ### Risk Mitigation Strategy
 
@@ -259,7 +286,43 @@ Later that week the daemon does crash — a disk-full edge case during a long se
 
 ---
 
-### Journey Requirements Summary
+### Phase 3 Journeys (added 2026-08-02)
+
+Captured from the maintainer's narration in the Phase 3 discovery session. Journeys 1 through 4 above are the V1 record and stand unchanged; the `brew install` path in Journey 3 is historical (see Installation Methods for the real paths).
+
+### Journey A: The Pane-Cycling Day (as-is, the journey this cycle exists to fix)
+
+**pickles runs several projects, each a herdr workspace / tmux session with multiple panes: agents, editors, commands.**
+
+An agent gets kicked off in one pane; attention moves to another project. The loop for discovering what needs attention is manual: cycle through the panes and look. The most common find is a session blocked on a permission prompt, because sessions start in accept-edits mode with the intention of switching to auto mode, and sometimes that switch never happens. The session has been sitting blocked for however long it took the cycle to come back around. The other find is an agent that went idle a while ago, with follow-up waiting.
+
+The cost is not one big failure; it is a steady leak. Attention goes to polling. Blocked and finished sessions wait for the next sweep instead of for the person.
+
+### Journey B: Interrupt-Driven With a Glanceable Fallback (intended daily-driver day)
+
+Same environment, same projects. The daemon is already running (start-on-login, Story 5.9).
+
+An agent blocks on permissions or finishes a turn. An OS notification fires immediately, naming the state change, the reason (permission prompt for which tool), and WHERE: which repo, and where feasible which tmux pane. pickles hops to that session and unblocks or responds. When a notification was missed live (away from the desk, heads-down), the fallback is at-a-glance: a one-shot CLI print of every session's state, grouped by repo, showing working / idle / needs-prompt with ages. For watching the flow of events over time, a longer-lived live board shows the eventing itself.
+
+Pane-cycling becomes a thing that no longer happens. The hop (notification lands you in the right pane) is a stretch goal: pursued only if it turns out cheap; the floor requirement is that every surface names WHERE the session is.
+
+**This journey requires:** `state.session.*` subscription with the per-key map pattern (snapshot absorbed silently, live frames treated as transitions), the events stream joined for notification reasons, `cwd` and `started_at` on the wire (shipped, Story 5.7), REST `?state=` filters (shipped, Story 5.8). Zero new substrate capabilities: everything in this journey runs on the shipped v0.1.0 wire surface.
+
+### Journey C: The Stranger's First Hour (adoption)
+
+**An ecosystem-versed developer, already burned by point tools.**
+
+They have used existing agent-observability and status tools, and hit the wall every such tool builds: each one owns its own capture plumbing, so combining them means fighting them or rebuilding them. They want to do more, and they refuse to re-solve instrumentation to get it.
+
+They arrive at bowerbird with a specific use case in mind, possibly a tool they already built and want to re-base onto a real substrate. They install (quickstart path, timed and falsified in Story 5.14). They find the cookbook entry nearest their use case and copy it as a starting skeleton: entries earn their keep as prototype accelerators, not demos. Within the first hour they have a working prototype of THEIR thing running against live sessions.
+
+The keep-moment: their prototype runs alongside everything else with no instrumentation fight. The thing they came fed up about is the thing that just worked.
+
+The bounce risk concentrates in the find-the-nearest-entry step: if no entry is near their use case, the hour dies in protocol documentation. Cookbook breadth-of-starting-points is therefore the load-bearing adoption deliverable.
+
+### Journey Requirements Summary (Journeys 1 through 4)
+
+Covers the V1 journeys only. Phase 3 journey requirements are inline in Journey B above; the load-bearing fact there is that they introduce zero new substrate capabilities.
 
 | Capability | Required By |
 |---|---|
@@ -333,7 +396,7 @@ The deliberate restraint bet is validated by what *doesn't* appear in issues and
 Targets: macOS arm64, macOS x86_64, Linux x86_64 (Linux arm64 if CI budget allows). Pickles has prior art for the release pipeline. This is the path for users without a Rust toolchain.
 
 **2. Source build**
-`cargo install bowerbird` for any platform with a Rust stable toolchain. `Cargo.lock` committed; reproducible builds.
+`cargo install --git https://github.com/technicalpickles/bowerbird --tag vX.Y.Z` for any platform with a Rust stable toolchain. `Cargo.lock` committed; reproducible builds. (Corrected 2026-08-02: plain `cargo install bowerbird` does not exist; crates.io publishing is deferred per ADR 0011, and `brew install` was cut by the no-list. Journey 3's install wording above is the historical V1 record.)
 
 **Hook installation (separate from binary install):**
 `bowerbird install` atomically modifies `~/.claude/settings.json` — reads, parses, merges the hook entry, writes to `.tmp`, renames. On collision (concurrent write from Claude Code), the operation retries with backoff. The hook entry written to `settings.json` uses a **PATH-relative binary name** (`bowerbird`) rather than an absolute path, to survive Homebrew upgrades and `cargo install` updates. Version-mismatch between shim and daemon (different binary versions installed via different methods) logs a warning on daemon startup and is documented as unsupported.
@@ -356,7 +419,7 @@ The ingest path uses a Unix domain socket with filesystem-permission security �
 | `GET /healthz` | none | Liveness — process up and responding |
 | `GET /readyz` | none | Readiness — DB reachable, migrations applied, broadcasters live |
 | `GET /status` | bearer | Version, uptime, connected tool count, last event time |
-| `GET /sessions` | bearer | List known sessions |
+| `GET /sessions` | bearer | List known sessions. Optional filters (Story 5.8, ADR 0008): `?state=<csv>` (read-time current_state), `?since=<updated_at_ms>` (recency bound, not a cursor), `?limit=<n>`. Absent = unfiltered. |
 | `GET /sessions/:id` | bearer | Session detail and current projection state |
 | `GET /sessions/:id/events?since=<cursor>` | bearer | Cursor-paginated event log; response includes `oldest_available_event_id` |
 | `GET /sessions/:id/stats` | bearer | Per-session event counts and tool-use breakdown. Fields are additive-only; clients must tolerate unknown fields. |
@@ -377,7 +440,7 @@ Connect: `ws://127.0.0.1:<port>/ws` (bearer token in `Authorization` header or `
 { "op": "unsubscribe", "topic": "events.*" }
 ```
 
-One topic per message; multi-topic subscription is "send multiple subscribe messages." Inbound messages use strict `deny_unknown_fields` parsing per `crates/protocol/src/ws.rs::ClientMessage`. Wire shape back-amended for Story 2.1 (2026-05-20).
+One topic per message; multi-topic subscription is "send multiple subscribe messages." Inbound messages use strict `deny_unknown_fields` parsing per `crates/protocol/src/ws.rs::ClientMessage`. Wire shape back-amended for Story 2.1 (2026-05-20). Subscribe additionally accepts an optional `states` array (Story 5.8, ADR 0008) scoping the snapshot-on-subscribe burst to sessions in the named states; valid only on `state.session.*` family topics, and it scopes only the snapshot, never the live stream.
 
 **Server-sent frame types:**
 
@@ -388,6 +451,7 @@ One topic per message; multi-topic subscription is "send multiple subscribe mess
 | `event` | Each new event matching subscribed topics |
 | `dropped` | Client broadcast slot lagged; includes lag count in events (not bytes). Client should re-fetch snapshot via REST. Socket stays open. |
 | `close` | Daemon graceful shutdown |
+| `sync` | Reserved; specced with a validated constructor but never emitted by any shipped daemon (added to this table 2026-08-02 to document reality; activation is a Growth-backlog item with no current demand) |
 
 **Topics (v1):**
 - `state.session.*` — all session state changes (wildcard; new sessions appear as `state` frames)
@@ -442,7 +506,7 @@ The reader path through docs must exist at launch:
 | Quickstart | Works against `bowerbird replay` with bundled demo fixture — no Claude Code required. Covers install → replay → run reference example → see output. Forward-pointer to `presenter-authoring.md` at the success moment. |
 | `docs/presenter-authoring.md` | How to build a tool that consumes the WebSocket stream: connect, subscribe, handle state/event/dropped frames, snapshot on reconnect. Language-agnostic with TypeScript examples. |
 | `docs/protocol.md` | Wire format reference: all endpoints, frame types, topic syntax, auth contract, ingest socket. Machine-readable enough to generate client stubs from. |
-| `docs/cookbook/` | v1 ships at least three entries, each a self-contained directory under `docs/cookbook/<name>/` containing prose README + runnable code. Must exist at launch (not a post-launch deliverable). |
+| `docs/cookbook/` | v1 ships at least three entries, each a self-contained directory under `docs/cookbook/<name>/` containing prose README + runnable code. Must exist at launch (not a post-launch deliverable). Phase 3 target: seven entries (the three V1 entries plus `session-glance`, `transition-alerts`, `live-board`, `tmux-ambient`), each validated by daily use before landing (FR40 through FR43). |
 | `docs/protocol-changelog.md` | Structured changelog; CI-enforced; required entry for any `crates/protocol/src/*.rs` change. |
 
 ### Code Examples
@@ -521,6 +585,18 @@ All three examples must run against `bowerbird replay` with bundled fixture file
 - FR37: The daemon accepts inbound events via a socket accessible only to the current OS user
 - FR38: Tool builders can authenticate REST and WebSocket connections using a bearer token
 - FR39: Tool builders can access structured changelog information identifying the type and nature of any protocol changes between releases
+
+### Attention Surfaces & Cookbook (Phase 3, added 2026-08-02)
+
+All Phase 3 FRs are presenter-layer deliverables (cookbook entries): no new daemon or protocol capability is required, which is itself the Phase 3 bet. Each entry follows the cookbook's canonical shape (self-contained directory, five-section README, runnable TypeScript, CI typecheck + smoke) and lands only after it has been validated by real daily use.
+
+- FR40: Tool builders can print a one-shot glance of every live session's state from the command line, grouped by repository (derived from `cwd`), with per-session age (derived from `started_at`), via the `session-glance` cookbook entry consuming REST `GET /sessions?state=`
+- FR41: Tool builders can receive OS notifications when a session transitions into `WaitingInput` (blocked) or from `Working` to `Idle` (turn done), with the triggering reason joined from the events stream (e.g. which tool's permission prompt), via the `transition-alerts` cookbook entry; the entry documents the per-key map pattern that absorbs the snapshot burst silently and stays correct across reconnects
+- FR42: Tool builders can run a long-lived live board showing per-session state and event flow across all sessions, via the `live-board` cookbook entry (the bowerbird-deck archival that accompanies this is a project task recorded in Phase 3 Scope and the addendum, not part of this capability)
+- FR43: Tool builders can surface a session-attention count in the tmux status line via the `tmux-ambient` cookbook entry, wired from the same query as `session-glance`
+- FR44: Every Phase 3 attention surface names WHERE the session is: at minimum the repository derived from `cwd`; optionally the tmux pane, derived presenter-side by matching the session's `last_pid` into tmux pane PIDs (the substrate ships location facts, never location interpretation)
+
+**Open question carried into Phase 3 (not an FR):** the `Reaction` classification (`tool-reactions.toml`) has had zero consumers since Epic 1 and sits in tension with the restraint doctrine (the daemon "collects faithfully and routes without opinion", yet ships a classification layer). No Phase 3 journey demanded it. Decide during the cycle: keep as the one sanctioned interpretation hook (and give it a consumer), or deprecate it with an ADR. Do not force a consumer into existence to dodge the decision.
 
 ## Non-Functional Requirements
 
