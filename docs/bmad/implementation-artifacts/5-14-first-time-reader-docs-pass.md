@@ -1,6 +1,6 @@
 # Story 5.14: First-time-reader docs pass
 
-Status: review
+Status: done
 
 ## Story
 
