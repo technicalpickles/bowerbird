@@ -1,0 +1,38 @@
+# Team override for bmad-dev-story. Committed; applies to everyone.
+#
+# Closes Epic 5 retro AI-3 (taskwarrior a9005b7a), open since Epic 3 retro
+# AI-5 and carried through Epic 4 AI-6. Stock bmad-dev-story mandates a
+# complete File List but never verifies it against git, so "complete" is the
+# dev agent's recollection of intentional edits. Side-effect files (sprint
+# status bumps, planning-doc edits, formatter reflows, mid-story guardrails)
+# drop out silently. That drift bit stories 3.3, 3.4, 4.3, 4.4 and four more
+# in Epic 5, and was caught every time by a human-prompted review step rather
+# than by the workflow itself.
+#
+# The audit now runs where the drift originates instead of being reconciled
+# downstream by reviewers.
+
+[workflow]
+
+persistent_facts = [
+  "The Dev Agent Record's File List is verified against git, not self-attested. Before setting story Status to `review`, run `python3 scripts/check-file-list.py <story-file> --base main` from the repo root and resolve every discrepancy it reports. Exit 1 means drift, not a script failure.",
+  "Team agreement A9 (docs/bmad/implementation-artifacts/epic-3-retro-2026-05-25.md) makes File List drift HIGH severity in BOTH directions: a file changed in git but absent from the File List, and a file declared in the File List that git shows unchanged. The second direction matters as much as the first because it means an edit was claimed that did not ship.",
+  "Resolve File List drift by correcting the record, never by narrowing the audit. Reach for --ignore only when a path is genuinely outside the story's authorship (unrelated local scratch), and say so in the Completion Notes when you do.",
+]
+
+on_complete = """
+Run the File-List-vs-git audit before you consider the story finished:
+
+    python3 scripts/check-file-list.py <story-file> --base main
+
+If it exits 1, fix the File List (or the code, when the audit reveals an
+unintended edit) and re-run until it exits 0. Record the clean result in the
+Dev Agent Record's Completion Notes, citing the file counts it reported.
+
+If it exits 2, that is a tooling problem (missing story file, not a git repo),
+not a finding: report it plainly rather than working around it.
+
+Do not declare the story ready for review with the audit unresolved. This
+check is the whole point of Epic 5 retro AI-3; skipping it recreates the drift
+that bit eight stories across three epics.
+"""
