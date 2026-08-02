@@ -241,8 +241,9 @@ the story key is a slug).
   - [x] `scripts/test.sh` green (never raw `cargo test`; see Dev Notes "Test execution"). `cargo fmt --check` and
         `cargo clippy --all-targets --workspace -- -D warnings` green.
   - [x] `cd docs/cookbook/session-glance && npm ci && npm run typecheck` green (mirrors CI's `typecheck-examples`).
-  - [x] `git diff | grep $'^+.*—'` is empty (no emdashes in added lines). Generated prose reliably
-        reintroduces them; the `—` escape keeps this file itself sweep-clean.
+  - [x] `git diff | grep $'^+.*\xe2\x80\x94'` is empty (no emdashes in added lines). Generated prose reliably
+        reintroduces them; writing the character as the `$'\xe2\x80\x94'` shell escape (the UTF-8 bytes; works in bash 3.2 and zsh)
+        keeps this file itself sweep-clean instead of exempting it.
   - [x] `python3 scripts/check-file-list.py docs/bmad/implementation-artifacts/6-session-glance.md --base main`
         exits 0 before Status flips to `review`. Exit 1 is drift, not a script failure: fix the record, not the audit.
         `--ignore` is only for paths genuinely outside this story's authorship, and using it belongs in Completion
@@ -647,12 +648,13 @@ committed test edits alike, and reported CLEAN on the first invocation with no f
 trip over `docs/cookbook/session-glance/node_modules/`, which the cookbook `.gitignore` already excludes). No finding
 to report against the audit itself.
 
-**One nit on the story file itself, not a finding worth acting on.** The `verify` task's em-dash sweep
-(`git diff | grep $'^+.*—'`) is clean for every file this story authored: code, tests, and the entry README have no
-em-dashes in added lines. The only hits in the diff are inside this story file's own description OF the check, which
-create-story wrote with literal em-dashes while claiming the escape kept the file sweep-clean. Left alone: rewriting
-Dev Notes prose is outside the sections dev-story may modify, and the sweep's purpose (keeping authored prose clean)
-is met.
+**One nit on the story file itself, resolved post-dev.** The `verify` task's em-dash sweep
+(`git diff | grep $'^+.*\xe2\x80\x94'`) is clean for every file this story authored: code, tests, and the entry README have no
+em-dashes in added lines. The only hits in the diff were inside this story file's own description OF the check, which
+create-story wrote with literal em-dashes while claiming an escape kept the file sweep-clean. Dev left them alone
+(rewriting Dev Notes prose is outside the sections dev-story may modify); they were then rewritten as the `$'\xe2\x80\x94'`
+shell escape, verified to still match under both macOS bash 3.2 and zsh (the `\u2014` form does not: bash 3.2 lacks it), so the sweep is now literally clean across the whole
+diff rather than clean-except-here.
 
 ### File List
 
