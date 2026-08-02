@@ -1,0 +1,143 @@
+# Story 5.15: Crates.io namespace decision and v0.1.0 tag
+
+Status: ready-for-dev
+
+## Story
+
+As the project owner,
+I want a deliberate decision on crates.io publishing,
+and the v0.1.0 tag pushed, so V1 is shipped.
+
+Closes Epic 3 retro AI-3 / Epic 4 retro AI-5 (the pre-release crates.io namespace check). This is the epic's closer: stories 5.1 through 5.14 are all done, `v0.1.0-rc3` is the published prerelease, and this story turns the release candidate into the first stable release. It is release mechanics plus one real decision, not feature work: zero production Rust changes are expected (the only possible exception is Cargo.toml metadata, and only if the maintainer chooses to publish, which the Dev Notes recommend against for v0.1.0).
+
+**Scope boundary:** the namespace decision (ADR), the pre-tag runbook, the two reader-doc flips handed off by Story 5.14, the deferred-work audit, release notes, the tag itself, and the sprint-status close-out. NOT in scope: epic-5 retro (optional, post-tag), any crate renames (record the naming plan in the ADR instead; see Dev Notes), the taskwarrior deferred pool (13abdf3d, b4748a47, 55f4a1af, 95f95aa7 and friends stay post-tag), Homebrew or any new distribution surface (no-list).
+
+## Acceptance Criteria
+
+Source: [epics.md:1342-1366](../planning-artifacts/epics.md). Adaptations from the epic text are flagged inline and disclosed per the 5.14 precedent.
+
+1. **Given** the crates.io namespace check **When** Story 5.15 is started **Then** the namespace availability is documented (available / squatted / taken-by-related-project) for the actual workspace package set; if the maintainer decides to publish, each published crate's `Cargo.toml` gains `description`, `repository`, `keywords`, `categories`, and a `[package.metadata.docs.rs]` block; if the maintainer decides not to publish at v0.1.0 (or a rename is required), an ADR documents the decision. **Epic-text adaptations (disclosed, three):** (a) the epic's verification command `cargo search bowerbird` is misleading (substring matches, and `cargo info` resolves the local workspace first); the check runs against the crates.io API instead, per the method recorded in the 5.13-era pre-check. (b) The epic says "the four workspace crates"; the workspace actually has FIVE packages (`bowerbird` at the root plus `bowerbird-daemon`, `bowerbird-shim`, `protocol`, `adapter-claude`). (c) The epic's "if available, publish" clause predates the vendored libsqlite3-sys patch: publishing `bowerbird-daemon` today would ship a known WAL-close deadlock to crates.io consumers (see Dev Notes §Publish blockers). The AC's own escape hatch (an ADR documenting the decision) is the expected path; publishing anyway requires the maintainer to explicitly accept the blockers.
+
+2. **Given** all Epic 5 stories 5.1 through 5.14 are complete and any hotfix stories are merged **When** the maintainer tags `v0.1.0` **Then** the release workflow runs end-to-end producing artifacts; the GitHub Release is published (not draft); release notes name the V1 scope, the dogfooding signal that motivated the tag, and the contract-test summary.
+
+3. **Given** the v0.1.0 tag exists **When** the maintainer reads `docs/bmad/implementation-artifacts/deferred-work.md` **Then** every deferred-work entry closed by an Epic 5 story is struck through with a backlink to its closing story (audit; most are already struck), and the Story 3.4 crates.io-publishing entry is either struck (if this story's decision closes it) or annotated with the ADR reference (if publishing stays deferred). **Epic-text adaptation (disclosed):** the epic's parenthetical citation list uses pre-renumbering story identifiers that no longer map cleanly onto the file's section headers; the governing intent is the audit described here, not the stale enumeration.
+
+4. **Given** the v0.1.0 release notes **When** a first-time reader (Story 5.14's audience) finds them **Then** they include the install one-liner, a link to Quickstart, and an honest statement of "what works today and what doesn't" (the deferred-work entries that remain: code-signing, second-adapter, etc.).
+
+5. **Given** the final v0.1.0 tag (implicit in AC 2; made explicit here so it cannot be missed) **When** the tag's tree is built **Then** it carries the two Story 5.14 handoff flips from `docs/release-checklist.md` §"At the final v0.1.0 tag": README's status line reads the released wording (emdash-free "first stable release" framing) and quickstart step 0's download URL targets `releases/download/v0.1.0/...` (the direct tag URL, never `releases/latest`). The flips must land on main BEFORE the tag is created so the tarball's bundled README is correct.
+
+## Tasks / Subtasks
+
+Task headers are stable slugs (cite these in commits, not ordinals).
+
+- [ ] **`namespace-verification` (AC: 1)**
+  - [ ] Re-run the crates.io availability check against the ACTUAL five package names. The pre-check recorded in sprint-status (2026-08-01, 5.13 session) tested `bowerbird / bowerbird-daemon / bowerbird-cli / bowerbird-client`: two of those packages do not exist, `bowerbird-shim` was never checked, and `protocol` / `adapter-claude` were never checked. Method: `curl -s -o /dev/null -w '%{http_code}' -A "bowerbird-release-check (github.com/technicalpickles/bowerbird)" https://crates.io/api/v1/crates/<name>` (404 = free, 200 = taken; the `-A` user-agent is required, crates.io returns 403 without one). Do NOT use `cargo search` (substring noise) or `cargo info` (resolves the local workspace first).
+  - [ ] Story-creation-time result (2026-08-01, re-verify at dev time): `bowerbird` 404, `bowerbird-daemon` 404, `bowerbird-shim` 404, `adapter-claude` 404, `protocol` **200 TAKEN** (unrelated crate). Rename candidates `bowerbird-protocol` and `bowerbird-adapter-claude` both 404. Consequence: the brand namespace is free, but the workspace cannot be published as-is; the protocol crate would need a rename first.
+  - [ ] Record the results (names, HTTP codes, date) in the Dev Agent Record and in the ADR.
+- [ ] **`publish-decision-adr` (AC: 1, 3)**
+  - [ ] Present the maintainer the publish-vs-defer decision with the Dev Notes §Decision brief (blockers, options, recommendation). This is the story's only real decision and it is the maintainer's (pickles), not the agent's. HALT for the decision if running unattended.
+  - [ ] Write `docs/decisions/0011-crates-io-publishing-at-v0-1-0.md` recording the decision. Follow the house ADR format exactly (Deciders / Related / Implementation / `Affects context.md sections:` / observable-triggers-only "Revisit when"; reviewer rejects an empty Revisit-when). Related: ADR 0001 (project name). Whatever the decision, the ADR must record: the verified availability table, the `protocol` name conflict and the recorded rename plan (`bowerbird-protocol`, `bowerbird-adapter-claude` verified free today, availability not guaranteed later), and the publish blockers as revisit triggers (vendored libsqlite3-sys removed when deadpool-sqlite supports rusqlite >= 0.39; path deps need version keys; semver commitment).
+  - [ ] If the decision is publish (not recommended): add the five metadata blocks, version keys on all path deps, resolve the `protocol` rename, and re-run the full suite; this expands the story materially and should be acknowledged as such.
+  - [ ] Update `docs/bmad/implementation-artifacts/deferred-work.md` §"Deferred from: Story 3.4" crates.io entry per AC 3: strike with backlink if closed, else annotate with the ADR reference and what remains deferred.
+- [ ] **`pre-tag-runbook` (AC: 2)**
+  - [ ] Run `docs/release-checklist.md` steps 1 through 5 in order. Expected state, verify rather than assume: step 1 baselines armed (macos.json full, linux.json solo/fanout3/steady with burst deliberately 0 per the recorded deferral); step 2 chaos already done 2026-07-31 via PRs #35/#36/#37 (note the verification in the release notes, do not re-run); step 3 `cargo fmt --check` + `cargo clippy --all-targets --workspace -- -D warnings` + `scripts/test.sh` (NEVER raw `cargo test`; if the lock is held, do not retry-loop); step 4 tarball smoke (`cargo build --release --workspace --exclude bowerbird-shim`, `cargo build --profile release-shim -p bowerbird-shim`, `./scripts/tarball-smoke-test.sh v0.1.0`); step 5 is the `namespace-verification` task above.
+- [ ] **`doc-flips-at-tag` (AC: 5)**
+  - [ ] Flip `README.md` line 12-14: replace `Status: v0.1.0 release candidate.` plus its rc3 link sentence with the released wording, e.g. `Status: v0.1.0, the first stable release.` linking the v0.1.0 release page. Emdash-free (the epic's literal string carries an emdash; the release-checklist wording is the adapted form, precedent 5.14 AC 4).
+  - [ ] Retarget `docs/quickstart.md` step 0: every `v0.1.0-rc3` occurrence becomes `v0.1.0` (the curl URL to `releases/download/v0.1.0/bowerbird-v0.1.0-aarch64-apple-darwin.tar.gz`, the `sudo install` path, the `rm -rf` path, and the prose sentence naming the version), AND the lead-in prose at line 21 ("download the current release candidate", no rc3 literal, easy to miss in a literal-only sweep) becomes released wording ("download the v0.1.0 release" or similar). Do NOT use `releases/latest/download/...`: asset names are version-prefixed, so a latest-URL 404s the moment any newer release ships. Also update the expected `--version` output note: the rc parenthetical ("release-candidate builds print the bare version") can drop since `bowerbird 0.1.0` is now exactly the released version.
+  - [ ] Neither the status line nor the URL is test-pinned, but run `scripts/test.sh --test release_pipeline_docs --test cli_docs_drift` after the edits anyway (the suites pin neighboring strings), plus the emdash sweep on the diff.
+  - [ ] Land these flips on main (with the ADR, release notes file, and record updates) BEFORE creating the tag, so the tagged tree and its bundled README/quickstart are correct.
+- [ ] **`deferred-work-audit` (AC: 3)**
+  - [ ] Sweep `deferred-work.md` end to end: every entry whose closing Epic 5 story has merged must be struck with the house `**Resolved by Story N.N:**` form and backlink. Expected: nearly all already struck (5.4, 5.5, 5.13, 5.14, 5.17, 5.18 entries were struck by their stories); the audit confirms rather than rewrites. Fix any straggler found; the crates.io entry is handled in `publish-decision-adr`.
+  - [ ] Compile the list of entries that REMAIN live; this feeds the release-notes honesty section (AC 4). Known majors: macOS code-signing/notarization, Windows, musl, second adapter (multi-source disambiguation family), Linux burst bench lane unarmed, Linux daemon supervision manual (no systemd), no event-log truncation/gc, migration-era backfill strategy, `STALE_WORKING_MS` retirement, wedged-but-listening daemon detection gap.
+- [ ] **`release-notes` (AC: 2, 4)**
+  - [ ] Draft the v0.1.0 release-notes body BEFORE tagging (scratch file, not committed to the repo). Required content: what bowerbird is and the V1 scope (one paragraph, README first-screen register); the dogfooding signal that motivated the tag (the maintainer's daily-driver daemon: rc lineage verified end to end, live sessions observed, the dogfood-triage stories 5.7-5.11 all came from real use); the contract-test summary (suite size ~650 tests including the required contract tests, protocol v1.0 compat corpus, cross-version upgrade rc2-to-rc3 verified in CI, bench gates armed per platform with the disclosed Linux-burst deferral); the crates.io namespace decision and its ADR (checklist step 5 requires documenting the result here); the install one-liner (quickstart step 0's curl + tar + install sequence for macOS arm64, with the other-targets note); a link to `docs/quickstart.md`; the honest what-works/what-doesn't list from `deferred-work-audit`; the chaos-verification note (step 2). Emdash-free: release notes are external-facing prose.
+  - [ ] Keep the workflow-rendered sections in mind: the release job already writes the tarball table, musl deferral, checksum, and Gatekeeper sections and appends auto-generated What's-Changed. The hand-written body must complement, not duplicate; plan to prepend/merge via `gh release edit v0.1.0 --notes-file <file>` after the run (see `tag-and-verify`), preserving or restating the workflow's table.
+- [ ] **`tag-and-verify` (AC: 2)**
+  - [ ] Confirm the `doc-flips-at-tag` commit (and everything else this story lands) is merged to main and main CI is green. Then: `git tag v0.1.0 <that-sha>` and `git push origin v0.1.0` (maintainer action or explicit go-ahead; pushing a tag is the unrecallable step. Sandbox note: push typically needs the command sandbox disabled).
+  - [ ] Watch the release run (`gh run watch`): `build` all three targets green; `cross-version-test` runs FOR REAL on both platforms with prior tag `v0.1.0-rc3` (tags sorted `-v:refname`, rc3 is the newest non-current; the rc1/rc2/rc3 tags were deliberately kept at rc3 publish time for exactly this; the job must PASS the upgrade body, not skip; a skip means tag resolution broke); `release` job creates the GitHub Release with `draft: false` and `prerelease: false` automatically (no `-` in the tag), so the release is public the moment the job finishes, with template-plus-autogenerated notes until the next step.
+  - [ ] Immediately after the run: `gh release edit v0.1.0 --notes-file <drafted-notes>` to land the AC 2 / AC 4 body. Verify the six assets (three tarballs + three .sha256) are attached and the release is listed as Latest.
+  - [ ] Step 8 smoke per the checklist: install from the published v0.1.0 tarball on the maintainer machine (install-over-existing acceptable, fresh path proven at rc1; disclose which), confirm daemon running, events landing, presenter receiving `state.session.*` frames. Record the run URL, asset list, and smoke evidence in the Dev Agent Record. Step 9: if anything surfaced, hotfix story before proceeding; else record "no hotfix needed."
+- [ ] **`close-out` (AC: all)**
+  - [ ] Sprint-status: `5-15-crates-io-namespace-and-v0-1-0-tag` -> done (per the 5.12 precedent a maintainer decision may skip formal review for release-mechanics stories; otherwise review first), `dogfooding-validation-phase` -> done (its comment says "'done' on v0.1.0 tag" and cites Story 5.14 by the epic's OLD numbering; this story is that closer, fix the comment while flipping), `epic-5` -> done (all stories done; `epic-5-retrospective` stays optional). Update `last_updated` per house style.
+  - [ ] Verify suite green after all repo edits: `scripts/test.sh`, fmt, clippy, emdash sweep on the full diff (grep added lines for the em dash character; must be empty; the pattern is paraphrased here so this file is not itself a match, per 5.14 Completion Note 8), File List matches `git status --porcelain` (recurring review finding).
+  - [ ] File the one NEW followup this story's creation already surfaced: the cross-version prior-tag resolution footgun for the next release (Dev Notes §Release workflow mechanics, versionsort.suffix fix shape). Post-tag followups already tracked in taskwarrior; do not re-file: 13abdf3d (config.toml reference doc), b4748a47 (README/INSTALL a-g redundancy), 55f4a1af (presenter-authoring hybrid split), 95f95aa7 (fanout example current_state union), e4a7a210 (bench re-measure watch, notes through ~2026-08-14). File additional NEW followups only for genuinely new discoveries.
+
+## Dev Notes
+
+### Decision brief: publish vs defer (for `publish-decision-adr`)
+
+The maintainer framed this story's only real decision as "crates.io publish-vs-reserve mechanics." Facts to present:
+
+**Publish blockers (why publishing at v0.1.0 ships broken or blocked):**
+
+1. **`[patch.crates-io]` vendored libsqlite3-sys** (workspace root `Cargo.toml`). The vendored 0.36.0-with-SQLite-3.51.3 exists because stock 0.36.0 bundles SQLite 3.51.1, which has the unix-VFS lock-order inversion that deadlocks concurrent `sqlite3_close` on the same WAL db (this repo's test-hang root cause). Cargo patch sections do NOT travel with a published crate: a crates.io consumer of `bowerbird-daemon` builds against stock libsqlite3-sys 0.36.0 and gets the deadlock back. Unblocks when deadpool-sqlite supports rusqlite >= 0.39 (tracked upstream, deadpool issue #490); until then a published daemon is a known-bug distribution.
+2. **The `protocol` name is taken** on crates.io (HTTP 200, unrelated crate). Publishing requires renaming `protocol` (and by symmetry probably `adapter-claude`, which is free today but generic and un-namespaced). `bowerbird-protocol` / `bowerbird-adapter-claude` verified free 2026-08-01. A crate rename is itself ADR-worthy and touches every internal path dep, `docs/protocol.md` references, and the contract-test inventory: not tag-week work.
+3. **Path deps carry no `version` keys** (`protocol = { path = "crates/protocol" }` etc.); `cargo publish` requires version refs on every dependency. Mechanical but nonzero, and it commits the workspace to synchronized version bumps.
+4. **Semver commitment.** The deferred-work Story 3.4 entry deliberately deferred publishing to "a post-V1 release-management story" because publishing commits to the Rust ecosystem's backward-compat expectations. The protocol crate's Rust-source compat policy is explicitly undefined (deferred-work 5.7 entry: additive required public fields break struct-literal consumers). The wire is the stable surface today, not the Rust API.
+
+**What "reserve" means if chosen:** publishing a minimal placeholder of (at least) `bowerbird` to hold the brand name. crates.io has no rule against name reservation, but placeholder crates are contested practice and a placeholder still requires metadata and a version. Alternative: accept the (low, verified-free-today) squatting risk and simply not publish, documented in the ADR with the availability snapshot.
+
+**Recommendation to present:** do not publish at v0.1.0. Distribution stays GitHub Releases tarballs + `cargo install --git --tag` (exactly what README/INSTALL/release notes already promise; NFR10's `--locked` install honors the vendored patch because it builds from the git tree). ADR 0011 records: availability table, the rename plan for a future publishing story, revisit triggers (deadpool #490 resolution; a second adapter or SDK consumer wanting `cargo add`; namespace threat). Whether to also place a placeholder `bowerbird` reservation is a pure maintainer-preference sub-decision; present both, no strong recommendation. `Affects context.md sections:` likely "none" (context.md's Scope cuts already say "No distro packaging. Homebrew (macOS) + cargo install is the distribution surface"; note in passing that sentence still oversells Homebrew, which no-list.md corrected in 5.14, but context.md is not this story's charter).
+
+### Release workflow mechanics at a dash-less tag (read before tagging)
+
+- `.github/workflows/release.yml` triggers on tag push `v*.*.*`. For `v0.1.0` (no `-`): `prerelease: false`, `draft: false`. The release goes PUBLIC as soon as the release job finishes, with the workflow-rendered body (tarball table, musl deferral, checksums, Gatekeeper) plus `generate_release_notes: true` auto-append. The AC-required narrative lands via `gh release edit v0.1.0 --notes-file` immediately after; a brief window with template-only notes is accepted (alternative of pre-creating a draft release for the tag was considered and rejected: softprops would update it but `draft: false` in the workflow flips it public anyway).
+- `cross-version-test` becomes the first REAL rc3-to-final upgrade verification. Prior-tag resolution is `git tag --sort=-v:refname | grep -v ^current | head -1` under `fetch-depth: 0`; with tags rc1/rc2/rc3 present, prior = `v0.1.0-rc3` (VERIFIED in a scratch repo at story creation, 2026-08-01). A SKIP here is a failure signal (the workflow's own warning wording says so).
+- **Latent prior-tag footgun for the NEXT release (file a followup, do not fix here):** git's default version sort orders `v0.1.0` BELOW `v0.1.0-rc1/2/3` (verified in the same scratch repo: descending order is rc3, rc2, rc1, v0.1.0). Correct outcome for THIS tag, but at the next release (v0.1.1 or v0.2.0) the resolution picks `v0.1.0-rc3` as prior instead of `v0.1.0`, so the upgrade test would verify rc3-to-next rather than release-to-release. Fix shape when it is fixed: `git -c versionsort.suffix=- tag --sort=-v:refname` in the workflow's resolve step (makes suffixed prereleases sort below their release). Taskwarrior followup at close-out.
+- Do NOT delete the rc tags (prior-tag resolution and the rc-lineage record depend on them). The rc1/rc2 release OBJECTS are already deleted; only rc3's release object and all three tags remain, which is the expected state.
+- Tag the exact main sha that carries the doc flips; the tarball bundles `README.md` and `INSTALL.md` from the tagged tree.
+- `tests/cross_version_upgrade.rs`'s non-CI fallback hardcodes `v0.1.0` as prior for LOCAL runs; irrelevant to the CI job, do not touch it.
+
+### The two doc flips (Story 5.14 handoff, verified current state 2026-08-01)
+
+- `README.md:12-14` currently: `Status: v0.1.0 release candidate.` + `[v0.1.0-rc3](https://github.com/technicalpickles/bowerbird/releases/tag/v0.1.0-rc3)\nis the current prerelease.` Replace both sentences with released wording + v0.1.0 release link.
+- `docs/quickstart.md:24-31`: four `v0.1.0-rc3` occurrences (curl URL, install path, rm path, prose) plus the rc-suffix note in the expected-output sentence. Direct tag URL form only.
+- Neither string is test-pinned (5.14 confirmed; the pins are neighbors). The pinned-string landmine map lives in the 5.14 story's Dev Notes §Test-pin map if any adjacent text gets touched: do not reword pinned sentences.
+- House emdash rule: every added line must survive the diff sweep for the em dash character (pattern paraphrased; quoting it verbatim makes the quoting file a match, the exact trap 5.14's review caught). The epic's own replacement string carries an emdash; the release-checklist's adapted wording is the shippable form.
+
+### Testing / verification discipline
+
+- `scripts/test.sh` always, never raw `cargo test` (second concurrent cargo test is the confirmed hang trigger; lock is exclusive, do not retry-loop, `--unlock` only if stuck). Safe to run with the maintainer's live daemon loaded (label-isolation seam, PR #40).
+- Expected suite size ~650 passed / 0 failed (5.14's last run). This story should not change that count unless the publish path is taken.
+- `cargo fmt --check` and `cargo clippy --all-targets --workspace -- -D warnings` gate CI; warnings are errors.
+- Doc-suite quick loop after doc edits: `scripts/test.sh --test release_pipeline_docs --test cli_docs_drift`.
+
+### Previous story intelligence (5.14, done 2026-08-01; and 5.12, the release-mechanics precedent)
+
+- 5.12 precedent: release-mechanics stories have flipped straight to done by maintainer decision with review skipped; the alternative is the 5.13/5.14-style three-layer review. Maintainer's call at review time; the record shape (Completion Notes + Change Log + File List) is required either way.
+- 5.14 recurring-findings pre-empt: File List must match `git status --porcelain` exactly; every epic-text adaptation disclosed in Completion Notes (this story has four pre-disclosed in its ACs); Change Log gets one entry per pass.
+- 5.14's review caught the `releases/latest` footgun this story's AC 5 now guards against; do not reintroduce it in release notes or the README flip.
+- Emdash sweep exception class (5.14 Completion Note 8): spec task lines re-added by checkbox flips are the only permitted matches; do not reword task text to fix them.
+- ADR discipline: 0010 was rejected-then-fixed territory in 5.13's pass for format compliance; empty "Revisit when" is a rejection. Next number is 0011.
+
+### Git intelligence
+
+Recent main is the 5.14 docs funnel (df80570 tip: story flip; 88551d4 merge; PR #41 all 8 CI jobs green first attempt). Working tree clean at story creation. Maintainer daemon running (test harness is isolation-safe). Git user: Josh Nichols (pickles). PRs rebase-merge via the maintainer; tag push is a maintainer action.
+
+### Project Structure Notes
+
+- Story file: `docs/bmad/implementation-artifacts/5-15-crates-io-namespace-and-v0-1-0-tag.md` (matches sprint-status key `5-15-crates-io-namespace-and-v0-1-0-tag`).
+- Files expected to change: `README.md`, `docs/quickstart.md`, `docs/decisions/0011-crates-io-publishing-at-v0-1-0.md` (new), `docs/bmad/implementation-artifacts/deferred-work.md`, `docs/bmad/implementation-artifacts/sprint-status.yaml`, this story file. Release-notes draft stays out of the repo (scratch + GitHub release body). No `crates/**` or `src/**` changes on the recommended path.
+- New tag: `v0.1.0` on main. New GitHub Release: `bowerbird v0.1.0`, published, Latest.
+
+### References
+
+- [Source: docs/bmad/planning-artifacts/epics.md#Story 5.15] statement + 4 ACs (lines 1342-1366).
+- [Source: docs/release-checklist.md] the ordered pre-tag runbook (steps 1-9), rc2+ cross-version note (lines 164-174), and §"At the final v0.1.0 tag" (lines 176-191), the authoritative statement of the two doc flips.
+- [Source: .github/workflows/release.yml] build/cross-version/release job behavior, prior-tag resolution, draft/prerelease conditionals, workflow-rendered notes body.
+- [Source: docs/bmad/implementation-artifacts/deferred-work.md#Deferred from: Story 3.4] the crates.io-publishing entry this story dispositions (also the source of the metadata-block list).
+- [Source: Cargo.toml (workspace root)] the `[patch.crates-io]` vendored libsqlite3-sys block and its comment (deadlock rationale, deadpool #490); package set and path deps.
+- [Source: docs/bmad/implementation-artifacts/epic-3-retro-2026-05-25.md] AI-3 acceptance wording (result in release notes; ADR if squatted). [Source: docs/bmad/implementation-artifacts/epic-4-retro-2026-05-25.md] AI-5, the same check re-scoped to the final tag.
+- [Source: docs/bmad/implementation-artifacts/5-14-first-time-reader-docs-pass.md] previous story: handoff origin, test-pin map, adaptation-disclosure precedent, review shape.
+- [Source: docs/bmad/project-context.md#ADR triggers] ADR format (all required fields, observable revisit triggers); §Scope cuts (distribution surface).
+- [Source: docs/bmad/implementation-artifacts/sprint-status.yaml] 5-15 backlog entry, dogfooding-validation-phase comment (old-numbering citation to fix at flip time), namespace pre-check provenance (2026-08-01 comment, wrong name set).
+
+## Dev Agent Record
+
+### Agent Model Used
+
+### Debug Log References
+
+### Completion Notes List
+
+### File List
