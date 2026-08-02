@@ -28,6 +28,12 @@ fn workspace_root() -> PathBuf {
 /// resolves the link and matches, so CI would `npm ci && npm run typecheck`
 /// a directory that no guard in this file has ever seen. `fs::metadata`
 /// resolves, which puts the two back in agreement.
+///
+/// Duplicated in all three `cookbook_entry_dirs()` copies deliberately: each
+/// `tests/*.rs` file is its own crate. It landed in THIS one alone the first
+/// time, which left `cli_examples.rs` and `cli_docs_drift.rs` still dropping a
+/// symlinked entry -- a fix in one of three copies is not a fix (taskwarrior
+/// `4238d5ea` tracks the shared-helper cleanup).
 fn is_dir_following_symlinks(p: &Path) -> bool {
     fs::metadata(p).map(|m| m.is_dir()).unwrap_or(false)
 }
@@ -190,8 +196,39 @@ fn each_entry_has_required_files() {
     }
 }
 
-/// An entry's `tests/` sidecar and its `scripts.test` must exist together or
-/// not at all.
+/// Every `*.test.ts` FILE under `dir`, recursively.
+///
+/// Recursive because the npm script's glob is `tests/**/*.test.ts`: a
+/// non-recursive `read_dir` reports "no tests here" for an entry whose suite
+/// lives one directory down, and would then fail an entry that CI runs
+/// perfectly well.
+///
+/// `is_file()` because a name check alone counts things `npm test` cannot run.
+/// The review called out a DIRECTORY named `foo.test.ts`; measured, the
+/// recursion branch above already claims that case (it is a directory, so it
+/// is descended into and contributes nothing), so `is_file()` is not what
+/// closes it. What `is_file()` does close is everything the directory branch
+/// declines: a DANGLING SYMLINK named `foo.test.ts` is neither a directory nor
+/// a file, and without this check it counted as coverage while `npm test`
+/// reported green over an empty suite. Verified both ways.
+fn test_files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if is_dir_following_symlinks(&path) {
+            found.extend(test_files_under(&path));
+        } else if path.is_file() && path.to_string_lossy().ends_with(".test.ts") {
+            found.push(path);
+        }
+    }
+    found
+}
+
+/// An entry's `tests/` sidecar, its `scripts.test`, and CI's invocation of
+/// that script must exist together or not at all.
 ///
 /// CI's cookbook loop runs `npm test --if-present`, which is silent when an
 /// entry declares no test script. That is deliberate (two entries genuinely
@@ -199,13 +236,26 @@ fn each_entry_has_required_files() {
 /// weight: `session-glance/tests/glance.test.ts` -- the ONLY executable
 /// statement of the canonical `deriveRepo` contract, and the only coverage of
 /// the worktree-`.git`-as-a-FILE branch -- ran nowhere in CI until the
-/// `--if-present` line landed, because this job used to run typecheck alone
+/// `--if-present` line landed, because that job used to run typecheck alone
 /// and the Rust smoke never invokes npm.
 ///
-/// The biconditional is what closes it in both directions:
+/// Four things have to hold, and the guard originally checked one of them:
 ///
-///   - tests without a script: the files exist and CI skips them.
-///   - a script without tests: `npm test` resolves the glob to nothing.
+///  1. **CI actually runs the script.** This is the finding the guard is named
+///     for and the one it did not check: it never read `ci.yml` at all, so
+///     deleting `&& npm test --if-present` from the workflow left every
+///     assertion here green while `glance.test.ts` went straight back to
+///     running nowhere. A guard that cannot see the regression it was written
+///     for is decoration.
+///  2. **`tests/` present iff `scripts.test` present.** Tests without a script
+///     are a suite CI skips; a script without tests is a command that matches
+///     no files.
+///  3. **The script actually runs the sidecar.** Key PRESENCE was the whole
+///     check, so `"test": "true"` passed: a script that exits 0 without
+///     reading a single test file is worse than no script, because it reports
+///     green.
+///  4. **The sidecar contains runnable test FILES**, found the way the npm
+///     glob finds them. See [`test_files_under`].
 ///
 /// Deliberately NOT a flat "every entry must have tests/": `rest-cursor-
 /// pagination` and `state-session-fanout` ship none, and manufacturing test
@@ -213,11 +263,37 @@ fn each_entry_has_required_files() {
 /// that tests an entry DOES ship are wired to the command CI runs.
 #[test]
 fn entry_tests_are_wired_to_npm_test() {
+    // (1) The workflow line itself. Scoped to the cookbook loop's own command
+    // so an unrelated `npm test` elsewhere in the file cannot satisfy it.
+    let ci = read_workspace_file(".github/workflows/ci.yml");
+    let loop_line = ci
+        .lines()
+        .find(|l| l.contains("cd \"$d\"") && l.contains("npm ci"))
+        .unwrap_or_else(|| {
+            panic!(
+                "no cookbook loop line in .github/workflows/ci.yml (looked for one running \
+                 `cd \"$d\"` and `npm ci`). Either the loop moved or the guard below is \
+                 asserting over a workflow that no longer exists."
+            )
+        });
+    assert!(
+        loop_line.contains("npm test"),
+        "the cookbook loop in .github/workflows/ci.yml does not run `npm test`, so every \
+         entry's tests/ sidecar runs NOWHERE in CI: the Rust smoke never invokes npm and \
+         the typecheck job only runs tsc. That is the exact regression the assertions \
+         below exist to prevent, and without this line they all stay green through it. \
+         Got: `{loop_line}`"
+    );
+    assert!(
+        loop_line.contains("npm run typecheck"),
+        "the cookbook loop no longer runs `npm run typecheck`; got: `{loop_line}`"
+    );
+
     let mut with_tests = 0usize;
     for name in cookbook_entry_dirs() {
         let dir = workspace_root().join("docs/cookbook").join(&name);
         let tests_dir = dir.join("tests");
-        let has_tests_dir = tests_dir.is_dir();
+        let has_tests_dir = is_dir_following_symlinks(&tests_dir);
         let body = read_workspace_file(&format!("docs/cookbook/{name}/package.json"));
         let parsed: serde_json::Value = serde_json::from_str(&body)
             .unwrap_or_else(|e| panic!("docs/cookbook/{name}/package.json invalid JSON: {e}"));
@@ -226,6 +302,7 @@ fn entry_tests_are_wired_to_npm_test() {
             .and_then(|v| v.get("test"))
             .and_then(|v| v.as_str());
 
+        // (2) The biconditional.
         assert_eq!(
             has_tests_dir,
             test_script.is_some(),
@@ -236,17 +313,26 @@ fn entry_tests_are_wired_to_npm_test() {
             test_script.is_some(),
         );
 
+        if let Some(script) = test_script {
+            // (3) The script has to READ the sidecar. Presence of the key was
+            // the entire check, so `"test": "true"` passed it.
+            assert!(
+                script.contains("tests/"),
+                "docs/cookbook/{name}: scripts.test = {script:?} never mentions `tests/`, so \
+                 `npm test` can exit 0 without running a single file in the sidecar. A test \
+                 script that reports green over nothing is worse than no test script."
+            );
+        }
+
         if has_tests_dir {
             with_tests += 1;
-            let found = fs::read_dir(&tests_dir)
-                .unwrap_or_else(|e| panic!("read_dir {}: {e}", tests_dir.display()))
-                .filter_map(|e| e.ok())
-                .filter(|e| e.file_name().to_string_lossy().ends_with(".test.ts"))
-                .count();
+            // (4) Runnable files, found the way the npm glob finds them.
+            let found = test_files_under(&tests_dir);
             assert!(
-                found > 0,
-                "docs/cookbook/{name}/tests/ has no *.test.ts files, so `npm test` runs \
-                 an empty suite and reports green"
+                !found.is_empty(),
+                "docs/cookbook/{name}/tests/ has no *.test.ts FILES (searched recursively, \
+                 the way the `tests/**/*.test.ts` glob does), so `npm test` runs an empty \
+                 suite and reports green"
             );
         }
     }

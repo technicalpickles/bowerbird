@@ -29,13 +29,17 @@
 //     --state=<csv>   pass-through to the REST `?state=` filter
 //     --help, -h      the same contract on stdout, exit 0
 //
+// One env knob: `BOWERBIRD_GLANCE_TIMEOUT_MS` overrides how long the entry
+// waits for the daemon (default 5000). See `requestTimeoutMs`.
+//
 // Exit codes: 0 on success (including zero live sessions), 1 on any failure
 // (bad flag, bad state token, daemon unreachable, daemon unresponsive, HTTP
-// error). README.md "Run it" is the authoritative statement of the contract.
+// error, a response body that is not an array of session objects).
+// README.md "Run it" is the authoritative statement of the contract.
 
 import { homedir } from "node:os";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 /// The five `?state=` tokens the daemon accepts, lowercase and
@@ -115,7 +119,44 @@ export interface Options {
 /// forever with no message and no exit, and the tmux status-line surface
 /// (`6-tmux-ambient`) shells out to it on a repeating interval, so it would
 /// accumulate hung processes rather than print one bad status.
-const REQUEST_TIMEOUT_MS = 5000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 5000;
+
+/// The env var that overrides the deadline, and the reason it exists.
+///
+/// 5000ms is a fine default for a human typing the command, and a poor one for
+/// the surface this entry was built to feed: a tmux status line refreshes on
+/// `status-interval` (commonly 1-5s), so a wedged daemon can stall one refresh
+/// past the next. The default stays 5s because that is the right answer for
+/// the interactive case; a status line that wants to fail faster sets
+/// `BOWERBIRD_GLANCE_TIMEOUT_MS=1000` instead of forking the entry.
+const TIMEOUT_ENV = "BOWERBIRD_GLANCE_TIMEOUT_MS";
+
+/**
+ * Resolve the request deadline in ms.
+ *
+ * Unset or empty is the default. Anything else must be a positive safe
+ * integer, and a value that is not gets a hard error rather than a silent
+ * fallback: a typo'd `BOWERBIRD_GLANCE_TIMEOUT_MS=1s` that quietly reverts to
+ * 5000 is exactly the kind of "configured it and it did nothing" that the
+ * flag parser refuses to do for arguments.
+ *
+ * Pure and exported so the default and the override are unit-testable without
+ * mutating `process.env` (which is a race in a parallel test runner).
+ */
+export function requestTimeoutMs(env: Record<string, string | undefined>): number {
+  const raw = env[TIMEOUT_ENV];
+  if (raw === undefined || raw.trim().length === 0) {
+    return DEFAULT_REQUEST_TIMEOUT_MS;
+  }
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error(
+      `${TIMEOUT_ENV}=${JSON.stringify(raw)} is not a positive whole number of ` +
+        `milliseconds (default: ${DEFAULT_REQUEST_TIMEOUT_MS})`,
+    );
+  }
+  return parsed;
+}
 
 interface ServerInfo {
   bind_addr: string;
@@ -187,19 +228,29 @@ function resolveToken(): string {
  *   1. `cwd` is absent (`null`, `undefined`, empty, or any non-string that
  *      slipped through the wire cast) -> the single named bucket
  *      `(unknown repo)`. The session is never dropped.
- *   2. Otherwise walk up from `cwd` itself to the nearest ancestor containing
+ *   2. `cwd` is RELATIVE -> `basename(cwd)`, with no filesystem walk at all.
+ *      A relative path resolves against the READER's working directory, not
+ *      the recorded session's, so walking it makes the answer depend on where
+ *      this entry was invoked from: run from the repo root, every relative
+ *      `cwd` collapses to a heading literally named `.`; run the same command
+ *      from `/tmp` against the same daemon and the headings differ. Two runs
+ *      of one surface disagreeing is the failure AC 3 exists to prevent, and
+ *      nothing in the protocol or the daemon validates `cwd` as absolute, so
+ *      this is a rule rather than an assumption. `basename` is
+ *      machine-independent and needs no filesystem.
+ *   3. Otherwise walk up from `cwd` itself to the nearest ancestor containing
  *      a `.git` ENTRY, and render that ancestor's basename. Existence, not
  *      `isDirectory()`: in a git worktree `.git` is a FILE, and an
  *      `isDirectory()` check would walk straight past the worktree into the
  *      main repo.
- *   3. No `.git` ancestor found -> `basename(cwd)`. A directory that cannot
+ *   4. No `.git` ancestor found -> `basename(cwd)`. A directory that cannot
  *      be READ counts as "no `.git` here" and the walk CONTINUES upward:
  *      `existsSync` returns `false` on EACCES rather than throwing, so an
  *      unreadable directory inside a real repo still resolves to that repo.
  *      Only a `cwd` with no readable `.git` anywhere above it (a since-
  *      deleted directory, a `cwd` recorded on another machine) falls back to
  *      the basename.
- *   4. Never throws, for any input. Rule 1's guard is what makes that true:
+ *   5. Never throws, for any input. Rule 1's guard is what makes that true:
  *      `cwd` reaches here through an unchecked cast of the REST body, so a
  *      `null`-vs-`undefined` slip or a non-string would otherwise take down
  *      the whole run rather than bucket one session.
@@ -211,7 +262,7 @@ function resolveToken(): string {
  *     repo name. That is arguably the more useful grouping, but it is a
  *     behavior, so it is stated rather than assumed.
  *   - A `cwd` **below the repo root** (an agent launched from a subdirectory)
- *     resolves correctly to the repo. That is why rule 2 exists instead of a
+ *     resolves correctly to the repo. That is why rule 3 exists instead of a
  *     bare `basename(cwd)`.
  *   - A **symlinked `cwd`** groups under the link's own path, not the link
  *     target's. `cwd` is verbatim off the wire and nothing here calls
@@ -220,7 +271,7 @@ function resolveToken(): string {
  *   - This touches the filesystem. Two consequences, both real: the function
  *     is not purely testable (so the path walking is kept in this one small
  *     helper and the formatting side stays pure), and a `cwd` recorded on
- *     ANOTHER machine finds nothing to walk and falls through to rule 3.
+ *     ANOTHER machine finds nothing to walk and falls through to rule 4.
  */
 export function deriveRepo(cwd: string | null): string {
   // `== null` catches `undefined` as well as `null`, and the `typeof` check
@@ -229,6 +280,12 @@ export function deriveRepo(cwd: string | null): string {
   // a claim about the daemon, not a guarantee about this value.
   if (cwd == null || typeof cwd !== "string" || cwd.length === 0) {
     return UNKNOWN_REPO;
+  }
+  // Rule 2. Checked BEFORE any `existsSync`, because the whole point is that a
+  // relative path must never be resolved against this process's working
+  // directory.
+  if (!isAbsolute(cwd)) {
+    return basename(cwd) || cwd;
   }
   let dir = cwd;
   // Bounded by the filesystem root: `dirname("/") === "/"`, so the
@@ -262,14 +319,24 @@ export function deriveRepo(cwd: string | null): string {
  * future-dated `started_at` (clock skew between the recording host and this
  * one) clamps to `0s` rather than rendering a negative age.
  *
- * Anything that is not a SAFE INTEGER is `age unknown` too, not just
- * non-finite values. A `started_at` of `-1e30` is finite, so a
- * `Number.isFinite` guard passes it through, and the day count then formats
- * in scientific notation (`1e+22d`) -- which escapes the documented two-unit
- * shape a consumer parses. Every real epoch-ms value is a safe integer.
+ * Anything that is not a POSITIVE SAFE INTEGER is `age unknown` too, not just
+ * non-finite values, and the two halves of that are separate bugs:
+ *
+ *   - A `started_at` of `-1e30` is finite, so a `Number.isFinite` guard passes
+ *     it through, and the day count then formats in scientific notation
+ *     (`1e+22d`) -- which escapes the documented two-unit shape a consumer
+ *     parses. Every real epoch-ms value is a safe integer.
+ *   - A `started_at` of `-1` or `0` IS a safe integer, and renders a
+ *     ~57-year age (`20667d21h`) off a value that means "at or before the
+ *     epoch". No session started in 1969. Non-positive is unusable, not old.
+ *
+ * `nowMs` is guarded on the same terms. It is a caller argument rather than a
+ * wire value, but `formatAge(1000, NaN)` rendered `NaNdNaNh` -- the exact
+ * output the null branch exists to prevent, reached through the other
+ * parameter.
  */
 export function formatAge(startedAt: number | null, nowMs: number): string {
-  if (startedAt === null || !Number.isSafeInteger(startedAt)) {
+  if (!usableEpochMs(startedAt) || !Number.isSafeInteger(nowMs)) {
     return UNKNOWN_AGE;
   }
   const seconds = Math.max(0, Math.floor((nowMs - startedAt) / 1000));
@@ -294,52 +361,105 @@ export function formatAge(startedAt: number | null, nowMs: number): string {
  * known.
  */
 export function ageSeconds(startedAt: number | null, nowMs: number): number | null {
-  if (startedAt === null || !Number.isSafeInteger(startedAt)) {
+  if (!usableEpochMs(startedAt) || !Number.isSafeInteger(nowMs)) {
     return null;
   }
   return Math.max(0, Math.floor((nowMs - startedAt) / 1000));
 }
 
-/** Project one wire item into the rendered/serialized row shape. */
+/// The shared guard behind `formatAge` and `ageSeconds`, spelled once so the
+/// `age` and `age_seconds` fields of a `--format=json` row cannot disagree
+/// about whether the age is known.
+function usableEpochMs(startedAt: number | null): startedAt is number {
+  return startedAt !== null && Number.isSafeInteger(startedAt) && startedAt > 0;
+}
+
+/**
+ * Flatten every character that could forge a LINE in the text format.
+ *
+ * The text format's ONLY structural discriminator is the two-space indent: an
+ * unindented line is a repo heading, an indented one is a session under it,
+ * and `6-tmux-ambient` parses exactly that. Any line terminator inside a
+ * printed value splits one line into two and manufactures a heading out of
+ * whatever followed it.
+ *
+ * The set is wider than the ASCII controls, because "what ends a line" is not
+ * only a newline:
+ *
+ *   - U+0000-U+001F, U+007F: the ASCII controls, LF and CR among them.
+ *   - U+0080-U+009F: the C1 controls, which contain U+0085 NEL. NEL ends a
+ *     line for a terminal and for several parsers, and it is NOT in
+ *     JavaScript's `\s`, so no whitespace-based guard catches it.
+ *   - U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR: line terminators
+ *     in the ECMAScript grammar itself.
+ *
+ * All of them become U+FFFD, which is one visible character and terminates
+ * nothing.
+ */
+export function sanitizeTextField(value: string): string {
+  return value.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, "\uFFFD");
+}
+
+/**
+ * Make a derived repo name safe to emit as a text-mode HEADING.
+ *
+ * A heading carries one hazard a session row does not: a LEADING SPACE makes
+ * it shape-identical to a session line. Both a leading space and an embedded
+ * newline are legal POSIX path components and `cwd` is verbatim off the wire,
+ * so both are reachable from a real session.
+ *
+ * Order matters. Leading whitespace is stripped FIRST, then the line-forging
+ * characters are flattened. The other order breaks the "whitespace-only
+ * collapses to the named bucket" promise for a TAB: a lone `\t` would flatten
+ * to U+FFFD and then survive the strip as a one-character heading. Stripping
+ * first, a name of nothing but JavaScript `\s` (spaces, tabs, newlines, NBSP,
+ * U+2028 ...) collapses to the empty string and then to the bucket, so the
+ * promise holds for all of them rather than for the space alone.
+ */
+export function sanitizeHeading(repo: string): string {
+  const deindented = repo.replace(/^\s+/, "");
+  const flattened = sanitizeTextField(deindented);
+  return flattened.length === 0 ? UNKNOWN_REPO : flattened;
+}
+
+/**
+ * Project one wire item into the rendered/serialized row shape.
+ *
+ * **Every field that reaches a text line is sanitized HERE, at construction,
+ * so there is exactly one representation of each afterwards.** Two reasons,
+ * and the second is why this is not done at print time:
+ *
+ *  1. `session_id`, `source` and `current_state` are as verbatim off the wire
+ *     as `cwd` is. Sanitizing the heading alone left the session line
+ *     forgeable through any of them: a `session_id` carrying a newline printed
+ *     a real-looking unindented heading AND a real-looking session row under
+ *     it.
+ *  2. Sanitizing at print time gives one value two spellings. `renderText`
+ *     groups and sorts on `row.repo`; if the printed heading were
+ *     `sanitizeHeading(row.repo)` instead, a `cwd` of `/x/ foo` and one of
+ *     `/x/foo` would be two distinct GROUPS that both PRINT `foo`, ordered by
+ *     a key the reader never sees. Measured: the headings came out
+ *     `foo, aaa, foo`, contradicting the README's "Repos sort by name".
+ *
+ * So `--format=json` carries the same sanitized `repo` / `source` /
+ * `session_id` / `current_state` that text mode prints -- one representation,
+ * not two. The raw path is still recoverable from the row: `cwd` and
+ * `started_at` are untouched wire values, because neither is printed as
+ * text-mode structure.
+ */
 export function toRow(item: SessionListItem, nowMs: number): GlanceRow {
   return {
-    repo: deriveRepo(item.cwd),
-    source: item.source,
-    session_id: item.session_id,
-    // Verbatim from the wire, PascalCase. No re-spelling, no re-filtering.
-    current_state: item.current_state,
+    repo: sanitizeHeading(deriveRepo(item.cwd)),
+    source: sanitizeTextField(item.source),
+    session_id: sanitizeTextField(item.session_id),
+    // PascalCase, verbatim from the wire apart from the line-forging flatten.
+    // No re-spelling, no re-filtering.
+    current_state: sanitizeTextField(item.current_state),
     age: formatAge(item.started_at, nowMs),
     age_seconds: ageSeconds(item.started_at, nowMs),
     started_at: item.started_at,
     cwd: item.cwd,
   };
-}
-
-/**
- * Make a derived repo name safe to emit as a text-mode heading.
- *
- * The text format's ONLY structural discriminator is the two-space indent:
- * an unindented line is a repo heading, an indented one is a session under
- * it, and `6-tmux-ambient` parses exactly that. `cwd` is verbatim off the
- * wire and both of these are legal POSIX path components:
- *
- *   - an embedded newline, which would split one heading across two lines and
- *     manufacture a phantom repo;
- *   - a leading space, which would make a heading shape-identical to a
- *     session row.
- *
- * So control characters become U+FFFD and leading whitespace is stripped. A
- * name that is nothing but whitespace collapses to the named unknown bucket
- * rather than to a blank line.
- *
- * Text mode only: `--format=json` carries `repo` verbatim, because JSON
- * escapes the control characters itself and a machine consumer wants the
- * unmangled value.
- */
-export function sanitizeHeading(repo: string): string {
-  const flattened = repo.replace(/[\u0000-\u001f\u007f]/g, "\uFFFD");
-  const deindented = flattened.replace(/^\s+/, "");
-  return deindented.length === 0 ? UNKNOWN_REPO : deindented;
 }
 
 /**
@@ -352,6 +472,12 @@ export function sanitizeHeading(repo: string): string {
  * Ordering is plain codepoint sort on both axes (repo, then
  * `<source>/<session_id>`) so two runs against the same daemon agree. Not
  * `localeCompare`, which varies with the ambient locale.
+ *
+ * **Nothing is sanitized here.** Every field this prints was made display-safe
+ * in `toRow`, which is what makes the group KEY, the sort key and the printed
+ * heading the same string. Re-sanitizing at this point would reintroduce the
+ * two-spellings bug that doc comment describes: rows grouped and ordered by
+ * one value, printed as another.
  */
 export function renderText(rows: GlanceRow[], states: string): string[] {
   if (rows.length === 0) {
@@ -368,7 +494,7 @@ export function renderText(rows: GlanceRow[], states: string): string[] {
   }
   const lines: string[] = [];
   for (const repo of [...groups.keys()].sort()) {
-    lines.push(sanitizeHeading(repo));
+    lines.push(repo);
     const group = [...(groups.get(repo) ?? [])].sort((a, b) =>
       `${a.source}/${a.session_id}` < `${b.source}/${b.session_id}` ? -1 : 1,
     );
@@ -406,7 +532,7 @@ export function normalizeStates(raw: string): string {
 }
 
 /** The accepted set, spelled once so the two error messages cannot drift. */
-const ACCEPTED_FLAGS = "--count, --format=text, --format=json, --state=<csv>, --help";
+const ACCEPTED_FLAGS = "--count, --format=text, --format=json, --state=<csv>, --help, -h";
 
 /**
  * The `--help` / `-h` text. Same contract the README states, on stdout, exit
@@ -425,7 +551,9 @@ export const USAGE = [
   "  --format=json  NDJSON, one object per session, fixed field set",
   "  --state=<csv>  pass-through to the REST `?state=` filter; tokens are",
   `                 idle, working, waitinginput, ended, unknown (default: ${DEFAULT_STATES})`,
-  "  --help, -h     this text on stdout, exit 0",
+  "  --help, -h     this text on stdout, exit 0; wins over any other argument",
+  "",
+  `env: ${TIMEOUT_ENV} sets the daemon deadline in ms (default: ${DEFAULT_REQUEST_TIMEOUT_MS}).`,
   "",
   "`--count` wins over `--format`. Exit 0 on success (including zero live",
   "sessions), 1 on any failure. Requires BOWERBIRD_TOKEN and a running daemon.",
@@ -440,6 +568,14 @@ export const USAGE = [
  * or `--state` is rejected rather than resolved last-wins, because last-wins
  * is precisely a result that depends on argument order. Repeating `--count`
  * is fine; it is a boolean with no second value to disagree with.
+ *
+ * `--help` / `-h` WINS over every other argument, including a bad one. The
+ * rationale for answering `--help` at all is that a CLI which replies
+ * "unrecognized argument --help" teaches the reader it has no discoverable
+ * surface -- and `session-glance --halp --help` did exactly that, because the
+ * single pass rejected the typo before it ever saw the request for help. The
+ * one moment a reader most needs the usage text is the moment they got the
+ * arguments wrong.
  */
 export function parseArgs(argv: string[]): Options {
   const options: Options = {
@@ -448,6 +584,11 @@ export function parseArgs(argv: string[]): Options {
     states: DEFAULT_STATES,
     help: false,
   };
+  // Scanned in its own pass, ahead of any validation, so no other argument can
+  // out-rank it.
+  if (argv.some((arg) => arg === "--help" || arg === "-h")) {
+    return { ...options, help: true };
+  }
   const seen = new Map<string, string>();
   const once = (family: string, arg: string): void => {
     const prior = seen.get(family);
@@ -460,9 +601,7 @@ export function parseArgs(argv: string[]): Options {
     seen.set(family, arg);
   };
   for (const arg of argv) {
-    if (arg === "--help" || arg === "-h") {
-      options.help = true;
-    } else if (arg === "--count") {
+    if (arg === "--count") {
       options.count = true;
     } else if (arg === "--format=json") {
       once("--format", arg);
@@ -486,33 +625,94 @@ export function parseArgs(argv: string[]): Options {
 // Fetch + render.
 // ---------------------------------------------------------------------------
 
+/**
+ * The mode-(c) message: something IS on the address, it accepted the
+ * connection, and it did not finish answering inside the deadline.
+ *
+ * Shared by the two places a stall surfaces -- the `fetch` call (no response
+ * headers) and the body read (headers, then the stream stops) -- because they
+ * are one failure from the reader's side and deserve one message.
+ */
+function unansweredError(bindAddr: string, timeoutMs: number): Error {
+  return new Error(
+    `daemon at http://${bindAddr} accepted the connection but did not answer within ` +
+      `${timeoutMs}ms. ~/.bowerbird/server.json points there; the daemon may be ` +
+      `wedged, or an unrelated process may have taken the address. Try \`bowerbird stop\` ` +
+      `then \`bowerbird start\`. Set ${TIMEOUT_ENV} to change the deadline.`,
+  );
+}
+
+/**
+ * Is this the abort the request deadline fired?
+ *
+ * `AbortSignal.timeout` rejects with a `DOMException` named `TimeoutError`
+ * from `fetch` itself; the same signal aborting a body read surfaces as an
+ * `AbortError` on some paths. Both mean "the deadline fired", so both route to
+ * the same message rather than to the generic one.
+ */
+function isTimeout(e: unknown): boolean {
+  const name = (e as Error | undefined)?.name;
+  return name === "TimeoutError" || name === "AbortError";
+}
+
+/**
+ * Reject a response body that is an array of things which are not sessions.
+ *
+ * `Array.isArray` is not enough on its own. `[1,2,3]` passes it, and then the
+ * failure is silent in both machine modes: text renders
+ * `  undefined/undefined  undefined  age unknown`, and `--format=json` DROPS
+ * documented keys (`JSON.stringify` omits `undefined` values), emitting
+ * `{"repo":...,"age":...,"age_seconds":null}` against the README's "the field
+ * set is fixed". `--count` reports a plausible integer for junk.
+ *
+ * Only the three fields the text contract PRINTS are required to be strings.
+ * `cwd` and `started_at` have their own guards downstream (`deriveRepo` rule 1
+ * and `formatAge`'s usable-epoch check), which is what keeps a single odd row
+ * a named bucket rather than a whole-run failure, and additive fields a future
+ * daemon adds are ignored rather than rejected.
+ */
+function checkRowShape(body: unknown[], bindAddr: string): SessionListItem[] {
+  for (const [index, item] of body.entries()) {
+    const bad =
+      typeof item !== "object" || item === null || Array.isArray(item)
+        ? "not a JSON object"
+        : (["source", "session_id", "current_state"] as const)
+            .filter((f) => typeof (item as Record<string, unknown>)[f] !== "string")
+            .map((f) => `no string field "${f}"`)
+            .join(", ");
+    if (bad.length > 0) {
+      throw new Error(
+        `daemon at http://${bindAddr} returned an array whose element ${index} is ${bad}, ` +
+          `where GET /sessions must return session objects. Something other than a bowerbird ` +
+          `daemon may be listening on that address.`,
+      );
+    }
+  }
+  return body as SessionListItem[];
+}
+
 async function fetchSessions(
   bindAddr: string,
   auth: string,
   states: string,
 ): Promise<SessionListItem[]> {
   const url = `http://${bindAddr}/sessions?state=${encodeURIComponent(states)}`;
+  const timeoutMs = requestTimeoutMs(process.env);
+  // ONE signal for the whole exchange, headers and body alike. A per-call
+  // deadline would let a server that dribbles the body forever hold the entry
+  // open indefinitely while never breaching any single timeout.
+  const signal = AbortSignal.timeout(timeoutMs);
   let res: Response;
   try {
-    res = await fetch(url, {
-      headers: { Authorization: auth },
-      // Without this the entry hangs forever against a listener that accepts
-      // and never answers. See REQUEST_TIMEOUT_MS.
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
+    res = await fetch(url, { headers: { Authorization: auth }, signal });
   } catch (e) {
     // Daemon-down failure mode (c): something IS listening on the address, it
     // accepted the connection, and it never answered. A one-shot glance that
     // never exits is worse than one that fails, because the status-line
     // surface that shells out to it on an interval would pile up hung
     // processes instead of showing one bad status.
-    if ((e as Error).name === "TimeoutError") {
-      throw new Error(
-        `daemon at http://${bindAddr} accepted the connection but did not answer within ` +
-          `${REQUEST_TIMEOUT_MS}ms. ~/.bowerbird/server.json points there; the daemon may be ` +
-          `wedged, or an unrelated process may have taken the address. Try \`bowerbird stop\` ` +
-          `then \`bowerbird start\`.`,
-      );
+    if (isTimeout(e)) {
+      throw unansweredError(bindAddr, timeoutMs);
     }
     // The second daemon-down failure mode, and the one the "daemon stopped
     // mid-day" adversity actually produces. `server.json` is still on disk
@@ -542,6 +742,34 @@ async function fetchSessions(
     }
     throw new Error(`daemon returned HTTP ${res.status}`);
   }
+  // Reading the body is its OWN failure mode, and it was the one path left
+  // outside a try. The status line is 200 by this point, so nothing above has
+  // fired, and Node's three shapes here all name neither the address nor the
+  // fix:
+  //
+  //   - a non-JSON body (an HTML error page from a proxy that took the port):
+  //     `Unexpected token '<', "<html>not "... is not valid JSON`
+  //   - headers, then the stream stalls past the deadline:
+  //     `The operation was aborted due to timeout`
+  //   - the connection reset mid-body: `terminated`
+  //
+  // The stall is mode (c) arriving one step later, so it gets mode (c)'s
+  // message. The other two are the same "that is not a bowerbird daemon"
+  // diagnosis as the non-array check below.
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch (e) {
+    if (isTimeout(e)) {
+      throw unansweredError(bindAddr, timeoutMs);
+    }
+    throw new Error(
+      `daemon at http://${bindAddr} answered HTTP ${res.status} but the body could not be ` +
+        `read as JSON: ${(e as Error).message}. GET /sessions must return a bare JSON array. ` +
+        `Something other than a bowerbird daemon may be listening on that address; ` +
+        `\`bowerbird stop\` then \`bowerbird start\` re-binds it.`,
+    );
+  }
   // A bare array, not an envelope -- CHECKED, not assumed. The cast below is
   // the only thing standing between the wire and every downstream `.length` /
   // `.map`, and the failure it lets through is silent in the one mode that
@@ -549,7 +777,6 @@ async function fetchSessions(
   // `undefined` and exits 0, which a tmux status line renders as a plausible
   // status forever. Text and JSON mode fail loudly on the same input; this
   // makes all three agree.
-  const body: unknown = await res.json();
   if (!Array.isArray(body)) {
     throw new Error(
       `daemon at http://${bindAddr} returned ${typeof body === "object" && body !== null ? "a JSON object" : JSON.stringify(body)} ` +
@@ -557,7 +784,7 @@ async function fetchSessions(
         `daemon may be listening on that address.`,
     );
   }
-  return body as SessionListItem[];
+  return checkRowShape(body, bindAddr);
 }
 
 async function main(argv: string[]): Promise<void> {

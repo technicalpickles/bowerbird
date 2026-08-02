@@ -53,6 +53,24 @@ const MIN_EXPECTED_ENTRIES: usize = 3;
 /// `tests/cli_examples.rs`'s smoke and by architecture.md's project tree.
 const ANCHOR_ENTRY: &str = "rest-cursor-pagination";
 
+/// Is `p` a directory, FOLLOWING symlinks?
+///
+/// `DirEntry::file_type()` does NOT follow symlinks (on Unix it is readdir's
+/// `d_type`), so a symlinked entry directory reads as neither file nor
+/// directory and every listing built on it silently drops the entry. CI's
+/// `for d in docs/cookbook/*/` glob does the opposite: the shell's `*/`
+/// resolves the link and matches, so CI would typecheck a directory that no
+/// guard here has ever seen. `fs::metadata` resolves, which puts the two back
+/// in agreement.
+///
+/// Duplicated in all three `cookbook_entry_dirs()` copies deliberately: each
+/// `tests/*.rs` file is its own crate. Fixing it in ONE of them is how the
+/// symlink hole half-closed the first time (taskwarrior `4238d5ea` tracks the
+/// shared-helper cleanup).
+fn is_dir_following_symlinks(p: &Path) -> bool {
+    fs::metadata(p).map(|m| m.is_dir()).unwrap_or(false)
+}
+
 /// Every cookbook entry directory name, derived from the `docs/cookbook/*/`
 /// glob (Story 6-session-glance, AC 4).
 ///
@@ -82,7 +100,7 @@ fn cookbook_entry_dirs() -> Vec<String> {
         .unwrap_or_else(|e| panic!("read_dir {}: {e}", cookbook.display()))
         .filter_map(|entry| {
             let entry = entry.expect("dir entry");
-            if !entry.file_type().expect("file type").is_dir() {
+            if !is_dir_following_symlinks(&entry.path()) {
                 return None;
             }
             // CI's skip, mirrored: no package.json means not an entry.

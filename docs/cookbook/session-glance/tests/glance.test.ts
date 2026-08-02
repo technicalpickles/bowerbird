@@ -22,10 +22,30 @@ import {
   ageSeconds,
   parseArgs,
   renderText,
+  requestTimeoutMs,
   sanitizeHeading,
+  sanitizeTextField,
   toRow,
   type GlanceRow,
 } from "../src/index.ts";
+
+/** One `GET /sessions` element, with only the interesting field overridden. */
+function wire(overrides: Record<string, unknown> = {}): Parameters<typeof toRow>[0] {
+  return {
+    source: "claude",
+    session_id: "s",
+    current_state: "Idle",
+    last_event_kind: "Stop",
+    last_event_at_ms: 0,
+    updated_at: 0,
+    last_pid: null,
+    cwd: null,
+    started_at: null,
+    ...overrides,
+  } as Parameters<typeof toRow>[0];
+}
+
+const NOW = 1_700_000_000_000;
 
 function withTempTree(fn: (root: string) => void): void {
   const root = mkdtempSync(join(tmpdir(), "session-glance-test-"));
@@ -60,7 +80,7 @@ test("deriveRepo rule 1: null cwd lands in the named bucket, never dropped", () 
   assert.equal(deriveRepo(""), "(unknown repo)");
 });
 
-test("deriveRepo rule 1+4: junk off the wire is a bucket, never a crash", () => {
+test("deriveRepo rule 1+5: junk off the wire is a bucket, never a crash", () => {
   // `cwd` reaches deriveRepo through an unchecked `as SessionListItem[]` cast
   // of the response body, so its declared `string | null` is a claim about the
   // daemon, not a guarantee about the value. `undefined` in particular is the
@@ -78,7 +98,7 @@ test("deriveRepo rule 1+4: junk off the wire is a bucket, never a crash", () => 
   assert.equal(deriveRepo("/tmp/some-project"), "some-project");
 });
 
-test("deriveRepo rule 2: cwd below the repo root resolves to the repo", () => {
+test("deriveRepo rule 3: cwd below the repo root resolves to the repo", () => {
   withTempTree((root) => {
     const repo = join(root, "my-repo");
     mkdirSync(join(repo, ".git"), { recursive: true });
@@ -89,7 +109,7 @@ test("deriveRepo rule 2: cwd below the repo root resolves to the repo", () => {
   });
 });
 
-test("deriveRepo rule 2: a worktree's `.git` FILE stops the walk", () => {
+test("deriveRepo rule 3: a worktree's `.git` FILE stops the walk", () => {
   // The load-bearing case for "existence, not isDirectory()". A worktree
   // nested inside a real repo would resolve to the OUTER repo under an
   // isDirectory() check, which is the bug this rule exists to prevent.
@@ -107,7 +127,7 @@ test("deriveRepo rule 2: a worktree's `.git` FILE stops the walk", () => {
   });
 });
 
-test("deriveRepo rule 3: no `.git` ancestor falls back to basename(cwd)", () => {
+test("deriveRepo rule 4: no `.git` ancestor falls back to basename(cwd)", () => {
   withTempTree((root) => {
     const plain = join(root, "just-a-dir");
     mkdirSync(plain, { recursive: true });
@@ -115,7 +135,7 @@ test("deriveRepo rule 3: no `.git` ancestor falls back to basename(cwd)", () => 
   });
 });
 
-test("deriveRepo rule 3: a path that does not exist falls back to basename(cwd)", () => {
+test("deriveRepo rule 4: a path that does not exist falls back to basename(cwd)", () => {
   // A cwd recorded on another machine, or on a since-deleted directory. Note
   // this is the SAME branch as the test above (no `.git` anywhere up the
   // walk); it is not the unreadable-directory case, which has its own test.
@@ -123,7 +143,7 @@ test("deriveRepo rule 3: a path that does not exist falls back to basename(cwd)"
   assert.equal(deriveRepo("/"), "/");
 });
 
-test("deriveRepo rule 3: an UNREADABLE directory is treated as having no `.git`", () => {
+test("deriveRepo rule 4: an UNREADABLE directory is treated as having no `.git`", (t) => {
   // The documented behavior, verified rather than assumed: `existsSync`
   // returns false on EACCES instead of throwing, so the walk does not stop at
   // an unreadable directory -- it keeps going up and finds the enclosing repo.
@@ -147,12 +167,53 @@ test("deriveRepo rule 3: an UNREADABLE directory is treated as having no `.git`"
         // expected
       }
       if (!unreadable) {
+        // `t.skip()`, not a bare `return`. A bare return reports this test as
+        // PASSED, which is a lie in the one environment where it does not run:
+        // the reader of a green suite has no way to tell the EACCES branch was
+        // never exercised. node:test prints it as `# SKIP` with the reason.
+        t.skip("running as root: chmod 000 does not bind, so there is no EACCES to observe");
         return;
       }
       assert.equal(deriveRepo(locked), "outer-repo");
     } finally {
       chmodSync(locked, 0o700);
     }
+  });
+});
+
+test("deriveRepo rule 2: a RELATIVE cwd never walks the reader's directory tree", () => {
+  // The bug this rule closes: `existsSync(join("relative/sub", ".git"))`
+  // resolves against THIS process's working directory, not the recorded
+  // session's. Run the entry from a repo root and every relative `cwd`
+  // collapses to a heading named `.`; run it from elsewhere and the same
+  // daemon yields different headings. Two runs of one surface disagreeing is
+  // exactly what AC 3 exists to prevent.
+  //
+  // Proved by running the derivation from two different working directories
+  // and asserting they agree, which is the property itself rather than a
+  // restatement of the implementation.
+  withTempTree((root) => {
+    const repo = join(root, "reader-repo");
+    mkdirSync(join(repo, "sub", ".git"), { recursive: true });
+    const original = process.cwd();
+    const seen = new Set<string>();
+    try {
+      for (const from of [repo, tmpdir()]) {
+        process.chdir(from);
+        seen.add(deriveRepo("sub/deeper"));
+        seen.add(deriveRepo("."));
+      }
+    } finally {
+      process.chdir(original);
+    }
+    assert.deepEqual(
+      [...seen].sort(),
+      [".", "deeper"],
+      `a relative cwd must derive the same name from every working directory; got ${[...seen]}`,
+    );
+    // Positive companion: the tree the walk WOULD have found is really there,
+    // so the agreement above is the rule firing and not an empty directory.
+    assert.equal(deriveRepo(join(repo, "sub", "deeper")), "sub");
   });
 });
 
@@ -209,6 +270,42 @@ test("formatAge keeps the two-unit shape for absurd started_at values", () => {
   assert.equal(formatAge(now - 400 * 24 * 3600 * 1000, now), "400d0h");
 });
 
+test("formatAge rejects a non-positive started_at instead of aging from 1969", () => {
+  // `-1` and `0` are SAFE INTEGERS, so the isSafeInteger guard passes them and
+  // the arithmetic then reports a ~57-year age (`20667d21h`) off a value that
+  // means "at or before the epoch". No session started in 1969; non-positive
+  // is unusable, not old.
+  const now = 1_700_000_000_000;
+  for (const nonPositive of [-1, 0, -86_400_000]) {
+    const rendered = formatAge(nonPositive, now);
+    assert.ok(
+      !/^\d{4,}d/.test(rendered),
+      `started_at ${nonPositive} must not render a multi-decade age; got: ${rendered}`,
+    );
+    assert.equal(rendered, "age unknown");
+    assert.equal(ageSeconds(nonPositive, now), null);
+  }
+  // Positive companion: 1ms past the epoch is still a (nonsensical but
+  // usable) value, so the rejection is about the sign and not about small
+  // numbers.
+  assert.equal(ageSeconds(1, 1001), 1);
+});
+
+test("formatAge guards nowMs, not just started_at", () => {
+  // The null branch exists so the age column never reads `NaN`. It was
+  // reachable through the OTHER parameter anyway: `formatAge(1000, NaN)`
+  // rendered `NaNdNaNh`. `nowMs` is a caller argument rather than a wire
+  // value, which is precisely why nothing else was guarding it.
+  for (const badNow of [Number.NaN, Infinity, -Infinity, 1.5, 1e30]) {
+    const rendered = formatAge(1000, badNow);
+    assert.ok(!rendered.includes("NaN"), `nowMs ${badNow} must not render NaN; got: ${rendered}`);
+    assert.equal(rendered, "age unknown");
+    assert.equal(ageSeconds(1000, badNow), null);
+  }
+  // Positive companion: a real `Date.now()`-shaped value still renders.
+  assert.equal(formatAge(1_700_000_000_000 - 5000, 1_700_000_000_000), "5s");
+});
+
 // ---------------------------------------------------------------------------
 // Grouped text rendering.
 // ---------------------------------------------------------------------------
@@ -231,14 +328,22 @@ test("renderText groups by repo, sorts deterministically, indents sessions", () 
   ]);
 });
 
-test("renderText headings cannot be mistaken for session rows", () => {
+test("headings cannot be mistaken for session rows", () => {
   // The text format's only structural discriminator is the two-space indent,
   // and `6-tmux-ambient` parses exactly that. `cwd` is verbatim off the wire,
   // and both a newline and a leading space are legal POSIX path components:
   // one would split a heading across two lines and manufacture a phantom
   // repo, the other would make a heading shape-identical to a session row.
+  //
+  // Driven through `toRow` from a hostile `cwd`, not by handing `renderText` a
+  // pre-built row: sanitization lives at row construction now (one
+  // representation, not two), so a fixture that skips `toRow` would assert
+  // against a shape the entry never produces.
   const lines = renderText(
-    [row({ repo: "evil\nrepo", session_id: "a" }), row({ repo: "  indented", session_id: "b" })],
+    [
+      toRow(wire({ cwd: "/parent/evil\nrepo", session_id: "a" }), NOW),
+      toRow(wire({ cwd: "/parent/  indented", session_id: "b" }), NOW),
+    ],
     "idle",
   );
   const headings = lines.filter((l) => !l.startsWith("  "));
@@ -251,8 +356,109 @@ test("renderText headings cannot be mistaken for session rows", () => {
   assert.equal(sanitizeHeading("bowerbird"), "bowerbird");
   assert.equal(sanitizeHeading("my.repo-2"), "my.repo-2");
   // A name that is nothing but whitespace collapses to the named bucket
-  // instead of printing a blank line.
-  assert.equal(sanitizeHeading("   "), "(unknown repo)");
+  // instead of printing a blank line. ALL whitespace, not just the space: the
+  // strip runs BEFORE the flatten precisely so a lone tab does not survive as
+  // a one-character U+FFFD heading.
+  for (const blank of ["   ", "\t", "\n", " \t\n ", "\u00a0", "\u2028"]) {
+    assert.equal(
+      sanitizeHeading(blank),
+      "(unknown repo)",
+      `a whitespace-only name must collapse to the bucket; ${JSON.stringify(blank)} did not`,
+    );
+  }
+});
+
+test("sanitizeTextField flattens every line terminator, not just the ASCII ones", () => {
+  // U+0085 NEL is a line terminator to a terminal and is NOT in JavaScript's
+  // `\s`, so no whitespace-based guard catches it; U+2028 / U+2029 are line
+  // terminators in the ECMAScript grammar itself. All three are one bad `cwd`
+  // or `session_id` away from forging a heading.
+  for (const terminator of ["\u0085", "\u2028", "\u2029", "\n", "\r", "\u0000", "\u007f"]) {
+    const flattened = sanitizeTextField(`a${terminator}b`);
+    assert.ok(
+      !flattened.includes(terminator),
+      `${JSON.stringify(terminator)} must not survive into a text line; got ${JSON.stringify(flattened)}`,
+    );
+    assert.equal(flattened, "a\uFFFDb");
+  }
+  // Positive companion: ordinary text, including non-ASCII that is NOT a line
+  // terminator, passes through untouched. The flatten is targeted.
+  assert.equal(sanitizeTextField("my.repo-2 \u00e9\u4e2d"), "my.repo-2 \u00e9\u4e2d");
+});
+
+test("a session row cannot be forged through session_id, source or current_state", () => {
+  // The heading was sanitized and the session line was not, so the SAME attack
+  // worked one field over: `session_id` is as verbatim off the wire as `cwd`
+  // is. A newline in any of the three printed wire fields would end the
+  // indented line and start an unindented one, which is a repo heading by
+  // definition.
+  for (const field of ["session_id", "source", "current_state"] as const) {
+    const forgery = "x\nEVIL-REPO\n  claude/forged  Working  0s";
+    const lines = renderText([toRow(wire({ [field]: forgery }), NOW)], "idle");
+    const headings = lines.filter((l) => !l.startsWith("  "));
+    assert.deepEqual(
+      headings,
+      ["(unknown repo)"],
+      `a forged ${field} produced extra headings: ${JSON.stringify(lines)}`,
+    );
+    for (const line of lines) {
+      assert.ok(
+        !line.includes("\n"),
+        `no line may embed a newline (via ${field}); got ${JSON.stringify(line)}`,
+      );
+    }
+  }
+  // Positive companion: ordinary values render exactly as the line format
+  // says, so the flatten above is targeted rather than a blanket mangle.
+  assert.deepEqual(
+    renderText([toRow(wire({ session_id: "sess-alpha", current_state: "WaitingInput" }), NOW)], "idle"),
+    ["(unknown repo)", "  claude/sess-alpha  WaitingInput  age unknown"],
+  );
+});
+
+test("the repo a row is GROUPED by is the repo that gets PRINTED", () => {
+  // Sanitizing at print time gave one value two spellings: rows were grouped
+  // and sorted on the raw `row.repo` and printed as `sanitizeHeading(repo)`,
+  // so `/x/ foo` and `/x/foo` became two groups that both printed `foo` --
+  // and the printed order came out `foo, aaa, foo`, contradicting the
+  // README's "Repos sort by name". Sanitizing once, in `toRow`, is what makes
+  // the group key, the sort key and the printed heading the same string.
+  const rows = [
+    toRow(wire({ cwd: "/x/ foo", session_id: "a" }), NOW),
+    toRow(wire({ cwd: "/x/aaa", session_id: "b" }), NOW),
+    toRow(wire({ cwd: "/x/foo", session_id: "c" }), NOW),
+  ];
+  const lines = renderText(rows, "idle");
+  const headings = lines.filter((l) => !l.startsWith("  "));
+  assert.deepEqual(
+    headings,
+    ["aaa", "foo"],
+    `one heading per printed name, sorted by it; got ${JSON.stringify(lines)}`,
+  );
+  // And both sessions really did land in the one `foo` group, which is what
+  // makes the heading count above a merge rather than a dropped row.
+  assert.deepEqual(lines, [
+    "aaa",
+    "  claude/b  Idle  age unknown",
+    "foo",
+    "  claude/a  Idle  age unknown",
+    "  claude/c  Idle  age unknown",
+  ]);
+  // Positive companion: `toRow` really did sanitize, so the merge above is
+  // the one-representation property and not two paths that happen to agree.
+  assert.equal(rows[0].repo, "foo");
+});
+
+test("--format=json carries the sanitized fields and the untouched cwd", () => {
+  // One representation, stated as an assertion: the JSON row is the same
+  // values text mode prints. `cwd` is the escape hatch, so a machine consumer
+  // can always recover the raw path.
+  const raw = "/x/ we\nird";
+  const row = toRow(wire({ cwd: raw, session_id: "s\nid" }), NOW);
+  assert.equal(row.repo, "we\uFFFDird");
+  assert.equal(row.session_id, "s\uFFFDid");
+  assert.equal(row.cwd, raw, "cwd stays verbatim: it is never printed as text-mode structure");
+  assert.equal(row.started_at, null);
 });
 
 test("renderText prints a clear line for zero live sessions, never blank", () => {
@@ -402,4 +608,63 @@ test("parseArgs rejects an invalid state token with the daemon's vocabulary", ()
     parseArgs(["--state=idle,working,waitinginput,ended,unknown"]).states,
     "idle,working,waitinginput,ended,unknown",
   );
+});
+
+test("parseArgs answers --help even when another argument is bad", () => {
+  // The rationale for answering `--help` at all is that a CLI which replies
+  // "unrecognized argument --help" teaches the reader it has no discoverable
+  // surface. A single-pass parser did exactly that one argument over: it
+  // rejected the typo before it ever reached the request for help, which is
+  // the moment a reader most needs the usage text.
+  for (const argv of [
+    ["--halp", "--help"],
+    ["--help", "--halp"],
+    ["--state=running", "-h"],
+    ["--format=json", "--format=text", "--help"],
+  ]) {
+    assert.equal(parseArgs(argv).help, true, `${argv.join(" ")} must still answer help`);
+  }
+  // Positive companion: without the help flag every one of those arguments is
+  // still rejected, so `--help` is winning rather than parsing being lax.
+  assert.throws(() => parseArgs(["--halp"]));
+  assert.throws(() => parseArgs(["--state=running"]));
+  assert.throws(() => parseArgs(["--format=json", "--format=text"]));
+});
+
+// ---------------------------------------------------------------------------
+// The request deadline and its env override.
+// ---------------------------------------------------------------------------
+
+test("requestTimeoutMs defaults to 5000 and takes a positive-integer override", () => {
+  // Pure and env-injected rather than reading `process.env` directly: mutating
+  // process env races every concurrent read in a parallel runner, which is the
+  // same rule `clippy.toml` enforces on the Rust side.
+  for (const unset of [{}, { BOWERBIRD_GLANCE_TIMEOUT_MS: "" }, { BOWERBIRD_GLANCE_TIMEOUT_MS: "  " }]) {
+    assert.equal(requestTimeoutMs(unset), 5000, `unset/blank must be the default; ${JSON.stringify(unset)}`);
+  }
+  assert.equal(requestTimeoutMs({ BOWERBIRD_GLANCE_TIMEOUT_MS: "1000" }), 1000);
+  assert.equal(requestTimeoutMs({ BOWERBIRD_GLANCE_TIMEOUT_MS: " 250 " }), 250);
+});
+
+test("requestTimeoutMs rejects a bad override instead of silently reverting", () => {
+  // A typo'd `BOWERBIRD_GLANCE_TIMEOUT_MS=1s` that quietly falls back to 5000
+  // is "I configured it and it did nothing", which is the failure the flag
+  // parser already refuses to produce for arguments.
+  for (const bad of ["1s", "0", "-1", "abc", "1.5", "1e30", "Infinity", "NaN"]) {
+    assert.throws(
+      () => requestTimeoutMs({ BOWERBIRD_GLANCE_TIMEOUT_MS: bad }),
+      (e: Error) => {
+        assert.ok(e.message.includes(bad), `must name the bad value: ${e.message}`);
+        assert.ok(
+          e.message.includes("milliseconds"),
+          `must say what a good value looks like: ${e.message}`,
+        );
+        return true;
+      },
+      `${JSON.stringify(bad)} must be rejected`,
+    );
+  }
+  // Positive companion: the neighbouring good value is accepted, so the
+  // rejections are about the values and not a blanket refusal.
+  assert.equal(requestTimeoutMs({ BOWERBIRD_GLANCE_TIMEOUT_MS: "1" }), 1);
 });

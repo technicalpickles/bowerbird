@@ -344,6 +344,15 @@ never daemon fields"). So the derivation living in a presenter is correct by des
 **Proposed rule** (create-story decision, see "Decisions made without asking" below; revise it only by updating the
 doc comment and the README together, since later stories bind to it):
 
+> **SUPERSEDED IN TWO PLACES. Read `deriveRepo`'s doc comment and the entry README, not this list.** Rule 3 below is
+> false and always was: `existsSync` returns `false` on EACCES rather than throwing, so an unreadable path does NOT
+> fall back to `basename(cwd)` -- the walk continues upward and an unreadable directory inside a real repo still
+> resolves to that repo. Resolved in favor of the shipped behavior in the 2026-08-02 review round (see "Review round"
+> below). The second review round then ADDED a rule: a relative `cwd` is `basename(cwd)` with no filesystem walk at
+> all, because walking one resolves it against whoever is reading and makes the same daemon yield different headings
+> from different working directories. The shipped rule is now five clauses, not four. Dev Notes are the planning
+> record and dev-story does not rewrite them, so this pointer is the supersession.
+
 1. `cwd` is `null` -> a single named bucket (e.g. `(unknown repo)`). Do not drop the session; a session with no `cwd`
    is exactly the one you would otherwise never notice.
 2. Walk up from `cwd` to the nearest ancestor containing a `.git` entry; render that ancestor's basename.
@@ -607,6 +616,51 @@ so each is named by its break and the message it produced:
 | the `once("--format", ...)` guard removed | `Missing expected exception: --format=json --format=text must be rejected` |
 | the `--help` / `-h` arm removed | `unrecognized argument "--help"; accepted flags are ...` |
 
+#### Review round TWO, 2026-08-02 (second code-review pass)
+
+Same discipline: `BOWERBIRD_NODE_BIN` on the mise Node **22.6.0** for every Rust run, each break reverted immediately
+after the observation. Two rows below are the round-one commit's OWN unobservable-red assertions, re-broken until the
+assertion under test was the one that fired.
+
+Each row quotes the message the run produced, not just its id. That is deliberate: `KEEP_RUNS=10` means a run log is
+gone within ten `scripts/test.sh` invocations, so a bare id stops being evidence very quickly (taskwarrior
+`c133d541` proposes making the quoted-message form a repo convention).
+
+| Run id | State | Break, and the message it produced |
+|---|---|---|
+| `20260802-174556-59686` | GREEN | Baseline for the round: `cli_examples` (13) + `cli_examples_drift` (7) + `cli_docs_drift`, under Node 22.6, with every round-two fix in place. |
+| `20260802-180039-64661` | RED | **M-c, the assertion made observable.** `BOWERBIRD_GLANCE_TIMEOUT_MS` ignored and the deadline back at a wide 25s. `the entry must give up on its own deadline (1500ms here, via BOWERBIRD_GLANCE_TIMEOUT_MS); it took 25.173796666s, which is over the 12s budget`. The first attempt at this break (`20260802-174639-60091`) fired the `"1500ms"` message needle instead, because widening the deadline changes BOTH the elapsed time and the number in the message. That is the same unobservable-red shape one layer over, so the needle was moved BELOW the bound as its positive companion, and the break re-run. |
+| `20260802-180107-65025` | RED | **M-d, the assertion made observable.** Both the `Array.isArray` check and `checkRowShape` reverted to the bare cast, which is the true pre-fix state. `--count must never print the literal string \`undefined\`; got: undefined`. The first attempt (`20260802-174705-60414`) removed only the array check, so `checkRowShape` threw a raw `body.entries is not a function` and a message-content needle fired instead of the ban. |
+| `20260802-180111-65306` | RED | **M-b, the finding itself.** `checkRowShape` removed AND `toRow`'s sanitizers reverted, which is the state round two measured. `an array of non-sessions must produce NO output ... Got: {"repo":"(unknown repo)","age":"age unknown","age_seconds":null}` three times: exactly the documented-keys-dropped row the README's "the field set is fixed" forbids. |
+| `20260802-180115-65571` | RED | The REWRITTEN `wait_bounded` re-observed doing its job: `AbortSignal.timeout` removed, the entry never exits, `session-glance []: the entry never exited within 30s and was killed by the hang guard`. Round one observed this against the watchdog-thread implementation; the `try_wait` implementation that replaced it needed its own observation. |
+| `20260802-174713-60905` | RED | **M-a, the finding itself.** `await res.json()` back outside the try. `the raw Node body-parse failure must not be the whole message; got: Unexpected token '<', "<html>not "... is not valid JSON` -- which names neither the address nor the fix. |
+| `20260802-174718-61146` | RED | **M-e(1), the finding itself.** `&& npm test --if-present` deleted from the `ci.yml` cookbook loop. `the cookbook loop in .github/workflows/ci.yml does not run \`npm test\` ... Got: \`(cd "$d" && npm ci && npm run typecheck)\``. Before this round the guard never read `ci.yml` at all, so this exact break left every assertion in it green. |
+| `20260802-174720-61182` | RED | **M-e(2).** `scripts.test` replaced with `"true"`. `scripts.test = "true" never mentions \`tests/\`, so \`npm test\` can exit 0 without running a single file in the sidecar`. |
+| `20260802-174722-61220` | RED | `glance.test.ts` moved out of the sidecar. `has no *.test.ts FILES (searched recursively ...)`. The `found > 0` assertion had no cited RED before. |
+| `20260802-180218-66302` / `20260802-180221-66361` | RED / RED | **M-e(3), and a recommended fix that turned out not to do what it was asked to do.** A DIRECTORY named `decoy.test.ts` as the only thing in `tests/`: red WITH `is_file()` and red WITHOUT it, because the recursion branch already claims a directory. So `is_file()` is not what closes the directory case. |
+| `20260802-180247-66636` / `20260802-180249-66695` | RED / GREEN | What `is_file()` actually closes, found by looking for it: a DANGLING SYMLINK named `dangling.test.ts`. Red with the check, **green without it** -- the guard reporting coverage over a suite `npm test` runs nothing from. The doc comment now says this instead of the directory story. |
+| `20260802-180225-66473` | RED | **M-e(4).** `glance.test.ts` moved to `tests/unit/`, which the `tests/**/*.test.ts` glob runs perfectly well, with the recursion removed from `test_files_under`. The guard FALSE-FAILS a green entry. The fixed version is green on the same tree (`20260802-180223-66417`). |
+| `20260802-174724-61247` | RED | The all-pairs pid assertion, which had no cited RED before. Daemon pid duplicated into the third slot: `the fixture needs three DISTINCT live pids and got [61298, 61326, 61326]`. **Side observation worth recording:** this break panics inside `distinct_live_pids`, which runs BEFORE `stop_daemon`, so it leaks two daemon subprocesses whose inherited stdout pipe keeps `scripts/test.sh`'s `tee` alive after the run itself has exited and released the lock. A deliberately-broken state, not a property of the shipped tests (they all reach `stop_daemon` / `force_stop`), but it is why that run needed a manual reap rather than `--unlock`. |
+| `20260802-175941-64137`, `20260802-180146-65942`, `20260802-180252-66750` | GREEN | Revert checks after each sweep. |
+
+**Entry-local Node breaks, round two.** The Node runner emits no run ids, so each is named by its break and the
+message it produced. Twelve breaks, each reverted immediately:
+
+| Break in `src/index.ts` | What went red |
+|---|---|
+| `session_id` no longer sanitized in `toRow` | `no line may embed a newline (via session_id); got "  claude/x\nEVIL-REPO\n  claude/forged  Working  0s  Idle  age unknown"`. **H-a verbatim**: the heading was sanitized and the session row was not, so the same forgery worked one field over. |
+| `toRow` stops sanitizing `repo`, `renderText` sanitizes at print time instead (the state round one shipped) | `one heading per printed name, sorted by it; got ["foo","  claude/a  Idle  age unknown","aaa","  claude/b  Idle  age unknown","foo","  claude/c  Idle  age unknown"]`. **H-b verbatim**: `foo, aaa, foo`, two groups printing one name, ordered by a key the reader never sees. |
+| `toRow` stops sanitizing `repo` (print-time sanitize also removed) | `exactly two headings; got ["  indented","  claude/b  Idle  age unknown","evil\nrepo","  claude/a  Idle  age unknown"]` |
+| the `isAbsolute` early return deleted from `deriveRepo` | `a relative cwd must derive the same name from every working directory; got sub,.,deeper`. **H-c verbatim**: three different answers for two relative paths, depending on where the reader stood. |
+| `formatAge` / `ageSeconds` stop guarding `nowMs` | `nowMs NaN must not render NaN; got: NaNdNaNh` |
+| `usableEpochMs` drops its `> 0` clause | `started_at -1 must not render a multi-decade age; got: 19675d22h` |
+| `sanitizeHeading` flattens before it strips | `a whitespace-only name must collapse to the bucket; "\t" did not`. The doc claim was false for a tab in exactly this way. |
+| `sanitizeTextField` narrowed back to the ASCII controls | `"" must not survive into a text line; got "ab"` |
+| `--help` loses its own pass | `unrecognized argument "--halp"; accepted flags are ...` -- the CLI answering a request for help by refusing it. |
+| `requestTimeoutMs` silently reverts to the default on a bad value | `Missing expected exception: "1s" must be rejected` |
+| `requestTimeoutMs` ignores the env var entirely | `Missing expected exception` plus the default/override equality |
+| `once("--state", ...)` removed, `once("--format", ...)` left in place | `Missing expected exception: --state=idle --state=working must be rejected`. The `--state` half of that test had no cited RED before; only the `--format` half did. |
+
 ### Completion Notes List
 
 **What shipped, by AC.**
@@ -687,8 +741,12 @@ the cause).
   reaching for it in this entry's output would have decided it by forcing a consumer into existence.
 
 **File List audit.** `python3 scripts/check-file-list.py docs/bmad/implementation-artifacts/6-session-glance.md
---base main` exits 0, reporting `12 changed in git | 12 declared`. No `--ignore` was used, so there is nothing to
-disclose on that front. This was the audit's first real exercise since commit `356c795` wired it, and it behaved
+--base main` exits 0. It reported `12 changed in git | 12 declared` when this paragraph was first written; the count
+has moved twice since, because each review round adds files (the first added `.github/workflows/ci.yml`, the second
+added nothing new but the count is stated in the present tense, so it goes stale by construction). The current number
+is in the Change Log entry for the round that took it, which is the only place it can stay true. No `--ignore` has
+been used in any round, so there is nothing to disclose on that front. This was the audit's first real exercise since
+commit `356c795` wired it, and it behaved
 correctly: it resolved the merge-base against `main` without help, counted the untracked-but-new entry files and the
 committed test edits alike, and reported CLEAN on the first invocation with no false positives (notably it did not
 trip over `docs/cookbook/session-glance/node_modules/`, which the cookbook `.gitignore` already excludes). No finding
@@ -836,28 +894,149 @@ reused:
 The comparator that never returns 0 (`renderText`'s sort) was left alone as the review directed: `PRIMARY KEY (source,
 session_id)` makes duplicate sort keys unreachable.
 
+## Review round TWO, 2026-08-02
+
+A second adversarial pass over the same branch, after the first round's fixes. Status stays `review`; the dogfood
+gate is still the one open item. C1, H1, H2 / H2-bis and H3 were re-verified hands-on by the review (including
+running the README's "Run it" block byte for byte) and are untouched here.
+
+**The round-one heading-sanitization fix was half a fix, and the half it did do introduced a regression.** Both are
+the same underlying mistake: sanitizing at the point of PRINTING rather than at the point of BUILDING the row.
+
+- **Only the heading was sanitized.** `session_id`, `source` and `current_state` are interpolated into the session
+  line and are as verbatim off the wire as `cwd` is. A `session_id` of `"s1\nEVIL-REPO\n  claude/forged  Working  0s"`
+  produced a forged unindented heading AND a forged session row beneath it. Reproduced directly through `renderText`
+  before the fix.
+- **Grouping and printing disagreed.** Rows were grouped and sorted on the raw `row.repo` and printed as
+  `sanitizeHeading(repo)`, so a `cwd` of `/x/ foo` and one of `/x/foo` became two distinct groups that both printed
+  `foo`, ordered by a string the reader never sees. Measured output: `foo, aaa, foo`, contradicting the README's
+  "Repos sort by name". Before `sanitizeHeading` existed the key and the printed heading were always the same value,
+  so this is a regression the round-one fix introduced.
+
+Fixed by making there be ONE representation. `toRow` sanitizes `repo`, `source`, `session_id` and `current_state` at
+construction; `renderText` prints them and sanitizes nothing. The group key, the sort key and the printed heading are
+now the same string by construction rather than by coincidence. `--format=json` consequently carries the sanitized
+values too, which is stated in both binding texts: `cwd` and `started_at` stay untouched, so a machine consumer can
+always recover the raw path from the row. The flatten set also widened past the ASCII controls to U+0080-U+009F
+(which is where U+0085 NEL lives) plus U+2028 / U+2029, and the leading-whitespace strip now runs BEFORE the flatten
+so that the documented "whitespace-only collapses to the named bucket" is true for a tab rather than only for a
+space.
+
+**A relative `cwd` walked the READER's directory tree.** Run from the repo root, every relative `cwd` collapsed to a
+heading literally named `.`; run from `/tmp`, the same daemon produced different headings. Two runs of one surface
+disagreeing is exactly what AC 3 exists to prevent, and nothing in the protocol or the daemon validates `cwd` as
+absolute. **Decision: a relative `cwd` is `basename(cwd)` with no filesystem walk at all** -- deterministic and
+machine-independent. It is now rule 2 of five in both binding texts (the `deriveRepo` doc comment and the README's
+"How it works"), and the unit test proves the property rather than the implementation: it derives from two different
+working directories and asserts they agree.
+
+**Two more unhandled failure modes in the fetch path.**
+
+- **`await res.json()` sat outside the try**, the same defect the round-one commit fixed for `server.json` sixty
+  lines above. Measured Node output: `Unexpected token '<', "<html>not "... is not valid JSON` for a non-JSON body,
+  a bare `The operation was aborted due to timeout` for a headers-then-stall, and `terminated` for a mid-body reset.
+  None names the address or the fix. Wrapped; the stall routes to the mode-(c) message (it IS mode (c), one step
+  later) and the other two get a message naming the address, quoting Node's reason, and suggesting the restart. Both
+  new shapes are in the README troubleshooting list.
+- **An array of junk passed `Array.isArray`.** `[1,2,3]` rendered `  undefined/undefined  undefined  age unknown` in
+  text and, worse, made `--format=json` DROP documented keys (`JSON.stringify` omits `undefined` values), emitting
+  `{"repo":...,"age":...,"age_seconds":null}` against the README's "the field set is fixed". `--count` reported a
+  confident `3`. `checkRowShape` now requires each element to be an object with string `source` / `session_id` /
+  `current_state` -- only the fields the text contract PRINTS, so `cwd` and `started_at` keep their own
+  bucket-don't-crash guards and a future daemon's additive fields are ignored rather than rejected.
+
+**H5's 5s deadline stays 5s, and gains an env override.** 5s is right for a human at a prompt and long for a tmux
+status line refreshing every 1-5s, which is the surface this entry exists to feed. Rather than change the default,
+`BOWERBIRD_GLANCE_TIMEOUT_MS` sets it, is documented in the README contract and in `--help`, appears in the timeout
+message so you can tell which deadline fired, and is a hard error rather than a silent revert when it is not a
+positive whole number of milliseconds. It is also what makes the mode-(c) smoke's elapsed assertion observable at all
+(see below).
+
+**Test-harness fixes, all four of the kind CLAUDE.md's discipline section exists for.**
+
+- `wait_bounded`'s watchdog thread held a raw pid and stored `finished` only AFTER `wait_with_output` had reaped the
+  child, so its final load could read false and `SIGKILL` a recycled pid; a panic in `wait_with_output` skipped the
+  store and leaked a thread that would kill up to 30s later; and `watchdog.join().unwrap_or(false)` turned a panicked
+  watchdog into "nothing was killed", silently disabling the guard. Rewritten around `try_wait` in the calling
+  thread, so the `Child` handle is never released while a kill is possible and there is no second thread to race.
+  Re-observed doing its job (`20260802-180115-65571`).
+- The non-array-body smoke had three unbounded waits (`accept()`, `read()`, and a `join()` that ran BEFORE every
+  assertion, so a stuck server thread hung the suite with no diagnosis). All three are bounded now, in a shared
+  `CannedServer` helper whose bounded `finish()` returns the server's own account of what it did -- which doubles as
+  the A13 positive companion that the response, not a refused connection, is what the assertions are about.
+- The M11 symlink fix had landed in ONE of the three `cookbook_entry_dirs()` copies. A fix in one of three copies is
+  not a fix; all three follow symlinks now, and each says so where the next reader will be.
+- The EACCES test skipped via a bare `return`, reporting PASS in the one environment where it does not run. `t.skip()`
+  with a reason.
+
+**The biconditional guard did not guard what it was named for.** `entry_tests_are_wired_to_npm_test` never read
+`ci.yml`, so deleting `&& npm test --if-present` from the workflow left every assertion in it green while
+`glance.test.ts` went straight back to running nowhere -- which is the exact regression round one added it to
+prevent. Three more holes in the same guard: `"test": "true"` passed on key presence alone, a name check counted
+things `npm test` cannot run, and a non-recursive `read_dir` disagreed with the `tests/**/*.test.ts` glob it is
+supposed to mirror. All four fixed, each with its own observation.
+
+> **Where a recommended fix turned out not to do what it was asked to do.** The review called for `is_file()` because
+> a DIRECTORY named `foo.test.ts` satisfies a name check. Measured, the recursion branch already claims that case (a
+> directory is descended into and contributes nothing), so the guard is red with `is_file()` and red without it --
+> `is_file()` is not what closes it. Looking for what it DOES close found a real one: a dangling symlink named
+> `dangling.test.ts` is neither a directory nor a file, and without the check it counted as coverage while `npm test`
+> ran an empty suite. Red with the check, GREEN without it. The fix is kept and the doc comment now states the case
+> it actually covers rather than the one it was asked for.
+
+**Two of round one's own assertions were unobservable-red, and one of the fixes for that was too.** `elapsed <
+GLANCE_HANG_GUARD` could not fire, because `wait_bounded` already panics at that same deadline inside `run_glance`;
+it was also far too loose to notice the request deadline widening from 5s to 25s. It is now a 12s budget against a
+1500ms override, which is a bound the entry clears by an order of magnitude when the deadline works. The first
+attempt at observing it fired the `"1500ms"` message needle instead -- widening the deadline changes both the elapsed
+time and the number in the message -- so the needle moved BELOW the bound as its positive companion and the break was
+re-run. `!stdout.contains("undefined")` sat behind `!ok`; the ban runs first now, and the break that observes it
+reverts the WHOLE body check rather than half of it, so the pre-fix `undefined`-on-exit-0 is what actually happens.
+
+**Smaller fixes, each named because the review named them:** `formatAge` / `ageSeconds` guard `nowMs` as well as
+`started_at` (`formatAge(1000, NaN)` rendered `NaNdNaNh`, reaching the exact output the null branch exists to
+prevent, through the other parameter) and reject a non-positive `started_at` (`-1` is a safe integer and rendered
+`20667d21h`); `--help` / `-h` now wins over any other argument, including a bad one, which is what its own stated
+rationale requires and what `--halp --help` did not do; `-h` added to `ACCEPTED_FLAGS`; the README's "two distinct
+daemon-down messages" corrected to four and the entry's own README no longer calls the demo output "verbatim" when
+the middle heading is `basename($PWD)` and depends on what you named your clone; and the Dev Notes' superseded rule 3
+carries an inline pointer at its own site instead of only being contradicted 380 lines later.
+
+**Filed, not fixed.** Taskwarrior `c133d541`: every A13 claim in this repo cites a `scripts/test.sh` run id, and
+`KEEP_RUNS=10` deletes those logs within ten runs -- 3 of 6 ids the review spot-checked were already gone. This
+story's round-two Debug Log References quote the assertion message next to each id, which is the mitigation; the task
+proposes making that a stated convention in `project-context.md`. Deliberately not done here, because it is a
+repo-wide docs change and this story is presenter-only.
+
 ### File List
 
 - `docs/bmad/implementation-artifacts/6-session-glance.md` (this story file: task checkboxes, Dev Agent Record,
   Dogfood Gate Evidence pending note, File List, Change Log, Status)
 - `docs/bmad/implementation-artifacts/sprint-status.yaml` (story key `6-session-glance` -> `in-progress` -> `review`)
 - `docs/cookbook/README.md` (index table row + Quick run block for the new entry; "the existing three" generalized)
-- `docs/cookbook/session-glance/README.md` (new; review round: reproducible "Run it" block with an inline fixture, rule 3 corrected, symlinked-`cwd` imprecision added, `--format=text` / `--help` documented, heading sanitization stated, troubleshooting split by message)
+- `docs/cookbook/session-glance/README.md` (new; review round: reproducible "Run it" block with an inline fixture, rule 3 corrected, symlinked-`cwd` imprecision added, `--format=text` / `--help` documented, heading sanitization stated, troubleshooting split by message; round two: relative-`cwd` rule added as rule 2 and the list renumbered to five, sanitization restated as row-build-time and covering every printed field, `BOWERBIRD_GLANCE_TIMEOUT_MS` documented, `--help` precedence stated, two new troubleshooting messages, "two distinct daemon-down messages" corrected to four, the demo output de-claimed as "verbatim")
 - `docs/cookbook/session-glance/package.json` (new)
 - `docs/cookbook/session-glance/package-lock.json` (new)
 - `docs/cookbook/session-glance/tsconfig.json` (new)
-- `docs/cookbook/session-glance/src/index.ts` (new; review round: `deriveRepo` type guard and dead catch removed, rule 3 doc corrected, request timeout, non-array body check, wrapped `JSON.parse`, realpath `isEntry`, `sanitizeHeading`, `--help`, repeated-flag rejection, `Number.isSafeInteger` age guard)
-- `docs/cookbook/session-glance/tests/glance.test.ts` (new; review round: real EACCES case, junk-off-the-wire case, heading sanitization, absurd `started_at`, `--help` and repeated-flag cases, two assertion reorders and one test split so the negatives are observable-red)
+- `docs/cookbook/session-glance/src/index.ts` (new; review round: `deriveRepo` type guard and dead catch removed, rule 3 doc corrected, request timeout, non-array body check, wrapped `JSON.parse`, realpath `isEntry`, `sanitizeHeading`, `--help`, repeated-flag rejection, `Number.isSafeInteger` age guard; round two: relative-`cwd` rule, `sanitizeTextField` + sanitization moved into `toRow` so one representation is grouped, sorted and printed, wider flatten set, strip-before-flatten, `checkRowShape`, wrapped `res.json()` with a shared unanswered-request message, `requestTimeoutMs` + `BOWERBIRD_GLANCE_TIMEOUT_MS`, `nowMs` and non-positive `started_at` guards, `--help` precedence pass, `-h` in `ACCEPTED_FLAGS`)
+- `docs/cookbook/session-glance/tests/glance.test.ts` (new; review round: real EACCES case, junk-off-the-wire case, heading sanitization, absurd `started_at`, `--help` and repeated-flag cases, two assertion reorders and one test split so the negatives are observable-red; round two: relative-`cwd` agreement test, session-row forgery through all three printed wire fields, group-key-equals-printed-heading, JSON field sanitization, wider line-terminator set, whitespace-only bucket across all of `\s`, `nowMs` and non-positive `started_at` guards, `--help` precedence, `requestTimeoutMs` default/override/rejection, EACCES skip via `t.skip()`, the heading test driven through `toRow` instead of a hand-built row: 33 tests)
 - `tests/cli_docs_drift.rs` (glob-derived entry lists; `cookbook_entry_consts_match_directory_listing` deleted with a
   named successor; `cookbook_readme_lists_three_required_entries` renamed
-  `cookbook_readme_links_every_entry_directory`)
+  `cookbook_readme_links_every_entry_directory`; round two: `is_dir_following_symlinks` on this file's copy of the
+  derivation, which the round-one M11 fix had missed)
 - `tests/cli_examples_drift.rs` (glob-derived `ENTRIES`; `entries_const_matches_directory_listing` repurposed as
   `every_cookbook_subdirectory_is_a_typechecked_entry`; review round: `is_dir_following_symlinks` on both listings,
-  symlinked-entry rejection, corrected docstring, new `entry_tests_are_wired_to_npm_test`)
+  symlinked-entry rejection, corrected docstring, new `entry_tests_are_wired_to_npm_test`; round two:
+  `entry_tests_are_wired_to_npm_test` now reads `ci.yml`, requires the test script to reference `tests/`, and finds
+  test files through a new recursive `test_files_under` that checks `is_file()`)
 - `tests/cli_examples.rs` (three session-glance smokes, glob-derived daemon-down loop, fast-failing count fence, doc
   comment update; review round: `--disable-warning=ExperimentalWarning` in `spawn_example`, `wait_bounded` helper
   replacing both `wait()`-then-read sites, all-pairs pid distinctness, address-is-dead precondition, assertion
-  reorder in the stale-`server.json` test, two new smokes for the unanswered-request and non-array-body modes)
+  reorder in the stale-`server.json` test, two new smokes for the unanswered-request and non-array-body modes; round
+  two: `wait_bounded` rebuilt around `try_wait` to close the pid-reuse race, `is_dir_following_symlinks` on this
+  file's copy of the derivation, a bounded `CannedServer` helper replacing three unbounded waits, `run_glance_with_env`,
+  the mode-(c) elapsed assertion made observable against a 1500ms override, the `undefined` ban reordered ahead of the
+  exit-code assertion, and two new smokes for the array-of-junk and unreadable-body modes)
 - `.github/workflows/ci.yml` (review round: the cookbook loop runs `npm test --if-present` and the step is renamed to
   say so; entry unit tests ran nowhere in CI before this)
 
@@ -906,3 +1085,29 @@ session_id)` makes duplicate sort keys unreachable.
   `npm ci && npm run typecheck && npm test` 23/23 from a wiped `node_modules` on 22.6, and all four cookbook entries
   pass the real CI loop. Three findings were filed rather than fixed, per the review's own triage: taskwarrior
   `db14068e`, `101914b0`, `4238d5ea`.
+
+- 2026-08-02: Second code-review round applied on the same branch; Status stays `review` and the dogfood gate stays
+  the one open item. C1, H1, H2 / H2-bis and H3 were re-verified by the review and left alone. Three HIGHs and seven
+  MEDIUMs fixed, plus the named LOWs. The two HIGHs that matter most are one fix and one regression from the FIRST
+  round, both the same mistake: sanitizing at print time instead of at row-build time. Only the heading was
+  sanitized, so a `session_id` carrying a newline forged both a heading and a session row; and rows were grouped and
+  sorted on the raw `repo` while printing the sanitized one, so `/x/ foo` and `/x/foo` became two groups that both
+  printed `foo` in the order `foo, aaa, foo`. `toRow` now sanitizes every printed wire field once, and `renderText`
+  sanitizes nothing, so the group key, the sort key and the printed heading are the same string by construction.
+  Third HIGH: a relative `cwd` walked the reader's own directory tree, so the same daemon yielded different headings
+  from different working directories; it is now `basename(cwd)` with no walk, stated as rule 2 of five in both
+  binding texts. `await res.json()` moved inside a try (the same defect the first round fixed for `server.json`), an
+  array of non-session elements is rejected rather than rendering `undefined` columns and dropping documented JSON
+  keys, and the 5s deadline gained `BOWERBIRD_GLANCE_TIMEOUT_MS` rather than changing. Test-harness: `wait_bounded`
+  rebuilt around `try_wait` (the watchdog could SIGKILL a recycled pid, leak a thread on panic, and silently disable
+  itself), three unbounded waits bounded, the M11 symlink fix propagated to the two `cookbook_entry_dirs()` copies it
+  had missed, and `entry_tests_are_wired_to_npm_test` taught to read `ci.yml` -- without which deleting
+  `npm test --if-present` from the workflow left every assertion in it green. Two of the first round's own assertions
+  were unobservable-red and are now observable; one of the fixes for that was itself unobservable on the first
+  attempt and was re-broken until the assertion under test fired. Twelve Rust RED runs and twelve Node-side breaks
+  are recorded in Debug Log References, each with the run id AND the message it produced, each reverted after the
+  observation. `scripts/test.sh` **657 passed / 0 failed** (`20260802-180327-67127`) under Node 22.6,
+  `cargo fmt --check` and `cargo clippy --all-targets --workspace -- -D warnings` clean, entry-local
+  `npm ci && npm run typecheck && npm test` **33/33** under Node 22.6 from a wiped `node_modules`. File-List audit
+  CLEAN, **13 changed in git | 13 declared**, no `--ignore`. One followup filed rather than fixed: taskwarrior
+  `c133d541`.
