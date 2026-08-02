@@ -18,17 +18,17 @@ The bundled fixture exists so you can exercise the pub/sub path without configur
 
 ## Step 0: install bowerbird
 
-On macOS arm64 (Apple Silicon), download the current release candidate and put the three binaries (`bowerbird`, `bowerbird-shim`, `bowerbird-daemon`) on your `$PATH` (`sudo` will ask for your password):
+On macOS arm64 (Apple Silicon), download the v0.1.0 release and put the three binaries (`bowerbird`, `bowerbird-shim`, `bowerbird-daemon`) on your `$PATH` (`sudo` will ask for your password):
 
 ```sh
-curl -fsSL https://github.com/technicalpickles/bowerbird/releases/download/v0.1.0-rc3/bowerbird-v0.1.0-rc3-aarch64-apple-darwin.tar.gz | tar -xz
+curl -fsSL https://github.com/technicalpickles/bowerbird/releases/download/v0.1.0/bowerbird-v0.1.0-aarch64-apple-darwin.tar.gz | tar -xz
 sudo mkdir -p /usr/local/bin
-sudo install -m 0755 bowerbird-v0.1.0-rc3-aarch64-apple-darwin/bin/* /usr/local/bin/
-rm -rf bowerbird-v0.1.0-rc3-aarch64-apple-darwin
+sudo install -m 0755 bowerbird-v0.1.0-aarch64-apple-darwin/bin/* /usr/local/bin/
+rm -rf bowerbird-v0.1.0-aarch64-apple-darwin
 bowerbird --version
 ```
 
-The last command prints `bowerbird 0.1.0` (release-candidate builds print the bare version); that is this step's success signal. On another platform, replace `aarch64-apple-darwin` with `x86_64-apple-darwin` (Intel Mac) or `x86_64-unknown-linux-gnu` (Linux) everywhere it appears; the version stays `v0.1.0-rc3`. [`INSTALL.md`](../INSTALL.md) is the detailed walkthrough.
+The last command prints `bowerbird 0.1.0`; that is this step's success signal. On another platform, replace `aarch64-apple-darwin` with `x86_64-apple-darwin` (Intel Mac) or `x86_64-unknown-linux-gnu` (Linux) everywhere it appears; the version stays `v0.1.0`. [`INSTALL.md`](../INSTALL.md) is the detailed walkthrough.
 
 ## Step 1: start the daemon
 

@@ -9,9 +9,9 @@ one UI.
 from install to live JSON state streaming out of a reference tool, using
 a bundled fixture. No Claude Code session required.
 
-Status: v0.1.0 release candidate.
-[v0.1.0-rc3](https://github.com/technicalpickles/bowerbird/releases/tag/v0.1.0-rc3)
-is the current prerelease.
+Status: v0.1.0, the first stable release.
+[v0.1.0](https://github.com/technicalpickles/bowerbird/releases/tag/v0.1.0)
+is the current release.
 
 ## Why this exists
 
