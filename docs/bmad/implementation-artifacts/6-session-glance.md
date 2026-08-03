@@ -257,15 +257,22 @@ Filled in by the dev/maintainer before this story lands. Required by AC 6 and th
 
 > **STATUS: PENDING. This is the only thing standing between the story and `done`.** The implementation is complete
 > and the story is at `review`; the gate is a human activity that cannot be produced in a dev session, because it
-> measures wall-clock exposure to real sessions. The maintainer performs it from branch `story/6-session-glance`
-> before the branch lands. Nothing below may be filled in by an agent.
+> measures wall-clock exposure to real sessions. Nothing below may be filled in by an agent.
+>
+> **DEVIATION, recorded rather than silent (maintainer decision, 2026-08-02): the gate runs POST-LAND, from `main`.**
+> The epic's protocol says dogfooding happens from the story branch pre-land, and names the exact failure mode this
+> creates: "if running pre-land is annoying, fix that friction first or the gate quietly becomes post-land"
+> (epics.md:1421). The maintainer chose to merge first and burn the entry in off `main`. That is a deliberate,
+> reasoned call (running a cookbook entry from a checked-out story branch is real friction), not an oversight, and it
+> is written here so the epic's own warning is not quietly violated. Two consequences the maintainer accepts:
+> the story lands with AC 6 open, and `6-session-glance` cannot flip to `done` until the harvest note below exists.
+> The honest read on the protocol is that its pre-land requirement did not survive first contact; whether to amend it
+> for the remaining three gated stories or hold the line belongs in the Epic 6 retro.
 >
 > What the maintainer needs to do:
 >
-> 1. Check out `story/6-session-glance` and run the entry against the real daemon over 3-5 working days, unprompted,
->    when a session is actually being wondered about. Not one demo run. If running it pre-land is annoying enough
->    that it does not happen, fix that friction first (epics.md:1421); a gate that quietly slips to post-land is the
->    failure mode this protocol exists to prevent.
+> 1. Run the entry from `main` against the real daemon over 3-5 working days, unprompted, when a session is actually
+>    being wondered about. Not one demo run.
 > 2. Provoke the named adversity for real: stop the daemon mid-day, then run the entry. Note that a graceful
 >    `bowerbird stop` removes `server.json` and exercises failure mode (a); to exercise mode (b), the one this story
 >    fixed, the daemon has to die uncleanly (`kill -9`, a crash, an OOM). Paste what it printed, verbatim.
@@ -276,7 +283,7 @@ Filled in by the dev/maintainer before this story lands. Required by AC 6 and th
 > `session_glance_names_the_address_when_server_json_is_stale` (mode b). What they cannot tell you is whether the
 > glance is worth reaching for.
 
-**Exposure window:** _(dates; 3-5 working days of real sessions, used unprompted, from the story branch)_
+**Exposure window:** _(dates; 3-5 working days of real sessions, used unprompted, from `main` post-land)_
 
 **Provoked adversity (named by the AC): daemon stopped mid-day.** _(what was run, what the entry printed verbatim,
 verdict: clear message or stack trace)_
