@@ -13,6 +13,12 @@
 //! example anchor regions is gone: there is no duplicated code to check
 //! anymore. `tests/cli_examples_drift.rs` remains the entry-side
 //! counterpart (required files, engines floor, Cargo-zone boundary).
+//!
+//! Story 6-session-glance (AC 4): every list of cookbook entries in this file
+//! is derived from the `docs/cookbook/*/` glob rather than hardcoded. See
+//! [`cookbook_entry_dirs`] for the derivation, CI's matching skip rule, and
+//! the A13 positive companion that keeps an empty derivation from passing
+//! every downstream assertion vacuously.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -34,21 +40,117 @@ const REQUIRED_DOCS: &[&str] = &[
     "docs/cookbook/README.md",
 ];
 
-const REQUIRED_COOKBOOK_ENTRIES: &[&str] = &[
-    "docs/cookbook/state-session-fanout/README.md",
-    "docs/cookbook/rest-cursor-pagination/README.md",
-    "docs/cookbook/dropped-frame-recovery/README.md",
-];
+/// Floor on how many cookbook entries the glob must find. Deliberately BELOW
+/// the current count so adding an entry never touches this number; it exists
+/// only to turn a silently-empty (or half-read) derivation into a red build.
+/// Dropping the real count below the floor is a conversation, not a silent
+/// pass.
+const MIN_EXPECTED_ENTRIES: usize = 3;
+
+/// One entry name that must always be in the derived list. The smallest
+/// hardcoded fact that proves the glob is reading the right directory rather
+/// than an empty or unrelated one. This entry is separately pinned by
+/// `tests/cli_examples.rs`'s smoke and by architecture.md's project tree.
+const ANCHOR_ENTRY: &str = "rest-cursor-pagination";
+
+/// Is `p` a directory, FOLLOWING symlinks?
+///
+/// `DirEntry::file_type()` does NOT follow symlinks (on Unix it is readdir's
+/// `d_type`), so a symlinked entry directory reads as neither file nor
+/// directory and every listing built on it silently drops the entry. CI's
+/// `for d in docs/cookbook/*/` glob does the opposite: the shell's `*/`
+/// resolves the link and matches, so CI would typecheck a directory that no
+/// guard here has ever seen. `fs::metadata` resolves, which puts the two back
+/// in agreement.
+///
+/// Duplicated in all three `cookbook_entry_dirs()` copies deliberately: each
+/// `tests/*.rs` file is its own crate. Fixing it in ONE of them is how the
+/// symlink hole half-closed the first time (taskwarrior `4238d5ea` tracks the
+/// shared-helper cleanup).
+fn is_dir_following_symlinks(p: &Path) -> bool {
+    fs::metadata(p).map(|m| m.is_dir()).unwrap_or(false)
+}
+
+/// Every cookbook entry directory name, derived from the `docs/cookbook/*/`
+/// glob (Story 6-session-glance, AC 4).
+///
+/// Replaces the hardcoded three-literal `REQUIRED_COOKBOOK_ENTRIES` const.
+/// Hardcoding was a structural gap, not a style problem: CI's typecheck loop
+/// already globs `docs/cookbook/*/`, so a newly added entry got typechecked
+/// while every Rust shape guard in this file silently skipped it.
+///
+/// Mirrors CI's own entry filter (`.github/workflows/ci.yml`): a subdir with
+/// no `package.json` is a legitimate non-entry docs subdir (images/, drafts/)
+/// and is skipped here exactly as it is skipped there. The companion
+/// assertion that no such subdir currently exists lives in
+/// `tests/cli_examples_drift.rs::every_cookbook_subdirectory_is_a_typechecked_entry`,
+/// which is also the named successor to the deleted
+/// `cookbook_entry_consts_match_directory_listing` (that test compared the
+/// hardcoded const against this same glob; under derivation it would compare
+/// the glob against itself).
+///
+/// **A13 positive companion.** Asserts the derivation is non-empty, meets the
+/// floor, and contains a known anchor BEFORE any caller asserts the derived
+/// entries conform. A guard that silently derives an empty list passes every
+/// downstream assertion vacuously, which is the "coin flip wearing a green
+/// checkmark" the convention exists to prevent.
+fn cookbook_entry_dirs() -> Vec<String> {
+    let cookbook = workspace_root().join("docs/cookbook");
+    let mut dirs: Vec<String> = fs::read_dir(&cookbook)
+        .unwrap_or_else(|e| panic!("read_dir {}: {e}", cookbook.display()))
+        .filter_map(|entry| {
+            let entry = entry.expect("dir entry");
+            if !is_dir_following_symlinks(&entry.path()) {
+                return None;
+            }
+            // CI's skip, mirrored: no package.json means not an entry.
+            if !entry.path().join("package.json").is_file() {
+                return None;
+            }
+            Some(entry.file_name().to_string_lossy().into_owned())
+        })
+        .collect();
+    dirs.sort();
+
+    assert!(
+        dirs.len() >= MIN_EXPECTED_ENTRIES,
+        "docs/cookbook/*/ derivation found {} entries ({dirs:?}), fewer than the \
+         floor of {MIN_EXPECTED_ENTRIES}. Every guard in this file asserts over \
+         this list, so an under-derived list would make them all pass vacuously.",
+        dirs.len(),
+    );
+    assert!(
+        dirs.iter().any(|d| d == ANCHOR_ENTRY),
+        "docs/cookbook/*/ derivation ({dirs:?}) is missing the anchor entry \
+         `{ANCHOR_ENTRY}`; the glob is not reading the cookbook directory."
+    );
+    dirs
+}
+
+/// The per-entry README paths, derived from [`cookbook_entry_dirs`].
+fn cookbook_entry_readmes() -> Vec<String> {
+    cookbook_entry_dirs()
+        .into_iter()
+        .map(|name| format!("docs/cookbook/{name}/README.md"))
+        .collect()
+}
 
 #[test]
 fn required_docs_exist() {
-    for rel in REQUIRED_DOCS.iter().chain(REQUIRED_COOKBOOK_ENTRIES.iter()) {
-        let p = workspace_root().join(rel);
+    let entry_readmes = cookbook_entry_readmes();
+    for rel in REQUIRED_DOCS
+        .iter()
+        .map(|s| (*s).to_string())
+        .chain(entry_readmes.iter().cloned())
+    {
+        let p = workspace_root().join(&rel);
         assert!(
             p.is_file(),
             "Story 4.3/5.13 required doc missing: {}; the five top-level \
-             docs plus the three per-entry cookbook READMEs must all exist",
+             docs plus one README per docs/cookbook/*/ entry ({} entries \
+             derived) must all exist",
             p.display(),
+            entry_readmes.len(),
         );
     }
 }
@@ -106,7 +208,8 @@ fn every_cookbook_entry_has_canonical_five_sections() {
         "## Files",
     ];
 
-    for rel in REQUIRED_COOKBOOK_ENTRIES {
+    for rel in cookbook_entry_readmes() {
+        let rel = rel.as_str();
         let body = read_workspace_file(rel);
         let seen = scan_prose_only_markdown(rel, &body, SECTIONS);
         assert_eq!(
@@ -130,41 +233,22 @@ fn cookbook_index_readme_is_prose_only() {
     scan_prose_only_markdown("docs/cookbook/README.md", &body, &[]);
 }
 
-#[test]
-fn cookbook_entry_consts_match_directory_listing() {
-    // The directory IS the surface (Story 5.13): CI's typecheck loop globs
-    // docs/cookbook/*/, so a new entry directory gets typechecked while the
-    // hardcoded guard lists here and in cli_examples_drift.rs silently skip
-    // it. This sync check turns that gap into a red build.
-    let cookbook = workspace_root().join("docs/cookbook");
-    let mut dirs: Vec<String> = fs::read_dir(&cookbook)
-        .unwrap_or_else(|e| panic!("read_dir {}: {e}", cookbook.display()))
-        .filter_map(|entry| {
-            let entry = entry.expect("dir entry");
-            let is_dir = entry.file_type().expect("file type").is_dir();
-            is_dir.then(|| entry.file_name().to_string_lossy().into_owned())
-        })
-        .collect();
-    dirs.sort();
-
-    let mut expected: Vec<String> = REQUIRED_COOKBOOK_ENTRIES
-        .iter()
-        .map(|rel| {
-            rel.trim_start_matches("docs/cookbook/")
-                .trim_end_matches("/README.md")
-                .to_string()
-        })
-        .collect();
-    expected.sort();
-
-    assert_eq!(
-        dirs, expected,
-        "docs/cookbook/ entry directories and REQUIRED_COOKBOOK_ENTRIES \
-         disagree. Every entry directory must be listed here (and in \
-         cli_examples_drift.rs::ENTRIES) so the shape guards and the smoke \
-         cover it; CI's typecheck glob alone is not structural coverage."
-    );
-}
+// `cookbook_entry_consts_match_directory_listing` lived here until Story
+// 6-session-glance. It compared the hardcoded `REQUIRED_COOKBOOK_ENTRIES`
+// const against the `docs/cookbook/*/` listing; with the const replaced by
+// `cookbook_entry_dirs()` it would compare the glob against itself, which is
+// a tautology, not a guard. Deleted WITH a named successor rather than
+// silently (Story 5.13's lesson: dropping a guard without a successor is a
+// coverage regression):
+//
+//   - Its "every entry dir is covered by the shape guards" intent is now true
+//     by construction, since every guard in this file iterates the glob.
+//   - Its "no entry dir escapes coverage" intent survives as
+//     `tests/cli_examples_drift.rs::every_cookbook_subdirectory_is_a_typechecked_entry`,
+//     which catches the one case glob-derivation cannot: a subdir WITHOUT a
+//     `package.json`, which both CI and the derivation skip by design.
+//   - Its "the derivation actually found something" intent is the A13
+//     positive companion inside `cookbook_entry_dirs()`.
 
 #[test]
 fn quickstart_internal_links_resolve() {
@@ -173,7 +257,11 @@ fn quickstart_internal_links_resolve() {
     // markdown file's parent and assert the target exists on disk.
     // Anchor fragments (`path#fragment`) are split — verifying the
     // fragment resolves to an actual heading is over-engineering for V1.
-    const DOCS_TO_CHECK: &[&str] = &[
+    //
+    // The tail (per-entry cookbook READMEs) is derived from the same
+    // `docs/cookbook/*/` glob as the rest of this file, so a new entry's
+    // README gets link-checked the moment its directory lands.
+    const TOP_LEVEL_DOCS: &[&str] = &[
         "README.md",
         "INSTALL.md",
         "docs/quickstart.md",
@@ -181,13 +269,16 @@ fn quickstart_internal_links_resolve() {
         "docs/protocol.md",
         "docs/cookbook/README.md",
         "docs/no-list.md",
-        "docs/cookbook/state-session-fanout/README.md",
-        "docs/cookbook/rest-cursor-pagination/README.md",
-        "docs/cookbook/dropped-frame-recovery/README.md",
     ];
+    let docs_to_check: Vec<String> = TOP_LEVEL_DOCS
+        .iter()
+        .map(|s| (*s).to_string())
+        .chain(cookbook_entry_readmes())
+        .collect();
 
     let mut failures: Vec<String> = Vec::new();
-    for rel in DOCS_TO_CHECK {
+    for rel in &docs_to_check {
+        let rel = rel.as_str();
         let md_path = workspace_root().join(rel);
         let body = fs::read_to_string(&md_path)
             .unwrap_or_else(|e| panic!("read {}: {e}", md_path.display()));
@@ -517,22 +608,31 @@ fn no_list_enumerates_thirteen_scope_cuts_with_intentional_framing() {
 }
 
 #[test]
-fn cookbook_readme_lists_three_required_entries() {
-    // AC #4 (Story 4.3), reshaped by Story 5.13: the cookbook's README is
-    // the entry-surface index. It must link the three self-contained entry
-    // directories so a reader sees the surface area at a glance. Drift
-    // here = silent loss of discoverability for one of the three patterns.
+fn cookbook_readme_links_every_entry_directory() {
+    // AC #4 (Story 4.3), reshaped by Story 5.13, glob-derived by Story
+    // 6-session-glance: the cookbook's README is the entry-surface index. It
+    // must link EVERY self-contained entry directory so a reader sees the
+    // surface area at a glance. Drift here = silent loss of discoverability
+    // for one of the patterns.
+    //
+    // Was `cookbook_readme_lists_three_required_entries`; both the `three` in
+    // the name and the three literal needles are gone, because the count is
+    // whatever `docs/cookbook/*/` currently holds.
     let body = read_workspace_file("docs/cookbook/README.md");
+    let needles: Vec<String> = cookbook_entry_dirs()
+        .into_iter()
+        .map(|name| format!("]({name}/)"))
+        .collect();
+    let needle_refs: Vec<&str> = needles.iter().map(|s| s.as_str()).collect();
     assert_contains_all(
-        "docs/cookbook/README.md index markers; three entry directory LINKS \
-         (the `](name/)` form, so the quick-run command paths cannot satisfy \
-         this test if the index table is deleted)",
+        &format!(
+            "docs/cookbook/README.md index markers; one directory LINK per \
+             derived entry ({} entries; the `](name/)` form, so the quick-run \
+             command paths cannot satisfy this test if the index table is \
+             deleted)",
+            needle_refs.len(),
+        ),
         &body,
-        &[
-            // Three entry directories as markdown link targets.
-            "](state-session-fanout/)",
-            "](rest-cursor-pagination/)",
-            "](dropped-frame-recovery/)",
-        ],
+        &needle_refs,
     );
 }

@@ -39,7 +39,7 @@ jobs:
       - name: Lint - inline SQL ban
         shell: bash
         run: ./scripts/lint-inline-sql.sh
-      - name: Test the bench-gate wrapper (scripts/run-bench-gate.py)
+      - name: Test the scripts/ helpers (bench-gate wrapper, File List audit)
         shell: bash
         run: python3 -m unittest discover scripts/tests
       # Parallel (libtest default threads) since 2026-07-29. The Epic 2 retro
@@ -75,7 +75,7 @@ jobs:
       - name: Verify Node version (>=22.6 required for --experimental-strip-types)
         shell: bash
         run: node --version | grep -E '^v22\.[6-9]|^v22\.[1-9][0-9]+|^v2[3-9]|^v[3-9]'
-      - name: Typecheck each example
+      - name: Typecheck and unit-test each example
         shell: bash
         run: |
           set -euxo pipefail
@@ -84,7 +84,16 @@ jobs:
             # docs tree; only Node entry dirs get typechecked. The structural
             # guards (tests/cli_examples_drift.rs) keep real entries honest.
             [ -f "$d/package.json" ] || continue
-            (cd "$d" && npm ci && npm run typecheck)
+            # `npm test --if-present` is not optional polish. Before it, an
+            # entry's tests/ sidecar ran NOWHERE in CI: the Rust smoke
+            # (tests/cli_examples.rs) exercises the entry end to end but never
+            # invokes npm, and this job ran typecheck only. session-glance's
+            # tests/glance.test.ts is the sole executable statement of the
+            # canonical deriveRepo contract, and it was dead weight.
+            # `--if-present` so an entry with no test script is still fine;
+            # tests/cli_examples_drift.rs::entry_tests_are_wired_to_npm_test
+            # is what stops an entry from having tests this never runs.
+            (cd "$d" && npm ci && npm run typecheck && npm test --if-present)
           done
 
   shim-bench-gate:

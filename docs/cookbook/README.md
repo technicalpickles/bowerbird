@@ -7,6 +7,7 @@ Recipes for common presenter problems. Each entry is a self-contained directory:
 | [`state-session-fanout/`](state-session-fanout/) | I need to track every session as it appears and route state to a per-session model. |
 | [`rest-cursor-pagination/`](rest-cursor-pagination/) | I need to fetch a session's history via REST and handle event-log truncation gracefully. |
 | [`dropped-frame-recovery/`](dropped-frame-recovery/) | My WebSocket dropped or the daemon restarted; how do I catch up without losing events? |
+| [`session-glance/`](session-glance/) | I missed a notification; what is every live session doing right now, grouped by repo? |
 
 The patterns are orthogonal; read the one matching your use case.
 
@@ -34,6 +35,9 @@ node --experimental-strip-types docs/cookbook/state-session-fanout/src/index.ts
 
 node --experimental-strip-types docs/cookbook/rest-cursor-pagination/src/index.ts session-alpha
 
+node --experimental-strip-types docs/cookbook/session-glance/src/index.ts
+# one-shot: every live session grouped by repo, then it exits
+
 node --experimental-strip-types docs/cookbook/dropped-frame-recovery/src/index.ts &
 sleep 1
 bowerbird stop && bowerbird start && bowerbird replay
@@ -53,4 +57,4 @@ See each entry's `README.md` for expected output, how the pattern works, and ada
 
 These directories are a TypeScript project zone, NOT part of the Cargo workspace. The root `Cargo.toml`'s `[workspace] members = ["crates/*"]` deliberately does not include them, so `cargo build --workspace`, `cargo clippy --workspace`, and `cargo test --workspace` stay Rust-only. The TypeScript smoke is invoked by `tests/cli_examples.rs` (a workspace-root test crate) which spawns `node --experimental-strip-types` as a subprocess, and CI typechecks each entry (`tsc --noEmit`) on every PR. The authoritative decision is `docs/bmad/project-context.md` §Example presenters.
 
-More recipes will follow as patterns emerge. Open an issue if you have a use case the existing three don't cover.
+More recipes will follow as patterns emerge. Open an issue if you have a use case the existing entries don't cover.

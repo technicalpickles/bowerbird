@@ -1,5 +1,6 @@
-//! End-to-end smoke tests for the three cookbook reference entries (Story
-//! 4.2; relocated into `docs/cookbook/` by Story 5.13's consolidation).
+//! End-to-end smoke tests for the cookbook reference entries (Story 4.2;
+//! relocated into `docs/cookbook/` by Story 5.13's consolidation; joined by
+//! `session-glance` in Story 6-session-glance).
 //!
 //! Each test orchestrates a real daemon subprocess + a Node subprocess
 //! running one of the TypeScript cookbook entries, then asserts the entry's
@@ -16,7 +17,7 @@
 //! contributors on stale local environments.
 
 use std::path::PathBuf;
-use std::process::{Child, Stdio};
+use std::process::{Child, Output, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -208,6 +209,24 @@ fn cookbook_dir() -> PathBuf {
 /// stderr are piped so the test can read them line-by-line; the daemon's
 /// bind_addr lives in `<tmp>/.bowerbird/server.json`, which the entry reads
 /// via `homedir()`-relative path resolution.
+///
+/// **`--disable-warning=ExperimentalWarning` is load-bearing, not tidiness.**
+/// `--experimental-strip-types` emits two stderr lines on the Node versions
+/// where it is still flagged:
+///
+/// ```text
+/// (node:123) ExperimentalWarning: Type Stripping is an experimental feature ...
+/// (Use `node --trace-warnings ...` to show where the warning was created)
+/// ```
+///
+/// Node unflagged type stripping in 22.18, so a modern local toolchain emits
+/// none of that and every "stderr is exactly one line" assertion passes on a
+/// laptop -- while CI, pinned to Node 22.6 by `.github/workflows/ci.yml`, sees
+/// three lines and goes red. Suppressing it HERE (where every entry is
+/// spawned) rather than filtering it at each assertion is what keeps the
+/// property structural: a new assertion on stderr shape inherits the fix
+/// instead of having to remember it. The flag has been available since Node
+/// 21.3 / 20.11, comfortably below this file's 22.6 floor.
 fn spawn_example(
     tmp: &TempDir,
     example_name: &str,
@@ -217,7 +236,8 @@ fn spawn_example(
     let node = node_bin().expect("node binary already gated by node_22_6_available");
     let entry = cookbook_dir().join(example_name).join("src/index.ts");
     let mut cmd = std::process::Command::new(node);
-    cmd.arg("--experimental-strip-types")
+    cmd.arg("--disable-warning=ExperimentalWarning")
+        .arg("--experimental-strip-types")
         .arg(&entry)
         .args(extra_args)
         .env("HOME", tmp.path())
@@ -268,6 +288,98 @@ fn read_stdout_until<F: FnMut(&str) -> bool>(
         "{label}: timed out before predicate matched; collected lines:\n{}",
         lines.join("\n")
     );
+}
+
+/// Wait for a ONE-SHOT entry to exit and collect both pipes.
+///
+/// Two properties, both of which the naive `child.wait()` then
+/// `read_to_string(stdout)` shape lacks:
+///
+///  1. `wait_with_output` drains stdout and stderr CONCURRENTLY with the
+///     wait. Waiting first and reading after deadlocks the moment the child
+///     writes more than a pipe buffer (64KiB on Linux) to the stream that is
+///     not being read: the child blocks on write, the parent blocks on wait.
+///     Today's entries print a few lines, so it has not bitten -- but the
+///     daemon-down loop is glob-derived now, so the entry that trips it will
+///     be one nobody edited this file for.
+///  2. The wait is BOUNDED. The child is killed at `GLANCE_HANG_GUARD` so a
+///     hung entry fails by name instead of hanging the suite with no
+///     diagnostic (CLAUDE.md: timeouts around child-exits are hang detectors,
+///     not latency assertions).
+///
+/// **The kill is issued by THIS thread, from `try_wait`, and not by a watchdog
+/// thread holding a raw pid.** The watchdog shape it replaces had three
+/// defects, all narrow and all real:
+///
+///  - PID REUSE. `wait_with_output` reaps the child, and only then did the
+///    main thread store `finished`. In that window the watchdog's final load
+///    could read `false` and `SIGKILL` a pid the OS had already handed to
+///    somebody else's process.
+///  - A panic in `wait_with_output` skipped the store entirely, leaking a
+///    thread that would `SIGKILL` a stale pid up to 30s later, well into
+///    whatever test ran next.
+///  - `watchdog.join().unwrap_or(false)` turned a panicked watchdog into
+///    "nothing was killed", silently disabling the guard.
+///
+/// Owning the `Child` here removes all three: `try_wait` reaps only when this
+/// thread asks it to, so the pid cannot be recycled while we still hold the
+/// handle, and `Child::kill` targets that handle rather than a bare integer.
+/// The pipes are drained by reader threads, which is what `wait_with_output`
+/// was doing for us and is still required to avoid the pipe-buffer deadlock.
+fn wait_bounded(mut child: Child, label: &str) -> Output {
+    fn drain<R: std::io::Read + Send + 'static>(
+        pipe: Option<R>,
+    ) -> Option<std::thread::JoinHandle<Vec<u8>>> {
+        pipe.map(|mut p| {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = p.read_to_end(&mut buf);
+                buf
+            })
+        })
+    }
+    let stdout_reader = drain(child.stdout.take());
+    let stderr_reader = drain(child.stderr.take());
+
+    let deadline = Instant::now() + GLANCE_HANG_GUARD;
+    let mut killed = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    killed = true;
+                    let _ = child.kill();
+                    break child
+                        .wait()
+                        .unwrap_or_else(|e| panic!("{label}: wait after kill failed: {e}"));
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => panic!("{label}: try_wait failed: {e}"),
+        }
+    };
+    // After the exit (or the kill) both pipes are closed, so these joins are
+    // bounded by the reads finishing rather than by the child's lifetime.
+    let stdout = stdout_reader
+        .map(|h| h.join().unwrap_or_default())
+        .unwrap_or_default();
+    let stderr = stderr_reader
+        .map(|h| h.join().unwrap_or_default())
+        .unwrap_or_default();
+    assert!(
+        !killed,
+        "{label}: the entry never exited within {GLANCE_HANG_GUARD:?} and was killed by the \
+         hang guard. A one-shot entry that does not exit is the failure mode the request \
+         timeout in src/index.ts exists to prevent. stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr),
+    );
+    Output {
+        status,
+        stdout,
+        stderr,
+    }
 }
 
 fn dump_child_diagnostics(label: &str, child: &mut Child) -> String {
@@ -719,33 +831,1059 @@ fn dropped_frame_recovery_recovers_after_close_frame_and_resumes() {
 // AC #1, #2, #3: examples fail clearly when the daemon is down.
 // ---------------------------------------------------------------------------
 
+/// Is `p` a directory, FOLLOWING symlinks?
+///
+/// `DirEntry::file_type()` does NOT follow symlinks (on Unix it is readdir's
+/// `d_type`), so a symlinked entry directory reads as neither file nor
+/// directory and every listing built on it silently drops the entry. CI's
+/// `for d in docs/cookbook/*/` glob does the opposite: the shell's `*/`
+/// resolves the link and matches, so CI would typecheck a directory that no
+/// guard here has ever seen. `fs::metadata` resolves, which puts the two back
+/// in agreement.
+///
+/// Duplicated in all three `cookbook_entry_dirs()` copies deliberately: each
+/// `tests/*.rs` file is its own crate. Fixing it in ONE of them is how the
+/// symlink hole half-closed the first time (taskwarrior `4238d5ea` tracks the
+/// shared-helper cleanup).
+fn is_dir_following_symlinks(p: &std::path::Path) -> bool {
+    std::fs::metadata(p).map(|m| m.is_dir()).unwrap_or(false)
+}
+
+/// Every cookbook entry directory, derived from the `docs/cookbook/*/` glob
+/// exactly as `tests/cli_docs_drift.rs` and `tests/cli_examples_drift.rs` do
+/// (Story 6-session-glance, AC 4): a subdir with no `package.json` is not an
+/// entry and is skipped, mirroring CI's own filter.
+///
+/// The daemon-down contract below is cookbook-wide, so the loop is derived
+/// rather than listed. A hardcoded list here would have exactly the failure
+/// mode AC 4 is about: a new entry gets typechecked and smoked but silently
+/// skips the "fails clearly with no daemon" assertion.
+fn cookbook_entry_dirs() -> Vec<String> {
+    let mut dirs: Vec<String> = std::fs::read_dir(cookbook_dir())
+        .expect("read_dir docs/cookbook")
+        .filter_map(|entry| {
+            let entry = entry.expect("dir entry");
+            if !is_dir_following_symlinks(&entry.path()) {
+                return None;
+            }
+            if !entry.path().join("package.json").is_file() {
+                return None;
+            }
+            Some(entry.file_name().to_string_lossy().into_owned())
+        })
+        .collect();
+    dirs.sort();
+    // A13 positive companion: an empty derivation would make the loop below
+    // assert nothing while still reporting green.
+    assert!(
+        dirs.len() >= 3 && dirs.iter().any(|d| d == "session-glance"),
+        "docs/cookbook/*/ derivation looks wrong: {dirs:?}"
+    );
+    dirs
+}
+
 #[test]
 fn cookbook_entries_fail_clearly_when_daemon_down() {
     if !node_22_6_available() {
         return;
     }
-    // No daemon started.
+    // No daemon started, so `server.json` is MISSING. That is daemon-down
+    // failure mode (a). Mode (b), `server.json` present but stale and the
+    // connection refused, is a different code path and is covered by
+    // `session_glance_names_the_address_when_server_json_is_stale`.
     let tmp = TempDir::new().expect("tempdir");
 
-    for example in [
-        "state-session-fanout",
-        "rest-cursor-pagination",
-        "dropped-frame-recovery",
-    ] {
-        let mut child = spawn_example(&tmp, example, &[], &[]);
-        let status = child.wait().expect("daemon-down subprocess wait");
+    for example in cookbook_entry_dirs() {
+        let example = example.as_str();
+        let child = spawn_example(&tmp, example, &[], &[]);
+        let out = wait_bounded(child, example);
         assert!(
-            !status.success(),
+            !out.status.success(),
             "{example}: expected non-zero exit with no daemon"
         );
-        use std::io::Read;
-        let mut stderr = String::new();
-        if let Some(mut s) = child.stderr.take() {
-            let _ = s.read_to_string(&mut stderr);
-        }
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
         assert!(
             stderr.contains("server.json"),
             "{example}: stderr should mention server.json on daemon-down; got:\n{stderr}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Story 6-session-glance: the one-shot glance entry.
+//
+// The bundled `bowerbird replay` fixture cannot drive these assertions: every
+// one of its sessions ends on `Stop` (so they all land on `Idle`), none carry
+// a `cwd`, and none carry a `pid`, which means the liveness probe would mark
+// them all `Ended` on its next 5s tick (`projection/liveness.rs`:
+// `last_pid IS NULL` -> `no_pid_at_upgrade`). So these tests replay their own
+// fixture: distinct LIVE pids so the probe leaves the rows alone (distinct
+// because a shared pid triggers Story 5.11 supersession), real directory
+// trees so the repo derivation has something to walk, and one deliberately
+// `Ended` session so "non-Ended only" is an assertion rather than an accident.
+// ---------------------------------------------------------------------------
+
+/// Hang detector for the glance polls, not a latency assertion.
+const GLANCE_HANG_GUARD: Duration = Duration::from_secs(30);
+
+struct GlanceFixture {
+    /// Path to the JSONL file `bowerbird replay` consumes.
+    path: PathBuf,
+    /// Basename of the ordinary repository the derivation should find by
+    /// walking up from a subdirectory.
+    repo: String,
+    /// Basename of the git-worktree directory (its `.git` is a FILE, so the
+    /// derivation must stop there rather than walking to the outer repo).
+    worktree: String,
+}
+
+/// Build the replay fixture plus the directory tree its `cwd` values point at.
+///
+/// `live_pids` must be three DISTINCT pids of processes that are alive: the
+/// liveness probe ends a session whose `last_pid` is null or dead, and the
+/// event-driven supersession path ends the predecessor when two sessions
+/// claim the same pid.
+fn write_glance_fixture(tmp: &TempDir, live_pids: [u32; 3]) -> GlanceFixture {
+    let root = tmp.path().join("work");
+    let repo = root.join("bowerbird-fixture-repo");
+    let repo_subdir = repo.join("crates").join("daemon");
+    // A worktree nested INSIDE the repo, so a derivation that tested
+    // `.git`.isDirectory() would walk past it and report the outer repo.
+    let worktree = repo.join("worktrees").join("wt-feature-branch");
+    std::fs::create_dir_all(repo.join(".git")).expect("mkdir repo/.git");
+    std::fs::create_dir_all(&repo_subdir).expect("mkdir repo subdir");
+    std::fs::create_dir_all(&worktree).expect("mkdir worktree");
+    std::fs::write(
+        worktree.join(".git"),
+        "gitdir: /elsewhere/.git/worktrees/wt-feature-branch\n",
+    )
+    .expect("write worktree .git file");
+
+    let line = |event_id: i64,
+                session_id: &str,
+                kind: &str,
+                payload: serde_json::Value,
+                pid: Option<u32>,
+                cwd: Option<&std::path::Path>| {
+        serde_json::json!({
+            "event_id": event_id,
+            "source": "claude",
+            "session_id": session_id,
+            "kind": kind,
+            "reaction": serde_json::Value::Null,
+            // `payload` rides the wire as a JSON *string*, verbatim.
+            "payload": payload.to_string(),
+            "created_at": 1_700_000_000_000i64,
+            "pid": pid,
+            "cwd": cwd.map(|p| p.to_string_lossy().into_owned()),
+        })
+        .to_string()
+    };
+
+    let body = [
+        // PreToolUse -> Working. cwd is BELOW the repo root, so rule 2 has to
+        // walk up to find `.git`.
+        line(
+            1,
+            "sess-alpha",
+            "PreToolUse",
+            serde_json::json!({ "tool_name": "Read" }),
+            Some(live_pids[0]),
+            Some(&repo_subdir),
+        ),
+        // Notification(permission_prompt) -> WaitingInput. cwd IS the
+        // worktree, whose `.git` is a file.
+        line(
+            2,
+            "sess-beta",
+            "Notification",
+            serde_json::json!({ "notification_type": "permission_prompt" }),
+            Some(live_pids[1]),
+            Some(&worktree),
+        ),
+        // Stop -> Idle, with no cwd at all: the `(unknown repo)` bucket.
+        line(
+            3,
+            "sess-gamma",
+            "Stop",
+            serde_json::json!({}),
+            Some(live_pids[2]),
+            None,
+        ),
+        // SessionEnded -> Ended, which the default filter must exclude. No
+        // pid needed: the probe skips rows that are already Ended.
+        line(
+            4,
+            "sess-delta",
+            "SessionEnded",
+            serde_json::json!({ "reason": "pid_dead" }),
+            None,
+            Some(&repo),
+        ),
+    ]
+    .join("\n");
+
+    let path = tmp.path().join("glance-fixture.jsonl");
+    std::fs::write(&path, format!("{body}\n")).expect("write glance fixture");
+    GlanceFixture {
+        path,
+        repo: repo
+            .file_name()
+            .expect("repo basename")
+            .to_string_lossy()
+            .into_owned(),
+        worktree: worktree
+            .file_name()
+            .expect("worktree basename")
+            .to_string_lossy()
+            .into_owned(),
+    }
+}
+
+/// Three distinct pids that are certainly alive: this test process, the
+/// daemon it just started, and pid 1 (init/launchd, which `kill(1, 0)`
+/// reports as EPERM and the probe therefore treats as alive).
+///
+/// All THREE pairs are checked, not just `self != daemon`. The hardcoded `1`
+/// is the one nobody thinks about: in a container whose entrypoint is the
+/// test binary, `std::process::id()` IS 1, two fixture sessions then claim
+/// the same pid, the Story 5.11 supersession path ends the predecessor, the
+/// count fence never reaches 3, and BOTH glance tests burn the full 30s hang
+/// guard before failing with a message about counts rather than about pids.
+fn distinct_live_pids(tmp: &TempDir) -> [u32; 3] {
+    let self_pid = std::process::id();
+    let daemon_pid = read_pid_file(tmp).expect("daemon pid file") as u32;
+    let pids = [self_pid, daemon_pid, 1];
+    for (i, a) in pids.iter().enumerate() {
+        for b in &pids[i + 1..] {
+            assert_ne!(
+                a, b,
+                "the fixture needs three DISTINCT live pids and got {pids:?}; a shared pid \
+                 triggers Story 5.11 supersession, which ends one of the fixture sessions \
+                 and makes the count fence unreachable"
+            );
+        }
+    }
+    pids
+}
+
+/// Run session-glance to completion. Returns `(success, stdout, stderr)`.
+fn run_glance(tmp: &TempDir, args: &[&str]) -> (bool, String, String) {
+    run_glance_with_env(tmp, args, &[])
+}
+
+/// `run_glance` with extra environment for the entry process. Passed per-child
+/// via `Command::env`, never through `std::env::set_var` (CLAUDE.md: mutating
+/// process env races concurrent reads and subprocess spawns).
+fn run_glance_with_env(
+    tmp: &TempDir,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> (bool, String, String) {
+    let child = spawn_example(tmp, "session-glance", args, extra_env);
+    let out = wait_bounded(child, &format!("session-glance {args:?}"));
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Poll `--count` until it reports `expected`, or the hang guard expires.
+///
+/// `POST /replay` returns once the envelopes are queued on the ingest
+/// channel, not once the projection has committed, so the rows land shortly
+/// after `bowerbird replay` exits. This is a probe fence on an observable
+/// (the count the entry itself reports), not a sleep-to-synchronize.
+fn wait_for_glance_count(tmp: &TempDir, expected: usize) {
+    let deadline = Instant::now() + GLANCE_HANG_GUARD;
+    let mut last = String::new();
+    while Instant::now() < deadline {
+        let (ok, stdout, stderr) = run_glance(tmp, &["--count"]);
+        last = format!("ok={ok} stdout={stdout:?} stderr={stderr:?}");
+        if let Some(n) = ok.then(|| stdout.trim().parse::<usize>().ok()).flatten() {
+            if n == expected {
+                return;
+            }
+            // Fail fast rather than burning the hang guard: the count only
+            // rises as rows commit, so OVERSHOOTING it can never be fixed by
+            // waiting. The fixture has exactly `expected` non-Ended sessions,
+            // so a higher count means the `?state=` filter is letting the
+            // Ended one through.
+            if n > expected {
+                force_stop(tmp);
+                panic!(
+                    "session-glance --count reported {n}, more than the {expected} \
+                     non-Ended sessions the fixture defines. The ?state= filter is \
+                     not excluding Ended."
+                );
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    force_stop(tmp);
+    panic!("session-glance --count never reached {expected}; last attempt: {last}");
+}
+
+#[test]
+fn session_glance_groups_live_sessions_by_repo_with_ages() {
+    if !node_22_6_available() {
+        return;
+    }
+    let tmp = TempDir::new().expect("tempdir");
+    start_daemon(&tmp);
+    let fixture = write_glance_fixture(&tmp, distinct_live_pids(&tmp));
+    bowerbird_cmd_in(&tmp)
+        .arg("replay")
+        .arg(&fixture.path)
+        .assert()
+        .success();
+    wait_for_glance_count(&tmp, 3);
+
+    let (ok, stdout, stderr) = run_glance(&tmp, &[]);
+
+    // Positive companion for the "Ended is excluded" assertion below: ask for
+    // Ended explicitly and confirm sess-delta really is in the daemon and
+    // really is Ended. Without this, its absence from the default output
+    // could just mean the fixture row never landed.
+    let (ended_ok, ended_stdout, ended_stderr) = run_glance(&tmp, &["--state=ended"]);
+
+    stop_daemon(&tmp);
+    force_stop(&tmp);
+
+    assert!(ok, "session-glance exited non-zero; stderr:\n{stderr}");
+    assert!(
+        ended_ok,
+        "session-glance --state=ended exited non-zero; stderr:\n{ended_stderr}"
+    );
+    assert!(
+        ended_stdout.contains("claude/sess-delta") && ended_stdout.contains("Ended"),
+        "precondition: sess-delta must exist in the Ended state; got:\n{ended_stdout}"
+    );
+
+    // AC 1: grouped by repository, derived presenter-side from `cwd`.
+    let lines: Vec<&str> = stdout.lines().collect();
+    for heading in [
+        fixture.repo.as_str(),
+        fixture.worktree.as_str(),
+        "(unknown repo)",
+    ] {
+        assert!(
+            lines.contains(&heading),
+            "expected a `{heading}` repo heading; got:\n{stdout}"
+        );
+    }
+    // The worktree's `.git` is a FILE. Grouping it under the outer repo would
+    // mean the derivation tested isDirectory() and walked past it.
+    let worktree_idx = lines
+        .iter()
+        .position(|l| *l == fixture.worktree)
+        .expect("worktree heading");
+    assert!(
+        lines[worktree_idx + 1].contains("claude/sess-beta"),
+        "sess-beta must sit under the worktree heading; got:\n{stdout}"
+    );
+
+    // AC 1: each session carries its state and an age.
+    for (session, state) in [
+        ("sess-alpha", "Working"),
+        ("sess-beta", "WaitingInput"),
+        ("sess-gamma", "Idle"),
+    ] {
+        let line = lines
+            .iter()
+            .find(|l| l.contains(&format!("claude/{session}")))
+            .unwrap_or_else(|| panic!("no line for {session}; got:\n{stdout}"));
+        assert!(
+            line.starts_with("  "),
+            "session lines are indented under their repo heading; got: {line:?}"
+        );
+        assert!(
+            line.contains(state),
+            "{session} should render `{state}` (PascalCase, verbatim from the \
+             wire); got: {line:?}"
+        );
+        let age = line.rsplit("  ").next().unwrap_or("");
+        assert!(
+            age.ends_with('s') || age.ends_with('m') || age.ends_with('h'),
+            "{session} should render an age from started_at, not a raw \
+             timestamp; got: {line:?}"
+        );
+        assert!(
+            !line.contains("NaN") && !line.contains("1970"),
+            "age must never render NaN or a 1970 timestamp; got: {line:?}"
+        );
+    }
+
+    // AC 1: every NON-ENDED session, which means the Ended one is absent.
+    assert!(
+        !stdout.contains("sess-delta"),
+        "sess-delta is Ended and must not appear in the default glance; got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("Ended"),
+        "the default filter is the four non-Ended tokens; got:\n{stdout}"
+    );
+}
+
+#[test]
+fn session_glance_machine_modes_pin_the_output_contract() {
+    if !node_22_6_available() {
+        return;
+    }
+    let tmp = TempDir::new().expect("tempdir");
+    start_daemon(&tmp);
+    let fixture = write_glance_fixture(&tmp, distinct_live_pids(&tmp));
+    bowerbird_cmd_in(&tmp)
+        .arg("replay")
+        .arg(&fixture.path)
+        .assert()
+        .success();
+    wait_for_glance_count(&tmp, 3);
+
+    let count = run_glance(&tmp, &["--count"]);
+    let blocked = run_glance(&tmp, &["--count", "--state=waitinginput"]);
+    let json = run_glance(&tmp, &["--format=json"]);
+    let bad_flag = run_glance(&tmp, &["--fromat=json"]);
+    let bad_state = run_glance(&tmp, &["--state=running"]);
+
+    stop_daemon(&tmp);
+    force_stop(&tmp);
+
+    // AC 2: `--count` is a single integer on stdout and nothing else. This is
+    // the entirety of the tmux status line's data path, so it is asserted as
+    // a contract, not spot-checked.
+    assert!(count.0, "--count exited non-zero; stderr:\n{}", count.2);
+    assert_eq!(
+        count.1.lines().count(),
+        1,
+        "--count must print exactly one line; got:\n{}",
+        count.1
+    );
+    assert_eq!(
+        count
+            .1
+            .trim()
+            .parse::<usize>()
+            .expect("--count is an integer"),
+        3
+    );
+    assert!(
+        blocked.0 && blocked.1.trim() == "1",
+        "--count --state=waitinginput should report the one blocked session; \
+         got stdout={:?} stderr={:?}",
+        blocked.1,
+        blocked.2
+    );
+
+    // AC 2: `--format=json` is NDJSON, one object per session, fixed field set.
+    assert!(json.0, "--format=json exited non-zero; stderr:\n{}", json.2);
+    let rows: Vec<serde_json::Value> = json
+        .1
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("NDJSON line {l:?}: {e}")))
+        .collect();
+    assert_eq!(rows.len(), 3, "one object per session; got:\n{}", json.1);
+    // Pinned against WELL-FORMED input only, which is the limit of what this
+    // test can see: `JSON.stringify` omits `undefined` values, so a junk row
+    // emits a SHORT object rather than one with wrong values, and no daemon
+    // this test drives produces one.
+    // `session_glance_rejects_an_array_of_things_that_are_not_sessions` is the
+    // counterpart that pins the malformed side.
+    const CONTRACT_FIELDS: &[&str] = &[
+        "repo",
+        "source",
+        "session_id",
+        "current_state",
+        "age",
+        "age_seconds",
+        "started_at",
+        "cwd",
+    ];
+    for row in &rows {
+        let obj = row.as_object().expect("NDJSON row is an object");
+        let mut keys: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
+        keys.sort();
+        let mut expected: Vec<&str> = CONTRACT_FIELDS.to_vec();
+        expected.sort();
+        assert_eq!(
+            keys, expected,
+            "the --format=json field set is the documented contract \
+             (README.md 'Run it'); adding or removing a key breaks every \
+             consumer. Row: {row}"
+        );
+    }
+    // The repo derivation is present in machine mode too, and the null-cwd
+    // session is bucketed rather than dropped.
+    let repos: Vec<&str> = rows
+        .iter()
+        .map(|r| r["repo"].as_str().expect("repo is a string"))
+        .collect();
+    assert!(
+        repos.contains(&"(unknown repo)"),
+        "a null cwd must land in the named bucket, not be dropped; got {repos:?}"
+    );
+    assert!(
+        repos.contains(&fixture.worktree.as_str()),
+        "the worktree must group by its own basename; got {repos:?}"
+    );
+
+    // AC 2 / `machine-output-contract`: bad input is a one-line failure that
+    // names the input and the accepted set, never a stack trace.
+    for (label, (ok, stdout, stderr), needle, accepted) in [
+        ("--fromat=json", bad_flag, "--fromat=json", "--count"),
+        (
+            "--state=running",
+            bad_state,
+            "running",
+            "idle, working, waitinginput, ended, unknown",
+        ),
+    ] {
+        assert!(!ok, "{label}: expected a non-zero exit; stdout:\n{stdout}");
+        assert_eq!(
+            stderr.lines().count(),
+            1,
+            "{label}: expected exactly one stderr line, not a stack trace; got:\n{stderr}"
+        );
+        assert!(
+            stderr.contains(needle),
+            "{label}: stderr must name the bad input; got:\n{stderr}"
+        );
+        assert!(
+            stderr.contains(accepted),
+            "{label}: stderr must list the accepted set; got:\n{stderr}"
+        );
+    }
+}
+
+/// Daemon-down failure mode (b), and the CI-side counterpart of AC 6's
+/// provoked adversity ("daemon stopped mid-day").
+///
+/// `cookbook_entries_fail_clearly_when_daemon_down` covers mode (a) only: no
+/// daemon ever ran, so `server.json` is missing and the read fails. The
+/// interesting case is different. The daemon removes `server.json` on a CLEAN
+/// shutdown, so a crash, an OOM kill, or a `kill -9` leaves the file behind
+/// pointing at an address nothing is listening on. Node reports that as a
+/// bare `TypeError: fetch failed`, which names neither the address nor the
+/// fix and is precisely the stack-trace-shaped failure AC 6 forbids.
+#[test]
+fn session_glance_names_the_address_when_server_json_is_stale() {
+    if !node_22_6_available() {
+        return;
+    }
+    let tmp = TempDir::new().expect("tempdir");
+    start_daemon(&tmp);
+
+    let server_json = data_dir(&tmp).join("server.json");
+    let before = std::fs::read_to_string(&server_json).expect("server.json while daemon is up");
+    let bind_addr = serde_json::from_str::<serde_json::Value>(&before).expect("server.json parses")
+        ["bind_addr"]
+        .as_str()
+        .expect("bind_addr is a string")
+        .to_string();
+
+    // SIGKILL, not `bowerbird stop`: a graceful stop deletes server.json and
+    // would put us back on mode (a).
+    let pid = read_pid_file(&tmp).expect("daemon pid file");
+    #[allow(unsafe_code)]
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    assert!(
+        wait_for_pid_dead(pid, Instant::now() + GLANCE_HANG_GUARD),
+        "daemon did not die after SIGKILL"
+    );
+
+    // A13 positive companion: the assertions below are only meaningful if the
+    // precondition actually fired, i.e. the file really did survive the kill.
+    // If a future change made shutdown remove it here too, this test would
+    // otherwise keep passing while silently testing mode (a) again.
+    let after = std::fs::read_to_string(&server_json)
+        .expect("server.json must SURVIVE an unclean daemon death; that is mode (b)");
+    assert_eq!(
+        after, before,
+        "the stale server.json should still point at the dead daemon's address"
+    );
+
+    // A13 positive companion, and the guard against a genuinely nasty false
+    // report. SIGKILL frees the ephemeral port immediately, and every daemon
+    // in this file shares `EXAMPLES_TEST_TOKEN` -- so a parallel test's daemon
+    // that happened to bind this freed port would answer the glance with a
+    // perfectly valid HTTP 200. The assertions below would then fail as though
+    // the entry's error handling were broken. Prove the address is dead FIRST,
+    // so a rebind fails the precondition by name instead.
+    let probe_addr: std::net::SocketAddr = bind_addr
+        .parse()
+        .unwrap_or_else(|e| panic!("bind_addr {bind_addr:?} is not a socket address: {e}"));
+    assert!(
+        std::net::TcpStream::connect_timeout(&probe_addr, Duration::from_millis(500)).is_err(),
+        "precondition: nothing may be listening on {bind_addr} after the SIGKILL. Something \
+         rebound the freed ephemeral port, so the assertions below would be measuring a live \
+         daemon's response rather than the refused-connection path this test exists for."
+    );
+
+    let (ok, stdout, stderr) = run_glance(&tmp, &[]);
+    force_stop(&tmp);
+
+    assert!(!ok, "expected a non-zero exit; stdout:\n{stdout}");
+    // CONTENT assertions run BEFORE the one-line shape assertion, and the
+    // ordering is load-bearing rather than stylistic. The raw Node failure
+    // this test exists to forbid is a MULTI-line stack, so behind
+    // `stderr.lines().count() == 1` the `"    at "` ban could never be the
+    // assertion that fires: the count would go first every time, and the ban
+    // would be permanently unobservable-red (A13). In this order, a stack
+    // trace is reported as "AC 6 forbids the raw Node failure shape", which is
+    // also the more useful diagnosis. The count assertion stays observable in
+    // its own right: two short lines with no banned content trip it and
+    // nothing else.
+    for banned in ["TypeError", "fetch failed", "    at "] {
+        assert!(
+            !stderr.contains(banned),
+            "AC 6 forbids the raw Node failure shape; stderr contains {banned:?}:\n{stderr}"
+        );
+    }
+    // And it must NOT be the mode-(a) message: the file is right there.
+    assert!(
+        !stderr.contains("cannot read"),
+        "mode (b) must not be reported as a missing server.json; got:\n{stderr}"
+    );
+    for needle in [
+        "cannot reach the daemon",
+        &format!("http://{bind_addr}"),
+        "server.json",
+        "bowerbird start",
+    ] {
+        assert!(
+            stderr.contains(needle),
+            "stale-server.json message must contain {needle:?}; got:\n{stderr}"
+        );
+    }
+    assert_eq!(
+        stderr.lines().count(),
+        1,
+        "expected exactly one stderr line, never a stack trace; got:\n{stderr}"
+    );
+}
+
+/// Daemon-down failure mode (c): something IS on the address, it accepted the
+/// connection, and it never answers.
+///
+/// The two modes above both resolve fast (a missing file, a refused
+/// connection). This one resolved never: before the request timeout landed,
+/// the entry sat on the socket with no message, no output, and no exit --
+/// measured at `timeout 12` giving exit 124. That is worse than either of the
+/// other two for the consumer this entry exists to feed: `6-tmux-ambient`
+/// shells out on a status-line interval, so a mode that hangs accumulates
+/// stuck processes instead of printing one bad status.
+///
+/// No daemon here at all. A plain `TcpListener` that never calls `accept()`
+/// reproduces it exactly: the kernel completes the handshake from the backlog,
+/// so `connect` succeeds and the HTTP response never comes.
+#[test]
+fn session_glance_gives_up_when_the_daemon_accepts_but_never_answers() {
+    if !node_22_6_available() {
+        return;
+    }
+    let tmp = TempDir::new().expect("tempdir");
+
+    // Held for the whole test, deliberately never accepted from.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind silent listener");
+    let bind_addr = listener.local_addr().expect("local_addr").to_string();
+
+    std::fs::create_dir_all(data_dir(&tmp)).expect("mkdir .bowerbird");
+    std::fs::write(
+        data_dir(&tmp).join("server.json"),
+        format!("{{\"bind_addr\":\"{bind_addr}\"}}"),
+    )
+    .expect("write server.json");
+
+    // A13 positive companion: the precondition is that the address is
+    // CONNECTABLE (that is what makes this mode (c) and not mode (b)). If the
+    // listener were not really listening the entry would take the
+    // refused-connection path and this test would silently become a third copy
+    // of the stale-server.json test.
+    let probe: std::net::SocketAddr = bind_addr.parse().expect("socket addr");
+    assert!(
+        std::net::TcpStream::connect_timeout(&probe, Duration::from_millis(500)).is_ok(),
+        "precondition: {bind_addr} must accept connections, or this is mode (b) not mode (c)"
+    );
+
+    // The deadline is driven DOWN to 1500ms through the documented env
+    // override, and that is what makes the elapsed assertion below observable.
+    // See `GIVE_UP_BUDGET`.
+    let started = Instant::now();
+    let (ok, stdout, stderr) =
+        run_glance_with_env(&tmp, &[], &[("BOWERBIRD_GLANCE_TIMEOUT_MS", "1500")]);
+    let elapsed = started.elapsed();
+    drop(listener);
+
+    assert!(!ok, "expected a non-zero exit; stdout:\n{stdout}");
+    for banned in ["TypeError", "fetch failed", "    at "] {
+        assert!(
+            !stderr.contains(banned),
+            "AC 6 forbids the raw Node failure shape; stderr contains {banned:?}:\n{stderr}"
+        );
+    }
+    for needle in [
+        "did not answer",
+        &format!("http://{bind_addr}"),
+        "bowerbird start",
+    ] {
+        assert!(
+            stderr.contains(needle),
+            "the unanswered-request message must contain {needle:?}; got:\n{stderr}"
+        );
+    }
+    assert_eq!(
+        stderr.lines().count(),
+        1,
+        "expected exactly one stderr line, never a stack trace; got:\n{stderr}"
+    );
+    // Hang detector, not a latency assertion -- but a hang detector that can
+    // actually fire. `elapsed < GLANCE_HANG_GUARD` could not: `wait_bounded`
+    // already panics at that same deadline inside `run_glance`, so the only way
+    // to REACH this line was to be under it. It was also far too loose to
+    // notice the deadline widening from 5s to 25s, which is a real regression
+    // for a status line that shells out on an interval.
+    //
+    // With the override at 1500ms, `GIVE_UP_BUDGET` is a bound the entry clears
+    // by an order of magnitude when the deadline works and misses whenever the
+    // deadline is ignored, widened, or lost. The slack is for Node startup on a
+    // starved 4-vCPU CI runner, not for the timeout.
+    //
+    // It runs BEFORE the "1500ms" companion below, and the order is the point:
+    // widening the deadline changes both the elapsed time and the number in the
+    // message, so with the companion first the reported failure was "the
+    // message should say 1500ms" and this bound never fired at all -- the same
+    // unobservable-red shape one layer over.
+    const GIVE_UP_BUDGET: Duration = Duration::from_secs(12);
+    assert!(
+        elapsed < GIVE_UP_BUDGET,
+        "the entry must give up on its own deadline (1500ms here, via \
+         BOWERBIRD_GLANCE_TIMEOUT_MS); it took {elapsed:?}, which is over the {GIVE_UP_BUDGET:?} \
+         budget and means the deadline was ignored or widened. stderr:\n{stderr}"
+    );
+    // A13 positive companion for the bound above: the override was READ, so a
+    // fast give-up is the CONFIGURED deadline firing and not some unrelated
+    // early failure that happens to be quick.
+    assert!(
+        stderr.contains("1500ms"),
+        "the message must name the deadline that fired, which is what makes the elapsed \
+         bound above a statement about BOWERBIRD_GLANCE_TIMEOUT_MS; got:\n{stderr}"
+    );
+}
+
+/// A one-shot canned HTTP responder on an ephemeral port.
+///
+/// Every wait inside it is BOUNDED (CLAUDE.md: timeouts around recvs, polls
+/// and child-exits are hang detectors). The shape it replaces had three
+/// unbounded waits -- a blocking `accept()`, a blocking `read()`, and a
+/// `join()` that ran BEFORE every assertion, so a server thread that never
+/// finished took the whole suite with it and reported nothing.
+struct CannedServer {
+    bind_addr: String,
+    outcome: std::sync::mpsc::Receiver<String>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+/// Serve `body` once as an HTTP 200 with `content_type`, then close.
+///
+/// `Connection: close` plus a correct `Content-Length`, so the entry's body
+/// read terminates on its own rather than on the request deadline.
+fn serve_canned(content_type: &str, body: &str) -> CannedServer {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind canned server");
+    let bind_addr = listener.local_addr().expect("local_addr").to_string();
+    listener
+        .set_nonblocking(true)
+        .expect("canned server: set_nonblocking");
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let (tx, outcome) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let deadline = Instant::now() + GLANCE_HANG_GUARD;
+        let sock = loop {
+            match listener.accept() {
+                Ok((sock, _)) => break Some(sock),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        break None;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => {
+                    let _ = tx.send(format!("accept failed: {e}"));
+                    return;
+                }
+            }
+        };
+        let Some(mut sock) = sock else {
+            let _ = tx.send(format!("nothing connected within {GLANCE_HANG_GUARD:?}"));
+            return;
+        };
+        let _ = sock.set_nonblocking(false);
+        let _ = sock.set_read_timeout(Some(GLANCE_HANG_GUARD));
+        let mut buf = [0u8; 4096];
+        if let Err(e) = sock.read(&mut buf) {
+            let _ = tx.send(format!("read failed: {e}"));
+            return;
+        }
+        let _ = sock.set_write_timeout(Some(GLANCE_HANG_GUARD));
+        if let Err(e) = sock.write_all(response.as_bytes()) {
+            let _ = tx.send(format!("write failed: {e}"));
+            return;
+        }
+        let _ = sock.flush();
+        let _ = tx.send("served".to_string());
+    });
+    CannedServer {
+        bind_addr,
+        outcome,
+        handle,
+    }
+}
+
+impl CannedServer {
+    /// Bounded join. Returns the thread's own account of what it did, which is
+    /// the A13 positive companion for every assertion about the RESPONSE: if
+    /// this is not `served`, the entry's failure was about reachability and
+    /// the test would otherwise be a silent fourth copy of the daemon-down
+    /// tests.
+    fn finish(self) -> String {
+        let outcome = self
+            .outcome
+            .recv_timeout(GLANCE_HANG_GUARD)
+            .unwrap_or_else(|e| panic!("canned server did not report within the hang guard: {e}"));
+        self.handle.join().expect("canned server thread panicked");
+        outcome
+    }
+}
+
+/// Point `server.json` at an address without starting a daemon.
+fn write_server_json(tmp: &TempDir, bind_addr: &str) {
+    std::fs::create_dir_all(data_dir(tmp)).expect("mkdir .bowerbird");
+    std::fs::write(
+        data_dir(tmp).join("server.json"),
+        format!("{{\"bind_addr\":\"{bind_addr}\"}}"),
+    )
+    .expect("write server.json");
+}
+
+/// `--count` against a daemon whose body is not a JSON array.
+///
+/// The three output modes used to disagree about this input, and `--count`
+/// disagreed in the worst direction: text and JSON blew up on `.map`, while
+/// `--count` read `.length` off a non-array, printed the literal string
+/// `undefined`, and exited 0. `--count` is exactly the mode a tmux status line
+/// consumes, so the one mode that failed silently is the one whose failure
+/// nobody would ever see. Measured against `{"sessions":[]}`, `7`, and
+/// `"abcdefgh"` -- the last of which has a `.length` and would have printed a
+/// plausible `8`.
+///
+/// A canned HTTP 200 from a plain `TcpListener`, because the point is a body
+/// the daemon would never send.
+#[test]
+fn session_glance_count_rejects_a_response_body_that_is_not_an_array() {
+    if !node_22_6_available() {
+        return;
+    }
+    let tmp = TempDir::new().expect("tempdir");
+    let server = serve_canned("application/json", "{\"sessions\":[]}");
+    let bind_addr = server.bind_addr.clone();
+    write_server_json(&tmp, &bind_addr);
+
+    let (ok, stdout, stderr) = run_glance(&tmp, &["--count"]);
+
+    // The `undefined` ban runs FIRST, and the ordering is load-bearing rather
+    // than stylistic. Behind `assert!(!ok)` it could never be the assertion
+    // that fires: the pre-fix behavior was `--count` printing `undefined` AND
+    // exiting 0, so the exit-code assertion went first every time and the ban
+    // was permanently unobservable-red (A13). In this order the reported
+    // failure is "it printed undefined", which is also the more useful
+    // diagnosis: that string is what a tmux status line would render forever.
+    assert!(
+        !stdout.contains("undefined"),
+        "--count must never print the literal string `undefined`; got:\n{stdout}"
+    );
+    assert!(
+        !ok,
+        "--count must fail on a non-array body; got exit 0 with stdout:\n{stdout}"
+    );
+    // A13 positive companion: the request REACHED the server and got a
+    // response. Without this, a refused connection would produce a non-zero
+    // exit too and this test would silently become a fourth copy of the
+    // daemon-down tests rather than a statement about the body.
+    assert!(
+        !stderr.contains("cannot reach the daemon"),
+        "precondition: the canned server must have answered, so the failure is about the \
+         BODY and not about reachability; got:\n{stderr}"
+    );
+    for needle in ["JSON array", &format!("http://{bind_addr}")] {
+        assert!(
+            stderr.contains(needle),
+            "the non-array-body message must contain {needle:?}; got:\n{stderr}"
+        );
+    }
+    assert_eq!(
+        stderr.lines().count(),
+        1,
+        "expected exactly one stderr line, never a stack trace; got:\n{stderr}"
+    );
+    // Joined AFTER the assertions, and bounded. A `join()` before them turns a
+    // stuck server thread into a suite hang with no diagnosis, when the
+    // assertions above would have said what actually went wrong.
+    assert_eq!(server.finish(), "served");
+}
+
+/// An array whose ELEMENTS are not session objects.
+///
+/// `Array.isArray` passes `[1,2,3]`, and the failure was then silent in the
+/// two machine modes the contract is written for: text rendered
+/// `  undefined/undefined  undefined  age unknown`, and `--format=json`
+/// DROPPED documented keys (`JSON.stringify` omits `undefined` values),
+/// emitting `{"repo":...,"age":...,"age_seconds":null}` against README.md's
+/// "the field set is fixed". `--count` reported a confident `3`.
+///
+/// This is the counterpart to `CONTRACT_FIELDS` in
+/// `session_glance_machine_modes_pin_the_output_contract`, which pins the
+/// field set only for WELL-FORMED input and so could never see a short row.
+#[test]
+fn session_glance_rejects_an_array_of_things_that_are_not_sessions() {
+    if !node_22_6_available() {
+        return;
+    }
+    let tmp = TempDir::new().expect("tempdir");
+    const JUNK_ARRAY: &str = "[1,2,3]";
+
+    // One canned server PER run. It is deliberately one-shot (accept, answer,
+    // close), so sharing it across three runs would leave runs 2 and 3 on the
+    // refused-connection path, testing nothing about the body.
+    let mut outputs = Vec::new();
+    for (label, args) in [
+        ("--format=json", &["--format=json"][..]),
+        ("text", &[][..]),
+        ("--count", &["--count"][..]),
+    ] {
+        let server = serve_canned("application/json", JUNK_ARRAY);
+        write_server_json(&tmp, &server.bind_addr);
+        let addr = server.bind_addr.clone();
+        let out = run_glance(&tmp, args);
+        // A13 positive companion, per run: the canned server really answered,
+        // so what follows is about the ROWS and not about reachability.
+        assert_eq!(
+            server.finish(),
+            "served",
+            "{label}: the canned server must have answered"
+        );
+        outputs.push((label, addr, out));
+    }
+
+    // The content assertions run before the exit-code ones, same A13 reason as
+    // the test above: every one of these was the pre-fix output on a
+    // SUCCESSFUL exit, so an exit-code assertion first would mask all of them.
+    for (label, addr, (ok, stdout, stderr)) in &outputs {
+        assert!(
+            stdout.trim().is_empty(),
+            "{label}: an array of non-sessions must produce NO output. Pre-fix, \
+             --format=json emitted a row MISSING documented keys (README.md 'the field set \
+             is fixed'; JSON.stringify drops undefined values), text rendered \
+             `undefined/undefined  undefined  age unknown`, and --count reported a \
+             confident `3`. Got:\n{stdout}"
+        );
+        assert!(
+            !ok,
+            "{label}: an array of non-sessions must be a failure; got exit 0"
+        );
+        assert!(
+            !stderr.contains("cannot reach the daemon"),
+            "{label}: precondition: the canned server answered, so the failure must be \
+             about the rows; got:\n{stderr}"
+        );
+        for needle in ["element 0", "not a JSON object", &format!("http://{addr}")] {
+            assert!(
+                stderr.contains(needle),
+                "{label}: the bad-row message must name {needle:?}; got:\n{stderr}"
+            );
+        }
+        assert_eq!(
+            stderr.lines().count(),
+            1,
+            "{label}: expected exactly one stderr line, never a stack trace; got:\n{stderr}"
+        );
+    }
+}
+
+/// A 200 whose body cannot be read as JSON at all.
+///
+/// `await res.json()` sat OUTSIDE the try that wraps the fetch, which is the
+/// same defect the `server.json` `JSON.parse` had sixty lines above. Measured
+/// Node output for the three shapes, none of which names the address or the
+/// fix and none of which appears in README.md's troubleshooting list:
+///
+/// ```text
+/// Unexpected token '<', "<html>not "... is not valid JSON
+/// The operation was aborted due to timeout
+/// terminated
+/// ```
+///
+/// An HTML error page is the realistic one: a dev server or proxy that took
+/// the port `server.json` still points at.
+#[test]
+fn session_glance_names_the_address_when_the_body_is_not_json() {
+    if !node_22_6_available() {
+        return;
+    }
+    let tmp = TempDir::new().expect("tempdir");
+    let server = serve_canned("text/html", "<html>not a daemon</html>");
+    let bind_addr = server.bind_addr.clone();
+    write_server_json(&tmp, &bind_addr);
+
+    let (ok, stdout, stderr) = run_glance(&tmp, &["--count"]);
+    assert_eq!(server.finish(), "served");
+
+    // Content bans first (A13): the raw Node failure is itself a ONE-LINE
+    // message on a non-zero exit, so behind `assert!(!ok)` or the line-count
+    // assertion neither ban could ever be the one that fires.
+    //
+    // The ban is on the raw text being the WHOLE message, not on its appearing
+    // at all: the new message quotes Node's reason at the END, because
+    // `Unexpected token '<'` is exactly what tells you a web server took the
+    // port. What it must not be is the entire output, which names neither the
+    // address nor the fix.
+    assert!(
+        !stderr.trim_start().starts_with("Unexpected token"),
+        "the raw Node body-parse failure must not be the whole message; got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("    at "),
+        "AC 6 forbids the raw Node failure shape; stderr carries stack frames:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("undefined"),
+        "--count must never print `undefined`; got:\n{stdout}"
+    );
+    assert!(!ok, "expected a non-zero exit; stdout:\n{stdout}");
+    // A13 positive companion: the server answered, so this is about the BODY.
+    assert!(
+        !stderr.contains("cannot reach the daemon"),
+        "precondition: the canned server must have answered; got:\n{stderr}"
+    );
+    for needle in [
+        "could not be read as JSON",
+        &format!("http://{bind_addr}"),
+        "bowerbird start",
+    ] {
+        assert!(
+            stderr.contains(needle),
+            "the unreadable-body message must contain {needle:?}; got:\n{stderr}"
+        );
+    }
+    assert_eq!(
+        stderr.lines().count(),
+        1,
+        "expected exactly one stderr line, never a stack trace; got:\n{stderr}"
+    );
 }
