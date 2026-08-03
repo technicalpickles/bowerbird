@@ -1,6 +1,6 @@
 # Story 6-session-glance: One-shot session glance CLI
 
-Status: review
+Status: qa
 
 <!-- Story key is the slug `6-session-glance`. Do NOT rename to `6.1` or
      `6-1-session-glance`: epics.md:1411 ("Story keys are slug-first, not
